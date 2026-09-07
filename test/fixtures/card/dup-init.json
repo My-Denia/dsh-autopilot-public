@@ -1,0 +1,244 @@
+[
+ {
+  "type": "turn/start",
+  "seq": 4,
+  "time": 1787598928278,
+  "data": {
+   "turn": 1
+  }
+ },
+ {
+  "type": "tool/call",
+  "seq": 22,
+  "time": 1787598937055,
+  "data": {
+   "turn": 1,
+   "step": 1,
+   "callId": "call_QqxQY0vPabfS7J2WXsZFdT66|fc_03487d8dfbbad842016a8c9859374887d09fa05285d06437be",
+   "name": "autopilot_status",
+   "arguments": "{}"
+  }
+ },
+ {
+  "type": "tool/result",
+  "seq": 23,
+  "time": 1787598937060,
+  "data": {
+   "turn": 1,
+   "step": 1,
+   "message": {
+    "source": {
+     "kind": "tool",
+     "callId": "call_QqxQY0vPabfS7J2WXsZFdT66|fc_03487d8dfbbad842016a8c9859374887d09fa05285d06437be"
+    },
+    "content": [
+     {
+      "type": "tool-result",
+      "toolCallId": "call_QqxQY0vPabfS7J2WXsZFdT66|fc_03487d8dfbbad842016a8c9859374887d09fa05285d06437be",
+      "content": [
+       {
+        "type": "text",
+        "text": "{\"initialized\":false,\"note\":\"no autopilot run on this session\"}"
+       }
+      ],
+      "isError": false
+     }
+    ],
+    "role": "user",
+    "id": "e8bbefad-1043-4f6c-8074-e5b5c2257860"
+   }
+  },
+  "sourceEventSeqs": [
+   22
+  ],
+  "surfaceOp": "append"
+ },
+ {
+  "type": "tool/call",
+  "seq": 137,
+  "time": 1787598949733,
+  "data": {
+   "turn": 1,
+   "step": 2,
+   "callId": "call_BUhhkMlxUzzJLJ067bkcfA87|fc_03487d8dfbbad842016a8c986454ac87d0b1734db3f9a1e5d6",
+   "name": "autopilot_init",
+   "arguments": "{\"acceptanceCriteria\":[\"autopilot_status returns an enforcement object\"],\"auditMode\":\"self-check\",\"baselineBranch\":\"\",\"baselineCommit\":\"\",\"baselineDirty\":false,\"baselineNote\":\"\",\"executionMode\":\"inline\",\"nonGoals\":[\"modify any file\"],\"objective\":\"PROBE-E-DOMAIN-STORE-RUN1 measure enforcement.store on a headless boot that has ctx.storageDomain\",\"risk\":\"low\",\"scope\":[\"none\"],\"size\":\"lightweight\",\"touchesOperatingLayer\":false,\"usageIds\":[]}"
+  }
+ },
+ {
+  "type": "tool/result",
+  "seq": 138,
+  "time": 1787598949742,
+  "data": {
+   "turn": 1,
+   "step": 2,
+   "message": {
+    "source": {
+     "kind": "tool",
+     "callId": "call_BUhhkMlxUzzJLJ067bkcfA87|fc_03487d8dfbbad842016a8c986454ac87d0b1734db3f9a1e5d6"
+    },
+    "content": [
+     {
+      "type": "tool-result",
+      "toolCallId": "call_BUhhkMlxUzzJLJ067bkcfA87|fc_03487d8dfbbad842016a8c986454ac87d0b1734db3f9a1e5d6",
+      "content": [
+       {
+        "type": "text",
+        "text": "Error: tool \"autopilot_init\" returned invalid output: value is not lossless JSON"
+       }
+      ],
+      "isError": true
+     }
+    ],
+    "role": "user",
+    "id": "c51fd391-b8a6-4a91-a611-e9de84cf5729"
+   },
+   "error": {
+    "name": "ToolOutputError",
+    "code": "INVALID_TOOL_OUTPUT"
+   }
+  },
+  "sourceEventSeqs": [
+   137
+  ],
+  "surfaceOp": "append"
+ },
+ {
+  "type": "tool/call",
+  "seq": 251,
+  "time": 1787598957281,
+  "data": {
+   "turn": 1,
+   "step": 3,
+   "callId": "call_IsM8dKXZkdjovNPGRsi90GiM|fc_03487d8dfbbad842016a8c986b952087d0b36731223a8d198f",
+   "name": "autopilot_init",
+   "arguments": "{\"acceptanceCriteria\":[\"autopilot_status returns an enforcement object\"],\"auditMode\":\"self-check\",\"baselineBranch\":\"\",\"baselineCommit\":\"\",\"baselineDirty\":false,\"baselineNote\":\"\",\"executionMode\":\"inline\",\"nonGoals\":[\"modify any file\"],\"objective\":\"PROBE-E-DOMAIN-STORE-RUN1 measure enforcement.store on a headless boot that has ctx.storageDomain\",\"risk\":\"low\",\"scope\":[\"none\"],\"size\":\"lightweight\",\"touchesOperatingLayer\":false,\"usageIds\":[]}"
+  }
+ },
+ {
+  "type": "tool/result",
+  "seq": 252,
+  "time": 1787598957283,
+  "data": {
+   "turn": 1,
+   "step": 3,
+   "message": {
+    "source": {
+     "kind": "tool",
+     "callId": "call_IsM8dKXZkdjovNPGRsi90GiM|fc_03487d8dfbbad842016a8c986b952087d0b36731223a8d198f"
+    },
+    "content": [
+     {
+      "type": "tool-result",
+      "toolCallId": "call_IsM8dKXZkdjovNPGRsi90GiM|fc_03487d8dfbbad842016a8c986b952087d0b36731223a8d198f",
+      "content": [
+       {
+        "type": "text",
+        "text": "Error: an autopilot run is already active on this session"
+       }
+      ],
+      "isError": true
+     }
+    ],
+    "role": "user",
+    "id": "e50706f9-9dc0-492e-ad3a-501c86a77c2c"
+   }
+  },
+  "sourceEventSeqs": [
+   251
+  ],
+  "surfaceOp": "append"
+ },
+ {
+  "type": "tool/call",
+  "seq": 291,
+  "time": 1787598963913,
+  "data": {
+   "turn": 1,
+   "step": 4,
+   "callId": "call_kS0DzsvKuhnPWfH7ZByWARC0|fc_03487d8dfbbad842016a8c9873bf2487d092ccd3733903b3d7",
+   "name": "autopilot_log",
+   "arguments": "{\"blockingScope\":\"none\",\"escalationTarget\":\"root-agent\",\"note\":\"\",\"stance\":\"on-plan\",\"text\":\"probe E checkpoint\"}"
+  }
+ },
+ {
+  "type": "tool/result",
+  "seq": 292,
+  "time": 1787598963922,
+  "data": {
+   "turn": 1,
+   "step": 4,
+   "message": {
+    "source": {
+     "kind": "tool",
+     "callId": "call_kS0DzsvKuhnPWfH7ZByWARC0|fc_03487d8dfbbad842016a8c9873bf2487d092ccd3733903b3d7"
+    },
+    "content": [
+     {
+      "type": "tool-result",
+      "toolCallId": "call_kS0DzsvKuhnPWfH7ZByWARC0|fc_03487d8dfbbad842016a8c9873bf2487d092ccd3733903b3d7",
+      "content": [
+       {
+        "type": "text",
+        "text": "{\"revision\":2,\"logCount\":1}"
+       }
+      ],
+      "isError": false
+     }
+    ],
+    "role": "user",
+    "id": "536606a6-c0c4-4896-8835-7b76f9fba676"
+   }
+  },
+  "sourceEventSeqs": [
+   291
+  ],
+  "surfaceOp": "append"
+ },
+ {
+  "type": "tool/call",
+  "seq": 303,
+  "time": 1787598969454,
+  "data": {
+   "turn": 1,
+   "step": 5,
+   "callId": "call_DD2WyV1PStm9pkLDo1vaBleA|fc_03487d8dfbbad842016a8c9879af5487d0a3429a143195d473",
+   "name": "autopilot_status",
+   "arguments": "{}"
+  }
+ },
+ {
+  "type": "tool/result",
+  "seq": 304,
+  "time": 1787598969456,
+  "data": {
+   "turn": 1,
+   "step": 5,
+   "message": {
+    "source": {
+     "kind": "tool",
+     "callId": "call_DD2WyV1PStm9pkLDo1vaBleA|fc_03487d8dfbbad842016a8c9879af5487d0a3429a143195d473"
+    },
+    "content": [
+     {
+      "type": "tool-result",
+      "toolCallId": "call_DD2WyV1PStm9pkLDo1vaBleA|fc_03487d8dfbbad842016a8c9879af5487d0a3429a143195d473",
+      "content": [
+       {
+        "type": "text",
+        "text": "{\"runId\":\"session-90651a46-87b5-4d37-a88e-e54b622302a0\",\"revision\":2,\"phase\":\"planning\",\"planGate\":\"pending\",\"executionGate\":\"pending\",\"planRevision\":0,\"objective\":\"PROBE-E-DOMAIN-STORE-RUN1 measure enforcement.store on a headless boot that has ctx.storageDomain\",\"size\":\"lightweight\",\"risk\":\"low\",\"executionMode\":\"inline\",\"auditMode\":\"self-check\",\"requiredRoles\":[\"plan\",\"execution\"],\"latestVerdicts\":{},\"replanBudgetRemaining\":2,\"auditCount\":0,\"logCount\":1,\"enforcement\":{\"sandbox\":\"off\",\"reminders\":0,\"ownerApprovals\":[],\"store\":\"domain\",\"approval\":\"native\",\"egress\":\"native-ask\",\"service\":\"registered\",\"outboundConsumed\":0},\"closeoutSubmitted\":false}"
+       }
+      ],
+      "isError": false
+     }
+    ],
+    "role": "user",
+    "id": "9e174252-b8f7-44a9-bff4-df9bca4272c5"
+   }
+  },
+  "sourceEventSeqs": [
+   303
+  ],
+  "surfaceOp": "append"
+ }
+]

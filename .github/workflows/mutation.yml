@@ -1,0 +1,60 @@
+# Mutation-score REPORT for dsh-autopilot. Not a gate, and kept out of CI's
+# gate list on purpose: stryker.config.json sets `thresholds.break: null`, and
+# ci.yml's own header states the doctrine — a gate that cannot fail does not
+# belong in a gate list. A scheduled report is a different animal: it exists
+# to make score DRIFT visible over time, not to block anything. Reading it is
+# a human act; nothing downstream consumes it.
+#
+# Scope mirrors the local `check:mutation`: src/domain only (the pure core).
+# Runtime measured locally at ~3 minutes; a runner is slower, so the timeout
+# is generous. This workflow has NEVER EXECUTED until someone dispatches it or
+# the schedule first fires.
+
+name: Mutation report
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Weekly, Monday 02:47 UTC — an off-peak minute chosen away from :00/:30
+    # so the fleet's on-the-hour thundering herd is not joined.
+    - cron: '47 2 * * 1'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  mutation:
+    name: Stryker over src/domain (report only)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Enable corepack and activate the pinned pnpm
+        run: |
+          npm i -g corepack@latest
+          corepack enable
+          corepack prepare --activate
+          pnpm --version
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Run Stryker (cannot fail the build by design)
+        run: npx stryker run
+
+      - name: Upload the report
+        uses: actions/upload-artifact@v4
+        with:
+          name: stryker-report
+          path: .stryker/mutation/
+          if-no-files-found: error
+          retention-days: 90

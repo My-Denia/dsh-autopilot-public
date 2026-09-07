@@ -1,0 +1,386 @@
+M5 — MUTATION TESTING OF THE PURE DOMAIN CORE
+=============================================
+Recorded 2026-08-27. Every number below is copied from a run that happened on
+this machine; nothing here is projected or rounded up from a partial run.
+
+Host: Windows 11, node v25.2.1, pnpm 11.17.0 (corepack), 32 logical CPUs.
+
+
+1. INSTALL
+----------
+Command (the one sanctioned network install of this goal run):
+
+    pnpm add -D @stryker-mutator/core@10 @stryker-mutator/vitest-runner@10
+
+Exit code 0, 6.2s. Verbatim tail:
+
+    Packages: +163
+    Progress: resolved 286, reused 90, downloaded 146, added 163, done
+
+    devDependencies:
+    + @stryker-mutator/core 10.0.0
+    + @stryker-mutator/vitest-runner 10.0.0
+
+    Done in 6.2s using pnpm v11.17.0
+
+Resulting versions, read back from the installed package manifests rather than
+from the install output:
+
+    @stryker-mutator/core          10.0.0   (engines.node >=22.0.0)
+    @stryker-mutator/vitest-runner 10.0.0
+    vitest                          3.2.7   (unchanged)
+
+COMPATIBILITY WITH vitest 3.2.7 — NOT A PROBLEM, and this was checked rather
+than inferred from the install exiting 0:
+
+    node_modules/@stryker-mutator/vitest-runner/package.json
+      peerDependencies: {"@stryker-mutator/core":"10.0.0","vitest":">=2.0.0"}
+
+3.2.7 satisfies `>=2.0.0`. pnpm reported no peer warnings, vitest was neither
+moved nor re-resolved, and the runner went on to drive the real suite (see 3).
+No downgrade of vitest was needed or performed. The M5 park-and-revert branch
+was therefore never taken; package.json and pnpm-lock.yaml keep the install.
+
+package.json diff from the install is exactly two devDependency lines. The
+lockfile change is the legitimate side effect of that install.
+
+
+2. CONFIGURATION — stryker.config.json
+--------------------------------------
+Scope is `src/domain/**/*.ts` and nothing else. That directory is the pure
+core — fold.ts, types.ts, usage.ts: no I/O, no cordis service graph, no client
+bundle. Stryker confirmed the scoping held: "Found 3 of 119 file(s) to be
+mutated."
+
+Choices worth their justification, since JSON cannot carry comments (Stryker
+parses the config with plain JSON.parse — verified in
+node_modules/@stryker-mutator/core/dist/src/config/config-reader.js:80 — and
+warns on every unknown key, so `_comment` keys would add a warning per line
+to every future run):
+
+  * plugins: ["@stryker-mutator/vitest-runner"] — REQUIRED here, not optional.
+    Stryker's default plugin discovery is the glob "@stryker-mutator/*" over
+    node_modules, and under pnpm those entries are symlinks into
+    node_modules/.pnpm/. The glob did not follow them. See section 3 for the
+    verbatim failure this caused before the key was added.
+
+  * reporters: ["clear-text","html","json"] — listed explicitly so that
+    "dashboard" is off BY CONSTRUCTION rather than by omission. The dashboard
+    reporter is the only one that transmits results off this machine (it POSTs
+    to dashboard.stryker-mutator.io). Nothing in this run left the host.
+
+  * report and temp paths under build/ — Stryker's defaults are
+    reports/mutation/ and .stryker-tmp/, and NEITHER is in .gitignore. .gitignore
+    is outside this task's write scope, so instead of editing it the outputs
+    were pointed at build/, which .gitignore line 5 already covers. Verified
+    after the run:
+        $ git check-ignore -v build/mutation/mutation.json build/.stryker-tmp
+        .gitignore:5:build/     build/mutation/mutation.json
+        .gitignore:5:build/     build/.stryker-tmp
+    and `git status --porcelain` shows no build/ entry. No stray .stryker-tmp/
+    or reports/ was left at the repo root.
+
+  * coverageAnalysis: "perTest" — the suite is 729 tests but most do not touch
+    the domain core; per-test coverage is what makes 1119 mutants finish in
+    minutes instead of hours. Measured: 54.48 tests run per mutant on average,
+    against 729 total.
+
+  * concurrency: 8 of 32 CPUs — deliberately not all of them; another agent was
+    working in this tree at the same time.
+
+  * thresholds.break: null — this run REPORTS, it does not gate. See section 7.
+
+
+3. THE RUN
+----------
+Stryker was run twice. The first run produced no mutation result at all and the
+second is the one being reported. Recording both because "run it once" was the
+instruction and this is a deviation from it.
+
+RUN 1 — `npx stryker run` — exit code 1, 3 seconds, ZERO mutants tested:
+
+    WARN OptionsValidator Unknown stryker config option "vitest".
+    INFO ProjectReader Found 3 of 119 file(s) to be mutated.
+    INFO Instrumenter Instrumented 3 source file(s) with 1119 mutant(s)
+    INFO ConcurrencyTokenProvider Creating 4 test runner process(es).
+    ERROR Stryker Unexpected error occurred while running Stryker StrykerError:
+      Error: Could not inject [class ChildProcessTestRunnerWorker].
+      Cause: Cannot find TestRunner plugin "vitest". In fact, no TestRunner
+      plugins were loaded. Did you forget to install it?
+
+The plugin WAS installed — `require.resolve('@stryker-mutator/vitest-runner')`
+resolved fine, and node_modules/@stryker-mutator/ held both symlinks. The two
+warnings are one fault: the runner plugin also contributes the schema for the
+"vitest" config key, so "unknown option vitest" is the same non-discovery
+showing up earlier. Fixed by naming the plugin explicitly (section 2). This is
+a pnpm-layout issue, NOT a vitest-3 incompatibility.
+
+RUN 2 — `npx stryker run` — exit code 0. THIS IS THE REPORTED RUN.
+
+    Wall clock:            177 s (Stryker's own line: "Done in 2 minutes and
+                           54 seconds"); 12:07:37 -> 12:10:32 local.
+    Files mutated:         3 of 119
+    Mutants generated:     1119
+    Initial (dry) run:     729 tests, succeeded, 6 s
+    Tests per mutant:      54.48 average
+
+
+4. RESULT
+---------
+    ----------|------------------|----------|-----------|------------|----------|----------|
+              | % Mutation score |          |           |            |          |          |
+    File      |  total | covered | # killed | # timeout | # survived | # no cov | # errors |
+    ----------|--------|---------|----------|-----------|------------|----------|----------|
+    All files |  78.19 |   83.17 |      871 |         4 |        177 |       67 |        0 |
+     fold.ts  |  72.27 |   76.11 |      254 |         4 |         81 |       18 |        0 |
+     types.ts |  78.11 |   85.54 |      414 |         0 |         70 |       46 |        0 |
+     usage.ts |  87.50 |   88.65 |      203 |         0 |         26 |        3 |        0 |
+    ----------|--------|---------|----------|-----------|------------|----------|----------|
+
+    KILLED 871 / TIMEOUT 4 / SURVIVED 177 / NO COVERAGE 67 / ERRORS 0
+    871 + 4 + 177 + 67 = 1119, which matches the instrumented count exactly.
+
+The same tally read independently out of build/mutation/mutation.json rather
+than off the console table: {"Killed":871,"Survived":177,"NoCoverage":67,
+"Timeout":4}. The two agree.
+
+AC5 asked for killed > 0. killed = 871, so the run carries information: these
+tests demonstrably detect deliberate damage to the domain core.
+
+The 4 timeouts are all one shape — reverse loop bounds in fold.ts, where the
+mutant makes the loop non-terminating rather than wrong:
+
+    fold.ts:74:19  EqualityOperator  i >= prior.audits.length
+    fold.ts:74:44  UpdateOperator    i--
+    fold.ts:86:37  EqualityOperator  i >= next.audits.length
+    fold.ts:86:61  UpdateOperator    i--
+
+Stryker counts a timeout as killed-equivalent. Read them as "the test suite
+hangs rather than passes", not as an unresolved gap.
+
+
+5. SURVIVORS — 177, REPORTED AS FOUND
+-------------------------------------
+Not chased to zero and no tests were added; test/ is outside this task's write
+scope, and a survivor count driven to zero by a task that also writes the tests
+would not mean anything anyway.
+
+By mutator, all 177:
+
+    StringLiteral          84
+    ConditionalExpression  47
+    EqualityOperator       16
+    MethodExpression       14
+    LogicalOperator         4
+    BlockStatement          3
+    OptionalChaining         2
+    ArrayDeclaration         2
+    ArrowFunction            2
+    ObjectLiteral            1
+    Regex                    1
+    CallExpression           1
+
+Representative sample, four per file, one per distinct mutator, taken from
+mutation.json (`-` original, `+` mutant):
+
+    src/domain/fold.ts:53:86   [StringLiteral]
+       -  'AP_INIT_REVISION'
+       +  ""
+    src/domain/fold.ts:48:7    [ConditionalExpression]
+       -  event.v !== 1
+       +  false
+    src/domain/fold.ts:53:9    [LogicalOperator]
+       -  event.revision !== 1 || next.revision !== 1
+       +  event.revision !== 1 && next.revision !== 1
+    src/domain/fold.ts:86:37   [EqualityOperator]
+       -  i < next.audits.length
+       +  i <= next.audits.length
+
+    src/domain/types.ts:496:17 [StringLiteral]
+       -  'AutopilotError'
+       +  ""
+    src/domain/types.ts:508:65 [ConditionalExpression]
+       -  triage.risk === 'critical'
+       +  false
+    src/domain/types.ts:600:9  [MethodExpression]
+       -  closeout.workspaceCleanup.trim()
+       +  closeout.workspaceCleanup
+    src/domain/types.ts:625:49 [BlockStatement]
+       -  { ...
+       +  {}
+
+    src/domain/usage.ts:113:16 [MethodExpression]
+       -  text.slice(0, 16)
+       +  text
+    src/domain/usage.ts:117:7  [ConditionalExpression]
+       -  kind === 'screencast'
+       +  true
+    src/domain/usage.ts:158:20 [EqualityOperator]
+       -  anchor.length > 0
+       +  anchor.length >= 0
+    src/domain/usage.ts:190:70 [StringLiteral]
+       -  '<empty ref>'
+       +  ""
+
+A note on reading that list, since 84 of 177 survivors are StringLiteral: many
+are diagnostic text — an error label or a problem message emptied to "". Those
+survive because the tests assert on structure and on which check fired, not on
+the prose. That is a defensible testing choice, not necessarily a hole, and the
+count should not be read as "84 missing assertions". The ConditionalExpression
+and EqualityOperator survivors (63 between them) are the ones worth reading as
+candidate gaps: each is a branch or boundary that can be forced one way with no
+test noticing. The full list is in build/mutation/mutation.json (gitignored;
+regenerate with `pnpm check:mutation`).
+
+The 67 no-coverage mutants — 46 of them in types.ts — are code no test reaches
+at all. They are a coverage statement, not a mutation-quality one.
+
+
+6. CAVEAT THAT LIMITS THESE NUMBERS — READ THIS BEFORE QUOTING THE SCORE
+-----------------------------------------------------------------------
+src/domain/types.ts was modified by a concurrently running agent DURING the
+reported run:
+
+    src/domain/types.ts  mtime = 2026-08-27 12:09:30
+    run window                 = 12:07:37 -> 12:10:32
+
+Stryker snapshots the project into its sandbox at the start of the run, so the
+414 killed / 70 survived / 46 no-coverage figures for types.ts describe that
+file as it stood at 12:07:37. `git diff --stat -- src/domain/` afterwards shows
+`src/domain/types.ts | 90 +++++` — ninety lines that were added at 12:09:30 and
+were therefore never instrumented, never mutated, and never tested by this run.
+
+So: 78.19% is a real measurement of a real tree, but not of the CURRENT tree.
+fold.ts and usage.ts are unaffected (both untouched since 2026-08-25). Anyone
+wanting a number that covers the added 90 lines has to re-run.
+
+
+7. WIRING
+---------
+package.json gained one script:
+
+    "check:mutation": "stryker run"
+
+It is deliberately NOT part of `check`, NOT part of `test`, and NOT in CI:
+  - a ~3 minute run does not belong in a typecheck gate;
+  - `thresholds.break` is null, so the command cannot fail a build on score,
+    and a gate that cannot fail is worse than no gate — it reads as enforcement
+    while enforcing nothing;
+  - the score is not yet stable enough to pin a threshold to honestly, for the
+    reason in section 6.
+
+
+8. WHAT THIS RUN DOES AND DOES NOT PROVE
+----------------------------------------
+DOES:
+  - Stryker 10.0.0 + vitest-runner 10.0.0 work against vitest 3.2.7 on node 25
+    in this repo. Not a peer-range reading — 1119 mutants were actually built
+    and executed, exit 0.
+  - The suite kills 871 of 1119 deliberate defects in the domain core and hangs
+    on 4 more. Those tests assert on behaviour; they are not smoke tests.
+  - usage.ts is the best-tested of the three (87.50%), fold.ts the weakest
+    (72.27%) and also the only file with non-terminating mutants.
+  - The whole thing is reproducible from a committed config: one command,
+    `pnpm check:mutation`.
+
+DOES NOT:
+  - Say anything whatsoever about src/ outside src/domain/ — the service, the
+    engine, the store, the tools and the client were not mutated. Roughly 116
+    of 119 files in scope of the project are unmeasured.
+  - Cover the 90 lines added to types.ts at 12:09:30 (section 6).
+  - Establish that the 177 survivors are acceptable. Nobody has triaged them.
+    They are recorded, not judged.
+  - Prove the tests are CORRECT. Mutation score measures sensitivity to change,
+    not whether the asserted behaviour is the behaviour anyone wanted.
+  - Constitute a regression baseline. The number moves with any edit to the
+    three files, and nothing enforces it.
+
+================================================================================
+RE-RUN BY THE EXECUTOR LEAD — 2026-08-27, and THIS is the authoritative number
+================================================================================
+
+WHY A SECOND RUN. The run recorded above is a real measurement of a real tree,
+but not of the tree that shipped: `src/domain/types.ts` was being edited (the
+treeHash work) WHILE that run was in flight — Stryker snapshots into its sandbox
+at start, so its types.ts figures describe the file as of 12:07:37 and ninety
+later lines were never instrumented. The child that ran it flagged this itself
+rather than letting the number stand unqualified, which is why it is corrected
+here instead of discovered later.
+
+This re-run was started only after every source edit of the round was finished
+and all gates were green, so it describes the tree as committed.
+
+  $ npx stryker run
+  exit 0, wall clock 3 minutes 9 seconds
+  Found 3 of 121 file(s) to be mutated; instrumented with 1119 mutant(s)
+  Initial dry run: 752 tests OK; 56.44 tests per mutant on average
+
+  ----------|------------------|----------|-----------|------------|----------|
+            | % Mutation score |          |           |            |          |
+  File      |  total | covered | # killed | # timeout | # survived | # no cov |
+  ----------|--------|---------|----------|-----------|------------|----------|
+  All files |  82.48 |   84.29 |      919 |         4 |        172 |       24 |
+   fold.ts  |  72.27 |   76.11 |      254 |         4 |         81 |       18 |
+   types.ts |  87.17 |   87.67 |      462 |         0 |         65 |        3 |
+   usage.ts |  87.50 |   88.65 |      203 |         0 |         26 |        3 |
+  ----------|--------|---------|----------|-----------|------------|----------|
+
+  919 + 4 + 172 + 24 = 1119, matching the instrumented count. 0 errors.
+
+AC5 IS SATISFIED, and the reason the criterion is written that way is worth
+restating: killed = 919 > 0. A mutation run that kills nothing proves nothing —
+it cannot distinguish "the tests are strong" from "the runner never executed
+them", which is exactly the failure the first attempt hit (0 mutants tested
+because the vitest plugin was not discovered under pnpm's layout).
+
+WHAT CHANGED AGAINST THE SUPERSEDED RUN, and why it moved:
+  total 78.19 -> 82.48, killed 871 -> 919, survived 177 -> 172, no-cov 67 -> 24.
+  Essentially all of the movement is in types.ts (78.11 -> 87.17, no-coverage
+  46 -> 3): the file grew the treeHash rules AND the tests that bear them, so
+  code that was uninstrumented-and-uncovered in the first run is now both
+  instrumented and exercised. fold.ts and usage.ts are byte-identical between
+  the two runs and their numbers are byte-identical too, which is the control
+  that says the delta is the edit and not run-to-run noise.
+
+SURVIVORS, RECORDED AND NOT CHASED (172):
+  by file:    fold.ts 81, types.ts 65, usage.ts 26
+  by mutator: StringLiteral 84, ConditionalExpression 44, EqualityOperator 17,
+              MethodExpression 14, LogicalOperator 4, OptionalChaining 2,
+              ArrayDeclaration 2, BlockStatement 2, ObjectLiteral 1, Regex 1,
+              ArrowFunction 1
+
+  READ THE 84 BEFORE QUOTING "172 GAPS". StringLiteral mutants replace a string
+  with "", and most of these are diagnostic PROSE — the tests assert on
+  structure and error codes rather than on wording, deliberately, because
+  asserting exact prose is how a suite becomes unmaintainable. e.g.
+    usage.ts:349:28  Buffer.from(utf8, 'utf8')  ->  Buffer.from(utf8, "")
+  which survives because '' and 'utf8' are the same encoding to Node.
+  The ~61 Conditional/Equality survivors are the ones that read as genuine
+  gaps and are the honest place to look next.
+
+  The 4 timeouts are one shape: reversed loop bounds in fold.ts (the
+  append-only audit scan and the countersign scan) making the loop
+  non-terminating. A timeout is a kill in the sense that the mutant did not
+  survive undetected, but it is reported separately here rather than folded
+  into "killed", because it was detected by a clock and not by an assertion.
+
+  No tests were added to move this number. Chasing survivors to zero would
+  optimize the metric rather than the suite, and the metric is not the goal.
+
+WHAT THIS RUN DOES NOT ESTABLISH:
+  - It covers src/domain only (3 of 121 files) — the pure core. The engine, the
+    gates, the store backends, the tools layer, the outbound manifest and the
+    whole client half are NOT mutated, so nothing here says anything about
+    their test strength.
+  - A surviving mutant is a question, not a verdict: some are equivalent
+    mutants that no test could kill.
+  - It is not wired into `check` or CI (runtime ~3 min, and thresholds.break is
+    null so it cannot fail a build). It is run on demand with
+    `pnpm check:mutation`.
+
+CONFIG NOTE, measured the hard way: the reports and temp dir must NOT live
+under `build/`. Stryker's sandbox is a copy of the whole project including
+node_modules, and `scripts/wrap-client.mjs` collects every `.js` under `build/`
+into the client bundle. With a leftover sandbox in place the bundler reported
+12,518 modules instead of 4. Output now goes to `.stryker/` (gitignored) and
+the bundler additionally skips node_modules and dot-directories.

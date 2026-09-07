@@ -1,0 +1,198 @@
+[
+ {
+  "type": "turn/start",
+  "seq": 5,
+  "time": 1787806102643,
+  "data": {
+   "turn": 1
+  }
+ },
+ {
+  "type": "tool/call",
+  "seq": 135,
+  "time": 1787806110307,
+  "data": {
+   "turn": 1,
+   "step": 1,
+   "callId": "call_DvyY238dJJBK1U7GtkDqZhiJ|fc_0f8b8bad3ede5c03016a8fc19daaf087d096c81d3ded588081",
+   "name": "run_code",
+   "arguments": "{\"code\":\"const result = await tools.autopilot_init({\\n  objective: \\\"M7 live-card probe\\\",\\n  scope: [\\\"probe/\\\"],\\n  nonGoals: [\\\"everything else\\\"],\\n  acceptanceCriteria: [\\\"card advances\\\"],\\n  risk: \\\"low\\\",\\n  size: \\\"lightweight\\\",\\n  executionMode: \\\"inline\\\",\\n  auditMode: \\\"self-check\\\"\\n});\\nreturn result;\",\"description\":\"Initialize live-card probe autopilot run\"}"
+  }
+ },
+ {
+  "type": "tool/code-dispatch-start",
+  "seq": 136,
+  "time": 1787806110356,
+  "data": {
+   "rootCallId": "call_DvyY238dJJBK1U7GtkDqZhiJ|fc_0f8b8bad3ede5c03016a8fc19daaf087d096c81d3ded588081",
+   "parentCallId": "call_DvyY238dJJBK1U7GtkDqZhiJ|fc_0f8b8bad3ede5c03016a8fc19daaf087d096c81d3ded588081",
+   "subCallId": "call_DvyY238dJJBK1U7GtkDqZhiJ|fc_0f8b8bad3ede5c03016a8fc19daaf087d096c81d3ded588081:code:1",
+   "name": "autopilot_init",
+   "arguments": {
+    "objective": "M7 live-card probe",
+    "scope": [
+     "probe/"
+    ],
+    "nonGoals": [
+     "everything else"
+    ],
+    "acceptanceCriteria": [
+     "card advances"
+    ],
+    "risk": "low",
+    "size": "lightweight",
+    "executionMode": "inline",
+    "auditMode": "self-check"
+   }
+  }
+ },
+ {
+  "type": "tool/code-dispatch",
+  "seq": 137,
+  "time": 1787806110362,
+  "data": {
+   "rootCallId": "call_DvyY238dJJBK1U7GtkDqZhiJ|fc_0f8b8bad3ede5c03016a8fc19daaf087d096c81d3ded588081",
+   "parentCallId": "call_DvyY238dJJBK1U7GtkDqZhiJ|fc_0f8b8bad3ede5c03016a8fc19daaf087d096c81d3ded588081",
+   "subCallId": "call_DvyY238dJJBK1U7GtkDqZhiJ|fc_0f8b8bad3ede5c03016a8fc19daaf087d096c81d3ded588081:code:1",
+   "name": "autopilot_init",
+   "arguments": {
+    "objective": "M7 live-card probe",
+    "scope": [
+     "probe/"
+    ],
+    "nonGoals": [
+     "everything else"
+    ],
+    "acceptanceCriteria": [
+     "card advances"
+    ],
+    "risk": "low",
+    "size": "lightweight",
+    "executionMode": "inline",
+    "auditMode": "self-check"
+   },
+   "isError": false,
+   "content": [
+    {
+     "type": "text",
+     "text": "{\"revision\":1,\"phase\":\"planning\",\"enforcement\":{\"sandbox\":\"off\",\"reminders\":0,\"ownerApprovals\":[],\"store\":\"file\",\"approval\":\"native\",\"egress\":\"native-ask\",\"service\":\"registered\",\"outboundConsumed\":0}}"
+    }
+   ]
+  }
+ },
+ {
+  "type": "tool/result",
+  "seq": 138,
+  "time": 1787806110365,
+  "data": {
+   "turn": 1,
+   "step": 1,
+   "message": {
+    "source": {
+     "kind": "tool",
+     "callId": "call_DvyY238dJJBK1U7GtkDqZhiJ|fc_0f8b8bad3ede5c03016a8fc19daaf087d096c81d3ded588081"
+    },
+    "content": [
+     {
+      "type": "tool-result",
+      "toolCallId": "call_DvyY238dJJBK1U7GtkDqZhiJ|fc_0f8b8bad3ede5c03016a8fc19daaf087d096c81d3ded588081",
+      "content": [
+       {
+        "type": "text",
+        "text": "{\n  \"revision\": 1,\n  \"phase\": \"planning\",\n  \"enforcement\": {\n    \"sandbox\": \"off\",\n    \"reminders\": 0,\n    \"ownerApprovals\": [],\n    \"store\": \"file\",\n    \"approval\": \"native\",\n    \"egress\": \"native-ask\",\n    \"service\": \"registered\",\n    \"outboundConsumed\": 0\n  }\n}"
+       }
+      ],
+      "isError": false
+     }
+    ],
+    "role": "user",
+    "id": "e811eef7-c6e4-4fe8-bce0-e99a9f900d63"
+   }
+  },
+  "sourceEventSeqs": [
+   135
+  ],
+  "surfaceOp": "append"
+ },
+ {
+  "type": "tool/call",
+  "seq": 183,
+  "time": 1787806117833,
+  "data": {
+   "turn": 1,
+   "step": 2,
+   "callId": "call_1LmuWY1ayFTYKA24aXVBDFww|fc_0f8b8bad3ede5c03016a8fc1a3e9c087d08a76cccaa872c064",
+   "name": "run_code",
+   "arguments": "{\"code\":\"const result = await tools.autopilot_submit_plan({ text: \\\"single probe milestone\\\" });\\nreturn result;\",\"description\":\"Submit single probe milestone plan\"}"
+  }
+ },
+ {
+  "type": "tool/code-dispatch-start",
+  "seq": 184,
+  "time": 1787806117861,
+  "data": {
+   "rootCallId": "call_1LmuWY1ayFTYKA24aXVBDFww|fc_0f8b8bad3ede5c03016a8fc1a3e9c087d08a76cccaa872c064",
+   "parentCallId": "call_1LmuWY1ayFTYKA24aXVBDFww|fc_0f8b8bad3ede5c03016a8fc1a3e9c087d08a76cccaa872c064",
+   "subCallId": "call_1LmuWY1ayFTYKA24aXVBDFww|fc_0f8b8bad3ede5c03016a8fc1a3e9c087d08a76cccaa872c064:code:1",
+   "name": "autopilot_submit_plan",
+   "arguments": {
+    "text": "single probe milestone"
+   }
+  }
+ },
+ {
+  "type": "tool/code-dispatch",
+  "seq": 185,
+  "time": 1787806117864,
+  "data": {
+   "rootCallId": "call_1LmuWY1ayFTYKA24aXVBDFww|fc_0f8b8bad3ede5c03016a8fc1a3e9c087d08a76cccaa872c064",
+   "parentCallId": "call_1LmuWY1ayFTYKA24aXVBDFww|fc_0f8b8bad3ede5c03016a8fc1a3e9c087d08a76cccaa872c064",
+   "subCallId": "call_1LmuWY1ayFTYKA24aXVBDFww|fc_0f8b8bad3ede5c03016a8fc1a3e9c087d08a76cccaa872c064:code:1",
+   "name": "autopilot_submit_plan",
+   "arguments": {
+    "text": "single probe milestone"
+   },
+   "isError": false,
+   "content": [
+    {
+     "type": "text",
+     "text": "{\"revision\":2,\"phase\":\"planning\",\"planRevision\":1,\"planGate\":\"pending\"}"
+    }
+   ]
+  }
+ },
+ {
+  "type": "tool/result",
+  "seq": 186,
+  "time": 1787806117866,
+  "data": {
+   "turn": 1,
+   "step": 2,
+   "message": {
+    "source": {
+     "kind": "tool",
+     "callId": "call_1LmuWY1ayFTYKA24aXVBDFww|fc_0f8b8bad3ede5c03016a8fc1a3e9c087d08a76cccaa872c064"
+    },
+    "content": [
+     {
+      "type": "tool-result",
+      "toolCallId": "call_1LmuWY1ayFTYKA24aXVBDFww|fc_0f8b8bad3ede5c03016a8fc1a3e9c087d08a76cccaa872c064",
+      "content": [
+       {
+        "type": "text",
+        "text": "{\n  \"revision\": 2,\n  \"phase\": \"planning\",\n  \"planRevision\": 1,\n  \"planGate\": \"pending\"\n}"
+       }
+      ],
+      "isError": false
+     }
+    ],
+    "role": "user",
+    "id": "c56cb36b-1c19-4608-bb52-4d86f420d3d9"
+   }
+  },
+  "sourceEventSeqs": [
+   183
+  ],
+  "surfaceOp": "append"
+ }
+]

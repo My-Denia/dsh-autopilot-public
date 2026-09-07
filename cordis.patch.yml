@@ -1,0 +1,26 @@
+# dsh-autopilot bundle layer: mounts the autopilot plugin with default config.
+# Override per profile in the profile's cordis.patch.yml by targeting id: autopilot.
+#
+# WHY storeKind IS PINNED TO `file` HERE RATHER THAN LEFT AT THE CODE DEFAULT
+# `auto` (2026-08-27). `auto` picks the domain backend whenever the profile
+# mounts `ctx.storageDomain`, and only the web-app bundle does. So one machine
+# running both a web profile and a headless profile ends up with the SAME run
+# root and two different canonical media: measured here, 41 file-backed runs and
+# 5 domain-table runs, each invisible to the other half of the deployment.
+#
+# The domain backend cannot be made the shared medium either: its json backing
+# is read-once-at-open plus whole-file republish, so two dsh processes on one
+# unit CLOBBER each other rather than interleave. The file backend appends one
+# canonical line per event and publishes its projection by rename, which is what
+# makes a second process's reads safe. Pinning is therefore a DEPLOYMENT
+# decision about which medium both profiles share, not a retraction of the
+# `auto` semantics — `storeKind: 'auto'` still means "probe, and record what you
+# actually got in enforcement.store". See DESIGN.md §6.
+#
+# A profile that genuinely wants the domain backend overrides this row by id;
+# the config layer above this one wins, so nothing here is a ceiling.
+- insert:
+    - id: autopilot
+      name: dsh-autopilot
+      config:
+        storeKind: file

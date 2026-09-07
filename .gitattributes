@@ -1,0 +1,22 @@
+# Line endings are pinned to LF in the repository AND in the working tree.
+#
+# WHY, specifically. This machine has `core.autocrlf=true` globally, so without
+# this file every checkout would rewrite the tree to CRLF. That is not a
+# cosmetic worry here: a 2026-08-25 audit found three source files had drifted
+# to CRLF while the other thirty-two were LF, and its finding was that a
+# diff-based review of those files could no longer be scoped to the actual
+# edits — every line reads as changed. The files were normalized by hand; this
+# file is what stops the next checkout from undoing that.
+#
+# `eol=lf` (not just `text=auto`) is the part that matters: `text=auto` alone
+# normalizes what is STORED and still lets autocrlf convert what is CHECKED OUT.
+* text=auto eol=lf
+
+# Artifacts that must survive byte-for-byte. `events.jsonl` fixtures are real
+# captured run streams replayed through the strict fold; rewriting their line
+# endings would change what is being replayed.
+*.jsonl -text
+*.png binary
+*.jpg binary
+*.webm binary
+*.mp4 binary

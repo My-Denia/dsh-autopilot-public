@@ -1,0 +1,150 @@
+# M3a outbound gate: authorization path driven on a real host (2026-08-27)
+# Profile autopilot-dev (web, 127.0.0.1:<PORT>), run session-32d85066-...
+#
+# READ THE SCOPE SECTION BEFORE CITING THIS FILE. An earlier draft of this
+# record claimed it closed the "outbound forward dispatch" residual and the
+# "approval:native answered by a real human" residual. Review of that draft
+# (PR #3) showed BOTH claims were wrong. They are corrected below and both
+# residuals stay OPEN. What follows is what the run actually bears.
+
+## What was driven
+
+A standard run on the web profile authored an outbound manifest, and four
+`git push` attempts were made through the dsh pwsh channel against a local
+bare repo (zero external effect). Each raised the native approval ask in the
+browser; each was answered "Allow once"; each then dispatched.
+
+## Raw observations
+
+outboundConsumed: 4
+approval (enforcement): native
+egress (enforcement):   native-ask
+outbound/consumed/ archives: 4
+  2026-08-27T13-34-39-582Z-0fd8f1ba-dfb4340c.json
+  2026-08-27T13-37-42-409Z-1d9c99c2-a49607a3.json
+  2026-08-27T13-43-12-278Z-79ae85ac-344f1153.json
+  2026-08-27T13-46-40-087Z-58c61bf0-de27b373.json
+consume-manifest events in events.jsonl: 4
+one archive body:
+  runId: session-32d85066-366b-45e0-bb27-6fe033fea285
+  consumed.command: git -C <scratch>/egress/src push localbare main (pwsh-wrapped; path redacted)
+  consumed.at: 2026-08-27T13:34:39.582Z
+
+Transport outcome of all four: FAILED. The dsh pwsh sandbox could not fork
+its shell — `sh.exe: *** fatal error - CreateFileMapping ..., Win32 error 5` —
+so git reported `fatal: Could not read from remote repository` and exited 1.
+No ref was ever transferred by any of the four. (The same push run from an
+ordinary shell on the same machine succeeds, so the fault is the dsh sandbox
+environment, not git and not the remote.)
+
+## PROVEN by this run
+
+- The gate's authorization path works end to end on a real host: manifest
+  resolution, validation, escalation to a native `ask`, and — on an answered
+  ask — an ALLOW that dispatches. NOTE what is NOT in that list: the
+  run_id/ui_change consistency refusal is NOT this plugin's. `ui_change` has no
+  implementation anywhere in this repository (it is a field of the driving
+  Claude-side harness's manifest); an earlier draft listed it here and thereby
+  credited the plugin with a check it does not implement.
+  The checker was seen to REJECT as well as to pass — but count the branches by
+  SOURCE, not by total. Only (1) below is this plugin. (2)-(4) come from the
+  driving Claude-side harness's own outbound gate, which was operating on the
+  same task; they are context, not plugin coverage. Verbatim, each corrected
+  and the same call then retried:
+
+    (1) undeclared command substring — the dsh-side gate, on the first push:
+        "autopilot outbound gate: manifest at <runDir>/outbound/manifest.json
+         does not authorize this egress: egress command matches no declared
+         command substring: const result = await tools.pwsh({ command: "git -C
+         <scratch>/egress/src push localbare main", ... })"
+    (2) declaration conflict — this harness's own gate, on the enabling call:
+        "outbound gate [active-run]: the covering run declares a user-visible
+         class ('api-behavior') but this manifest says "ui_change": false — one
+         of the two declarations is wrong, and the gate will not pick which."
+    (3) multi-command call:
+        "outbound gate: an outbound command must be the ONLY state-touching
+         command in its Bash call; found 'git push -u origin
+         audit-p1p2-evidence 2>'."
+    (4) body expansion not matching the declared source:
+        "outbound gate [run-id-declared]: outbound text (--body) expands
+         '$(cat goal-runs/audit-p1p2-evidence/pr-body.md)'; the only accepted
+         expansion is `$(cat pr-body.md)` — exactly the declared body_source,
+         one file, no other command."
+
+  So: ONE observed rejection branch in the plugin under test, three in the
+  driving harness. Any ledger entry citing this file must say one, not four.
+- `archiveConsumed` writes an archive per authorized dispatch. Four archives =
+  four authorized attempts. This is the archive's designed meaning
+  (`src/gate/preexecute.ts:402-427`: the archive marks an authorized dispatch
+  ATTEMPT and is written before `next()`).
+- The native approval CHANNEL is reachable and answerable in this deployment.
+  This was narrative in an earlier draft; here is the route discriminator that
+  makes it borne. `preexecute.ts:361-371` has exactly two paths to ALLOW: an
+  unconsumed standing `owner-approve` matched by `consumeApproval`, or an `ask`
+  that gets answered. The run record excludes the first:
+
+    enforcement.ownerApprovals: []          (empty — none was ever granted)
+    event ops in events.jsonl:  init 1, submit-plan 1, log 2, consume-manifest 4
+                                (ZERO consume-approval events)
+
+  `consumeApproval` MARKS an approval consumed (`.map`, setting `consumedBy`) and
+  emits a `consume-approval` event — it does not remove the entry — so an empty
+  array plus zero such events means the standing-approval path authorized none
+  of the four dispatches. With that path excluded, the answered-ask path is the
+  only remaining explanation for four ALLOWs. (Consistent with the record: the
+  one `owner-approve` attempted in this run was itself refused by the gate.)
+
+  This is a property of the CHANNEL, not of who answered — see the residual below.
+  Not retained, and worth naming: the approval responses themselves, any UI
+  capture, and per-ask timing. The discrimination above is by exclusion.
+
+## NEW FINDING — outboundConsumed is not a bearer for "egress went out"
+
+This is the substantive result of the run, and it contradicts what the first
+draft of this file asserted.
+
+`preexecute.ts:402-427` bumps `outboundConsumed` (and emits `consume-manifest`)
+ONLY when `next()` returns a non-error result, precisely so that the counter
+means "egresses that ACTUALLY went out", and so that "archived with no
+consume-manifest" is readable as authorized-but-not-dispatched. That
+distinction did not survive contact with the runtime: all four commands FAILED
+(exit 1, no ref moved) and the counter still reached 4, with a
+`consume-manifest` event for each.
+
+Cause: `isErrorResult` (`preexecute.ts:154-157`) keys on `isError === true` on
+the result object. The dsh pwsh tool does not set that flag for a command that
+exits non-zero, so a failed shell command is indistinguishable from a
+successful one at this seam. The counter therefore bears "dispatched, and the
+runtime did not flag an error" — NOT "the egress went out". Any downstream
+reader (including this package's own closeout prose) that treats
+`outboundConsumed > 0` as proof that text left the machine is reading a
+property the counter cannot observe.
+
+And the shape does not discriminate in the other direction either — an earlier
+draft of this file said error-producing wrappers make the not-dispatched case
+distinguishable, which is wrong: a later wrapper may dispatch the command,
+reach the remote, and only then throw or return an error result, producing
+exactly the same archive-without-event shape as a cancellation that preceded
+dispatch. The error shape alone proves NOTHING about whether the command was
+dispatched. Only a cancellation independently known to precede dispatch tells
+you that, and nothing in this capture establishes one.
+
+## STILL UNPROVEN after this run (do not cite this file as closing these)
+
+- **Outbound forward dispatch with a genuinely successful transport.** Nothing
+  here shows a real egress completing. The residual stays open, and closing it
+  needs a host whose shell channel actually works, or a channel other than the
+  broken pwsh fork path.
+- **`approval: native` answered by a real human / the governance property.**
+  The four "Allow once" clicks were performed by the driving AGENT through the
+  browser under the owner's blanket authorization for this task. Blanket
+  authorization does not convert an automated UI action into a human answer.
+  What is borne is the mechanical ask -> allow route; who answered is NOT.
+  Closing this needs the owner to answer the prompt themselves.
+- **owner-approve passthrough (`autopilot_signal action=owner-approve`).**
+  Blocked in this deployment for a reason worth recording: the signal call is
+  itself issued through the run_code channel, whose text is matched verbatim,
+  and the call text carried `note: "git push"`. The manifest did not declare
+  that substring, so the authorization call self-tripped the egress gate. On a
+  direct (non-run_code) tool channel this would not occur, but that was not
+  driven here.

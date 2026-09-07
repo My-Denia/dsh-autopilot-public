@@ -1,0 +1,76 @@
+# Tag-triggered release for dsh-autopilot: verify, then publish NOTES ONLY.
+#
+# WHY THERE IS DELIBERATELY NO TARBALL. package.json `files` packs `lib/`
+# wholesale and `exports` declares `"./client": "./lib/client.js"` — but
+# `build:client` cannot run on a CI runner (its type gate resolves externals
+# through absolute paths into a sibling dsh checkout; see ci.yml's header),
+# and `npm pack` skips missing paths SILENTLY. A CI-built tarball would
+# therefore carry the `./client` export while shipping no lib/client.js:
+# every consumer of the artifact would get a dead subpath with no error at
+# install time. A release that looks complete and is not is worse than no
+# artifact — so this workflow gates the tag and writes the release notes,
+# and attaches nothing.
+#
+# UNLOCK CONDITION for a real tarball: the client half becoming CI-buildable
+# (typing its externals against publishable artifacts instead of a sibling
+# checkout) — parked product work, tracked in DESIGN.md.
+#
+# The four verification commands below are BYTE-IDENTICAL to ci.yml's gate
+# list, on purpose: a tag must not pass a weaker bar than a pull request.
+# This workflow has NEVER EXECUTED until the first v* tag lands.
+
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Gate the tag, then publish notes-only
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Enable corepack and activate the pinned pnpm
+        run: |
+          npm i -g corepack@latest
+          corepack enable
+          corepack prepare --activate
+          pnpm --version
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck host sources
+        run: npx tsc -p tsconfig.json --noEmit
+
+      - name: Typecheck tests
+        run: npx tsc -p tsconfig.test.json
+
+      - name: Unit tests
+        run: npx vitest run
+
+      - name: Build host half
+        run: npx tsc -p tsconfig.json
+
+      - name: Create the notes-only release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # --notes is documented to PREPEND to --generate-notes output;
+          # --notes-file is not documented to combine, so it is not used.
+          gh release create "$GITHUB_REF_NAME" \
+            --title "dsh-autopilot $GITHUB_REF_NAME" \
+            --generate-notes \
+            --notes "$(cat .github/release-notes-preamble.md)"

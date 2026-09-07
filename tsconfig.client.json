@@ -1,0 +1,30 @@
+{
+  "//": "Browser half. Separate from tsconfig.json because the two halves disagree on every flag that matters: module (commonjs vs NodeNext), lib (DOM vs none), types (none vs node), and verbatimModuleSyntax (must be OFF here — under a CJS emit it makes every import/export statement a TS1286/TS1287 error). module:commonjs is LOAD-BEARING: tsc's CJS emit IS the envelope body that scripts/wrap-client.mjs wraps, so switching it to esnext produces an artifact the loader cannot parse. Externals are typed through `paths` into a dsh checkout located by the DSH_SRC env var (default: ~/dsh); the ${DSH_SRC} tokens here are NOT expanded by tsc — scripts/check-client-types.mjs expands them, verifies the targets exist (failing by name when the checkout is absent), and writes the gitignored tsconfig.client.local.json that the type gate and build actually run. See README §6.",
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "commonjs",
+    "moduleResolution": "node10",
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "jsx": "react-jsx",
+    "rootDir": "src",
+    "outDir": "build",
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "declaration": false,
+    "sourceMap": false,
+    "skipLibCheck": true,
+    "esModuleInterop": false,
+    "allowSyntheticDefaultImports": false,
+    "verbatimModuleSyntax": false,
+    "rewriteRelativeImportExtensions": true,
+    "forceConsistentCasingInFileNames": true,
+    "types": [],
+    "baseUrl": ".",
+    "paths": {
+      "react": ["${DSH_SRC}/node_modules/.pnpm/@types+react@18.3.31/node_modules/@types/react/index.d.ts"],
+      "react/jsx-runtime": ["${DSH_SRC}/node_modules/.pnpm/@types+react@18.3.31/node_modules/@types/react/jsx-runtime.d.ts"],
+      "@deepseek-ai/dsh-client-ui-conversation/client": ["${DSH_SRC}/packages/client/ui-conversation/lib/types/client/index.d.ts"]
+    }
+  },
+  "include": ["src/client/**/*.ts", "src/client/**/*.tsx"]
+}

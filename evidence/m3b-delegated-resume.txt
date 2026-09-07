@@ -1,0 +1,71 @@
+# M3b delegated executor resume — real-machine evidence 2026-08-27
+# Profile autopilot-headless, run session-4f9a3cd6-...; fully headless, independent audit route.
+
+# Design (auditor observes fail then pass — checker-resolution honest):
+# executor dispatched to write LINE-A only; execution audit reads out.txt, sees LINE-B
+# missing -> needs-fix; resume SAME child to append LINE-B; second audit reads both -> pass.
+
+## final scratch artifact
+out.txt:
+LINE-A
+LINE-B
+
+## resume evidence from the run record
+phase: completed
+executionGate: pass
+planGate: pass
+executor.childId: 9490aa1e-b0ff-48fb-b70c-b3a46a9dcc30
+executor.state: completed
+executor.executionRevision: 2 (2 = one resume happened)
+executor.generation: 1 (1 = resume did NOT re-create the child)
+
+## resume-executor / packet events in the canonical stream
+resume-executor events: 1
+submit-packet events:   2   (2 = first packet, then a second after resume)
+
+## execution audit verdicts in order (needs-fix then pass, same childId)
+
+## HONEST SCOPE — what this file does and does NOT bear
+
+WHAT IT BEARS (the event trace above is the bearer): the same-child resume
+MECHANICS. One `resume-executor`, two `submit-packet`, one childId throughout,
+`executionRevision` 1->2, `generation` unchanged at 1, and the execution gate
+moving needs-fix -> pass across that boundary. Those are read straight out of
+`events.jsonl` and would look different if resume had re-created the child.
+
+WHAT IT DOES NOT BEAR: what the auditor actually observed or wrote. The run
+used a real dispatched auditor (route provider EHH/gpt-5.6-sol, not a scripted
+verdict — a scripted one is a test-only seam), and the gate did move to
+needs-fix at rev10 and to pass at rev14, which is consistent with it having
+read the file before and after. But the auditors' verdict text and notes are
+NOT captured in this record: the `audit` events carry the folded snapshot, not
+a `detail.verdict` field, so nothing here shows the auditor's own words. The
+only artifact capture is the FINAL two-line out.txt, which cannot show the
+pre-fix state either. So "the auditor read the file and reported LINE-B
+missing" is an INFERENCE from the gate transition, not something this file
+proves. Closing that gap needs the audit prompt/response captured at dispatch
+time.
+- OPEN DEFECT surfaced by this run (an earlier version of this file called it
+  "behavior correct, doc wording stale" — that disposition was WRONG and was
+  corrected in PR #3 review; DESIGN.md carries the same entry):
+  types.ts:180 says the packet submission CASes on executionRevision. There is
+  no CAS. submitExecutionPacket guards only on executionPacket !== undefined
+  (AP_PACKET_EXISTS), resume is exactly what clears that slot, the submission
+  carries no expected execution revision, and the childId stays authorized
+  across the resume. So a delayed or retried revision-1 packet can be accepted
+  as the revision-2 packet and feed STALE evidence to the second audit.
+  AP_PACKET_EXISTS can reject "slot full"; it cannot see "slot empty but this
+  packet is old". Open until submission carries and validates the revision.
+
+
+## canonical event trace (executionGate + childId across the resume, the hard bearer)
+  rev4   audit            phase=plan-reviewing     execGate=pending    exRev=None child=
+  rev5   audit            phase=executing          execGate=pending    exRev=None child=
+  rev6   start-executor   phase=executing          execGate=pending    exRev=1 child=9490aa1e
+  rev7   start-executor   phase=executing          execGate=pending    exRev=1 child=9490aa1e
+  rev8   submit-packet    phase=execution-reviewing execGate=pending    exRev=1 child=9490aa1e
+  rev10  audit            phase=executing          execGate=needs-fix  exRev=1 child=9490aa1e
+  rev11  resume-executor  phase=executing          execGate=needs-fix  exRev=2 child=9490aa1e
+  rev13  submit-packet    phase=execution-reviewing execGate=needs-fix  exRev=2 child=9490aa1e
+  rev14  audit            phase=closing            execGate=pass       exRev=2 child=9490aa1e
+  # rev10 needs-fix -> rev11 resume (exRev 1->2, SAME child) -> rev13 2nd packet -> rev14 pass

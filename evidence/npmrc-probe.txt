@@ -1,0 +1,433 @@
+npmrc-probe — what `verify-deps-before-run` actually does, measured
+run: goal v2p1, milestone M4, 2026-08-27
+sandbox: C:\Users\<user>\AppData\Local\Temp\claude\C--Files-dsh-autopilot\
+         34ce9773-b0b0-41a3-9cbe-de971093d35b\scratchpad\npmrc-probe
+
+HEADLINE, stated up front because it inverts the file it was meant to confirm:
+the `verify-deps-before-run=warn` line in this repo's .npmrc is INERT. pnpm
+11.17.0 never reads it. The repo is not protected by it and never was. The two
+locations that DO work are pnpm-workspace.yaml (`verifyDepsBeforeRun:`) and the
+environment variable `pnpm_config_verify_deps_before_run`. The .npmrc comment
+block asserting the opposite — that pnpm-workspace.yaml is not honoured and
+.npmrc is the location — is backwards on both halves.
+
+
+================================================================================
+1. ENVIRONMENT
+================================================================================
+$ pnpm --version                       -> 11.17.0            (exit 0)
+$ node --version                       -> v25.2.1            (exit 0)
+$ which pnpm  -> /c/Users/<user>/AppData/Roaming/npm/pnpm
+$ which node  -> /c/Program Files/nodejs/node
+
+pnpm is a COREPACK SHIM, not a real npm global install. The shim body is:
+    exec node "$basedir/node_modules/corepack/dist/pnpm.js" "$@"
+Real bundle: C:\Users\<user>\AppData\Local\node\corepack\v1\pnpm\11.17.0\dist\pnpm.mjs
+Corepack cache also holds pnpm 10.34.4, 11.7.0, 11.22.0.
+The repo package.json has NO `packageManager` field, so version selection is
+corepack's default, not pinned by this project.
+
+User-level config:
+$ ls /c/Users/<user>/.npmrc  -> No such file or directory
+There is no user-level .npmrc at all. There is also no pnpm global config file
+(C:\Users\<user>\AppData\Local\pnpm\config\ does not exist). So nothing at user
+or global scope is competing with the project .npmrc — the project file is the
+only .npmrc in play, which makes the negative result below unambiguous.
+No auth tokens or credentials were encountered anywhere. REDACTION NOTE
+(2026-08-27, after this line was first written): the developer username in
+paths throughout this transcript was later replaced with the <user>
+placeholder when the file moved into the tracked tree — a username-only
+substitution, same treatment as the card fixtures; every other byte is the
+captured output. The original "nothing redacted" claim was true of the
+capture, not of this copy, and standing alone it contradicted the file's
+own contents.
+
+$ pnpm store path -> C:\Users\<user>\AppData\Local\pnpm\store\v11
+
+
+================================================================================
+2. SANDBOX CONSTRUCTION
+================================================================================
+Copied exactly four files from C:\Files\dsh-autopilot, verified by sha256 to be
+byte-identical to the repo originals at copy time:
+
+  package.json         4dfe2d35d666506db5db2c1428b4e3bb782d49674fa883de58a65832dc89e67a
+  pnpm-lock.yaml       756e7bdc0725ba7b1733866bb9c0c038f592a8f2f4ab61a9f3d605afe9317312
+  pnpm-workspace.yaml  683b2ab4e361bdd5f736ad10393f3bdbd414ee44f57702d219f561879d1959fa
+  .npmrc               9cc820a5b53284cfe69f4ada1d28ef3d14ac5600528e051b45fe9a3babf21b1d
+
+Added to the SANDBOX package.json only:
+  "probe": "node -e \"console.log('ran')\""
+
+The real repo's node_modules, pnpm-lock.yaml and package.json were never
+written to. No `pnpm install` / `add` / `update` was ever issued by hand, and
+`verify-deps-before-run=install` was never set anywhere.
+
+
+================================================================================
+3. WHAT THE BUNDLE SAYS (read before running, to know what to expect)
+================================================================================
+From pnpm.mjs, ../exec/commands/lib/runDepsStatusCheck.js:
+
+    const { upToDate, issue, workspaceState } = await checkDepsStatus(opts3);
+    if (upToDate === true) return;
+    if (upToDate === void 0 && opts3.allProjects == null
+        && opts3.rootProjectManifest == null) return;
+    const command = ["install", ...createInstallArgs(workspaceState?.settings)];
+    const install2 = runPnpmCli.bind(null, command, {...});
+    switch (opts3.verifyDepsBeforeRun) {
+      case "install": install2(); break;
+      case "prompt":  ... (throws if !process.stdin.isTTY) ...
+      case "error":   throw new PnpmError("VERIFY_DEPS_BEFORE_RUN", issue ?? ...)
+      case "warn":    ...
+    }
+
+and in the `pnpm run` handler:
+
+    if (opts3.verifyDepsBeforeRun) { await runDepsStatusCheck(opts3); }
+
+So `error` MUST throw when deps are not up to date. If a run with `error` set
+performs an install instead, the only possible explanation is that the value
+never reached opts.verifyDepsBeforeRun.
+
+RETRACTED BY THE EXECUTOR LEAD, 2026-08-27 — see the VERIFICATION section
+appended at the end of this file. The paragraph immediately below is FALSE as
+written and is kept rather than deleted so the correction is auditable.
+
+  [RETRACTED] DECISIVE STATIC FACT:
+  [RETRACTED] $ grep -o "verify-deps-before-run" pnpm.mjs   -> NO MATCHES
+  [RETRACTED] The hyphenated npmrc-style spelling does not occur anywhere in
+  [RETRACTED] pnpm 11.17.0's bundle.
+
+What is actually in the bundle (re-measured with python over the same file,
+because `grep -o -P` refuses to run in this shell's locale and a plain `grep -o`
+of a 12.8 MB single-line-ish minified file is not a reliable negative): the
+hyphenated spelling occurs FOUR times, and two of those occurrences are pnpm's
+own npm-style config tables — the known-key list, and the type table where it is
+declared `"verify-deps-before-run": Boolean` — plus the defaults table
+(`"verify-deps-before-run": "install"`) and one warning string. So pnpm's
+npm-config layer knows the hyphenated NAME. What was measured behaviourally is
+that a VALUE set under that name in .npmrc does not reach the runtime switch;
+the mechanism was NOT isolated and is therefore not asserted here (the declared
+`Boolean` type sitting under a switch that compares four strings is visible in
+the bundle and is the obvious suspect, but no experiment here separates
+"dropped at parse" from "dropped later").
+
+The conclusion the retracted paragraph was supporting SURVIVES — it was simply
+supported by the wrong evidence. The behavioural measurements below, and the
+independent re-measurements appended at the end, carry it on their own.
+
+Only the camelCase `verifyDepsBeforeRun` (the pnpm-workspace.yaml spelling) and
+the env var `pnpm_config_verify_deps_before_run` are read by the code path that
+matters. The env var is special-cased explicitly, right after the
+workspace-manifest merge:
+
+    if (process.env.pnpm_config_verify_deps_before_run != null) {
+      pnpmConfig.verifyDepsBeforeRun = process.env.pnpm_config_verify_deps_before_run;
+    }
+
+
+================================================================================
+4. WHERE THE SETTING IS READ FROM — four locations, same staleness condition
+================================================================================
+Staleness held constant across all four: sandbox had NO node_modules, which
+makes checkDepsStatus return upToDate === undefined ("cannot check"). Every
+variant below was run as `pnpm run probe` after `rm -rf node_modules`.
+
+--- A: .npmrc  `verify-deps-before-run=error`  (the repo's spelling) ----------
+NOT HONOURED. Full install ran, then the script ran.
+    ✓ Lockfile passes supply-chain policies (verified 2d ago)
+    Lockfile is up to date, resolution step is skipped
+    Progress: resolved 73, reused 73, downloaded 0, added 73, done
+    $ node -e "console.log('ran')"
+    ran
+  exit 0. node_modules CREATED (73 packages).
+
+--- D: .npmrc  `verifyDepsBeforeRun=error`  (camelCase in npmrc) --------------
+NOT HONOURED. Same as A: installed, printed `ran`, exit 0, node_modules created.
+So it is not merely a spelling problem — .npmrc is not the channel at all.
+
+--- B: pnpm-workspace.yaml  `verifyDepsBeforeRun: error` ----------------------
+(.npmrc key deleted entirely for this run; verified absent by grep)
+HONOURED — REFUSED:
+    [ERR_PNPM_VERIFY_DEPS_BEFORE_RUN] Cannot check whether dependencies are outdated
+    Run "pnpm install"
+  exit 1. No `ran`. node_modules NOT created.
+
+--- C: env  `pnpm_config_verify_deps_before_run=error` ------------------------
+HONOURED — REFUSED, identical message, exit 1, no `ran`, no node_modules.
+
+CONCLUSION OF SECTION 4: at identical staleness, .npmrc (either spelling) lets
+the install proceed while pnpm-workspace.yaml and the env var stop it. The
+repo's .npmrc line does nothing.
+
+This directly contradicts the "MEASURED" bullet in the current .npmrc claiming
+pnpm-workspace.yaml "does NOT honour this key". The earlier experiment reached
+that conclusion because BOTH of its runs were made under a staleness condition
+that did not exist (`touch package.json`), so neither run could refuse and the
+two locations looked equally dead.
+
+
+================================================================================
+5. THE TWO ASSIGNED EXPERIMENTS, with genuine dependency staleness
+================================================================================
+Staleness manufactured for real, not by timestamp: `left-pad: ^1.3.0` added to
+the sandbox package.json `dependencies` WITHOUT installing. Verified genuine:
+    $ grep -c 'left-pad' pnpm-lock.yaml   -> 0
+package.json requires a dependency the lockfile does not contain.
+
+node_modules was present for these two runs (created by pnpm itself in variant
+A above, entirely from the local store — "downloaded 0"). It is needed so that
+node_modules/.pnpm-workspace-state-v1.json exists and checkDepsStatus can
+return a real "out of sync" verdict rather than "cannot check".
+
+Control channel for these runs: pnpm-workspace.yaml, i.e. a location proven in
+section 4 to actually work. The inert .npmrc was left at the repo's real value.
+
+--- NEGATIVE CONTROL: deps in sync, `verifyDepsBeforeRun: error` --------------
+    $ node -e "console.log('ran')"
+    ran
+  exit 0. Proves `error` alone does not block anything — the refusals below are
+  caused by the staleness, not by the setting being present.
+
+--- EXPERIMENT (a): stale dep + `verifyDepsBeforeRun: error` ------------------
+$ pnpm run probe
+    [ERR_PNPM_VERIFY_DEPS_BEFORE_RUN] The lockfile in <sandbox> does not satisfy
+    project of id .
+
+    Run "pnpm install"
+  exit 1.  real 0m0.497s
+  EXPECTATION HELD. No `ran` printed. Note the message differs from section 4's
+  "Cannot check whether dependencies are outdated" — this is the genuine
+  stale-dependency verdict, confirming the manufactured staleness is what pnpm
+  detected.
+  After: pnpm-lock.yaml sha256 unchanged (756e7bdc...), store file count
+  unchanged (60016), node_modules/left-pad absent, grep -c left-pad on
+  pnpm-lock.yaml = 0.
+
+--- EXPERIMENT (b): stale dep + `verifyDepsBeforeRun: warn` -------------------
+$ pnpm run probe
+    [WARN] Your node_modules are out of sync with your lockfile. The lockfile in
+    <sandbox> does not satisfy project of id .
+    $ node -e "console.log('ran')"
+    ran
+  exit 0.  real 0m0.557s
+  EXPECTATION HELD. Warned, ran the script, installed nothing.
+  Before/after, measured rather than assumed:
+    pnpm-lock.yaml sha256   756e7bdc...  ->  756e7bdc...  (byte-identical)
+    store file count        60016        ->  60016        (unchanged)
+    node_modules entries    4            ->  4            (unchanged)
+    node_modules/left-pad   absent       ->  absent
+  So `warn` keeps the information and drops the side effect, exactly as the
+  .npmrc claims — but only when the setting is somewhere pnpm actually reads.
+
+
+================================================================================
+6. THE REPO'S ACTUAL CONFIG, RUN AGAINST THE SAME STALENESS
+================================================================================
+This is the run that matters: .npmrc restored to the repo's real file
+(`verify-deps-before-run=warn`), pnpm-workspace.yaml restored to the repo's real
+file (no verify key), left-pad staleness still in place.
+
+Because an unprotected run here would resolve left-pad against the network —
+the exact incident this file exists to prevent — it was executed with
+`pnpm_config_offline=true` as a hard network stop. Offline changes only whether
+the fetch can succeed, not whether pnpm decides to install.
+
+$ pnpm_config_offline=true pnpm run probe
+    ✓ Lockfile passes supply-chain policies (verified 2d ago)
+    [ERR_PNPM_NO_OFFLINE_META] Failed to resolve left-pad@>=1.3.0 <2.0.0-0 in
+    package mirror C:\Users\<user>\AppData\Local\pnpm-cache\v11\metadata\
+    registry.npmjs.org\left-pad.jsonl
+
+    This error happened while installing a direct dependency of <sandbox>
+    [ERROR] Command failed with exit code 1: "...node.exe" "...pnpm.mjs" install
+        at runPnpmCli (.../pnpm.mjs:249521:5)
+        at runDepsStatusCheck (.../pnpm.mjs:251287:7)
+  exit 1.
+
+Read it plainly: under the repo's real configuration, with `warn` set in
+.npmrc, runDepsStatusCheck spawned `pnpm install` anyway. The stack frames name
+the two functions in order. Had offline not been forced, that install would
+have gone to registry.npmjs.org for left-pad. The .npmrc line did not warn and
+did not stop it — pnpm fell through to its default, `install`.
+
+After: pnpm-lock.yaml sha256 unchanged, store count 60016 unchanged,
+node_modules/left-pad absent (the offline stop worked).
+
+
+================================================================================
+7. THE .npmrc LINE'S COST, RE-MEASURED
+================================================================================
+$ npm config get prefix          # with verify-deps-before-run in .npmrc
+    npm warn Unknown project config "verify-deps-before-run". This will stop
+    working in the next major version of npm.
+$ npm config get prefix          # same file, that one line deleted
+    (no warning)
+
+The npx/npm noise documented in .npmrc is real and is caused solely by that
+line. Since section 4 shows the line buys nothing, the noise is currently a
+pure cost. Moving the setting to pnpm-workspace.yaml both makes it work and
+removes the warning, because npm does not read pnpm-workspace.yaml.
+
+
+================================================================================
+8. WHAT WAS AND WAS NOT OBSERVED
+================================================================================
+OBSERVED:
+  - node_modules presence/absence and entry count, listed before and after
+    every run.
+  - pnpm-lock.yaml sha256 before and after every run — never changed once.
+  - pnpm store: file count under store\v11\files, 60016 before and after the
+    stale-dep runs.
+  - pnpm's own per-run accounting ("downloaded 0" on every install that ran).
+  - wall-clock: the refusing and warning runs took ~0.5s, far too short for
+    registry resolution.
+
+NOT OBSERVED / LIMITS:
+  - Store file COUNT is not a content hash. A same-count in-place rewrite would
+    not have been caught. No packages were reported downloaded, and left-pad
+    never appeared, so the claim made here is "no packages entered the store by
+    this measure", not "the store is bit-identical".
+  - No packet capture was taken. "Did not reach the network" is inferred from
+    downloaded-0, unchanged store, and sub-second timing — not measured
+    directly. The one run that provably WOULD have gone to the network
+    (section 6) was stopped by the offline flag, and its error names the
+    registry mirror it wanted.
+  - pnpm's update notifier printed "Update available! 11.17.0 -> 11.24.0" during
+    the first install. That is a cached/periodic check; whether it made a
+    request during these runs was not determined.
+  - Section 5 required node_modules to exist. The brief's "sandbox must have no
+    node_modules" could not hold for the genuine-dep-staleness experiments,
+    because without node_modules pnpm can only report "cannot check" and never
+    reaches a real dependency verdict. FINDING, per the brief: pnpm created
+    node_modules in the sandbox by itself, on the very first `pnpm run probe`,
+    while `verify-deps-before-run=error` was set in .npmrc. That creation was
+    not requested and is itself the proof that the .npmrc key is inert. All 73
+    packages came from the local store, downloaded 0.
+  - This probe does NOT prove interception of the 2026-08-25 incident's exact
+    path. That incident's staleness had a different cause (it added importer
+    entries for @deepseek-ai/cordis and @deepseek-ai/schemastery, packages
+    already in the tree), not a dependency missing from the lockfile. What is
+    proven is the detection-and-response semantics of the setting, and where
+    the setting has to live for those semantics to apply at all.
+
+
+================================================================================
+9. BOTTOM LINE
+================================================================================
+  - `error` genuinely refuses on a real stale dependency: exit 1, script never
+    runs. PROVEN.
+  - `warn` genuinely warns and runs without installing: lockfile, store and
+    node_modules all unchanged. PROVEN.
+  - Both of the above only hold when the setting is in pnpm-workspace.yaml or
+    in pnpm_config_verify_deps_before_run.
+  - In .npmrc — where this repo puts it — pnpm ignores it and falls back to its
+    default `install`, and will spawn a network install from a plain
+    `pnpm run <script>`. PROVEN, section 6.
+  - Therefore this repo is, as of this probe, still exposed to the failure mode
+    its .npmrc was written to prevent.
+
+Remediation is out of this milestone's write scope (pnpm-workspace.yaml is not
+in scope here) and is left to the Executor Lead: move `verifyDepsBeforeRun:
+warn` into pnpm-workspace.yaml, and decide whether the now-inert .npmrc line
+stays as documentation or goes along with its npm warning.
+
+================================================================================
+INDEPENDENT VERIFICATION BY THE EXECUTOR LEAD — 2026-08-27
+================================================================================
+
+WHY: the child's conclusion inverts a claim this repository already recorded as
+MEASURED (.npmrc is the location; pnpm-workspace.yaml is not). A finding that
+overturns a recorded measurement is exactly the kind that must not be forwarded
+on one agent's say-so, and one of its supporting facts (the grep) was checkable
+in seconds and turned out to be wrong. So the load-bearing experiments were
+re-run by hand, in the same sandbox, by the Executor Lead.
+
+Sandbox: .../scratchpad/npmrc-probe, node_modules present (73 packages, all from
+the local store), package.json carrying `left-pad: ^1.3.0` which the lockfile
+does not contain — i.e. REAL staleness, not a touched timestamp.
+Every run below was executed under `pnpm_config_offline=true`, so a wrong guess
+about the setting could not reach the network. That flag is the safety net, NOT
+the thing under test.
+
+E1 — .npmrc says error, pnpm-workspace.yaml says nothing:
+    $ printf 'verify-deps-before-run=error\n' > .npmrc
+    $ grep -c verifyDepsBeforeRun pnpm-workspace.yaml   -> 0
+    $ pnpm_config_offline=true pnpm run probe
+    [ERR_PNPM_NO_OFFLINE_META] Failed to resolve left-pad@>=1.3.0 <2.0.0-0 ...
+    [ERROR] Command failed with exit code 1: "...node.exe" "...pnpm.mjs" install
+    EXIT=1
+  READ THIS CAREFULLY: the non-zero exit is NOT a refusal. The error code is the
+  OFFLINE one, and the failing command is `pnpm install` — pnpm spawned an
+  install. That is the DEFAULT (`install`) behaviour, i.e. the `error` value in
+  .npmrc was not in force. Without the offline flag this is the network install
+  the whole .npmrc exists to prevent.
+
+E2 — same sandbox, same staleness, key moved to the workspace manifest
+     (.npmrc still says error, so the workspace value is what changes):
+    $ printf "packages:\n  - '.'\nallowBuilds:\n  esbuild: true\nverifyDepsBeforeRun: error\n" > pnpm-workspace.yaml
+    $ pnpm_config_offline=true pnpm run probe
+    [ERR_PNPM_VERIFY_DEPS_BEFORE_RUN] The lockfile in <sandbox> does not satisfy
+    project of id .
+    Run "pnpm install"
+    EXIT=1
+  THIS is a refusal: the gate's own error code, and the script never ran.
+
+E3 — same, with warn (the value this repository deploys):
+    $ printf "...\nverifyDepsBeforeRun: warn\n" > pnpm-workspace.yaml
+    $ pnpm_config_offline=true pnpm run probe
+    [WARN] Your node_modules are out of sync with your lockfile. ...
+    $ node -e "console.log('ran')"
+    ran
+    EXIT=0
+  Warning kept, side effect dropped, script ran.
+
+POST-CONDITIONS after all three (the no-install half, measured not assumed):
+    $ ls node_modules/left-pad   -> No such file or directory
+    $ sha256sum pnpm-lock.yaml   -> 756e7bdc0725ba7b1733866bb9c0c038f592a8f2f4ab61a9f3d605afe9317312
+  The lockfile hash is byte-identical to the repository's own pnpm-lock.yaml at
+  commit 991c932, so nothing rewrote it in either direction.
+
+A PROBE THAT DOES NOT WORK, recorded so nobody repeats it:
+    $ pnpm config get verify-deps-before-run   -> undefined
+    $ pnpm config get verifyDepsBeforeRun      -> undefined
+    $ pnpm_config_verify_deps_before_run=error pnpm config get verifyDepsBeforeRun
+                                               -> undefined
+  All three answer `undefined`, INCLUDING the env-var channel that is proven to
+  work at runtime. So `pnpm config get` cannot distinguish "not set" from "set
+  and effective" for this key, and no conclusion here rests on it.
+
+WHAT THIS ESTABLISHES:
+  1. The gate works. `error` refuses a genuinely stale project; `warn` warns and
+     runs without installing. Both were watched, with the negative control (an
+     in-sync project under `error` runs normally) that makes them mean something.
+  2. It does not work WHERE THIS REPOSITORY PUT IT. The value in .npmrc is inert
+     in pnpm 11.17.0; `pnpm-workspace.yaml` (camelCase) and the env var are the
+     channels that are honoured. The repository's own .npmrc says the opposite,
+     and that sentence is now known to be false — the earlier test could not
+     have caught it, because `touch package.json` creates no staleness, so both
+     locations looked equally dead.
+  3. Therefore, between 2026-08-25 and this measurement, this repository was NOT
+     protected against the incident it believed it had gated.
+
+WHAT IT DOES NOT ESTABLISH:
+  - That this setting would have intercepted the 2026-08-25 incident. That
+     staleness had a different cause (importer entries for packages already in
+     the tree), and this probe manufactures a missing dependency instead. The
+     interception claim remains unproven and is not made.
+  - The store-impact half is measured by file COUNT and by pnpm's own
+     `downloaded 0` accounting, not by a content hash of the store; no packet
+     capture was taken, so "no network" is an inference from the offline flag
+     plus the absence of any registry activity in the output, not a measurement
+     of the interface.
+  - The mechanism by which the .npmrc value is dropped (see the retraction
+     above). Only the outcome is measured.
+
+ACTION TAKEN by the Executor Lead: `verifyDepsBeforeRun: warn` added to the
+repository's pnpm-workspace.yaml — the location measured to work. The inert
+.npmrc line was left byte-unchanged: writing to .npmrc is refused by a
+credential-file guard ("credential file write blocked: pattern
+'(^|[\/])\.npmrc$'"), which is a permission decision no agent may launder by
+writing the same bytes through a shell. The corrected replacement text for that
+file's UNPROVEN block is carried in the execution packet for the owner.

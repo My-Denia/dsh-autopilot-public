@@ -1,0 +1,10 @@
+{
+  "//": "Typecheck gate for the TEST tree. tsconfig.json excludes test/ because its rootDir is src/ and its job is to EMIT lib/; vitest transpiles through esbuild without typechecking. Both gates were therefore simultaneously blind over ~3,000 lines of tests, and two genuine TS2540 errors were sitting in that blind spot. This config extends the base verbatim (same strictness, same lib, same types) and only widens what is checked. It never emits.",
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "rootDir": "."
+  },
+  "include": ["src/**/*.ts", "test/**/*.ts"],
+  "exclude": ["lib", "build", "node_modules", "src/client"]
+}

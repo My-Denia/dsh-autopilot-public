@@ -1,0 +1,33 @@
+# Dependabot vulnerability alerts — <owner>/dsh-autopilot
+# Re-captured 2026-08-28 after PR #3 review: the first version showed a bare 204
+# with no command or URL, so it could not tie the response to the alerts endpoint.
+
+## Endpoint under test
+repos/<owner>/dsh-autopilot/vulnerability-alerts
+  GET  -> 204 = enabled, 404 = disabled
+  PUT  -> enables;  DELETE -> disables (rollback)
+
+## BEFORE (captured 2026-08-27T13:15:57Z, prior to the PUT)
+$ gh api repos/<owner>/dsh-autopilot/vulnerability-alerts
+{"message":"Vulnerability alerts are disabled.","documentation_url":"https://docs.github.com/rest/repos/repos#check-if-vulnerability-alerts-are-enabled-for-a-repository","status":"404"}
+gh: Vulnerability alerts are disabled. (HTTP 404)
+exit=1
+
+## THE ENABLING CALL (2026-08-27)
+$ gh api -X PUT repos/<owner>/dsh-autopilot/vulnerability-alerts
+(204 No Content; gh prints nothing on success)
+
+## AFTER — check endpoint re-run now, with the URL visible in the request line
+$ gh api repos/<owner>/dsh-autopilot/vulnerability-alerts -i --verbose 2>&1 | grep -iE "^(> GET|> Host|< HTTP)"
+> GET /repos/<owner>/dsh-autopilot/vulnerability-alerts HTTP/1.1
+> Host: api.github.com
+< HTTP/2.0 204 No Content
+
+## Independent corroboration: GitHub is now serving advisories for this repo
+$ gh api repos/<owner>/dsh-autopilot/dependabot/alerts --jq "length"
+1
+(alerts endpoint answers only while alerts are enabled; it 403/404s when disabled)
+
+## boundary states covered by this capture
+- error-path: the GET before enabling returned 404 'Vulnerability alerts are disabled'
+- first-run: the PUT that first enabled alerts, verified by a 204 on the same URL afterwards

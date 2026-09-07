@@ -1,0 +1,70 @@
+# M3c cross-process visibility — real-machine evidence (re-driven 2026-08-28)
+#
+# THREE earlier versions of this file were rejected in PR #3 review. v1 redacted
+# the listener PID and never captured the writer's. v2 captured both but
+# collapsed the per-sample process list to '[...]', leaving the writer label
+# only in narrative. v3 kept the labels in the samples but then argued from
+# process coexistence to authorship, which does not follow. This version keeps
+# the labels AND states only what the capture can observe: see the two sections
+# below, which separate the read property (borne) from the write property (not).
+
+## Roles
+  <PID-WEB>        dsh web host (profile autopilot-dev), owns the 127.0.0.1:<PORT> listener
+  <PID-WRITER-1>   node process of the separate `--profile autopilot-headless` run
+  <PID-WRITER-2>   node process of the separate `--profile autopilot-headless` run
+  <PID-WRITER-3>   node process of the separate `--profile autopilot-headless` run
+  <PID-WRITER-4>   node process of the separate `--profile autopilot-headless` run
+  <PID-WRITER-5>   node process of the separate `--profile autopilot-headless` run
+  <PID-WRITER-6>   node process of the separate `--profile autopilot-headless` run
+
+## Run observed: session-e2763170-e129-490a-8d72-8b52eb2aa36c
+The headless process printed this same id as its own root session id, so the
+reader and the writer are describing ONE run.
+
+## Samples — listener and writer identity retained on every line
+(one line per revision transition, plus the first sample, which predates the writer)
+  16:29:41 webRev=1 logCount=0 servedBy=<PID-WEB> nodeTable=[<PID-WEB> +18 unrelated]
+  16:29:53 webRev=2 logCount=1 servedBy=<PID-WEB> nodeTable=[<PID-WEB> <PID-WRITER-1> +18 unrelated]
+  16:29:59 webRev=3 logCount=2 servedBy=<PID-WEB> nodeTable=[<PID-WEB> <PID-WRITER-1> +18 unrelated]
+  16:30:02 webRev=4 logCount=3 servedBy=<PID-WEB> nodeTable=[<PID-WEB> <PID-WRITER-1> +18 unrelated]
+  16:30:08 webRev=5 logCount=4 servedBy=<PID-WEB> nodeTable=[<PID-WEB> <PID-WRITER-1> +18 unrelated]
+
+## What this bears, and what it does NOT
+
+BORNE: the run was CREATED by a separate invocation, and a different process
+SERVED it. The creation side is no longer narrative — here is the captured
+stdout of the headless invocation, which was launched as its own OS process and
+told only to init a run, write four logs, and print its root session id:
+
+    $ node <dsh>/apps/cli/lib/bin.js --profile autopilot-headless "<probe task>"
+    RUNID=session-e2763170-e129-490a-8d72-8b52eb2aa36c
+
+That id is the same run the web listener served in every sample below, and the
+web host was already running and answering before this invocation started. So a
+run created outside the web host is readable, and keeps updating, through the
+web host's HTTP surface.
+
+Honest edge on even this: the capture ties the run id to a SEPARATE INVOCATION
+(its own stdout, its own command line), not to a specific PID — the PID linkage
+in the sample table is separate and weaker. If you need creation tied to a PID
+rather than to an invocation, that is not captured here.
+
+NOT BORNE — per-write authorship. This is the correction from the third round
+of PR #3 review, and the point is worth stating plainly because two earlier
+versions of this file got it wrong in the other direction: process COEXISTENCE
+is not AUTHORSHIP. The samples show the writer label absent while revision sits
+at 1 and present while it climbs, which is consistent with the headless process
+performing the four writes — but it does not EXCLUDE the web process having
+written them while the other node process merely ran. Nothing in this capture
+records which process issued each mutation.
+
+What would close it: per-write provenance (the store recording the writing
+process), or captured headless stdout/stderr tied to both the writer PID and
+the run id at each write. Neither was captured here, so the
+cross-process-WRITE residual stays open; only cross-process READ of a
+foreign-created run is closed.
+
+## Redaction note
+Real PIDs are replaced by stable labels; the same real PID always maps to the
+same label, and different PIDs never share one. Unrelated node processes on this
+machine are reduced to a count, since their identities are not part of the claim.

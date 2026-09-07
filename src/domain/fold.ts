@@ -1,0 +1,472 @@
+/**
+ * Strict replay fold over a run's event stream.
+ *
+ * The fold is the invariant guardian: every event is validated against the
+ * committed prefix before it is accepted, so an illegal stream (whether from a
+ * buggy writer or a hand-edited file) is rejected loudly instead of folding
+ * into a silently wrong state. Mirrors the CC rule that state.json is the only
+ * canonical status, plus the experimental-GAH insight that replay must reject
+ * malformed streams rather than tolerate them.
+ */
+
+import {
+  AutopilotError,
+  validateExternalReview,
+  TERMINAL_PHASES,
+  evaluateCompletion,
+  evidenceKindProblems,
+  isAbsoluteShapedBearer,
+  usageDeclarationProblems,
+} from './types.js'
+import type { Operation, Phase, RunEvent, Snapshot } from './types.js'
+
+/** Operations legal from each phase (undefined prior state only admits init). */
+const LEGAL_OPS: Record<Phase, readonly Operation[]> = {
+  'planning': ['submit-plan', 'audit', 'self-check', 'external-audit', 'log', 'replan', 'set-blocked', 'set-owner-decision', 'owner-approve', 'consume-approval', 'consume-manifest', 'declare-usage', 'sandbox'],
+  'plan-reviewing': ['audit', 'self-check', 'external-audit', 'log', 'set-blocked', 'set-owner-decision', 'owner-approve', 'consume-approval', 'consume-manifest', 'sandbox'],
+  'executing': ['start-executor', 'resume-executor', 'submit-packet', 'submit-evidence', 'log', 'replan', 'set-blocked', 'set-owner-decision', 'owner-approve', 'consume-approval', 'consume-manifest', 'declare-usage', 'reminder', 'audit', 'self-check', 'external-audit', 'sandbox'],
+  'execution-reviewing': ['audit', 'self-check', 'external-audit', 'log', 'replan', 'set-blocked', 'set-owner-decision', 'owner-approve', 'consume-approval', 'consume-manifest', 'reminder', 'sandbox'],
+  'replanning': ['submit-plan', 'audit', 'self-check', 'external-audit', 'log', 'set-blocked', 'set-owner-decision', 'consume-manifest', 'declare-usage', 'sandbox'],
+  // 'declare-usage' is legal here on purpose (added 2026-08-24): an entry
+  // reverted to 'undeclared' during execution used to reach 'closing' with no
+  // way back — `submit-closeout` refuses it and the entry could not be
+  // re-declared, so the only exits were set-blocked or
+  // set-owner-decision -> owner-resolve(resume-planning), which resets the plan
+  // gate and forces the whole cycle to be redone. Answering the question late
+  // is strictly better than a liveness dead end, and completion still refuses
+  // until it IS answered.
+  'closing': ['audit', 'self-check', 'external-audit', 'log', 'submit-closeout', 'set-blocked', 'set-owner-decision', 'owner-approve', 'consume-approval', 'consume-manifest', 'declare-usage', 'sandbox'],
+  'completed': [],
+  'blocked': [],
+  'needs-owner-decision': ['owner-resolve', 'log', 'owner-approve', 'consume-approval', 'consume-manifest'],
+}
+
+function fail(message: string, code: string): never {
+  throw new AutopilotError(message, code)
+}
+
+function assertStartExecutor(prior: Snapshot, next: Snapshot): void {
+  const prev = prior.executor
+  const folded = next.executor
+  if (folded === undefined) fail('start-executor must carry an executor', 'AP_EXECUTOR_OP')
+  if (prev === undefined || prev.state === 'completed' || prev.state === 'revoked') {
+    if (folded.executionRevision !== 1) fail('start-executor executionRevision must be 1', 'AP_EXECUTOR_REVISION')
+    if (folded.state !== 'starting') fail('start-executor from a predecessor must land in starting', 'AP_EXECUTOR_REVISION')
+    const expectedGen = prev === undefined ? 1 : prev.generation + 1
+    if (folded.generation !== expectedGen) {
+      fail(
+        `start-executor generation ${String(folded.generation)} is not ${String(expectedGen)}`,
+        'AP_EXECUTOR_REVISION',
+      )
+    }
+    if (prev !== undefined && folded.childId === prev.childId) {
+      fail('start-executor must not reuse a predecessor childId', 'AP_EXECUTOR_REVISION')
+    }
+    return
+  }
+  if (prev.state === 'starting') {
+    if (
+      folded.childId !== prev.childId
+      || folded.generation !== prev.generation
+      || folded.executionRevision !== prev.executionRevision
+    ) {
+      fail(
+        'start-executor starting transition must keep child identity and executionRevision',
+        'AP_EXECUTOR_REVISION',
+      )
+    }
+    if (folded.state !== 'running' && folded.state !== 'revoked') {
+      fail(`start-executor from starting landed in ${folded.state}`, 'AP_EXECUTOR_REVISION')
+    }
+    return
+  }
+  fail(`start-executor cannot replace a live executor in state ${prev.state}`, 'AP_EXECUTOR_EXISTS')
+}
+
+function assertExecutorLifecycle(prior: Snapshot, next: Snapshot, op: Operation): void {
+  const prev = prior.executor
+  const folded = next.executor
+  if (prev === undefined && folded === undefined) return
+  if (prev === undefined || folded === undefined) {
+    fail('executor appeared or disappeared', 'AP_EXECUTOR_MUTATED')
+  }
+  if (
+    folded.childId !== prev.childId
+    || folded.generation !== prev.generation
+    || folded.executionRevision !== prev.executionRevision
+    || JSON.stringify(folded.route) !== JSON.stringify(prev.route)
+  ) {
+    fail('executor identity mutated', 'AP_EXECUTOR_MUTATED')
+  }
+  if (folded.state !== prev.state) {
+    if (prev.state === 'completed' || prev.state === 'revoked') {
+      fail(
+        `executor state ${prev.state} is terminal and must not change to ${folded.state}`,
+        'AP_EXECUTOR_MUTATED',
+      )
+    }
+    if (folded.state !== 'completed' && folded.state !== 'revoked') {
+      fail(
+        `executor state ${prev.state} -> ${folded.state} is not a lifecycle terminal`,
+        'AP_EXECUTOR_MUTATED',
+      )
+    }
+    if (op === 'replan' && folded.state !== 'revoked') {
+      fail(
+        `replan cannot move executor ${prev.state} to ${folded.state}`,
+        'AP_EXECUTOR_MUTATED',
+      )
+    }
+    if (
+      (op === 'audit' || op === 'self-check' || op === 'external-audit')
+      && folded.state === 'completed'
+    ) {
+      const appended = next.audits.slice(prior.audits.length)
+      const latest = appended[appended.length - 1]
+      if (latest === undefined || latest.role !== 'execution' || latest.verdict !== 'pass') {
+        fail(
+          `executor completed without an execution-pass ${op}`,
+          'AP_EXECUTOR_MUTATED',
+        )
+      }
+    }
+  }
+}
+
+/**
+ * Packet CAS stamp on a submit-packet event.
+ * Missing detail / missing executionRevision is legacy-exempt only when bearerBase is absent.
+ * A present non-integer revision/generation, or a present non-string childId, is not.
+ */
+function packetIdentityStamp(detail: unknown):
+  | { readonly kind: 'absent' }
+  | { readonly kind: 'invalid'; readonly field: string; readonly raw: unknown }
+  | {
+      readonly kind: 'ok'
+      readonly executionRevision: number
+      readonly generation: number | undefined
+      readonly childId: string | undefined
+    } {
+  if (detail === null || typeof detail !== 'object') return { kind: 'absent' }
+  if (!('executionRevision' in detail)) return { kind: 'absent' }
+  const claimed = (detail as { executionRevision?: unknown }).executionRevision
+  if (typeof claimed !== 'number' || !Number.isInteger(claimed)) {
+    return { kind: 'invalid', field: 'executionRevision', raw: claimed }
+  }
+  let generation: number | undefined
+  if ('generation' in detail) {
+    const raw = (detail as { generation?: unknown }).generation
+    if (typeof raw !== 'number' || !Number.isInteger(raw)) {
+      return { kind: 'invalid', field: 'generation', raw }
+    }
+    generation = raw
+  }
+  let childId: string | undefined
+  if ('childId' in detail) {
+    const raw = (detail as { childId?: unknown }).childId
+    if (typeof raw !== 'string' || raw.length === 0) {
+      return { kind: 'invalid', field: 'childId', raw }
+    }
+    childId = raw
+  }
+  return { kind: 'ok', executionRevision: claimed, generation, childId }
+}
+
+/**
+ * Evidence-kind format stamp on a submit-closeout event.
+ *
+ * WHY A STAMP AND NOT `bearerBase`. The packet-identity rule above uses
+ * "bearerBase present" as its current-format test, and that works there because
+ * both landed in the same change. `EvidenceEntry.kind` did not: `bearerBase` has
+ * been stamped since PR #4, so every closeout already completed on today's main
+ * carries a base and no kinds. Reusing that test would stop those streams
+ * replaying — the fold would reject history that was legal when it was written.
+ * A stamp the WRITER puts on the event says exactly what the writer promised,
+ * which is the only thing replay may hold it to.
+ *
+ * 'absent' = written before this change; 'v1' = "proven evidence kind
+ * validation v1": every PROVEN entry carries a kind (an unproven entry bears
+ * nothing and may omit it — the tool schema is stricter, replay is not);
+ * anything else in the field is a corrupt stamp, not an old stream.
+ */
+function evidenceKindStamp(detail: unknown): 'absent' | 'invalid' | 'v1' {
+  if (detail === null || typeof detail !== 'object') return 'absent'
+  if (!('evidenceKinds' in detail)) return 'absent'
+  return (detail as { evidenceKinds?: unknown }).evidenceKinds === 1 ? 'v1' : 'invalid'
+}
+
+/** Assert one event is a legal successor of the prior snapshot; returns the new snapshot. */
+export function applyEvent(prior: Snapshot | undefined, event: RunEvent): Snapshot {
+  if (event.v !== 1) fail(`unsupported event version ${String((event as { v: unknown }).v)}`, 'AP_EVENT_VERSION')
+  const next = event.snapshot
+
+  if (prior === undefined) {
+    if (event.op !== 'init') fail(`first event must be init, got ${event.op}`, 'AP_FIRST_NOT_INIT')
+    if (event.revision !== 1 || next.revision !== 1) fail('init revision must be 1', 'AP_INIT_REVISION')
+    if (next.phase !== 'planning') fail(`init phase must be planning, got ${next.phase}`, 'AP_INIT_PHASE')
+    if (next.planGate !== 'pending' || next.executionGate !== 'pending') fail('init gates must be pending', 'AP_INIT_GATES')
+    if (next.audits.length !== 0) fail('init audits must be empty', 'AP_INIT_AUDITS')
+    if (next.executor !== undefined) fail('init executor must be absent', 'AP_INIT_EXECUTOR')
+    if (next.bearerBase !== undefined) {
+      if (next.bearerBase.length === 0) fail('init bearerBase must not be empty when present', 'AP_BEARER_BASE_EMPTY')
+      if (!isAbsoluteShapedBearer(next.bearerBase)) {
+        fail('init bearerBase must be absolute-shaped when present', 'AP_BEARER_BASE_RELATIVE')
+      }
+    }
+    return next
+  }
+
+  if (event.op === 'init') fail('run is already initialized', 'AP_ALREADY_INITIALIZED')
+  if (TERMINAL_PHASES.includes(prior.phase)) fail(`no events after terminal phase ${prior.phase}`, 'AP_AFTER_TERMINAL')
+  if (event.revision !== prior.revision + 1 || next.revision !== event.revision) {
+    fail(`non-monotonic revision: prior ${prior.revision}, event ${event.revision}, snapshot ${next.revision}`, 'AP_REVISION')
+  }
+  if (next.runId !== prior.runId) fail('runId changed mid-stream', 'AP_RUN_ID')
+  if (JSON.stringify(next.triage) !== JSON.stringify(prior.triage)) fail('triage is immutable after init', 'AP_TRIAGE_MUTATED')
+  if (prior.bearerBase !== next.bearerBase) fail('bearerBase mutated', 'AP_BEARER_BASE_MUTATED')
+  if (!LEGAL_OPS[prior.phase].includes(event.op)) {
+    fail(`op ${event.op} is illegal in phase ${prior.phase}`, 'AP_ILLEGAL_OP')
+  }
+
+  // Audit history is append-only.
+  if (next.audits.length < prior.audits.length) fail('audit history shrank', 'AP_AUDITS_SHRANK')
+  for (let i = 0; i < prior.audits.length; i++) {
+    if (JSON.stringify(next.audits[i]) !== JSON.stringify(prior.audits[i])) {
+      fail(`audit record ${i} was modified`, 'AP_AUDITS_MODIFIED')
+    }
+  }
+
+  // An owner countersign is validated ON REPLAY, not only where it was written.
+  // This repo already paid for the other arrangement once: a class obligation
+  // enforced solely by the writer, so a hand-edited or foreign stream carried
+  // it straight through the fold. The FILESYSTEM half (does the review exist?)
+  // deliberately stays out — replay must not depend on disk state, so that half
+  // settles at completion in the engine.
+  for (let i = prior.audits.length; i < next.audits.length; i++) {
+    const record = next.audits[i]
+    if (record?.external === undefined) continue
+    if (next.triage.auditMode !== 'external') {
+      fail(
+        `audit record ${i} carries an external countersign but auditMode is ${next.triage.auditMode}`,
+        'AP_EXTERNAL_WRONG_MODE',
+      )
+    }
+    const problems = validateExternalReview(record.external)
+    if (problems.length > 0) fail(`audit record ${i}: ${problems.join('; ')}`, 'AP_EXTERNAL_INVALID')
+  }
+
+  // Plan revision is monotonic.
+  if (next.plan.revision < prior.plan.revision) fail('plan revision decreased', 'AP_PLAN_REVISION')
+
+  // Usage evidence is append-or-replace, never subtractive. An id that was
+  // once declared names a real user-visible change; letting it vanish would
+  // let a run answer the usage question by deleting the question. Replacement
+  // (last-wins on the same id) is the legal way to upgrade a declaration.
+  if (prior.usage !== undefined) {
+    if (next.usage === undefined) fail('usage evidence disappeared', 'AP_USAGE_SHRANK')
+    const ids = new Set(next.usage.entries.map(entry => entry.id))
+    for (const entry of prior.usage.entries) {
+      if (!ids.has(entry.id)) fail(`usage entry ${entry.id} was dropped`, 'AP_USAGE_SHRANK')
+    }
+  }
+
+  // The plan-gate timestamp is the freshness anchor every usage artifact is
+  // measured against. Restamping it would silently re-validate artifacts that
+  // predate the gate, so it is write-once for the life of the run.
+  if (prior.planGatePassedAt !== undefined && next.planGatePassedAt !== prior.planGatePassedAt) {
+    fail('planGatePassedAt was restamped', 'AP_GATE_STAMP_MUTATED')
+  }
+
+  // A new plan submission must not carry stale execution evidence or gate
+  // values into the next round (evidence chains restart per plan revision).
+  if (event.op === 'submit-plan') {
+    if (next.executionPacket !== undefined) fail('submit-plan must clear the execution packet', 'AP_STALE_EVIDENCE')
+    if (next.executionGate !== 'pending') fail('submit-plan must reset executionGate to pending', 'AP_STALE_EVIDENCE')
+  }
+
+  // Stamped packet identity must match the live executor. Absent detail is
+  // legacy-exempt only when bearerBase is absent. A present non-integer
+  // revision/generation is a corrupt stamp, not an old stream. Current-format
+  // streams also require generation and childId so a replacement executor at
+  // revision 1 cannot accept a delayed packet from the revoked generation.
+  if (event.op === 'submit-packet') {
+    const stamp = packetIdentityStamp(event.detail)
+    if (stamp.kind === 'invalid') {
+      if (stamp.field === 'executionRevision') {
+        fail(
+          `submit-packet executionRevision is not an integer: ${String(stamp.raw)}`,
+          'AP_PACKET_REVISION_REQUIRED',
+        )
+      }
+      fail(
+        `submit-packet ${stamp.field} is not valid: ${String(stamp.raw)}`,
+        'AP_PACKET_REVISION_REQUIRED',
+      )
+    }
+    if (stamp.kind === 'absent' && prior.bearerBase !== undefined) {
+      fail(
+        'submit-packet executionRevision is required on current-format streams',
+        'AP_PACKET_REVISION_REQUIRED',
+      )
+    }
+    if (stamp.kind === 'ok') {
+      if (prior.bearerBase !== undefined) {
+        if (stamp.generation === undefined) {
+          fail(
+            'submit-packet generation is required on current-format streams',
+            'AP_PACKET_REVISION_REQUIRED',
+          )
+        }
+        if (stamp.childId === undefined) {
+          fail(
+            'submit-packet childId is required on current-format streams',
+            'AP_PACKET_REVISION_REQUIRED',
+          )
+        }
+      }
+      const liveRev = prior.executor?.executionRevision
+      if (liveRev !== stamp.executionRevision) {
+        fail(
+          `submit-packet executionRevision ${String(stamp.executionRevision)} does not match live ${String(liveRev)}`,
+          'AP_PACKET_REVISION_MISMATCH',
+        )
+      }
+      const foldedRev = next.executor?.executionRevision
+      if (foldedRev !== stamp.executionRevision) {
+        fail(
+          `submit-packet snapshot executionRevision ${String(foldedRev)} does not retain stamped live ${String(stamp.executionRevision)}`,
+          'AP_PACKET_REVISION_MUTATED',
+        )
+      }
+      if (stamp.generation !== undefined && stamp.generation !== prior.executor?.generation) {
+        fail(
+          `submit-packet generation ${String(stamp.generation)} does not match live ${String(prior.executor?.generation)}`,
+          'AP_PACKET_REVISION_MISMATCH',
+        )
+      }
+      if (stamp.childId !== undefined && stamp.childId !== prior.executor?.childId) {
+        fail(
+          `submit-packet childId ${stamp.childId} does not match live ${String(prior.executor?.childId)}`,
+          'AP_PACKET_REVISION_MISMATCH',
+        )
+      }
+    }
+  }
+
+  // No executor before the plan gate has ever passed (start-executor requires it right now).
+  if (event.op === 'start-executor' && prior.planGate !== 'pass') {
+    fail('executor before planGate pass', 'AP_EXECUTOR_BEFORE_GATE')
+  }
+  if (next.executor !== undefined && prior.executor === undefined && event.op !== 'start-executor') {
+    fail(`executor appeared via op ${event.op}`, 'AP_EXECUTOR_OP')
+  }
+  if (event.op === 'resume-executor') {
+    const prev = prior.executor
+    const folded = next.executor
+    if (prev === undefined || folded === undefined) {
+      fail('resume-executor requires a live running executor', 'AP_EXECUTOR_REVISION')
+    }
+    if (prev.state !== 'running' || folded.state !== 'running') {
+      fail(
+        `resume-executor state ${prev.state} -> ${folded.state} is not running -> running`,
+        'AP_EXECUTOR_REVISION',
+      )
+    }
+    if (folded.childId !== prev.childId || folded.generation !== prev.generation) {
+      fail('resume-executor must keep childId and generation', 'AP_EXECUTOR_REVISION')
+    }
+    if (folded.executionRevision !== prev.executionRevision + 1) {
+      fail(
+        `resume-executor executionRevision ${String(folded.executionRevision)} is not prior ${String(prev.executionRevision)} + 1`,
+        'AP_EXECUTOR_REVISION',
+      )
+    }
+  } else if (event.op === 'start-executor') {
+    assertStartExecutor(prior, next)
+  } else if (
+    event.op === 'replan'
+    || event.op === 'audit'
+    || event.op === 'self-check'
+    || event.op === 'external-audit'
+  ) {
+    assertExecutorLifecycle(prior, next, event.op)
+  } else if (JSON.stringify(prior.executor) !== JSON.stringify(next.executor)) {
+    fail('executor mutated', 'AP_EXECUTOR_MUTATED')
+  }
+
+  // Plan gate pass requires the usage question to have been answered. The
+  // coupling used to live ONLY in `AutopilotEngine.applyVerdict`, which is the
+  // writer — so a stream that arrived any other way (a hand-edited file, a
+  // buggy writer, an older build) folded clean and became the live snapshot on
+  // a cold resume, after which `start-executor` sees `planGate === 'pass'` and
+  // proceeds. The executionGate rule below already carried its invariant into
+  // the fold; this is the missing symmetric half.
+  if (next.planGate === 'pass' && prior.planGate !== 'pass') {
+    const undeclared = usageDeclarationProblems(next.usage)
+    if (undeclared.length > 0) {
+      fail(`planGate pass with unanswered usage evidence: ${undeclared.join('; ')}`, 'AP_GATE_WITH_UNDECLARED_USAGE')
+    }
+  }
+
+  // Execution gate pass requires a matching latest execution-audit pass in the record.
+  if (next.executionGate === 'pass' && prior.executionGate !== 'pass') {
+    const executionAudits = next.audits.filter(record => record.role === 'execution')
+    const latest = executionAudits[executionAudits.length - 1]
+    if (latest === undefined || latest.verdict !== 'pass') {
+      fail('executionGate pass without a latest execution-audit pass', 'AP_GATE_WITHOUT_AUDIT')
+    }
+  }
+
+  // Evidence kinds, BEFORE the completion re-check below. Order is the point:
+  // a kind-less proven entry also fails `evaluateCompletion`, and if that ran
+  // first the stream would be rejected as AP_INCOMPLETE_COMPLETION — true but
+  // useless. The specific code is what tells a reader which rule was broken.
+  if (event.op === 'submit-closeout') {
+    const stamp = evidenceKindStamp(event.detail)
+    if (stamp === 'invalid') {
+      const raw = (event.detail as { evidenceKinds?: unknown }).evidenceKinds
+      fail(
+        `submit-closeout evidenceKinds stamp is not the integer 1: ${String(raw)}`,
+        'AP_EVIDENCE_KIND_STAMP_INVALID',
+      )
+    }
+    if (stamp === 'v1') {
+      const problems = evidenceKindProblems(next.closeout?.evidence ?? [], { requireKind: true })
+      const first = problems[0]
+      if (first !== undefined) {
+        fail(
+          `submit-closeout stamped evidenceKinds 1: ${problems.map(problem => problem.message).join('; ')}`,
+          first.code,
+        )
+      }
+    }
+  }
+
+  // Completion is structurally validated, not asserted.
+  if (next.phase === 'completed') {
+    const check = evaluateCompletion(next)
+    if (!check.ok) {
+      fail(`completed snapshot fails completion check: ${check.problems.join('; ')}`, 'AP_INCOMPLETE_COMPLETION')
+    }
+  }
+
+  return next
+}
+
+/** Fold result. */
+export interface FoldState {
+  readonly snapshot: Snapshot | undefined
+  readonly eventCount: number
+}
+
+/**
+ * Replay a full event stream strictly. Throws AutopilotError on the first
+ * illegal event. An empty stream folds to an uninitialized state.
+ */
+export function foldRun(events: readonly RunEvent[]): FoldState {
+  let snapshot: Snapshot | undefined
+  for (const event of events) {
+    snapshot = applyEvent(snapshot, event)
+  }
+  return { snapshot, eventCount: events.length }
+}

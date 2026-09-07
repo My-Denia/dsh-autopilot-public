@@ -1,0 +1,127 @@
+# CI for dsh-autopilot.
+#
+# Status: LIVE. This workflow was authored offline (YAML validated locally with
+# PyYAML 6.0.3, syntax only) and first executed on 2026-08-27. That first run
+# (run #1, id 33043015191, commit c076a10) FAILED — a test-fixture defect, not
+# a workflow or product one: sandboxWritableRoots hardcoded '/tmp' while the
+# fixtures were created under tmpdir(), which on a Linux runner is the same
+# root, so the negative containment cases went vacuous. Fixed by moving the
+# fixtures to an in-repo .test-tmp/; every run since is green. The Actions tab
+# is the authority on current status, not this comment. The client half is
+# still NOT in this gate — see below.
+#
+# ---------------------------------------------------------------------------
+# WHAT THIS WORKFLOW DELIBERATELY DOES NOT COVER
+# ---------------------------------------------------------------------------
+# The package has two halves. Only the HOST half is verified here.
+#
+# The CLIENT half — `check:client`, `build:client`, `test:client-bundle` — is
+# absent, and not by oversight. tsconfig.client.json types its externals
+# through `paths` carrying ${DSH_SRC} tokens that
+# scripts/check-client-types.mjs expands (env var, default ~/dsh) into a
+# LOCAL dsh source checkout:
+#
+#   react                                  -> ${DSH_SRC}/node_modules/...
+#   react/jsx-runtime                      -> ${DSH_SRC}/node_modules/...
+#   @deepseek-ai/dsh-client-runtime/client -> ${DSH_SRC}/packages/...
+#
+# react and the client runtime are HOST-PROVIDED externals and are deliberately
+# not dependencies of this package, so `pnpm install` does not and cannot bring
+# them onto a runner — no DSH_SRC value can point at a checkout that is not
+# there. scripts/check-client-types.mjs exits 1 by design when the expanded
+# paths are missing, listing them by name rather than emitting a wall of
+# TS2307.
+#
+# So `check:client` would fail on any runner, `build:client` would fail with it,
+# and `test:client-bundle` needs lib/client.js which only `build:client`
+# produces. They are omitted rather than wrapped in `continue-on-error` or a
+# conditional skip: a step that is green because it did not run is a worse
+# signal than a step that is not there.
+#
+# THE STANDING CONSEQUENCE — everything below is unverified by CI and is only
+# ever checked by a human running `pnpm check:client && pnpm build:client &&
+# pnpm test:client-bundle` locally:
+#   * every type error in src/client/** (AutopilotRunCard.tsx, definition.ts,
+#     live.ts and the rest of the browser half);
+#   * the CJS emit shape that scripts/wrap-client.mjs wraps, i.e. whether the
+#     produced lib/client.js is loadable at all;
+#   * the client bundle smoke test.
+# A green check on this workflow says the HOST half builds, typechecks and
+# passes its tests. It says nothing whatsoever about the browser half.
+#
+# Making this runnable in CI needs a real fix — typing the externals against
+# published packages, or vendoring the .d.ts files — not a CI-side workaround.
+#
+# Mutation testing (`pnpm check:mutation`) is also intentionally absent: it
+# takes ~3 minutes, its thresholds.break is null so it cannot fail a build, and
+# a gate that cannot fail does not belong in a gate list.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# A superseded run of the SAME ref stops when a newer push arrives; runs on
+# different refs (main vs two PRs) never cancel each other.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  host:
+    name: Host half (typecheck, test, build)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # engines.node is ">=22"; 22 is the floor, so CI runs the floor.
+      - name: Set up Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      # Corepack rather than pnpm/action-setup: package.json already carries
+      # `"packageManager": "pnpm@11.17.0"`, and corepack reads exactly that
+      # field. That keeps ONE pinned version for both the runner and the
+      # developer machine. pnpm/action-setup would introduce a second place to
+      # write the version, which can silently disagree with the field that
+      # produced pnpm-lock.yaml.
+      #
+      # The `npm i -g corepack@latest` line is a precaution, not a cargo cult:
+      # the corepack bundled with Node 22 predates recent pnpm releases and
+      # fails their signature check with "Cannot find matching keyid". It is
+      # cheap; if it ever proves unnecessary, delete it.
+      - name: Enable corepack and activate the pinned pnpm
+        run: |
+          npm i -g corepack@latest
+          corepack enable
+          corepack prepare --activate
+          pnpm --version
+
+      # --frozen-lockfile: CI must never resolve anything new. If package.json
+      # and pnpm-lock.yaml disagree, that is a failure to report, not a
+      # condition to fix in place.
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # The gates are invoked directly rather than through `pnpm run <script>`
+      # so that CI runs a fixed command list, and so nothing here depends on
+      # pnpm's verify-deps-before-run behaviour (see pnpm-workspace.yaml).
+      - name: Typecheck host sources
+        run: npx tsc -p tsconfig.json --noEmit
+
+      - name: Typecheck tests
+        run: npx tsc -p tsconfig.test.json
+
+      - name: Unit tests
+        run: npx vitest run
+
+      # The `build:host` half only. `build` in package.json is
+      # build:host && build:client, and build:client cannot run here.
+      - name: Build host half
+        run: npx tsc -p tsconfig.json
