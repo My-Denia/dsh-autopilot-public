@@ -21,6 +21,6 @@
 # the config layer above this one wins, so nothing here is a ceiling.
 - insert:
     - id: autopilot
-      name: dsh-autopilot
+      name: dsh-goal-autopilot
       config:
         storeKind: file

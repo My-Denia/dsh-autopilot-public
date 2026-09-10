@@ -53,7 +53,7 @@ const seed = new Map([['react', React], ['react/jsx-runtime', ReactJsxRuntime]])
 // predicate is the bundle's own mirror. Only the two react seed words remain.
 
 const file = process.argv[2] ?? resolve(root, 'lib/client.js')
-const expectedId = process.argv[3] ?? 'dsh-autopilot'
+const expectedId = process.argv[3] ?? 'dsh-goal-autopilot'
 const source = readFileSync(file, 'utf8')
 
 /** Run the artifact in a fresh context and collect its registrations. */

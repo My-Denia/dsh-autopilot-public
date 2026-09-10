@@ -14,8 +14,10 @@ dsh-autopilot 是把 Claude Code 侧 `goal-autopilot-harness`（下称 CC GAH）
   全快照事件 + 单调 revision、精确活体 root 校验、一次性审计子代理 + 结构化裁决
   schema、CAS 世代号执行器、drain-before-replace。命名完全隔离
   （`autopilot_*` 工具 / 独立存储），两者可在同一 profile 共存。
-- **部署形态**：单包 out-of-tree bundle（`dsh.bundle.patch`），
-  `dsh plugin --profile <name> add <本仓库路径>` 安装（pnpm link）。
+- **部署形态**：单包 out-of-tree bundle（`dsh.bundle.patch`）。当前安装走 npm
+  包名 `dsh-goal-autopilot`（`dsh plugin --profile <name> add dsh-goal-autopilot`）。
+  从本仓库路径 `add`（pnpm link）仍可用于开发。项目逻辑名仍是 dsh-autopilot；
+  未加 scope 的 npm 名 `dsh-autopilot` 属于另一个独立项目，本仓库不使用该名。
 - **不运行时依赖任何 dsh 服务包**：`src/` 只 import 两个非相对**包**，其余非相对
   value import 全是 `node:` 内建（实测 2026-08-25：16 个 src 文件里 15 条非相对
   value import ＝ 13 条 node 内建 + 2 条包）。两个包都是纯函数/协议表面而不是

@@ -1,11 +1,28 @@
 {
-  "name": "dsh-autopilot",
+  "name": "dsh-goal-autopilot",
   "version": "0.1.0",
   "description": "Native Goal Autopilot Harness for DeepSeek Harness (dsh): plan-execute-audit gates, mechanical enforcement, and evidence-bound closeout as an out-of-tree plugin bundle.",
   "type": "module",
   "main": "lib/index.js",
   "types": "lib/index.d.ts",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/My-Denia/dsh-autopilot-public.git"
+  },
+  "homepage": "https://github.com/My-Denia/dsh-autopilot-public",
+  "bugs": {
+    "url": "https://github.com/My-Denia/dsh-autopilot-public/issues"
+  },
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "goal",
+    "autopilot",
+    "plan-execute-audit",
+    "agent-governance"
+  ],
   "files": [
     "lib",
     "cordis.patch.yml",
@@ -20,12 +37,12 @@
   "scripts": {
     "build": "npm run build:host && npm run build:client",
     "build:host": "tsc -p tsconfig.json",
-    "build:client": "node scripts/check-client-types.mjs && tsc -p tsconfig.client.local.json && node scripts/wrap-client.mjs --id dsh-autopilot --in build --entry client/index.js --out lib/client.js",
+    "build:client": "node scripts/check-client-types.mjs && tsc -p tsconfig.client.local.json && node scripts/wrap-client.mjs --id dsh-goal-autopilot --in build --entry client/index.js --out lib/client.js",
     "check": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.test.json",
     "check:client": "node scripts/check-client-types.mjs && tsc -p tsconfig.client.local.json --noEmit",
     "check:mutation": "stryker run",
     "test": "vitest run",
-    "test:client-bundle": "node scripts/run-bundle.mjs lib/client.js dsh-autopilot"
+    "test:client-bundle": "node scripts/run-bundle.mjs lib/client.js dsh-goal-autopilot"
   },
   "dsh": {
     "bundle": {

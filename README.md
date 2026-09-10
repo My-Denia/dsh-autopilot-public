@@ -6,6 +6,11 @@ out-of-tree plugin bundle. Design lineage: the Claude Code `goal-autopilot-harne
 skill, rebuilt on dsh's plugin seams so its gates are executable invariants instead
 of prompt conventions. Full design: [DESIGN.md](./DESIGN.md).
 
+The project name remains **dsh-autopilot** / Goal Autopilot Harness. The npm
+distribution name is **dsh-goal-autopilot**. Unscoped `dsh-autopilot` on npm
+belongs to a separate, independent project; this repository does not publish
+under that name. Install this plugin as `dsh-goal-autopilot`.
+
 This repository is an **experimental** **developer preview**. It is source you
 can read, build, and try against dsh `0.1.2-rc.1` on Node 22+. It
 does not provide production-grade complete security and
@@ -101,24 +106,33 @@ plugin remount while an executor is already live is warned, not vetoed.
 ## Install
 
 ```sh
-# build once
-cd dsh-autopilot
+dsh plugin --profile <name> add dsh-goal-autopilot
+```
+
+Pin a version:
+
+```sh
+dsh plugin --profile <name> add dsh-goal-autopilot@0.1.0
+```
+
+From a local checkout (development):
+
+```sh
 pnpm install
 pnpm run build
-
-# add to a dsh profile (creates the profile if missing)
-dsh plugin --profile <name> add C:\path\to\dsh-autopilot
+dsh plugin --profile <name> add .
 ```
 
 For a web profile, ensure the profile's `package.json` bundles include the web app
 (that bundle is what mounts `ctx.storageDomain`, so it is also what makes
-`storeKind: auto` resolve to the domain backend):
+`storeKind: auto` resolve to the domain backend). After `dsh plugin add`, the
+bundle name is the npm package name:
 
 ```json
 "dsh": { "profile": { "bundles": [
   "@deepseek-ai/dsh-base",
   "@deepseek-ai/dsh-web-app",
-  "dsh-autopilot"
+  "dsh-goal-autopilot"
 ] } }
 ```
 
