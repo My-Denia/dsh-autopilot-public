@@ -5,6 +5,15 @@ dsh-autopilot 是把 Claude Code 侧 `goal-autopilot-harness`（下称 CC GAH）
 提示词纪律 + 外挂 hook 脆弱地逼近的机制，dsh 的插件化架构可以做成**可执行的结构性
 不变量**。这份文档记录设计决策、CC→dsh 机制映射、不可机械化的不变量、以及路线图。
 
+## Documentation map
+
+Visitor landing page: [README.md](README.md).
+
+- [Compatibility](docs/compatibility.md) — host versions, WSL/Windows, 0.1.1 runtime
+- [Security](docs/security.md) — approval, egress, sandbox assumptions
+- [Operator reference](docs/reference.md) — `autopilot_*` tools and run state
+- [Changelog](CHANGELOG.md)
+
 ## 1. 设计前提与决策
 
 - **蓝本**：CC GAH（`~/.claude/skills/goal-autopilot-harness/SKILL.md`）的
