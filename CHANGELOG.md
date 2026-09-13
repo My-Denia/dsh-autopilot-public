@@ -1,9 +1,16 @@
 # Changelog
 
+Host and packaging bounds that outlive a single release are in
+[docs/compatibility.md](docs/compatibility.md).
+
 ## 0.1.1 — 2026-09-13
 
 Packaging / runtime compatibility release. Parent of the version bump is
 `ff7ccaef` (keep `dsh-tools` a host-provided peer).
+
+0.1.0 shipped `@deepseek-ai/dsh-tools` in runtime `dependencies`; that is the
+defect this release repairs. No separate 0.1.0 changelog date is recorded
+here.
 
 ### Fixed
 
