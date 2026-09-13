@@ -10,10 +10,6 @@ overrides:
 importers:
 
   .:
-    dependencies:
-      '@deepseek-ai/dsh-tools':
-        specifier: 0.1.2-rc.1
-        version: 0.1.2-rc.1(de5e1ff2d608fbe22667925341ad1dfc)
     devDependencies:
       '@deepseek-ai/cordis':
         specifier: 4.0.2
@@ -30,6 +26,9 @@ importers:
       '@deepseek-ai/dsh-subagent':
         specifier: 0.1.2-rc.1
         version: 0.1.2-rc.1(6241f70df87ac98c48965b657a1f7a60)
+      '@deepseek-ai/dsh-tools':
+        specifier: 0.1.2-rc.1
+        version: 0.1.2-rc.1(de5e1ff2d608fbe22667925341ad1dfc)
       '@deepseek-ai/dsh-util-values':
         specifier: 0.1.2-rc.1
         version: 0.1.2-rc.1(@deepseek-ai/cordis@4.0.2)
