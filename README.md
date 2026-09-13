@@ -12,12 +12,23 @@ belongs to a separate, independent project; this repository does not publish
 under that name. Install this plugin as `dsh-goal-autopilot`.
 
 This repository is an **experimental** **developer preview**. It is source you
-can read, build, and try against dsh `0.1.2-rc.1` on Node 22+. It
-does not provide production-grade complete security and
+can read, build, and try on Node 22+ against host `dsh` `0.1.2-rc.1` or
+`0.1.5-rc.1`. `@deepseek-ai/dsh-tools` is a **host-provided peer**
+(`0.1.2-rc.1 || >=0.1.5-rc.1 <0.1.6`), not a runtime dependency. **0.1.1**
+fixes the 0.1.0 defect that installed a second `dsh-tools` copy, split the
+module-instance `TOOL_RUNTIME_SCHEDULER` Symbol, and crashed host `skill`
+load. It does not provide production-grade complete security and
 does not provide remote exactly-once. Existing limits stay in force and are
 not repaired in this snapshot: No structured verdict means a gate does not
 flip; closeout keys off event format stamps, not `// bearerBase`; a
 plugin remount while an executor is already live is warned, not vetoed.
+
+On WSL2 with `dsh` `0.1.5-rc.1`, 0.1.1 has verified npm install, compose/mount,
+skill install/load, autopilot entry, and plan/replan/audit through the plan
+gate. The full write lifecycle remains unverified because the tested headless
+model does not currently follow the host sandbox escalation contract for
+ordinary workspace-write calls. That host/model mismatch is outside this
+plugin's fix.
 
 ## What it does
 
@@ -112,7 +123,7 @@ dsh plugin --profile <name> add dsh-goal-autopilot
 Pin a version:
 
 ```sh
-dsh plugin --profile <name> add dsh-goal-autopilot@0.1.0
+dsh plugin --profile <name> add dsh-goal-autopilot@0.1.1
 ```
 
 From a local checkout (development):
@@ -136,8 +147,21 @@ bundle name is the npm package name:
 ] } }
 ```
 
-**dsh version.** This package pins dsh `0.1.2-rc.1` (upgraded from `0.1.1-rc.2`
-on 2026-09-04) and must be booted by a 0.1.2 CLI: dsh 0.1.2 removed
+**dsh version (support matrix, not a wish).**
+
+| Host `dsh` CLI | How it was established | Install / mount | Full NL run to closeout |
+| --- | --- | --- | --- |
+| `0.1.2-rc.1` | Original package pin / earlier real-host work | claimed by this snapshot's design notes | earlier host traces in DESIGN.md §8 (not re-run this round) |
+| `0.1.5-rc.1` | WSL2 live CLI, 2026-09-13, **not downgraded** | **0.1.1 peer-layout:** compose/mount + skill load + `autopilot_init` without a nested `dsh-tools` runtime. **0.1.0** installed a second runtime and broke host `skill`. | **not verified:** write lifecycle. Tested headless model sends redundant `sandbox_permissions=workspace-write` |
+| Windows | out of scope this round | **not verified** | **not verified** |
+
+On a 0.1.5 profile, `dsh plugin add` may print a pnpm peer WARN because
+`dsh-tools@0.1.2-rc.1` still wants 0.1.2-era peers. The add still exited 0 in
+the WSL measurement; `pnpm peers check` lists the missing names. That WARN
+alone is not a signal to downgrade the host CLI.
+
+The 0.1.2 CLI remains the **minimum** line this source was written against:
+dsh 0.1.2 removed
 `Session.events` (the plugin reads `snapshotEvents()`), the
 `@deepseek-ai/dsh-client-runtime` package (the client half now injects only
 `dsh-client-ui-slots` and `dsh-client-ui-conversation`, and registers its card
@@ -506,11 +530,12 @@ before `check:client`, `build:client` and `test:client-bundle`. With the pins at
 Requires Node 22+. `src/` imports exactly two non-relative PACKAGES; every other
 non-relative import is a `node:` builtin (measured 2026-08-25: 15 non-relative
 value imports across 16 files — 13 builtins plus the two packages). The two are
-`@deepseek-ai/dsh-tools` (a `dependencies` entry, pinned to the dsh version you
-run) for `defineTool`, and `@deepseek-ai/schemastery` (a `peerDependencies`
-entry the host already provides) for the `Config` export. `@deepseek-ai/cordis`
-is a devDependency only — no file in `src/` imports it, so it is not declared as
-a peer. Everything else reaches dsh through injected services and local
-structural types; no dsh SERVICE package is imported at runtime, which is what
-keeps a second physical copy from giving the plugin a different service identity
-than the host's.
+`@deepseek-ai/dsh-tools` (a **peer**, range
+`0.1.2-rc.1 || >=0.1.5-rc.1 <0.1.6`; the test/build pin stays in
+`devDependencies`) for `defineTool`, and `@deepseek-ai/schemastery` (also a
+`peerDependencies` entry the host already provides) for the `Config` export.
+`@deepseek-ai/cordis` is a devDependency only — no file in `src/` imports it,
+so it is not declared as a peer. Shipping `dsh-tools` in runtime
+`dependencies` (0.1.0) created a second module instance and split
+`TOOL_RUNTIME_SCHEDULER`. 0.1.1 keeps a single host copy. Other dsh surfaces
+reach the plugin through injected services and local structural types.

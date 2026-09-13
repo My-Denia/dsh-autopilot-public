@@ -1,6 +1,6 @@
 {
   "name": "dsh-goal-autopilot",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Native Goal Autopilot Harness for DeepSeek Harness (dsh): plan-execute-audit gates, mechanical enforcement, and evidence-bound closeout as an out-of-tree plugin bundle.",
   "type": "module",
   "main": "lib/index.js",

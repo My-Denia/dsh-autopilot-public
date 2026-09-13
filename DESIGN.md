@@ -22,7 +22,10 @@ dsh-autopilot 是把 Claude Code 侧 `goal-autopilot-harness`（下称 CC GAH）
   value import 全是 `node:` 内建（实测 2026-08-25：16 个 src 文件里 15 条非相对
   value import ＝ 13 条 node 内建 + 2 条包）。两个包都是纯函数/协议表面而不是
   服务——`@deepseek-ai/dsh-tools` 的 `defineTool`
-  （`dependencies`，纯工厂函数，双副本无害）与 `@deepseek-ai/schemastery`
+  （`peerDependencies`，由宿主提供单例。0.1.0 把它放进 `dependencies`
+  会装出第二份 runtime，分裂模块实例局部 `TOOL_RUNTIME_SCHEDULER` Symbol，
+  宿主 `skill` 因此崩溃。0.1.1 起不再装第二份。不是“双副本无害”。）
+  与 `@deepseek-ai/schemastery`
   （`peerDependencies`，只为导出 `Config`；宿主只碰
   `['~standard'].validate` 这个 Standard-Schema 结构性契约，从不碰类身份）。
   其余 dsh 表面——`agents` / `subagents` / `tools` / `systemPrompt` /

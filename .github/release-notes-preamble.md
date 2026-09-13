@@ -11,3 +11,11 @@
 The tag was verified on the runner with the same four gate commands CI
 runs on every pull request (host typecheck, test typecheck, unit tests,
 host build) before this release was created.
+
+0.1.1 is a packaging/runtime compatibility release: it stops installing a
+second `dsh-tools` copy that split `TOOL_RUNTIME_SCHEDULER` and crashed host
+`skill`. It does not claim a verified full write lifecycle, a finished
+end-to-end install path, a repaired headless-model sandbox mismatch, or
+production-grade complete security. The full write lifecycle remains
+unverified because the tested headless model does not currently follow the
+host sandbox escalation contract for ordinary workspace-write calls.
