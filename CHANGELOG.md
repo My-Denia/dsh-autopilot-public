@@ -3,7 +3,7 @@
 Host and packaging bounds that outlive a single release are in
 [docs/compatibility.md](docs/compatibility.md).
 
-## 0.2.0 — unreleased
+## 0.2.0 — 2026-10-07
 
 Adapts the plugin to DeepSeek Harness (`dsh`) 0.2.0, the CLI and the Desktop
 app's bundled `dsh` command. Measured on WSL2 against a real `dsh`
