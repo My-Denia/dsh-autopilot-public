@@ -2052,3 +2052,103 @@ describe('replay enforces the declaration rules, not just the class label', () =
     expect(evaluateCompletion(completable({ usage: { entries: [sound] } })).ok).toBe(true)
   })
 })
+
+// ── Routing pins: detail.routing validation + last-wins derivation (M3b) ──
+
+describe('routing pins derive from dispatch detail.routing, last-wins per role', () => {
+  const PIN = { provider: 'beta', model: 'm-c', reasoningEffort: 'high' } as const
+
+  /** A legal audit event from plan-reviewing, carrying a routing decision. */
+  function auditWithRouting(
+    prior: Snapshot,
+    routing: unknown,
+    pins: Snapshot['routingPins'],
+  ): RunEvent {
+    const audits = prior.audits
+    return event('audit', makeSnapshot({
+      revision: prior.revision + 1,
+      phase: 'planning',
+      audits,
+      routingPins: pins,
+    }, STANDARD_TRIAGE), prior.revision + 1, { routing })
+  }
+
+  const STANDARD_TRIAGE = makeTriage({ size: 'standard', risk: 'medium', executionMode: 'inline', auditMode: 'independent' })
+
+  it('accepts a well-formed audit routing decision and derives the pin', () => {
+    const prior = makeSnapshot({ phase: 'plan-reviewing' }, STANDARD_TRIAGE)
+    const next = applyEvent(prior, auditWithRouting(prior, { role: 'plan-auditor', pin: PIN, why: ['because'], authorizationSource: 'session-policy' }, { 'plan-auditor': PIN }))
+    expect(next.routingPins).toEqual({ 'plan-auditor': PIN })
+  })
+
+  it('an inherit decision CLEARS the role pin (a reload must not resurrect it)', () => {
+    const prior = makeSnapshot({ phase: 'plan-reviewing', routingPins: { 'plan-auditor': PIN } }, STANDARD_TRIAGE)
+    const next = applyEvent(prior, auditWithRouting(prior, { role: 'plan-auditor', why: ['inheritance'] }, undefined))
+    expect(next.routingPins).toBeUndefined()
+  })
+
+  it('rejects a malformed detail.routing loudly (unknown key)', () => {
+    const prior = makeSnapshot({ phase: 'plan-reviewing' }, STANDARD_TRIAGE)
+    expect(() => applyEvent(prior, auditWithRouting(prior, { role: 'plan-auditor', pin: PIN, why: ['x'], authorizationSource: 'session-policy', extra: 1 }, { 'plan-auditor': PIN })))
+      .toThrowError(/unknown key "extra"/)
+  })
+
+  it('rejects a pin without an authorizationSource (an explicit route always has an authority)', () => {
+    const prior = makeSnapshot({ phase: 'plan-reviewing' }, STANDARD_TRIAGE)
+    expect(() => applyEvent(prior, auditWithRouting(prior, { role: 'plan-auditor', pin: PIN, why: ['x'] }, { 'plan-auditor': PIN })))
+      .toThrowError(/authorizationSource is required/)
+  })
+
+  it('rejects a non-auditor role on an audit op', () => {
+    const prior = makeSnapshot({ phase: 'plan-reviewing' }, STANDARD_TRIAGE)
+    expect(() => applyEvent(prior, auditWithRouting(prior, { role: 'executor', pin: PIN, why: ['x'], authorizationSource: 'plugin-config' }, { executor: PIN })))
+      .toThrowError(/auditor role/)
+  })
+
+  it('rejects an empty why list', () => {
+    const prior = makeSnapshot({ phase: 'plan-reviewing' }, STANDARD_TRIAGE)
+    expect(() => applyEvent(prior, auditWithRouting(prior, { role: 'plan-auditor', why: [] }, undefined)))
+      .toThrowError(/why must be a non-empty array/)
+  })
+
+  it('rejects a snapshot whose pins do not match the detail-derived state', () => {
+    const prior = makeSnapshot({ phase: 'plan-reviewing' }, STANDARD_TRIAGE)
+    // The decision pins plan-auditor, but the snapshot wrote a DIFFERENT pin.
+    const wrong = { provider: 'alpha', model: 'm-a' }
+    expect(() => applyEvent(prior, auditWithRouting(prior, { role: 'plan-auditor', pin: PIN, why: ['x'], authorizationSource: 'session-policy' }, { 'plan-auditor': wrong })))
+      .toThrowError(/routingPins do not match detail\.routing/)
+  })
+
+  it('rejects pins mutated without any routing decision (0.2.0 events stay pin-stable)', () => {
+    const prior = makeSnapshot({ phase: 'plan-reviewing', routingPins: { 'plan-auditor': PIN } }, STANDARD_TRIAGE)
+    const mutated = makeSnapshot({ revision: prior.revision + 1, phase: 'planning', routingPins: { 'plan-auditor': PIN, executor: { provider: 'a', model: 'b' } } }, STANDARD_TRIAGE)
+    expect(() => applyEvent(prior, event('log', mutated))).toThrowError(/mutated via op log/)
+  })
+
+  it('init may not carry routing pins', () => {
+    expect(() => applyEvent(undefined, event('init', makeSnapshot({ routingPins: { executor: { provider: 'a', model: 'b' } } }))))
+      .toThrowError(/init routingPins/)
+  })
+
+  it('a start-executor routing decision must name the executor role', () => {
+    const prior = makeSnapshot({ phase: 'executing', planGate: 'pass' }, STANDARD_TRIAGE)
+    const executor: ExecutorRecord = { childId: 'c1', generation: 1, executionRevision: 1, state: 'starting', route: { provider: 'spawn', routeProvider: 'p', routeModel: 'm', routeStatus: 'verified' } }
+    const ok = applyEvent(prior, event('start-executor', makeSnapshot({
+      revision: prior.revision + 1,
+      phase: 'executing',
+      planGate: 'pass',
+      executor,
+      routingPins: { executor: PIN },
+    }, STANDARD_TRIAGE), prior.revision + 1, { stage: 'starting', childId: 'c1', routing: { role: 'executor', pin: PIN, why: ['x'], authorizationSource: 'session-policy' } }))
+    expect(ok.routingPins).toEqual({ executor: PIN })
+
+    expect(() => applyEvent(prior, event('start-executor', makeSnapshot({
+      revision: prior.revision + 1,
+      phase: 'executing',
+      planGate: 'pass',
+      executor,
+      routingPins: { executor: PIN },
+    }, STANDARD_TRIAGE), prior.revision + 1, { stage: 'starting', childId: 'c1', routing: { role: 'plan-auditor', pin: PIN, why: ['x'], authorizationSource: 'session-policy' } })))
+      .toThrowError(/must be "executor"/)
+  })
+})

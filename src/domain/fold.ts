@@ -11,6 +11,14 @@
 
 import {
   AutopilotError,
+  ROUTING_AUDITOR_ROLES,
+  ROUTING_AUTHORIZATION_SOURCES,
+  ROUTING_CANDIDATE_DISPOSITIONS,
+  ROUTING_IDENTITY_AXES,
+  ROUTING_INDEPENDENCE_OUTCOMES,
+  ROUTING_ROLES,
+  applyRoutingDecision,
+  sameRoutingPins,
   validateExternalReview,
   TERMINAL_PHASES,
   evaluateCompletion,
@@ -18,7 +26,7 @@ import {
   isAbsoluteShapedBearer,
   usageDeclarationProblems,
 } from './types.js'
-import type { Operation, Phase, RunEvent, Snapshot } from './types.js'
+import type { Operation, Phase, RunEvent, RoutingDecisionDetail, Snapshot } from './types.js'
 
 /** Operations legal from each phase (undefined prior state only admits init). */
 const LEGAL_OPS: Record<Phase, readonly Operation[]> = {
@@ -195,6 +203,185 @@ function evidenceKindStamp(detail: unknown): 'absent' | 'invalid' | 'v1' {
   return (detail as { evidenceKinds?: unknown }).evidenceKinds === 1 ? 'v1' : 'invalid'
 }
 
+/**
+ * The routing decision on a dispatch commit's `detail.routing`, STRICTLY
+ * validated (packet M3b): `{role, pin?, why, authorizationSource,
+ * fallbackFrom?, repinFrom?, candidates?}` and nothing else. Malformed ⇒ fold
+ * error — a routing decision is authorization-bearing state, and a hand-edited
+ * or foreign stream must be rejected loudly rather than folded into a pin the
+ * engine never wrote. The `candidates` set (execution-audit P2-2) is validated
+ * with the same strictness: a fabricated considered set is as dishonest on
+ * replay as a fabricated pin, entry by entry over closed vocabularies.
+ *
+ * Returns the VALIDATED detail, or `undefined` when no routing decision is
+ * present (the 0.2.0 shape — every historical fixture takes this arm).
+ */
+function routingDecisionOf(op: Operation, detail: unknown): RoutingDecisionDetail | undefined {
+  if (detail === null || typeof detail !== 'object' || !('routing' in detail)) return undefined
+  const routing = (detail as { routing?: unknown }).routing
+  if (routing === undefined) return undefined
+  const where = `${op} detail.routing`
+  const problems: string[] = []
+  if (routing === null || typeof routing !== 'object' || Array.isArray(routing)) {
+    fail(`${where} must be an object, got ${typeof routing}`, 'AP_ROUTING_DETAIL')
+  }
+  const record = routing as Record<string, unknown>
+  const known: readonly string[] = ['role', 'pin', 'why', 'authorizationSource', 'fallbackFrom', 'repinFrom', 'candidates']
+  for (const key of Object.keys(record)) {
+    if (!known.includes(key)) problems.push(`${where} has an unknown key "${key}"`)
+  }
+  const pinProblems = (label: string, value: unknown): string[] => {
+    if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+      return [`${where}.${label} must be an object`]
+    }
+    const pin = value as Record<string, unknown>
+    const out: string[] = []
+    for (const key of Object.keys(pin)) {
+      if (key !== 'provider' && key !== 'model' && key !== 'reasoningEffort') {
+        out.push(`${where}.${label} has an unknown key "${key}"`)
+      }
+    }
+    for (const field of ['provider', 'model'] as const) {
+      const raw = pin[field]
+      if (typeof raw !== 'string' || raw.trim().length === 0) {
+        out.push(`${where}.${label}.${field} must be a non-empty string`)
+      }
+    }
+    const effort = pin.reasoningEffort
+    if (effort !== undefined && (typeof effort !== 'string' || effort.trim().length === 0)) {
+      out.push(`${where}.${label}.reasoningEffort must be a non-empty string when present`)
+    }
+    return out
+  }
+  const role = record.role
+  if (typeof role !== 'string' || !ROUTING_ROLES.includes(role)) {
+    problems.push(`${where}.role must be one of ${ROUTING_ROLES.join('|')}, got ${JSON.stringify(role)}`)
+  } else if (op === 'start-executor') {
+    if (role !== 'executor') problems.push(`${where}.role must be "executor" on a start-executor op, got "${role}"`)
+  } else if (op === 'audit') {
+    if (!ROUTING_AUDITOR_ROLES.includes(role)) {
+      problems.push(`${where}.role must be an auditor role (${ROUTING_AUDITOR_ROLES.join('|')}) on an audit op, got "${role}"`)
+    }
+  }
+  if ('pin' in record && record.pin !== undefined) problems.push(...pinProblems('pin', record.pin))
+  const why = record.why
+  if (!Array.isArray(why) || why.length === 0 || why.some((entry) => typeof entry !== 'string')) {
+    problems.push(`${where}.why must be a non-empty array of strings`)
+  }
+  const source = record.authorizationSource
+  if (source !== undefined) {
+    if (typeof source !== 'string' || !ROUTING_AUTHORIZATION_SOURCES.includes(source)) {
+      problems.push(
+        `${where}.authorizationSource must be one of ${ROUTING_AUTHORIZATION_SOURCES.join('|')}, got ${JSON.stringify(source)}`,
+      )
+    }
+  } else if ('pin' in record && record.pin !== undefined) {
+    // An explicit route always has an authority; an inherit under an absent
+    // policy has none (see RoutingDecisionDetail). REQUIRE it exactly there.
+    problems.push(`${where}.authorizationSource is required when a pin is present`)
+  }
+  if ('fallbackFrom' in record && record.fallbackFrom !== undefined) {
+    const fallback = record.fallbackFrom
+    if (!Array.isArray(fallback)) {
+      problems.push(`${where}.fallbackFrom must be an array`)
+    } else {
+      for (const entry of fallback) {
+        if (entry === null || typeof entry !== 'object' || Array.isArray(entry)) {
+          problems.push(`${where}.fallbackFrom entries must be objects`)
+          continue
+        }
+        const item = entry as Record<string, unknown>
+        for (const key of Object.keys(item)) {
+          if (key !== 'provider' && key !== 'model' && key !== 'reason') {
+            problems.push(`${where}.fallbackFrom entry has an unknown key "${key}"`)
+          }
+        }
+        for (const field of ['provider', 'model', 'reason'] as const) {
+          const raw = item[field]
+          if (typeof raw !== 'string' || raw.trim().length === 0) {
+            problems.push(`${where}.fallbackFrom entry .${field} must be a non-empty string`)
+          }
+        }
+      }
+    }
+  }
+  if ('repinFrom' in record && record.repinFrom !== undefined) {
+    problems.push(...pinProblems('repinFrom', record.repinFrom))
+  }
+  if ('candidates' in record && record.candidates !== undefined) {
+    const candidates = record.candidates
+    if (!Array.isArray(candidates)) {
+      problems.push(`${where}.candidates must be an array`)
+    } else {
+      for (const entry of candidates) {
+        if (entry === null || typeof entry !== 'object' || Array.isArray(entry)) {
+          problems.push(`${where}.candidates entries must be objects`)
+          continue
+        }
+        const item = entry as Record<string, unknown>
+        const entryKeys: readonly string[] = ['provider', 'model', 'contextWindow', 'hasReasoningEfforts', 'independence', 'disposition', 'note']
+        for (const key of Object.keys(item)) {
+          if (!entryKeys.includes(key)) problems.push(`${where}.candidates entry has an unknown key "${key}"`)
+        }
+        for (const field of ['provider', 'model'] as const) {
+          const raw = item[field]
+          if (typeof raw !== 'string' || raw.trim().length === 0) {
+            problems.push(`${where}.candidates entry .${field} must be a non-empty string`)
+          }
+        }
+        const disposition = item.disposition
+        if (typeof disposition !== 'string' || !ROUTING_CANDIDATE_DISPOSITIONS.includes(disposition)) {
+          problems.push(
+            `${where}.candidates entry .disposition must be one of ${ROUTING_CANDIDATE_DISPOSITIONS.join('|')}, got ${JSON.stringify(disposition)}`,
+          )
+        }
+        const window = item.contextWindow
+        if (window !== undefined && (typeof window !== 'number' || !Number.isInteger(window) || window <= 0)) {
+          problems.push(`${where}.candidates entry .contextWindow must be a positive integer when present`)
+        }
+        if (typeof item.hasReasoningEfforts !== 'boolean') {
+          problems.push(`${where}.candidates entry .hasReasoningEfforts must be a boolean`)
+        }
+        const note = item.note
+        if (note !== undefined && (typeof note !== 'string' || note.trim().length === 0)) {
+          problems.push(`${where}.candidates entry .note must be a non-empty string when present`)
+        }
+        const independence = item.independence
+        if (independence !== undefined) {
+          if (independence === null || typeof independence !== 'object' || Array.isArray(independence)) {
+            problems.push(`${where}.candidates entry .independence must be an object`)
+          } else {
+            const axes = independence as Record<string, unknown>
+            for (const key of Object.keys(axes)) {
+              if (key !== 'modelAxis' && key !== 'providerAxis' && key !== 'outcome') {
+                problems.push(`${where}.candidates entry .independence has an unknown key "${key}"`)
+              }
+            }
+            for (const axis of ['modelAxis', 'providerAxis'] as const) {
+              const raw = axes[axis]
+              if (typeof raw !== 'string' || !ROUTING_IDENTITY_AXES.includes(raw)) {
+                problems.push(
+                  `${where}.candidates entry .independence.${axis} must be one of ${ROUTING_IDENTITY_AXES.join('|')}, got ${JSON.stringify(raw)}`,
+                )
+              }
+            }
+            const outcome = axes.outcome
+            if (typeof outcome !== 'string' || !ROUTING_INDEPENDENCE_OUTCOMES.includes(outcome)) {
+              problems.push(
+                `${where}.candidates entry .independence.outcome must be one of ${ROUTING_INDEPENDENCE_OUTCOMES.join('|')}, got ${JSON.stringify(outcome)}`,
+              )
+            }
+          }
+        }
+      }
+    }
+  }
+  if (problems.length > 0) {
+    fail(`${where} is malformed: ${problems.join('; ')}`, 'AP_ROUTING_DETAIL')
+  }
+  return record as unknown as RoutingDecisionDetail
+}
+
 /** Assert one event is a legal successor of the prior snapshot; returns the new snapshot. */
 export function applyEvent(prior: Snapshot | undefined, event: RunEvent): Snapshot {
   if (event.v !== 1) fail(`unsupported event version ${String((event as { v: unknown }).v)}`, 'AP_EVENT_VERSION')
@@ -207,6 +394,9 @@ export function applyEvent(prior: Snapshot | undefined, event: RunEvent): Snapsh
     if (next.planGate !== 'pending' || next.executionGate !== 'pending') fail('init gates must be pending', 'AP_INIT_GATES')
     if (next.audits.length !== 0) fail('init audits must be empty', 'AP_INIT_AUDITS')
     if (next.executor !== undefined) fail('init executor must be absent', 'AP_INIT_EXECUTOR')
+    if (next.routingPins !== undefined) {
+      fail('init routingPins must be absent — pins derive from dispatch detail.routing only', 'AP_INIT_ROUTING_PINS')
+    }
     if (next.bearerBase !== undefined) {
       if (next.bearerBase.length === 0) fail('init bearerBase must not be empty when present', 'AP_BEARER_BASE_EMPTY')
       if (!isAbsoluteShapedBearer(next.bearerBase)) {
@@ -226,6 +416,32 @@ export function applyEvent(prior: Snapshot | undefined, event: RunEvent): Snapsh
   if (prior.bearerBase !== next.bearerBase) fail('bearerBase mutated', 'AP_BEARER_BASE_MUTATED')
   if (!LEGAL_OPS[prior.phase].includes(event.op)) {
     fail(`op ${event.op} is illegal in phase ${prior.phase}`, 'AP_ILLEGAL_OP')
+  }
+
+  // Routing pins derive from dispatch-op `detail.routing` ONLY (plan "Route
+  // records and stability", refined pinning delta): last-wins per role — set on
+  // a `route` decision, cleared on an `inherit`. The engine builds the committed
+  // snapshot with the SAME shared derivation (`applyRoutingDecision`), so this
+  // check holds every event to the one rule rather than trusting the writer's
+  // arithmetic. Events without `detail.routing` replay exactly as 0.2.0: the
+  // pin state must be byte-stable across them, which is also what makes a
+  // legacy stream with no pins at all fold unchanged.
+  if (event.op === 'audit' || event.op === 'start-executor') {
+    const routing = routingDecisionOf(event.op, event.detail)
+    const expected = routing !== undefined ? applyRoutingDecision(prior.routingPins, routing) : prior.routingPins
+    if (!sameRoutingPins(expected, next.routingPins)) {
+      fail(
+        routing !== undefined
+          ? `routingPins do not match detail.routing for role "${routing.role}" (expected ${JSON.stringify(expected)}, got ${JSON.stringify(next.routingPins)})`
+          : `routingPins mutated without a routing decision (expected ${JSON.stringify(prior.routingPins)}, got ${JSON.stringify(next.routingPins)})`,
+        'AP_ROUTING_PINS',
+      )
+    }
+  } else if (!sameRoutingPins(prior.routingPins, next.routingPins)) {
+    fail(
+      `routingPins mutated via op ${event.op} (pins derive from audit/start-executor detail.routing only)`,
+      'AP_ROUTING_PINS_MUTATED',
+    )
   }
 
   // Audit history is append-only.

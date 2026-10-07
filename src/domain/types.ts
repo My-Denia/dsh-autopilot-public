@@ -4,7 +4,19 @@
  * Design lineage: the CC goal-autopilot-harness state.json contract, rebuilt
  * as an event-sourced snapshot stream (the pattern proven by dsh's
  * experimental GAH package, reimplemented independently here).
+ *
+ * The routing vocabulary below (`Role`, `AuthorizationSource`,
+ * `FallbackRecord`) is imported TYPE-ONLY from `../routing/` — the values in
+ * this module (`ROUTING_ROLES` and siblings) are hand-declared mirrors so the
+ * domain layer keeps zero runtime dependencies on the routing core, while the
+ * fold still validates the vocabulary exactly. The runtime edge stays
+ * one-directional (`routing/*` imports `errorMessage` from here); a value
+ * import back would close a cycle for no benefit.
  */
+
+import type { Role } from '../routing/select.js'
+import type { AuthorizationSource } from '../routing/authorize.js'
+import type { CandidateConsidered, FallbackRecord } from '../routing/select.js'
 
 /** One autopilot run is rooted at one top-level Session; its id is the run id. */
 export type RunId = string
@@ -90,7 +102,18 @@ export interface RouteRecord {
   readonly provider: string
   readonly routeProvider: string
   readonly routeModel: string
-  readonly routeStatus: 'verified' | 'unverified'
+  /**
+   * Route evidence status (plan v3, M4). `verified` ONLY when selected,
+   * creation (`Agent.options`), and observed (`request/header`) all agree.
+   * `mismatch` names the differing axes in `routeDiagnostic` — divergence is
+   * recorded, never smoothed over. `unverifiable` = a verification leg was
+   * in scope and the read failed (observed unreadable, or creation unreadable
+   * while a selection had to be checked); creation-only evidence is NEVER
+   * `verified` (the R1-P1 fix). `unverified` keeps its 0.2.0 meaning: no
+   * route claim was in play to verify (inheritance without a readable
+   * creation route; self-check; external countersign).
+   */
+  readonly routeStatus: 'verified' | 'unverified' | 'mismatch' | 'unverifiable'
   readonly routeDiagnostic?: string
   /**
    * Whether this dispatch reviewed from outside the builder's family. Absent on
@@ -98,6 +121,148 @@ export interface RouteRecord {
    * the executor's own record).
    */
   readonly crossFamily?: CrossFamilyOutcome
+  // ── Model routing (plan v3 "Route records and stability"; additive, OPTIONAL
+  // so every 0.2.0 fixture replays untouched) ────────────────────────────────
+  /** What GAH chose for this dispatch (creation route; `Agent.options` prove it). */
+  readonly selected?: RoutingPin
+  /**
+   * What the child actually ran (latest `request/header` route), populated by
+   * the engine after the dispatch (M4). Absent ⇒ the read failed and
+   * `routeStatus` says so; a reader must never treat `selected` as observed.
+   */
+  readonly observed?: RoutingPin
+  /** Where the explicit-selection decision's authority came from (explicit routes only). */
+  readonly authorizationSource?: AuthorizationSource
+  /** The rule-trace of the selection decision; non-empty whenever GAH routed. */
+  readonly why?: readonly string[]
+  /** Preflight rejections that moved selection onward (plan step 6). */
+  readonly fallbackFrom?: readonly FallbackRecord[]
+  /**
+   * The considered candidate set behind `selected` (execution-audit P2-2:
+   * the durable leg of the plan's `candidatesConsidered` contract), verbatim
+   * from the selector's per-candidate record — provider/model, the
+   * floor-bearing facts (`contextWindow` when known, `hasReasoningEfforts`),
+   * the two-axis identity vs the executor's live pin (auditor roles), the
+   * disposition, and the per-candidate note. That IS the minimal honest set:
+   * every field answers a question the `why` trace otherwise leaves open, and
+   * nothing here is derivable from the other fields. Absent on records the
+   * selector produced no set for (inherit dispatches, pin reuse, pool picks).
+   */
+  readonly candidatesConsidered?: readonly CandidateConsidered[]
+}
+
+/**
+ * One role's pinned route as the engine writes it and the fold derives it
+ * (plan "Route records and stability", refined pinning delta: pins ride on the
+ * dispatch op's own `detail.routing`; there is deliberately NO `routing/pin`
+ * op, so LEGAL_OPS is unchanged).
+ */
+export interface RoutingPin {
+  readonly provider: string
+  readonly model: string
+  readonly reasoningEffort?: string
+}
+
+/**
+ * The routing decision stamped on a dispatch commit's `detail.routing`.
+ *
+ * STRICTLY VALIDATED BY THE FOLD (packet M3b): when present it must carry
+ * exactly `{role, pin?, why, authorizationSource, fallbackFrom?, repinFrom?,
+ * candidates?}` with every field type-checked — malformed ⇒ fold error, never
+ * silent. A `pin` is present iff the dispatch is explicit (`route` decisions); an
+ * `inherit` decision carries no pin and CLEARS the role's pin (last-wins per
+ * role), because a reload must not resurrect a pin the live run replaced with
+ * inheritance.
+ *
+ * `authorizationSource` is REQUIRED IFF `pin` is present (an explicit route
+ * always has an authority) and OPTIONAL otherwise: `unreachable-inherit`
+ * marks an unreachable policy projection, while an inherit under an ABSENT
+ * policy — the native default — is the absence of an authorization and names
+ * no source at all.
+ */
+export interface RoutingDecisionDetail {
+  readonly role: Role
+  readonly pin?: RoutingPin
+  readonly why: readonly string[]
+  readonly authorizationSource?: AuthorizationSource
+  readonly fallbackFrom?: readonly FallbackRecord[]
+  /** The pin this dispatch replaced, when a dead pinned route forced a re-select. */
+  readonly repinFrom?: RoutingPin
+  /**
+   * The considered candidate set, ADDITIVE and OPTIONAL (execution-audit
+   * P2-2): present exactly when a selection decision carried one (the
+   * selector's `candidatesConsidered`), validated entry-by-entry by the fold
+   * so a hand-edited stream cannot smuggle a fabricated considered set past
+   * replay. Deliberately NOT coupled to `pin` presence: an inherit decision
+   * that one day records the set it refused is honest, not illegal.
+   */
+  readonly candidates?: readonly CandidateConsidered[]
+}
+
+/** The five routed roles, as the fold validates them (mirror of `Role`). */
+export const ROUTING_ROLES: readonly string[] = [
+  'executor', 'planner', 'plan-auditor', 'execution-auditor', 'rules-auditor',
+]
+
+/** The auditor roles: the only roles a dispatch op other than `start-executor` may name. */
+export const ROUTING_AUDITOR_ROLES: readonly string[] = [
+  'plan-auditor', 'execution-auditor', 'rules-auditor',
+]
+
+/** The authorization-source vocabulary (mirror of `AuthorizationSource`). */
+export const ROUTING_AUTHORIZATION_SOURCES: readonly string[] = [
+  'session-policy', 'plugin-config', 'unreachable-inherit',
+]
+
+/** The candidate-disposition vocabulary (mirror of `CandidateConsidered['disposition']`). */
+export const ROUTING_CANDIDATE_DISPOSITIONS: readonly string[] = [
+  'selected', 'eligible', 'excluded-below-floor', 'preflight-rejected',
+]
+
+/** The two-axis identity vocabulary (mirror of `IdentityAxis`, `../routing/identity.js`). */
+export const ROUTING_IDENTITY_AXES: readonly string[] = ['same', 'distinct', 'unknown']
+
+/** The independence-outcome vocabulary (mirror of `IndependenceOutcome`, `../routing/identity.js`). */
+export const ROUTING_INDEPENDENCE_OUTCOMES: readonly string[] = [
+  'achieved', 'same-family', 'unknown-family', 'not-required',
+]
+
+/**
+ * Derive the next `routingPins` state from one routing decision: last-wins per
+ * role — set when the decision pins, CLEAR when it inherits.
+ *
+ * THE ONE DERIVATION, SHARED BY THE WRITER AND THE FOLD on purpose: the engine
+ * builds the committed snapshot with it and `applyEvent` recomputes the same
+ * value to hold the event to it, so "what the pins are" can never drift
+ * between the writer's intent and the stream's replay. An empty result is
+ * `undefined`, not `{}`: the absent field is the 0.2.0 shape and stays the
+ * 0.2.0 shape until a pin exists.
+ */
+export function applyRoutingDecision(
+  pins: Partial<Record<Role, RoutingPin>> | undefined,
+  routing: RoutingDecisionDetail,
+): Partial<Record<Role, RoutingPin>> | undefined {
+  const next: Partial<Record<Role, RoutingPin>> = { ...(pins ?? {}) }
+  if (routing.pin !== undefined) next[routing.role] = routing.pin
+  else delete next[routing.role]
+  return Object.keys(next).length === 0 ? undefined : next
+}
+
+/** Order-insensitive deep equality of two pin states (the fold's comparison). */
+export function sameRoutingPins(
+  a: Partial<Record<Role, RoutingPin>> | undefined,
+  b: Partial<Record<Role, RoutingPin>> | undefined,
+): boolean {
+  const left = a ?? {}
+  const right = b ?? {}
+  const leftKeys = Object.keys(left)
+  const rightKeys = Object.keys(right)
+  if (leftKeys.length !== rightKeys.length) return false
+  for (const key of leftKeys) {
+    if (!(key in right)) return false
+    if (JSON.stringify(left[key as Role]) !== JSON.stringify(right[key as Role])) return false
+  }
+  return true
 }
 
 /**
@@ -765,6 +930,13 @@ export interface Snapshot {
    */
   readonly bearerBase?: string
   readonly enforcement: Enforcement
+  /**
+   * Per-role routing pins, derived by the fold from dispatch-op
+   * `detail.routing` (last-wins per role; set on a `route` decision, cleared on
+   * an `inherit`). ABSENT on every 0.2.0 stream and until the first pinned
+   * dispatch — those replay exactly as before.
+   */
+  readonly routingPins?: Partial<Record<Role, RoutingPin>>
   readonly diagnostic?: string
 }
 
