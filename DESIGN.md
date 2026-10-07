@@ -70,7 +70,7 @@ shell 类工具走与 plan gate 同一条阶梯（sandbox `active` 放行、`str
 | PreToolUse 计划门禁 hook（Bash 写文件是有记录在案的盲区） | `tools.guard` 拒绝 write/edit/str_replace_editor(非 view) + **init 时 `session.append('sandbox/mode','read-only')` OS 级钳制**，plan gate 通过后恢复原模式 | 盲区从"已知绕过"变为 OS 层关闭；sandbox 后端不可用时降级为 `degraded` 并如实记录（fail-open 有据） |
 | 审计裁决出处取证（SubagentStop trail 行、GBK 事故、role/decision 绑定、schema8 硬化） | `ctx.subagents.start({ outputSchema, toolFilter: 只读, maxDepth: 1 })`，裁决**带内返回**（`result.structured`），审计记录由引擎在收到裁决的同一操作里写入 | 整套取证机器不再需要——出处天然结构化 |
 | 审计者独立性（提示词约定"不要泄露预期结论"） | 只读工具过滤 + 深度上限 1 由平台强制；无结构化裁决/停止原因非 completed/schema 不符 → **永不翻门禁** | 约定 → 平台强制 |
-| Stop hook 执行门禁提醒（8 次平台熔断，3 次自释放） | `agent/turn-stopping` 监听 + `agent.followup`（plugin 来源，不伪造 user 权限），协议常量 3 次自释放 | 等价，原生实现 |
+| Stop hook 执行门禁提醒（8 次平台熔断，3 次自释放） | `agent/turn-stopping` 监听 + `agent.followup`（生产者自有来源 `kind: 'dsh-autopilot'`，不伪造 user 权限；dsh 0.1.7+ 拒收旧的 `kind: 'plugin'` 包装，见 §8.4），协议常量 3 次自释放 | 等价，原生实现 |
 | validate_goal_run.py 收尾校验脚本 | `completed` 是唯一需要通过 `evaluateCompletion` 的状态转移：closeout 已提交 + 双门禁 pass + 必需角色 latest-wins 全 pass + 模式一致的出处（independent 拒绝 self-check 记录）+ 每条验收标准恰好一个 bearer | 事后扫描 → 事前结构性拒绝 |
 | outbound 出站证据清单 hook（Bash/PowerShell matcher 补丁史） | v2：命令类匹配仍在 guard，但**决定**移到 `tools/pre-execute`（异步、可 `ask`）：读 `<run>/outbound/manifest.json` → 校验（runId / 命令覆盖 / 6h 新鲜度 / 每 claim 一个 bearer / 工件存在非空且在 run 目录内 / 出站文本里的计数逐条比对）→ 无效则 deny；有效时若存在一条其 `target` **本身就是出站命令类**、**且按 shell token 边界命中本次命令**的未消费 `owner-approve` 则消费它直接 allow（2026-08-24 第五轮修：此前是取第一条未消费的批准、完全不比对文本，等于批准是可互换的令牌，而 seam 又在 ask 之前消费，人根本看不到提示），否则 `ask` 交给 `ctx.approval`；`tools/execute` 里**授权即归档**、**非 error 结果才计数**（归档写在 `next()` 之前，`enforcement.outboundConsumed` 只在 `next()` 返回非 error 结果后加一；注意这不等于「派发成功」——shell 工具非零退出不置 `isError`，2026-08-27 实测四条失败命令仍加满计数，语义与代价见 §6）。seam 装不上时 guard **无条件拒绝**全部出站（fail-closed，比 v1 更严） | hook matcher → 平台 seam + 证据清单；一次一批准语义保留在 native 通道内 |
 | 出站批准通道（CC 只有提示词层的「先暂停、要用户确认」，没有机械通道） | v2：`tools/pre-execute` 返回 `ask`，由运行时经 `ctx.get('approval')` 解析；批准服务缺席时**运行时自身**把 ask 降级为 deny（fail-closed，不需要本插件补一层）；会话 approval 策略为 `'never'` 时确定性 `rejected`。init 时 `observeApproval` 读三档（无服务 / 有服务但策略 `'never'` 或零监听器 / 有监听器），只有最后一档记 `enforcement.approval: 'native'`，其余记 `'signal-only'`（只有 direct-human-turn 的 `owner-approve` 能授权） | 提示词暂停 → 平台批准通道；但记的是「有没有人订阅」，不是「有没有人应答」（§6，2026-08-25 收窄后仍未关闭） |
@@ -2296,6 +2296,51 @@ rc.1 升级 run 没有跑过一次真正的委派 e2e。整改结果：
    回归）；plan 审计员未走结构化输出时引擎已把 phase 提交成 `plan-reviewing`，之后没有合法
    操作能退出（main 上同码，属既有缺陷，不在本次整改范围）；`subagent` 对 executor 与审计员
    仍可见，因为 `restrict()` 只遮蔽继承的工具（既有、已在 `engine.ts` 注释里写明）。
+
+### 8.4 dsh 0.2.0 适配：安装门禁 + 四处宿主漂移（2026-10-07）
+
+上游 `dsh` 发布 0.2.0-rc.2（npm `latest`）与带 `dsh` 命令的 Desktop。本轮在 WSL2 上用隔离的
+0.2.0-rc.2 安装（`DSH_HOME`、`DSH_AGENTS_HOME` 都在 `.scratch/` 内）加一个只绑 127.0.0.1 的
+Messages 协议 mock 驱动真宿主，不用任何真实凭据。可复述的结论：
+
+1. **安装门禁**：0.1.7 起 app-boot 在安装与启动时用 `semver.satisfies(runtime, range,
+   {includePrerelease:true})` 检查每个 `@deepseek-ai/dsh*` peer
+   （`packages/boot/app-boot/src/plugin-compatibility.ts`）。0.1.1 的
+   `0.1.2-rc.1 || >=0.1.5-rc.1 <0.1.6` 在 0.2.0-rc.2 上被拒装（实测 exit 1，"installation
+   rejected"）。0.2.0 把范围扩成 `… || >=0.2.0-rc.1 <0.2.1-0`：用宿主自己的
+   `evaluatePluginCompatibility` 核对，0.1.2-rc.1 / 0.1.5-rc.1 / 0.2.0-rc.1 / 0.2.0-rc.2 /
+   0.2.0 兼容，0.1.7-rc.2 与 0.2.1-alpha.1 不兼容（未测，所以不声明）。
+2. **执行器复用从来没通过**：引擎的 needs-fix 复用调 `ctx.subagents.followup()`，而已发布的
+   dsh-subagent 0.1.2-rc.1、0.1.5-rc.1、0.1.7-rc.2、0.2.0-rc.2 都**没有**这个方法，只有
+   `sendMessage(sender, targetId, content, {signal})`。所有 fake 都实现了 `followup`，所以
+   测试一直是绿的。改为 `sendMessage(root, childId, …)`，发送者归属由宿主按活的 root 推导；
+   新增 `test/subagent-surface.test.ts` 对**已安装**的 `SubagentRuntime` 原型核对每个被调用
+   的方法。
+3. **executor 子代理认不出来**：0.2 上 `childCtx.get('agent')` 为 undefined，读
+   `childCtx.agent` 抛 `cannot get property "agent" without inject`（cordis 严格 inject），
+   被 `recognizeExecutorChild` 吞成"不认识"，于是 executor 没有 packet 工具、没有出站守卫、
+   没有 seam。改为优先用 `agent/created` 载荷里的 Agent 本身；上下文查找只留给只有上下文的
+   调用方。`test/apply.test.ts` (h2) 按 0.2 的形状建子上下文，修复前红、修复后绿。
+4. **提醒把进程打崩**：session format v4（0.1.7+）在追加时拒收 `source.kind === 'plugin'`
+   （`session-format-v3-to-v4/src/message-sources.ts`），第一条 stop 提醒就让 dsh 以 exit 1
+   退出。改为生产者自有的 `kind: 'dsh-autopilot'`；0.1.2/0.1.5 对 `user/message` 只要求
+   非空 kind，两条线都接受。
+5. **卡片的 PTC 事件改名**：v2→v3 迁移把 `tool/code-dispatch(-start)` 改名为
+   `tool/ptc-dispatch(-start)`，载荷字段不变。卡片两种拼写都认（0.1.x 仍在 peer 范围内）；
+   `test/card.test.ts` B15b 用 `ptc.json` 只做同一改名得到的样本，修复前红、修复后绿。
+6. **`agent/created` 语义**：0.1.7 起 `announce(agent, source, signal?)` 是异步串行，监听器
+   抛出变成 reject，否决仍成立；它也会因 resume/clear/compaction 对新 Agent 触发，安装
+   映射按 Agent 对象作键并与 `agent/disposed` 成对，重复安装是 no-op。
+
+真机 e2e（0.2.0-rc.2，headless，mock 模型）：修复前的构建在 executor 启动后既拿不到 packet
+工具、又在 stop 提醒处崩溃；0.2.0 构建 exit 0，走完 init → usage → plan → 独立 plan 审计
+（真子代理、结构化输出）pass → executor 启动并提交 packet rev 1 → 执行审计 needs-fix →
+resume 把 findings 送到同一子代理 → packet rev 2 被接受（重复提交被拒）→ 三条 stop 提醒
+正常投递。web profile 广告并返回本插件的 client bundle（HTTP 200）。
+
+**未验证**：Desktop 应用本身（macOS/Windows）没有运行；Windows 仍不在支持范围；真实
+模型下的完整写生命周期与 closeout；冷恢复（子代理不在内存时 `sendMessage` 走 cold-resume）
+之后的 executor 重新识别；浏览器里卡片的实际渲染。
 
 ## 9. 路线图
 

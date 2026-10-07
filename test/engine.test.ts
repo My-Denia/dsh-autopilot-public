@@ -486,7 +486,7 @@ describe('delegated executor lifecycle', () => {
     expect(stamped).not.toBe('rel-dir')
   })
 
-  it('does not advance executionRevision when followup fails, and retries', async () => {
+  it('does not advance executionRevision when the resume send fails, and retries', async () => {
     const subagents = stubSubagents({
       verdicts: [
         { verdict: 'pass', note: 'plan ok' },
@@ -505,7 +505,7 @@ describe('delegated executor lifecycle', () => {
     await h.engine.submitExecutionPacket(child, { packet: 'work', residualRisks: [], executionRevision: 1 })
     await h.engine.audit(h.root, { role: 'execution', prompt: 'audit' })
     await expect(h.engine.resumeExecutor(h.root, { findings: 'missing test', nextPrompt: 'add it', signal }))
-      .rejects.toThrowError(/followup failed/)
+      .rejects.toThrowError(/sendMessage failed/)
     expect(h.engine.peek(h.root.id)?.executor?.executionRevision).toBe(1)
     await h.engine.resumeExecutor(h.root, { findings: 'missing test', nextPrompt: 'add it', signal })
     expect(h.engine.peek(h.root.id)?.executor?.executionRevision).toBe(2)

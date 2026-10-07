@@ -139,8 +139,15 @@ export interface SubagentsRef {
     }
     signal: AbortSignal
   }): Promise<unknown>
-  followup(parent: unknown, childId: string, content: Array<{ type: 'text'; text: string }>, options: {
-    source: unknown
+  /**
+   * Deliver one message to a direct continuable child (`SubagentManager.sendMessage`).
+   * The host derives sender attribution from the exact live `sender`. This is
+   * the resume transport: the manager has had no `followup` since at least
+   * dsh 0.1.2-rc.1 (checked against the published 0.1.2-rc.1, 0.1.5-rc.1,
+   * 0.1.7-rc.2 and 0.2.0-rc.2 packages), so the earlier call threw
+   * `followup is not a function` on every real host.
+   */
+  sendMessage(sender: unknown, targetId: string, content: Array<{ type: 'text'; text: string }>, options: {
     signal: AbortSignal
   }): Promise<unknown>
   interrupt(childId: string, authority: { kind: 'ancestor'; agent: unknown }): void
@@ -1243,11 +1250,11 @@ export class AutopilotEngine {
       }
 
       const nextRevision = prior.executor.executionRevision + 1
-      await this.subagents.followup(
+      await this.subagents.sendMessage(
         root,
         prior.executor.childId,
         [{ type: 'text', text: `[audit findings]\n${request.findings}\n\n[next dispatch]\n${request.nextPrompt}\n\n${packetRevisionHint(nextRevision)}` }],
-        { source: { kind: 'coordinator', form: 'relay', senderSessionId: root.id }, signal: request.signal },
+        { signal: request.signal },
       )
       return await this.commit(prior, 'resume-executor', {
         ...prior,

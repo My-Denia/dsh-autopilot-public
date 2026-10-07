@@ -20,6 +20,19 @@ import type { AutopilotEngine } from '../engine.js'
 import { EGRESS_FAIL_CLOSED_REASON, decideTool, egressCommandOf } from './decide.js'
 import type { GateConfig } from './decide.js'
 
+/**
+ * Producer-owned message source kind for the stop reminder.
+ *
+ * NOT `{ kind: 'plugin', plugin: … }`. Session format v4 (dsh 0.1.7+) retired
+ * the shared `plugin` wrapper and refuses it at append time
+ * (`session-format-v3-to-v4/src/message-sources.ts`: "format v4 message
+ * requires a producer-owned source kind"); on a real 0.2.0-rc.2 host the
+ * first reminder took the whole dsh process down with exit 1 (run
+ * dsh-020-compat-20261007). dsh 0.1.5 accepts any non-empty kind on a
+ * `user/message`, so one producer kind serves both lines.
+ */
+export const REMINDER_SOURCE_KIND = 'dsh-autopilot'
+
 /** Structural subset of an agent-scoped context the gate touches. */
 export interface GateAgentRef {
   readonly id: string
@@ -34,7 +47,7 @@ export interface GateAgentRef {
     id: string
     role: 'user'
     content: Array<{ type: 'text'; text: string }>
-    source: { kind: 'plugin'; plugin: string; form: 'notice'; summary: string }
+    source: { kind: typeof REMINDER_SOURCE_KIND; form: 'notice'; summary: string }
   }): void
 }
 
@@ -71,7 +84,7 @@ export function installRootGate(
             type: 'text',
             text: `[autopilot ${count}/${MAX_STOP_REMINDERS}] The run is mid-execution and the execution gate is "${snapshot.executionGate}". Before ending: submit execution evidence/packet and run the execution audit, or move the run to blocked / needs-owner-decision. (This reminder self-releases after ${MAX_STOP_REMINDERS} rounds.)`,
           }],
-          source: { kind: 'plugin', plugin: 'dsh-autopilot', form: 'notice', summary: 'autopilot execution-gate reminder' },
+          source: { kind: REMINDER_SOURCE_KIND, form: 'notice', summary: 'autopilot execution-gate reminder' },
         })
       } catch {
         // Fail-open by design.

@@ -14,11 +14,12 @@ The project name is **dsh-autopilot**. The npm package is
 belongs to a separate, independent project; install this plugin as
 `dsh-goal-autopilot`.
 
-> This is a **developer preview**. Experimental. Latest is **0.1.1**, a
-> **packaging** / runtime compatibility fix so hosts keep a single
-> `@deepseek-ai/dsh-tools` **host-provided peer**. Not a production release.
-> On WSL2 + `dsh` `0.1.5-rc.1`, install through the **plan gate** is
-> measured; the full **write lifecycle** is not. Windows is not verified.
+> This is a **developer preview**. Experimental. Latest is **0.2.0**, which
+> adapts the plugin to **`dsh` 0.2.0** (CLI and the Desktop app's bundled
+> `dsh` command). On WSL2 + `dsh` `0.2.0-rc.2`, install, mount, and a
+> delegated run through needs-fix resume are measured with a local mock
+> model. Desktop is not run here, and Windows is not verified. Not a
+> production release.
 
 dsh-autopilot turns a natural-language goal into a gated run: plan, audit,
 execute, audit, then close only when the evidence is bound. Design lineage is
@@ -48,7 +49,10 @@ flowchart LR
 
 ## Quick Start
 
-Requires [dsh](https://github.com/deepseek-ai/deepseek-harness) and **Node 22+**.
+Requires [dsh](https://github.com/deepseek-ai/deepseek-harness) `0.2.0` (or
+`0.1.2-rc.1` / `0.1.5-rc.1`) and **Node 22+**. On dsh Desktop, install
+`dsh-goal-autopilot` from the plugin manager or with the bundled `dsh`
+command.
 
 ```sh
 dsh plugin --profile <name> add dsh-goal-autopilot
@@ -57,7 +61,7 @@ dsh plugin --profile <name> add dsh-goal-autopilot
 Pin the current release:
 
 ```sh
-dsh plugin --profile <name> add dsh-goal-autopilot@0.1.1
+dsh plugin --profile <name> add dsh-goal-autopilot@0.2.0
 ```
 
 Then ask, in natural language:
@@ -84,15 +88,16 @@ That is the shape. The invariants, honest limits, and host traces live in
 | Topic | Current fact |
 | --- | --- |
 | Maturity | Experimental developer preview (not a production release) |
-| npm | `dsh-goal-autopilot@0.1.1` |
-| 0.1.1 | Packaging / runtime compatibility fix |
-| Hosts | `dsh` `0.1.2-rc.1` or `0.1.5-rc.1` |
-| WSL2 + 0.1.5-rc.1 | Install, mount, skill load, plan-gate path measured |
-| Full NL write → execution audit → closeout | Not verified |
+| npm | `dsh-goal-autopilot@0.2.0` |
+| 0.2.0 | Adapts to `dsh` 0.2.0: peer range, executor resume, executor recognition, reminder source kind, PTC card events |
+| Hosts | `dsh` `0.2.0` line, `0.1.5-rc.1`, `0.1.2-rc.1` (0.1.7 and 0.2.1 are outside the range) |
+| WSL2 + 0.2.0-rc.2 | Install, mount, skill, plan audit → delegated executor → needs-fix resume measured with a mock model |
+| Full NL write → execution audit → closeout | Not verified with a real model |
+| Desktop (macOS / Windows) | Not run — not verified |
 | Windows | Not verified — not claimed as supported |
 | Security | Quality gates + fail-closed egress; not complete security |
 
-Host matrix, the 0.1.0 duplicate-runtime fix, and the sandbox residual:
+Host matrix, Desktop notes, the 0.2.0 fixes, and the sandbox residual:
 [docs/compatibility.md](./docs/compatibility.md).
 
 ## Documentation
@@ -100,7 +105,7 @@ Host matrix, the 0.1.0 duplicate-runtime fix, and the sandbox residual:
 | Doc | For |
 | --- | --- |
 | [DESIGN.md](./DESIGN.md) | Architecture, state machine, invariants, verification |
-| [docs/compatibility.md](./docs/compatibility.md) | DSH versions, WSL/Windows, 0.1.1 runtime |
+| [docs/compatibility.md](./docs/compatibility.md) | DSH versions, Desktop, WSL/Windows, 0.2.0 fixes |
 | [docs/security.md](./docs/security.md) | Approval, egress, sandbox, non-goals |
 | [docs/reference.md](./docs/reference.md) | Tool protocol, run state, usage classes |
 | [CHANGELOG.md](./CHANGELOG.md) | Release history |
@@ -121,8 +126,7 @@ pnpm run test    # vitest
 pnpm run build   # emit lib/
 ```
 
-Client-half typecheck needs a built dsh checkout at `DSH_SRC` (default
-`~/dsh`). CI runs the host half only. See
+Client-half typecheck needs a dsh tree at `DSH_SRC` (default `~/dsh`). CI runs the host half only. See
 [docs/compatibility.md](./docs/compatibility.md).
 
 ## License

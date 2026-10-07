@@ -52,6 +52,12 @@ interface ChildInjection {
   registerThrows?: boolean
   guardThrows?: boolean
   disposerThrows?: ReadonlyArray<'seam' | 'packet-tool' | 'egress-guard'>
+  /**
+   * dsh 0.1.7+ child context: `get('agent')` is undefined and reading the
+   * `agent` property throws, exactly as measured on a real 0.2.0-rc.2 host
+   * (`cannot get property "agent" without inject`, cordis strict inject).
+   */
+  strictAgentAccess?: boolean
 }
 
 /** What the scripted child recorded: tool names, disposer order, and the agent object itself. */
@@ -143,7 +149,7 @@ function fakeCtx(storeRoot: string, options: { storageDomain?: unknown; seamThro
       options: {},
     }
     child.ctx = {
-      agent: child,
+      ...(injection.strictAgentAccess === true ? {} : { agent: child }),
       get: () => undefined,
       tools: {
         register(definition: unknown) {
@@ -157,6 +163,11 @@ function fakeCtx(storeRoot: string, options: { storageDomain?: unknown; seamThro
         },
       },
       on: (event: string) => (event === 'tools/pre-execute' ? disposer('seam') : () => {}),
+    }
+    if (injection.strictAgentAccess === true) {
+      Object.defineProperty(child.ctx, 'agent', {
+        get() { throw new Error('cannot get property "agent" without inject') },
+      })
     }
     recordedChild.agent = child
     for (const listener of created) listener({ agent: child })
@@ -202,7 +213,7 @@ function fakeCtx(storeRoot: string, options: { storageDomain?: unknown; seamThro
         publishChild(spec)
         return { childId: spec.childId, messageId: 'scripted-message' }
       },
-      async followup() { return {} },
+      async sendMessage() { return 'scripted-message' },
       interrupt() {},
       async drainContinuableChildren() { return {} },
     },
@@ -888,6 +899,21 @@ describe('apply: executor child published through agent/created (transactional, 
     host.dispose(host.child.agent)
     expect(host.child.disposed).toHaveLength(3)
     expect(host.recorded.warnings.filter(w => w.includes('child surface'))).toEqual([])
+    await dispose()
+  })
+
+  it('(h2) on a dsh 0.2 child context (reading ctx.agent throws) the executor is still recognized from the announced agent', async () => {
+    // RED before the fix: recognition read `childCtx.agent`, the throw was
+    // swallowed as "not recognized", and the executor ran with NO packet tool.
+    const root = mkdtempSync(join(tmpdir(), 'dsh-autopilot-apply-'))
+    const host = fakeCtx(root, { child: { strictAgentAccess: true } })
+    const dispose = await apply(host.ctx, { storeRoot: root })
+
+    await startExecutor(host)
+    expect(executorOf(host)?.executor?.state).toBe('running')
+    expect(host.child.toolNames).toEqual(['autopilot_submit_packet'])
+    host.dispose(host.child.agent)
+    expect(host.child.disposed).toEqual(['egress-guard', 'packet-tool', 'seam'])
     await dispose()
   })
 
