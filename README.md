@@ -36,10 +36,10 @@ Autonomous LLM agents inside coding hosts are powerful, but ungoverned execution
 
 | Ungoverned Agent Behaviors | Governed by dsh-autopilot |
 | :--- | :--- |
-| **Premature file mutations**<br>Agent starts writing code immediately upon prompt without validating requirements. | **Structural Plan Gate**<br>File writes and edits are blocked at the engine level; OS-level sandbox enforces `read-only` mode until an independent plan audit passes. |
+| **Premature file mutations**<br>Agent starts writing code immediately upon prompt without validating requirements. | **Structural Plan Gate**<br>File writes and edits are blocked at the engine level; requests `read-only` sandbox mode (enforced at the OS layer when the host confine backend is available; otherwise logged as degraded) until plan audit passes. |
 | **Self-congratulatory audits**<br>Agent reviews its own code: *"I checked my changes and everything looks clean."* | **Independent Subagent Audits**<br>One-shot isolated subagents with read-only tools and a strict schema verdict. No passing structured verdict means no gate flip. |
-| **Context loss on review failure**<br>Review failure spawns a new agent from scratch, discarding historical reasoning. | **Delegated Executor &amp; CAS Resume**<br>Single continuable child agent with CAS generation counter. On `needs-fix`, the same executor resumes where it left off. |
-| **Silent destructive actions**<br>Agent runs `git push`, modifies remote tags, or publishes packages autonomously. | **Owner-Only Egress Guard**<br>Fail-closed pre-execution interception on `git`, `gh`, and `npm publish`. Requires a hash-verified `manifest.json` and explicit owner approval. |
+| **Context loss on review failure**<br>Review failure spawns a new agent from scratch, discarding historical reasoning. | **Delegated Executor &amp; CAS Resume**<br>Single continuable child agent with execution-revision CAS. On `needs-fix`, the same executor resumes where it left off. |
+| **Silent destructive actions**<br>Agent runs `git push`, modifies remote tags, or publishes packages autonomously. | **Owner-Only Egress Guard**<br>Fail-closed pre-execution interception on `git`, `gh`, and `npm publish`. Requires a validated evidence manifest (`manifest.json`) and explicit owner approval. |
 | **Unsubstantiated completion claims**<br>Agent announces *"Done!"* without recording evidence or coverage. | **Evidence-Bound Closeout**<br>`completed` state is rejected until dual gates pass, required roles match, and every acceptance criterion has a 1:1 bearer artifact. |
 
 ---
@@ -53,17 +53,17 @@ Autonomous LLM agents inside coding hosts are powerful, but ungoverned execution
 A standard run follows an event-sourced state machine (`planning` → `plan-reviewing` → `executing` → `execution-reviewing` → `completed`):
 
 1. **Natural Language Goal Dispatch**  
-   The user triggers a run via natural language. The engine creates the goal run under `goal-runs/<slug>/` and locks mutations by placing the session sandbox in `read-only` mode.
+   The user triggers a run via natural language. The engine initializes run state under `$DSH_HOME/storages/dsh-autopilot/runs/<sessionId>/` and requests `read-only` sandbox mode.
 2. **Phase 1: Planning &amp; Usage Declaration**  
    The lead agent crafts a compact contract (goal, scope, non-goals, risk level, milestones, and acceptance criteria) and declares human-observable boundary states via `autopilot_usage`.
 3. **Plan Gate (Independent Audit)**  
    A one-shot auditor subagent is spawned with read-only tools and `maxDepth: 1`. The plan gate flips to `pass` only when a structured JSON verdict (`verdict: 'pass'`) is received and all usage declarations are bound.
 4. **Phase 2: Delegated Execution &amp; Same-Executor Resume**  
-   A dedicated continuable child executor implements the plan under a CAS generation counter. If an audit returns `needs-fix`, the same child resumes execution rather than stranding orphaned processes.
+   A dedicated continuable child executor implements the plan under execution-revision CAS. If an audit returns `needs-fix`, the same child resumes execution rather than stranding orphaned processes.
 5. **Phase 3: Execution Gate &amp; Evidence-Bound Closeout**  
    An independent execution auditor verifies the deliverables against the contract. The engine rejects `completed` until both gates have passed and each acceptance criterion has a verified bearer artifact on disk.
 6. **Continuous Egress Interception**  
-   Any mutating shell action (`git push`, `gh release`, `npm publish`) is intercepted before execution. The engine verifies `<run>/outbound/manifest.json` against on-disk hashes and halts for explicit owner approval.
+   Any mutating shell action (`git push`, `gh release`, `npm publish`) is intercepted before execution. The engine verifies the evidence manifest (`<run>/outbound/manifest.json`) for command coverage and freshness, halting for explicit owner approval.
 
 ---
 
@@ -96,24 +96,24 @@ In any chat session on that profile, dispatch in natural language:
 Use dsh-autopilot to implement <goal> and verify the result.
 ```
 
-The plugin automatically initializes the run, enforces the sandbox, coordinates independent auditor subagents, and binds evidence before closing. Operators who want manual control of `autopilot_*` tools can consult the [Operator Reference](./docs/reference.md).
+The plugin automatically initializes the run, requests read-only sandbox mode, coordinates independent auditor subagents, and binds evidence before closing. Operators who want manual control of `autopilot_*` tools can consult the [Operator Reference](./docs/reference.md).
 
 ---
 
 ## Core Capabilities
 
 - 🛡️ **Mechanical Plan Gate**  
-  Standard runs cannot mutate files until an independent plan audit passes. PreToolUse guards block write/edit tools, and the OS-level sandbox enforces `read-only` mode during planning.
+  Standard runs cannot mutate files until an independent plan audit passes. PreToolUse guards block write/edit tools, and the engine requests `read-only` sandbox mode during planning (enforced at the OS layer when host confine is available; degraded otherwise).
 - ⚖️ **Isolated Subagent Audits**  
   Auditors are strictly isolated with read-only tools and `maxDepth: 1`. Audits return in-band structured verdicts (`pass`, `needs-replan`, `blocked`). The engine never derives or guesses a pass.
 - 🔄 **Same-Executor Resume (`needs-fix`)**  
   Fixes are assigned back to the same running executor subagent, maintaining context and preventing unbounded fan-out or orphaned child tasks.
 - 🛑 **Fail-Closed Owner Egress Guard**  
-  Mutating remote operations (`git push`, `gh release`, `npm publish`) require a cryptographic evidence manifest (`manifest.json`) and explicit owner authority. If approval is missing, execution deterministically fails closed.
+  Mutating remote operations (`git push`, `gh release`, `npm publish`) require a validated evidence manifest (`manifest.json`) and explicit owner authority. If approval is missing, execution deterministically fails closed.
 - 📜 **Evidence-Bound Closeout**  
   The engine rejects completion unless both gates have passed, required roles are satisfied, and every acceptance criterion is backed by an on-disk bearer artifact.
 - ⏱️ **Turn Reminder &amp; Usage Governance**  
-  A bounded 3x nudge prevents agents from silently stopping mid-execution. Every run must declare observable usage states before mutations are unlocked.
+  A bounded 3x nudge prevents agents from silently stopping mid-execution. Standard runs must declare observable usage states before mutations are unlocked.
 
 ---
 

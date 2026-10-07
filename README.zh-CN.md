@@ -36,10 +36,10 @@
 
 | 无治理的 Agent 执行流 | 由 dsh-autopilot 机械治理 |
 | :--- | :--- |
-| **抢跑写文件**<br>收到 Prompt 立即修改源码，未经规划与需求确认。 | **结构性计划门禁 (Plan Gate)**<br>引擎层直接拦截写/改工具，并在规划期将会话沙盒置为 OS 级 `read-only` 只读模式，计划审计通过前不可能改写磁盘。 |
+| **抢跑写文件**<br>收到 Prompt 立即修改源码，未经规划与需求确认。 | **结构性计划门禁 (Plan Gate)**<br>引擎层直接拦截写/改工具，并在规划期请求 `read-only` 沙盒模式（宿主 confine 后端可用时在 OS 层强制执行；否则记录 degraded 降级），计划审计通过前无法改写文件。 |
 | **自导自演虚假评审**<br>同一个模型自己写自己审：*“我仔细看过了，改动非常完美。”* | **隔离子代理审计 (Independent Audits)**<br>通过独立上下文的一次性子代理执行评审，只分配只读工具，且必须返回结构化 JSON 裁决 (`pass` / `needs-replan`)，未获通过绝不翻转门禁。 |
-| **审查失败上下文丢失**<br>审查指出错误后直接新开 Agent 重跑，遗失历史推导过程与修改上下文。 | **CAS 世代执行器就地恢复**<br>指派具备 CAS 世代号的单一可延续子代理；在收到 `needs-fix` 时就地唤醒同一执行器继续修复，杜绝孤儿任务与无底洞分支。 |
-| **私自出站与破坏性动作**<br>Agent 自主执行 `git push`、改动远程 tag、甚至发布 npm 包。 | **Owner-Only 出站拦截 (Fail-Closed Egress)**<br>在执行层对 `git`、`gh`、`npm publish` 等出站写命令实施 fail-closed 拦截，必须持有包含新鲜哈希的 `manifest.json` 与明确的人类所有者授权。 |
+| **审查失败上下文丢失**<br>审查指出错误后直接新开 Agent 重跑，遗失历史推导过程与修改上下文。 | **执行版本 CAS 就地恢复**<br>指派具备 execution-revision CAS 的单一可延续子代理；在收到 `needs-fix` 时就地唤醒同一执行器继续修复，杜绝孤儿任务与无底洞分支。 |
+| **私自出站与破坏性动作**<br>Agent 自主执行 `git push`、改动远程 tag、甚至发布 npm 包。 | **Owner-Only 出站拦截 (Fail-Closed Egress)**<br>在执行层对 `git`、`gh`、`npm publish` 等出站写命令实施 fail-closed 拦截，必须持有经结构与证据校验的 `manifest.json` 清单与明确的人类所有者授权。 |
 | **空头支票式完成宣告**<br>没有任何验证依据就宣称 *“任务已全部完成”*。 | **证据绑定收尾 (Evidence-Bound Closeout)**<br>收尾状态机严格校验：双重门禁必须全 pass、必需角色齐全、且每条验收标准必须在磁盘上持有 1:1 的证据载体文件方可置为 `completed`。 |
 
 ---
@@ -53,17 +53,17 @@
 标准治理运行遵循全快照事件溯源状态机（`planning` → `plan-reviewing` → `executing` → `execution-reviewing` → `completed`）：
 
 1. **自然语言目标派发**  
-   用户使用自然语言下达任务指令。引擎在 `goal-runs/<slug>/` 初始化运行目录，将会话沙盒置入 `read-only` 模式，锁定一切文件改写动作。
+   用户使用自然语言下达任务指令。引擎在 `$DSH_HOME/storages/dsh-autopilot/runs/<sessionId>/` 初始化运行状态，并请求将会话沙盒置入 `read-only` 模式。
 2. **第一阶段：规划与使用声明**  
    主控代理制定紧凑合约（目标、范围、非目标、风险等级、里程碑及验收标准），并通过 `autopilot_usage` 明确声明人可观测的状态边界。
 3. **计划门禁（独立审计）**  
    宿主派发独立的审计子代理（只读工具集、`maxDepth: 1`）。只有在收到结构化的 `pass` 裁决且所有使用维度均已声明绑定时，计划门禁才落盘放行。
 4. **第二阶段：委托执行与就地恢复**  
-   指派专职可延续子代理在 CAS 世代号保护下落实实现。若后续审计提出 `needs-fix`，调度器唤醒同一个执行器进行针对性修复，避免丢弃上下文。
+   指派专职可延续子代理在 execution-revision CAS 保护下落实实现。若后续审计提出 `needs-fix`，调度器唤醒同一个执行器进行针对性修复，避免丢弃上下文。
 5. **第三阶段：执行审计与证据绑定收尾**  
    独立的执行审计子代理对交付成果进行二进制核查。引擎的 `evaluateCompletion()` 严格确保：双门禁 pass、角色匹配无遗漏、每条验收标准具备磁盘上的凭据载体文件，方可完成收尾。
 6. **全程出站拦截守卫**  
-   涉及远程状态改写的 Shell 命令（如 `git push`、`gh release`、`npm publish`）在执行前被无条件拦截。只有凭据清单（`manifest.json`）与人类所有者批准齐备时才予放行，否则确定性 fail-closed 拒绝。
+   涉及远程状态改写的 Shell 命令（如 `git push`、`gh release`、`npm publish`）在执行前被无条件拦截。只有经校验的凭据清单（`manifest.json`）与人类所有者批准齐备时才予放行，否则确定性 fail-closed 拒绝。
 
 ---
 
@@ -96,20 +96,20 @@ dsh plugin --profile <name> add dsh-goal-autopilot@0.2.0
 Use dsh-autopilot to implement <你的工程目标> and verify the result.
 ```
 
-插件引擎将自动初始化治理运行、开启只读沙盒钳制、调度独立子代理进行审计、并在收尾时校验凭据完整性。如需手动调用或深入了解内部 `autopilot_*` 系列工具，可查阅 [操作员参考手册](./docs/reference.md)。
+插件引擎将自动初始化治理运行、请求只读沙盒模式、调度独立子代理进行审计、并在收尾时校验凭据完整性。如需手动调用或深入了解内部 `autopilot_*` 系列工具，可查阅 [操作员参考手册](./docs/reference.md)。
 
 ---
 
 ## 核心能力
 
 - 🛡️ **结构性计划门禁 (Plan Gate)**  
-  标准任务在独立计划审计通过前无法修改任何文件。引擎级 PreToolUse 守卫拦截一切 write/edit 调用，且在规划期激活 OS 层只读沙盒。
+  标准任务在独立计划审计通过前无法修改任何文件。引擎级 PreToolUse 守卫拦截一切 write/edit 调用，并在规划期请求 `read-only` 沙盒模式（confine 后端可用时在 OS 层强制执行；否则记录 degraded 降级）。
 - ⚖️ **严格隔离的子代理审计**  
   审计子代理与规划/执行上下文完全隔离，受限为只读工具且 `maxDepth: 1`。审计结果直接带内返回结构化数据（`pass`、`needs-replan`、`blocked`），不凭模型文本自觉推断。
 - 🔄 **同一执行器就地修复 (`needs-fix`)**  
   针对审计指出的缺陷，直接恢复同一位执行器子代理，保留已有的推导与环境认知，防止因新开代理导致的任务漂移与孤儿进程。
 - 🛑 **Fail-Closed 出站拦截守卫**  
-  任何外发或推送动作（`git push`、`gh release`、`npm publish`）均需经由包含密码学 SHA-256 校验的 `manifest.json` 清单及所有者明确授权。缺失服务或未授权一律阻断。
+  任何外发或推送动作（`git push`、`gh release`、`npm publish`）均需经由校验完备的证据清单（`manifest.json`）及所有者明确授权。缺失服务或未授权一律阻断。
 - 📜 **证据绑定收尾机制**  
   绝不凭一句口头“完成”了事：`evaluateCompletion()` 强制要求双重门禁通关、执行模式出处一致、且每条验收标准在磁盘上有确切的凭证载体。
 - ⏱️ **执行催促提醒与使用维度声明**  
