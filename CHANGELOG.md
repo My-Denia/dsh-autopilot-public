@@ -25,6 +25,8 @@ app's bundled `dsh` command. Measured on WSL2 against a real `dsh`
   agent announced by `agent/created`.
 - The stop reminder no longer exits dsh 0.2. Its message source kind is now
   `dsh-autopilot`; session format v4 refuses the retired `kind: 'plugin'`.
+- The npm package now ships `docs/` and `CHANGELOG.md`. The README links
+  to them, and in an installed package those links were dead.
 - The run card follows PTC calls on dsh 0.1.7+, which renamed
   `tool/code-dispatch(-start)` to `tool/ptc-dispatch(-start)`. Both names
   are accepted.
