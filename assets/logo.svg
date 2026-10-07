@@ -1,0 +1,91 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 120" width="120" height="120" fill="none">
+  <defs>
+    <!-- Background Gradient -->
+    <linearGradient id="bgGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#0b1329" />
+      <stop offset="50%" stop-color="#0f172a" />
+      <stop offset="100%" stop-color="#050a18" />
+    </linearGradient>
+
+    <!-- Border Glow Gradient -->
+    <linearGradient id="borderGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#38bdf8" stop-opacity="0.8" />
+      <stop offset="40%" stop-color="#6366f1" stop-opacity="0.4" />
+      <stop offset="100%" stop-color="#0ea5e9" stop-opacity="0.2" />
+    </linearGradient>
+
+    <!-- Shield & Helm Gradients -->
+    <linearGradient id="shieldGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#0ea5e9" />
+      <stop offset="50%" stop-color="#6366f1" />
+      <stop offset="100%" stop-color="#10b981" />
+    </linearGradient>
+
+    <linearGradient id="coreGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#38bdf8" />
+      <stop offset="100%" stop-color="#6366f1" />
+    </linearGradient>
+
+    <linearGradient id="accentEmerald" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#34d399" />
+      <stop offset="100%" stop-color="#059669" />
+    </linearGradient>
+
+    <!-- Drop Shadows and Glows -->
+    <filter id="softGlow" x="-20%" y="-20%" width="140%" height="140%">
+      <feGaussianBlur stdDeviation="3" result="blur" />
+      <feComposite in="SourceGraphic" in2="blur" operator="over" />
+    </filter>
+
+    <filter id="coreGlow" x="-30%" y="-30%" width="160%" height="160%">
+      <feGaussianBlur stdDeviation="4" result="blur" />
+      <feComposite in="SourceGraphic" in2="blur" operator="over" />
+    </filter>
+  </defs>
+
+  <!-- Container Base -->
+  <rect x="4" y="4" width="112" height="112" rx="26" fill="url(#bgGrad)" stroke="url(#borderGrad)" stroke-width="1.75" />
+
+  <!-- Subtle Inner Grid / Tech Lines -->
+  <circle cx="60" cy="60" r="42" stroke="#1e293b" stroke-width="1" stroke-dasharray="3 3" opacity="0.6" />
+  <circle cx="60" cy="60" r="28" stroke="#334155" stroke-width="1" opacity="0.4" />
+
+  <!-- Dynamic Steering Compass Cross-Ticks -->
+  <line x1="60" y1="16" x2="60" y2="24" stroke="#38bdf8" stroke-width="2.5" stroke-linecap="round" opacity="0.9" />
+  <line x1="60" y1="96" x2="60" y2="104" stroke="#6366f1" stroke-width="2.5" stroke-linecap="round" opacity="0.8" />
+  <line x1="16" y1="60" x2="24" y2="60" stroke="#38bdf8" stroke-width="2.5" stroke-linecap="round" opacity="0.8" />
+  <line x1="96" y1="60" x2="104" y2="60" stroke="#10b981" stroke-width="2.5" stroke-linecap="round" opacity="0.9" />
+
+  <!-- Main Governed Shield Emblem -->
+  <path d="M 60 22 
+           C 76 22, 88 28, 92 37 
+           C 92 64, 78 84, 60 95 
+           C 42 84, 28 64, 28 37 
+           C 32 28, 44 22, 60 22 Z"
+        fill="none"
+        stroke="url(#shieldGrad)"
+        stroke-width="3"
+        stroke-linejoin="round"
+        filter="url(#softGlow)" />
+
+  <!-- Autopilot Guidance Ring & Core -->
+  <!-- Steering Helm Outer Ring -->
+  <circle cx="60" cy="56" r="21" stroke="#38bdf8" stroke-width="2" stroke-linecap="round" opacity="0.85" />
+
+  <!-- 4 Diagonal Navigation Fins (Autopilot Helm) -->
+  <line x1="45" y1="41" x2="52" y2="48" stroke="#38bdf8" stroke-width="2.5" stroke-linecap="round" />
+  <line x1="75" y1="41" x2="68" y2="48" stroke="#38bdf8" stroke-width="2.5" stroke-linecap="round" />
+  <line x1="45" y1="71" x2="52" y2="64" stroke="#6366f1" stroke-width="2.5" stroke-linecap="round" />
+  <line x1="75" y1="71" x2="68" y2="64" stroke="#10b981" stroke-width="2.5" stroke-linecap="round" />
+
+  <!-- Inner Verification Gate Lock (Central Node) -->
+  <polygon points="60,45 69,56 60,67 51,56" fill="url(#coreGrad)" filter="url(#coreGlow)" />
+
+  <!-- Verified Check / Core Gate Pip -->
+  <circle cx="60" cy="56" r="3.5" fill="#ffffff" />
+
+  <!-- Verified Gate Badge Pip at Base -->
+  <circle cx="60" cy="85" r="4.5" fill="url(#accentEmerald)" stroke="#0b1329" stroke-width="1.5" />
+  <path d="M 58 85 L 59.5 86.5 L 62.5 83.5" stroke="#ffffff" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round" />
+</svg>

@@ -1,0 +1,191 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 300" width="960" height="300" fill="none">
+  <defs>
+    <!-- Background Canvas Gradients -->
+    <linearGradient id="heroBg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#070b16" />
+      <stop offset="50%" stop-color="#0d1527" />
+      <stop offset="100%" stop-color="#060913" />
+    </linearGradient>
+
+    <radialGradient id="glowCyan" cx="15%" cy="30%" r="50%">
+      <stop offset="0%" stop-color="#0ea5e9" stop-opacity="0.18" />
+      <stop offset="100%" stop-color="#0ea5e9" stop-opacity="0" />
+    </radialGradient>
+
+    <radialGradient id="glowIndigo" cx="80%" cy="50%" r="60%">
+      <stop offset="0%" stop-color="#6366f1" stop-opacity="0.16" />
+      <stop offset="100%" stop-color="#6366f1" stop-opacity="0" />
+    </radialGradient>
+
+    <!-- Card Background Gradient -->
+    <linearGradient id="cardBg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#141f36" stop-opacity="0.9" />
+      <stop offset="100%" stop-color="#0c1527" stop-opacity="0.85" />
+    </linearGradient>
+
+    <!-- Gradient Accents -->
+    <linearGradient id="accentCyanIndigo" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#38bdf8" />
+      <stop offset="50%" stop-color="#818cf8" />
+      <stop offset="100%" stop-color="#34d399" />
+    </linearGradient>
+
+    <linearGradient id="titleGrad" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#ffffff" />
+      <stop offset="60%" stop-color="#f1f5f9" />
+      <stop offset="100%" stop-color="#94a3b8" />
+    </linearGradient>
+
+    <linearGradient id="pillBorder" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#38bdf8" stop-opacity="0.6" />
+      <stop offset="100%" stop-color="#6366f1" stop-opacity="0.6" />
+    </linearGradient>
+
+    <filter id="heroShadow" x="-10%" y="-10%" width="120%" height="120%">
+      <feDropShadow dx="0" dy="8" stdDeviation="12" flood-color="#000000" flood-opacity="0.5" />
+    </filter>
+  </defs>
+
+  <style>
+    .font-sans { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
+    .font-mono { font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace; }
+  </style>
+
+  <!-- Background Base -->
+  <rect width="960" height="300" rx="16" fill="url(#heroBg)" />
+  <rect width="960" height="300" rx="16" fill="url(#glowCyan)" />
+  <rect width="960" height="300" rx="16" fill="url(#glowIndigo)" />
+
+  <!-- Outer Border -->
+  <rect x="1" y="1" width="958" height="298" rx="15" stroke="#1e293b" stroke-width="1.5" />
+
+  <!-- Background Tech Grid Texture -->
+  <g opacity="0.12" stroke="#64748b" stroke-width="1">
+    <line x1="40" y1="0" x2="40" y2="300" />
+    <line x1="160" y1="0" x2="160" y2="300" />
+    <line x1="280" y1="0" x2="280" y2="300" />
+    <line x1="400" y1="0" x2="400" y2="300" />
+    <line x1="520" y1="0" x2="520" y2="300" />
+    <line x1="640" y1="0" x2="640" y2="300" />
+    <line x1="760" y1="0" x2="760" y2="300" />
+    <line x1="880" y1="0" x2="880" y2="300" />
+    <line x1="0" y1="60" x2="960" y2="60" />
+    <line x1="0" y1="140" x2="960" y2="140" />
+    <line x1="0" y1="220" x2="960" y2="220" />
+  </g>
+
+  <!-- LEFT HERO SECTION: Identity & Value Proposition -->
+  <g transform="translate(48, 38)">
+    <!-- Pill Badge -->
+    <rect x="0" y="0" width="310" height="26" rx="13" fill="#0b172d" stroke="url(#pillBorder)" stroke-width="1" />
+    <circle cx="13" cy="13" r="4" fill="#10b981" />
+    <text x="25" y="17" fill="#38bdf8" font-size="11" font-weight="700" letter-spacing="0.08em" class="font-mono">DEEPSEEK HARNESS PLUGIN</text>
+    <text x="195" y="17" fill="#64748b" font-size="11" class="font-mono">|</text>
+    <text x="207" y="17" fill="#cbd5e1" font-size="11" font-weight="600" class="font-sans">GOVERNED RUNS</text>
+
+    <!-- Main Title -->
+    <g transform="translate(0, 48)">
+      <text x="0" y="32" fill="url(#titleGrad)" font-size="38" font-weight="800" letter-spacing="-0.03em" class="font-sans">dsh-autopilot</text>
+      <text x="254" y="16" fill="#38bdf8" font-size="13" font-weight="700" class="font-mono">v0.2.0</text>
+    </g>
+
+    <!-- Tagline -->
+    <text x="0" y="112" fill="#38bdf8" font-size="16" font-weight="600" letter-spacing="0.02em" class="font-sans">
+      Plan &#183; Audit &#183; Execute &#183; Evidence
+    </text>
+
+    <!-- Value Statement -->
+    <text x="0" y="138" fill="#94a3b8" font-size="13.5" font-weight="400" line-height="20" class="font-sans">
+      <tspan x="0" dy="0">Turn open-ended agent turns into mechanically governed execution.</tspan>
+      <tspan x="0" dy="20">OS read-only sandbox, independent audit gates, CAS executor resume,</tspan>
+      <tspan x="0" dy="20">and fail-closed egress for trustworthy AI engineering.</tspan>
+    </text>
+
+    <!-- Specs Pills -->
+    <g transform="translate(0, 196)">
+      <!-- Pill 1: npm package -->
+      <rect x="0" y="0" width="180" height="24" rx="6" fill="#111c33" stroke="#334155" stroke-width="1" />
+      <text x="10" y="16" fill="#64748b" font-size="11" class="font-mono">pkg:</text>
+      <text x="42" y="16" fill="#e2e8f0" font-size="11" font-weight="600" class="font-mono">dsh-goal-autopilot</text>
+
+      <!-- Pill 2: dsh compat -->
+      <rect x="188" y="0" width="132" height="24" rx="6" fill="#111c33" stroke="#334155" stroke-width="1" />
+      <circle cx="199" cy="12" r="3.5" fill="#38bdf8" />
+      <text x="210" y="16" fill="#cbd5e1" font-size="11" font-weight="500" class="font-sans">dsh 0.2 verified</text>
+
+      <!-- Pill 3: Preview notice -->
+      <rect x="328" y="0" width="128" height="24" rx="6" fill="#111c33" stroke="#334155" stroke-width="1" />
+      <text x="338" y="16" fill="#f59e0b" font-size="11" font-weight="600" class="font-sans">Developer Preview</text>
+    </g>
+  </g>
+
+  <!-- RIGHT HERO SECTION: Governed Execution Flow Cards -->
+  <g transform="translate(560, 28)" filter="url(#heroShadow)">
+    <!-- Container Card for Governance Matrix -->
+    <rect x="0" y="0" width="352" height="244" rx="14" fill="url(#cardBg)" stroke="#334155" stroke-width="1.2" />
+
+    <!-- Matrix Header -->
+    <rect x="0" y="0" width="352" height="36" rx="14" fill="#0e172a" />
+    <path d="M 0 24 L 0 36 L 352 36 L 352 24 Z" fill="#0e172a" />
+    <circle cx="18" cy="18" r="4" fill="#ef4444" opacity="0.8" />
+    <circle cx="30" cy="18" r="4" fill="#f59e0b" opacity="0.8" />
+    <circle cx="42" cy="18" r="4" fill="#10b981" opacity="0.8" />
+    <text x="60" y="22" fill="#94a3b8" font-size="11.5" font-weight="600" letter-spacing="0.05em" class="font-mono">MECHANICAL GATES PIPELINE</text>
+
+    <!-- Item 1: Plan Gate -->
+    <g transform="translate(16, 48)">
+      <rect x="0" y="0" width="320" height="32" rx="6" fill="#0c1629" stroke="#1e293b" stroke-width="1" />
+      <rect x="8" y="7" width="18" height="18" rx="4" fill="#0284c7" fill-opacity="0.2" stroke="#38bdf8" stroke-width="1" />
+      <text x="13" y="20" fill="#38bdf8" font-size="11" font-weight="700" class="font-mono">1</text>
+      <text x="34" y="20" fill="#f1f5f9" font-size="12" font-weight="600" class="font-sans">Plan Gate</text>
+      <text x="100" y="20" fill="#64748b" font-size="11" class="font-sans">OS read-only sandbox</text>
+      <rect x="256" y="7" width="56" height="18" rx="4" fill="#064e3b" />
+      <text x="265" y="20" fill="#34d399" font-size="10" font-weight="700" class="font-mono">ENFORCED</text>
+    </g>
+
+    <!-- Item 2: Audit Gates -->
+    <g transform="translate(16, 86)">
+      <rect x="0" y="0" width="320" height="32" rx="6" fill="#0c1629" stroke="#1e293b" stroke-width="1" />
+      <rect x="8" y="7" width="18" height="18" rx="4" fill="#4f46e5" fill-opacity="0.2" stroke="#818cf8" stroke-width="1" />
+      <text x="13" y="20" fill="#818cf8" font-size="11" font-weight="700" class="font-mono">2</text>
+      <text x="34" y="20" fill="#f1f5f9" font-size="12" font-weight="600" class="font-sans">Audit Gates</text>
+      <text x="108" y="20" fill="#64748b" font-size="11" class="font-sans">Subagent schema verdict</text>
+      <rect x="256" y="7" width="56" height="18" rx="4" fill="#312e81" />
+      <text x="267" y="20" fill="#a5b4fc" font-size="10" font-weight="700" class="font-mono">ISOLATED</text>
+    </g>
+
+    <!-- Item 3: Delegated Exec -->
+    <g transform="translate(16, 124)">
+      <rect x="0" y="0" width="320" height="32" rx="6" fill="#0c1629" stroke="#1e293b" stroke-width="1" />
+      <rect x="8" y="7" width="18" height="18" rx="4" fill="#0d9488" fill-opacity="0.2" stroke="#2dd4bf" stroke-width="1" />
+      <text x="13" y="20" fill="#2dd4bf" font-size="11" font-weight="700" class="font-mono">3</text>
+      <text x="34" y="20" fill="#f1f5f9" font-size="12" font-weight="600" class="font-sans">Delegated Exec</text>
+      <text x="128" y="20" fill="#64748b" font-size="11" class="font-sans">CAS generation resume</text>
+      <rect x="256" y="7" width="56" height="18" rx="4" fill="#134e4a" />
+      <text x="268" y="20" fill="#5eead4" font-size="10" font-weight="700" class="font-mono">RESUME</text>
+    </g>
+
+    <!-- Item 4: Owner Egress -->
+    <g transform="translate(16, 162)">
+      <rect x="0" y="0" width="320" height="32" rx="6" fill="#0c1629" stroke="#1e293b" stroke-width="1" />
+      <rect x="8" y="7" width="18" height="18" rx="4" fill="#b45309" fill-opacity="0.2" stroke="#f59e0b" stroke-width="1" />
+      <text x="13" y="20" fill="#f59e0b" font-size="11" font-weight="700" class="font-mono">4</text>
+      <text x="34" y="20" fill="#f1f5f9" font-size="12" font-weight="600" class="font-sans">Owner Egress</text>
+      <text x="120" y="20" fill="#64748b" font-size="11" class="font-sans">git / gh / publish guard</text>
+      <rect x="256" y="7" width="56" height="18" rx="4" fill="#78350f" />
+      <text x="259" y="20" fill="#fde68a" font-size="10" font-weight="700" class="font-mono">FAIL-CLOSED</text>
+    </g>
+
+    <!-- Item 5: Closeout -->
+    <g transform="translate(16, 200)">
+      <rect x="0" y="0" width="320" height="32" rx="6" fill="#0c1629" stroke="#1e293b" stroke-width="1" />
+      <rect x="8" y="7" width="18" height="18" rx="4" fill="#059669" fill-opacity="0.2" stroke="#34d399" stroke-width="1" />
+      <text x="13" y="20" fill="#34d399" font-size="11" font-weight="700" class="font-mono">5</text>
+      <text x="34" y="20" fill="#f1f5f9" font-size="12" font-weight="600" class="font-sans">Evidence Closeout</text>
+      <text x="150" y="20" fill="#64748b" font-size="11" class="font-sans">1:1 Bearer artifacts</text>
+      <rect x="256" y="7" width="56" height="18" rx="4" fill="#064e3b" />
+      <text x="272" y="20" fill="#6ee7b7" font-size="10" font-weight="700" class="font-mono">BOUND</text>
+    </g>
+  </g>
+</svg>
