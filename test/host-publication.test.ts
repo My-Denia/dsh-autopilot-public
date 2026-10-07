@@ -3,10 +3,12 @@
  *
  * WHY. Since dsh 0.1.2 the executor child's surface is installed from an
  * `agent/created` listener. The whole fail-closed contract of that listener
- * rests on one host fact: a SYNCHRONOUS throw from an `agent/created`
- * listener vetoes the agent's publication (`AgentRegistry.announce()`,
- * `packages/core/agent/src/index.ts`: "A synchronous creation failure vetoes
- * publication and rolls back"), so `agents.create()` rejects, the subagent
+ * rests on one host fact: a throw from an `agent/created` listener vetoes the
+ * agent's publication. On rc.1 `AgentRegistry.announce(agent)` was synchronous
+ * and rethrew; since dsh 0.1.7 it is `async announce(agent, source, signal?)`
+ * running the listeners through `ctx.serial` ("a listener failure rejects",
+ * `packages/core/agent/src/index.ts`), so the veto is now a REJECTION. Either
+ * way `agents.create()` rejects, the subagent
  * manager's `startContinuable()` rejects, and the engine records the executor
  * as `revoked`. If that fact were false, a throwing listener would merely be
  * logged and the executor would run without its packet tool — the exact P2
@@ -42,8 +44,8 @@ async function mountRegistry(): Promise<{ ctx: Context; registry: AgentRegistry 
   return { ctx, registry }
 }
 
-describe('rc.1 AgentRegistry publication path', () => {
-  it('a synchronous throw from an agent/created listener VETOES announce()', async () => {
+describe('AgentRegistry publication path (0.2: async serial announce)', () => {
+  it('a throw from an agent/created listener VETOES announce() (rejects)', async () => {
     const { ctx, registry } = await mountRegistry()
     const seen: string[] = []
     ctx.on('agent/created', ({ agent }: { agent: Agent }) => {
@@ -52,7 +54,7 @@ describe('rc.1 AgentRegistry publication path', () => {
     })
     const agent = structuralAgent(ctx, 'session-veto')
     const detach = registry.enter(agent, undefined)
-    expect(() => registry.announce(agent)).toThrow('inject: child surface installation failed')
+    await expect(registry.announce(agent, 'startup')).rejects.toThrow('inject: child surface installation failed')
     expect(seen).toEqual(['session-veto'])
     detach()
   })
@@ -62,10 +64,10 @@ describe('rc.1 AgentRegistry publication path', () => {
     // registry refusing every announce.
     const { ctx, registry } = await mountRegistry()
     const seen: string[] = []
-    ctx.on('agent/created', ({ agent }: { agent: Agent }) => { seen.push(agent.id) })
+    ctx.on('agent/created', ({ agent }: { agent: Agent }) => { seen.push(agent.id); return undefined })
     const agent = structuralAgent(ctx, 'session-ok')
     const detach = registry.enter(agent, undefined)
-    expect(() => registry.announce(agent)).not.toThrow()
+    await expect(registry.announce(agent, 'startup')).resolves.toBeUndefined()
     expect(seen).toEqual(['session-ok'])
     expect(registry.get(agent.id)).toBe(agent)
     detach()

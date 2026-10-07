@@ -833,6 +833,57 @@ describe('B15 — a PTC session produces a card', () => {
   })
 })
 
+/**
+ * B15b — the same real PTC session as written by dsh 0.1.7+ (session format v3+).
+ *
+ * Upstream renamed `tool/code-dispatch-start` / `tool/code-dispatch` to
+ * `tool/ptc-dispatch-start` / `tool/ptc-dispatch` (the v2->v3 migration's
+ * `renamePtcEvent`, `packages/session/session-format-v2-to-v3/src/migration.ts`;
+ * emitted under the new names with the same `name/subCallId/arguments/isError/
+ * content` fields by `packages/core/tools/src/ptc.ts` on 0.2.0-rc.2). The
+ * fixture below is `ptc.json` passed through exactly that rename and nothing
+ * else, so it stays a real capture in today's spelling. Before this was added
+ * the card matched only the old names and was invisible again on 0.2.
+ */
+function loadPtcV4(): readonly CardEvent[] {
+  const renamed: Record<string, string> = {
+    'tool/code-dispatch-start': 'tool/ptc-dispatch-start',
+    'tool/code-dispatch': 'tool/ptc-dispatch',
+  }
+  return load('ptc').map(e => (renamed[e.type] === undefined ? e : { ...e, type: renamed[e.type]! }))
+}
+
+describe('B15b — a PTC session in the 0.1.7+ spelling produces the same card', () => {
+  it('the derived fixture carries only the new names', () => {
+    const events = loadPtcV4()
+    expect(events.filter(e => e.type === 'tool/ptc-dispatch-start')).toHaveLength(2)
+    expect(events.filter(e => e.type === 'tool/ptc-dispatch')).toHaveLength(2)
+    expect(events.some(e => e.type.startsWith('tool/code-dispatch'))).toBe(false)
+  })
+
+  it('folds to the same visible card as the old spelling', () => {
+    const { starts, state } = fold(loadPtcV4())
+    expect(starts).toEqual([5])
+    expect(state?.firstSeq).toBe(136)
+    const node = makeDefinition().buildViewNode(ctxOf(state))
+    expect(node?.anchorSeq).toBe(136)
+    expect(node?.data.calls.map(c => c.name)).toEqual(['autopilot_init', 'autopilot_submit_plan'])
+    expect(state?.data).toEqual(fold(load('ptc')).state?.data)
+  })
+
+  it('keeps the publication cadence and the by-name foreign refusal', () => {
+    const definition = makeDefinition()
+    const events = loadPtcV4()
+    const start = events.find(e => e.type === 'tool/ptc-dispatch-start')!
+    const done = events.find(e => e.type === 'tool/ptc-dispatch')!
+    expect(definition.publication({ event: start, role: 'update', location: null })).toBe('immediate')
+    expect(definition.publication({ event: done, role: 'update', location: null })).toBe('animation-frame')
+    expect(definition.match(start)).toEqual({ id: AUTOPILOT_RUN_ID, role: 'update' })
+    const foreign: CardEvent = { ...start, data: { ...(start.data as Record<string, unknown>), name: 'str_replace_editor' } }
+    expect(definition.match(foreign)).toBeNull()
+  })
+})
+
 describe('B16 — the two envelope families coexist and neither disturbs the other', () => {
   it('a mixed session folds both families into one card', () => {
     // COMPOSITE, and said so plainly: both halves are real captures, but no

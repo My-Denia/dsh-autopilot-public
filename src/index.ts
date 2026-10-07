@@ -525,7 +525,9 @@ export async function resolveStore(
  * `registerContinuableSetup` registry).
  *
  * `agent` is declared as an OWN PROPERTY alongside `get`, because that is the
- * shape a real host produces — see {@link createContinuableChildSetup}.
+ * shape dsh 0.1.1–0.1.5 produced — see {@link createContinuableChildSetup}.
+ * On dsh 0.1.7+ reading it throws (strict inject); see
+ * {@link recognizeExecutorChild}, which prefers the announced Agent.
  */
 export interface ContinuableChildContext {
   get(name: string): unknown
@@ -582,12 +584,27 @@ export function createContinuableChildSetup(
  * commits `executor.state: 'starting'` with the minted childId BEFORE it calls
  * `startContinuable` (src/engine.ts).
  *
+ * PREFER THE ANNOUNCED AGENT. `agent/created` hands the Agent itself to the
+ * listener, and since dsh 0.1.7 that is the ONLY reliable way to reach it from
+ * this plugin: on a real 0.2.0-rc.2 host `childCtx.get('agent')` is undefined
+ * and the property read throws `cannot get property "agent" without inject`
+ * (cordis strict-inject check; measured 2026-10-07, run
+ * dsh-020-compat-20261007). The swallowed throw read as "not recognized", so
+ * the delegated executor got no packet tool, no egress guard and no seam. The
+ * context lookup stays only as the fallback for callers that hold nothing but
+ * the context ({@link createContinuableChildSetup}).
+ *
+ * @param announced - the Agent from `agent/created`, when the caller has it.
  * @returns the parent run's root session id, or undefined.
  */
-export function recognizeExecutorChild(engine: AutopilotEngine, childCtx: ContinuableChildContext): string | undefined {
+export function recognizeExecutorChild(
+  engine: AutopilotEngine,
+  childCtx: ContinuableChildContext,
+  announced?: unknown,
+): string | undefined {
   try {
-    const child = (lookupService(childCtx, 'agent') ?? childCtx.agent) as AgentRef | undefined
-    if (child === undefined) return undefined
+    const child = (announced ?? lookupService(childCtx, 'agent') ?? childCtx.agent) as AgentRef | undefined
+    if (child === undefined || child === null) return undefined
     const parentId = child.session.header.parentSession
     if (parentId === undefined) return undefined
     const run = engine.peek(parentId)
@@ -915,7 +932,7 @@ export async function apply(rawCtx: unknown, config?: ConfigInput): Promise<() =
       if (child.session?.header?.parentSession === undefined) return
       if (child.ctx === undefined || child.ctx === null) return
       const childCtx = child.ctx as ContinuableChildContext
-      const rootId = recognizeExecutorChild(engine, childCtx)
+      const rootId = recognizeExecutorChild(engine, childCtx, agent)
       if (rootId === undefined) return
       const dispose = installExecutorChildSurface(engine, resolved.gate, childCtx, rootId, cleanupWarn(String(child.id), rootId))
       childInstalled.set(agent, dispose)

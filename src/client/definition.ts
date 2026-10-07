@@ -352,6 +352,25 @@ export interface DispatchCallFields {
 }
 
 /**
+ * The PTC dispatch envelope names, in BOTH spellings.
+ *
+ * dsh 0.1.7+ (session format v3+) writes `tool/ptc-dispatch-start` /
+ * `tool/ptc-dispatch`; earlier hosts wrote `tool/code-dispatch-start` /
+ * `tool/code-dispatch` (upstream `session-format-v2-to-v3` `renamePtcEvent`).
+ * The payload fields are unchanged, so only the names differ. Both stay
+ * accepted because 0.1.x hosts remain in this plugin's peer range; every match
+ * site goes through these two predicates so a third spelling is one edit.
+ */
+export function isDispatchStartType(type: string): boolean {
+  return type === 'tool/ptc-dispatch-start' || type === 'tool/code-dispatch-start'
+}
+
+/** Result-side twin of {@link isDispatchStartType}. */
+export function isDispatchResultType(type: string): boolean {
+  return type === 'tool/ptc-dispatch' || type === 'tool/code-dispatch'
+}
+
+/**
  * Read a `tool/code-dispatch-start` envelope.
  *
  * Unlike `tool/result`, this event NAMES its tool, so a foreign dispatch is
@@ -469,7 +488,7 @@ function withStale(data: AutopilotRunChatData): AutopilotRunChatData {
 /**
  * Fold one autopilot invocation into the state — from EITHER envelope family.
  *
- * `tool/call` (direct) and `tool/code-dispatch-start` (PTC) are normalized to
+ * `tool/call` (direct) and a PTC dispatch-start ({@link isDispatchStartType}) are normalized to
  * the same three fields here and folded by one body. That sameness is the
  * point: a second copy of this fold for the PTC path could only be held level
  * with this one by a test, and the defect that made this function necessary was
@@ -477,7 +496,7 @@ function withStale(data: AutopilotRunChatData): AutopilotRunChatData {
  */
 export function applyCall(state: AutopilotRunState, match: CardMatch): AutopilotRunState {
   const event = match.event
-  const call = event.type === 'tool/code-dispatch-start'
+  const call = isDispatchStartType(event.type)
     ? asCall(readDispatchStart(event))
     : readCall(event)
   if (call === undefined) return state
@@ -582,7 +601,7 @@ function optional<K extends string, T>(key: K, value: T | undefined): Record<K, 
  */
 export function applyResult(state: AutopilotRunState, match: CardMatch): AutopilotRunState {
   const event = match.event
-  const result = event.type === 'tool/code-dispatch'
+  const result = isDispatchResultType(event.type)
     ? asResult(readDispatch(event))
     : readResult(event)
   if (result === undefined) return state
@@ -873,10 +892,10 @@ export function createAutopilotRunDefinition(deps: CardDeps): AutopilotRunDefini
       // and the fold stays idempotent for the same reason it does there: a
       // repeated completion for an already-consumed subCallId finds no pending
       // entry and returns the state object unchanged.
-      if (event.type === 'tool/code-dispatch-start') {
+      if (isDispatchStartType(event.type)) {
         return readDispatchStart(event) === undefined ? null : { id: AUTOPILOT_RUN_ID, role: 'update' }
       }
-      if (event.type === 'tool/code-dispatch') {
+      if (isDispatchResultType(event.type)) {
         return readDispatch(event) === undefined ? null : { id: AUTOPILOT_RUN_ID, role: 'update' }
       }
       return null
@@ -886,8 +905,8 @@ export function createAutopilotRunDefinition(deps: CardDeps): AutopilotRunDefini
 
     update: (context, match) => {
       const type = match.event.type
-      if (type === 'tool/call' || type === 'tool/code-dispatch-start') return applyCall(context.state, match)
-      if (type === 'tool/result' || type === 'tool/code-dispatch') return applyResult(context.state, match)
+      if (type === 'tool/call' || isDispatchStartType(type)) return applyCall(context.state, match)
+      if (type === 'tool/result' || isDispatchResultType(type)) return applyResult(context.state, match)
       return context.state
     },
 
@@ -903,7 +922,7 @@ export function createAutopilotRunDefinition(deps: CardDeps): AutopilotRunDefini
     // deliberately, so "a result lands on an animation frame" stays one rule
     // rather than two.
     publication: (match) => (
-      match.event.type === 'tool/call' || match.event.type === 'tool/code-dispatch-start'
+      match.event.type === 'tool/call' || isDispatchStartType(match.event.type)
         ? 'immediate'
         : 'animation-frame'
     ),

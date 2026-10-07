@@ -373,7 +373,7 @@ async function toolBed(verdicts: Array<{ verdict: string; note: string }> = []):
       agents.set(spec.childId, child)
       return {}
     },
-    async followup() { return {} },
+    async sendMessage() { return 'scripted-message' },
     interrupt() { /* not exercised here */ },
     async drainContinuableChildren() { return {} },
   }
@@ -629,7 +629,7 @@ describe('§2 the engine\'s tool filters against a real registry', () => {
         agents.set(spec.childId, structuralAgent(spec.childId, root.id))
         return {}
       },
-      async followup() { return {} },
+      async sendMessage() { return 'scripted-message' },
       interrupt() {},
       async drainContinuableChildren() { return {} },
     }
@@ -813,7 +813,7 @@ describe('§4 the continuable child setup on a real cordis child context', () =>
         agents.set(spec.childId, structuralAgent(spec.childId, root.id))
         return {}
       },
-      async followup() { return {} },
+      async sendMessage() { return 'scripted-message' },
       interrupt() {},
       async drainContinuableChildren() { return {} },
     }
@@ -848,7 +848,7 @@ describe('§4 the continuable child setup on a real cordis child context', () =>
     const engine = makeEngine({
       async start() { throw new Error('not used') },
       async startContinuable() { return {} },
-      async followup() { return {} },
+      async sendMessage() { return 'scripted-message' },
       interrupt() {},
       async drainContinuableChildren() { return {} },
     }, new Map<string, AgentRef>([[root.id, root]]))

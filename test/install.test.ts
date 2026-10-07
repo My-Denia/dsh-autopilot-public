@@ -58,11 +58,13 @@ function capturingAgent(id: string): {
   stopListener: () => StopListener | undefined
   events: string[]
   followups: string[]
+  sources: unknown[]
 } {
   let captured: Guard | undefined
   let stopping: StopListener | undefined
   const events: string[] = []
   const followups: string[] = []
+  const sources: unknown[] = []
   const agent: GateAgentRef = {
     id,
     session: { header: {} },
@@ -79,12 +81,16 @@ function capturingAgent(id: string): {
         return () => {}
       },
     },
-    followup: (message) => { followups.push(message.content.map(block => block.text).join('')) },
+    followup: (message) => {
+      followups.push(message.content.map(block => block.text).join(''))
+      sources.push(message.source)
+    },
   }
   return {
     agent,
     events,
     followups,
+    sources,
     guard: () => {
       if (captured === undefined) throw new Error('installRootGate registered no guard')
       return captured
@@ -386,6 +392,15 @@ describe('installRootGate: the turn-stop reminder listener', () => {
     expect(host.followups[0]).toContain('[autopilot 1/' + String(MAX_STOP_REMINDERS) + ']')
     expect(host.followups[0]).toContain('execution gate is')
     expect(host.followups[0]).toContain('pending')
+  })
+
+  it('attributes the nudge to a producer-owned source kind, never the retired plugin wrapper', async () => {
+    // Session format v4 (dsh 0.1.7+) refuses `kind: 'plugin'` at append time,
+    // and on a real 0.2.0-rc.2 host that refusal exited the whole process.
+    const { host } = install(midExecution())
+    await host.stopListener()!({ agent: {}, turn: 1 })
+    expect(host.sources).toEqual([{ kind: 'dsh-autopilot', form: 'notice', summary: 'autopilot execution-gate reminder' }])
+    expect(JSON.stringify(host.sources)).not.toContain('"plugin"')
   })
 
   it('says NOTHING for a lightweight run', async () => {

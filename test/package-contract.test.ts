@@ -15,8 +15,12 @@ const pkg = JSON.parse(readFileSync(pkgPath, 'utf8')) as {
 }
 
 const TOOLS = '@deepseek-ai/dsh-tools'
-const PEER = '0.1.2-rc.1 || >=0.1.5-rc.1 <0.1.6'
-const DEV_PIN = '0.1.2-rc.1'
+// The 0.2.0 line only (`<0.2.1-0` keeps 0.2.1 prereleases OUT under dsh's
+// includePrerelease compatibility check). dsh 0.1.7+ refuses to install a
+// plugin whose dsh peers do not satisfy the running version, so this string is
+// also the plugin's install gate (app-boot `plugin-compatibility.ts`).
+const PEER = '0.1.2-rc.1 || >=0.1.5-rc.1 <0.1.6 || >=0.2.0-rc.1 <0.2.1-0'
+const DEV_PIN = '0.2.0-rc.2'
 
 describe('package contract: dsh-tools is host-provided', () => {
   it('does not list @deepseek-ai/dsh-tools in runtime dependencies', () => {

@@ -114,10 +114,12 @@ export function stubSubagents(script: {
       script.onStartContinuable?.(spec.childId)
       return {}
     },
-    async followup(_parent, childId, content, _options) {
+    // The resume transport (`SubagentManager.sendMessage`). The record keeps
+    // its historical `followups` name; the manager never had `followup`.
+    async sendMessage(_sender, childId, content, _options) {
       if (followupFailsLeft > 0) {
         followupFailsLeft -= 1
-        throw new Error('followup failed (scripted)')
+        throw new Error('sendMessage failed (scripted)')
       }
       const text = content.map(block => block.text).join('\n')
       followups.push({ childId, text })
