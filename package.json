@@ -28,6 +28,8 @@
     "cordis.patch.yml",
     "skill",
     "DESIGN.md",
+    "CHANGELOG.md",
+    "docs",
     "evidence"
   ],
   "engines": {
