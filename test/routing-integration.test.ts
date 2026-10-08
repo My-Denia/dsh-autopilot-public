@@ -42,6 +42,8 @@ interface StubModel {
 class StubLlm implements LlmRuntimeSubset {
   private readonly live: Set<string>
   public readonly preflights: LlmCallConfig[] = []
+  /** Routes `resolveCallConfig` REJECTS (F7 fixtures): "provider/model" → reason. */
+  public readonly preflightRejects = new Map<string, string>()
 
   constructor(private readonly models: readonly StubModel[]) {
     this.live = new Set(models.map(model => model.provider))
@@ -84,6 +86,8 @@ class StubLlm implements LlmRuntimeSubset {
 
   async resolveCallConfig(config: LlmCallConfig) {
     this.preflights.push(config)
+    const rejection = this.preflightRejects.get(`${config.provider}/${config.model}`)
+    if (rejection !== undefined) throw new Error(rejection)
     return { ...config }
   }
 }
@@ -1053,5 +1057,116 @@ describe('F5 (PR #2 review, round 2): routing.roles.executor is visible to audit
     await toExecuting(h)
     expect(h.subagents.auditOptions[0]).toEqual({ provider: 'alpha', model: 'm-small', reasoningEffort: 'high' })
     expect(h.engine.peek(h.root.id)?.audits[0]?.route?.crossFamily).toBe('achieved')
+  })
+})
+
+// ── F7 (PR #2 Codex round 3): the auto-mode pool fallback checks liveness and preflight ──
+//
+// The pool fallback fires when the routing core terminated to inheritance
+// (here: a single-route or empty policy∩catalog authorized set). Before F7 a
+// pool pick was dispatched after ONLY the grant check, so a policy-authorized
+// but DEAD provider got dispatched. Now every pool candidate runs the same
+// checks as any explicit selection — provider liveness against the catalog
+// snapshot, then preflight/resolveCallConfig — and a failing entry is skipped
+// honestly (why names it) with the walk falling to the next pool entry or the
+// inheritance result standing. The grant rule stays FIRST (a present policy
+// excluding the entry still escalates), and the 0.2.0-verbatim off-mode pool
+// path stays untouched (see the mode-off suite above).
+
+describe('F7 (PR #2 round 3): pool fallback liveness and preflight', () => {
+  /** An auto-mode harness whose executor names the 'alpha' family, so the beta/gamma pool entries qualify as out-of-family picks. */
+  function autoHarness(f: ReturnType<typeof fixture>, config?: Parameters<typeof resolveConfig>[0]): Harness {
+    return makeHarness({
+      routing: f.portsFor(),
+      config: {
+        executor: { agentOptions: { provider: 'alpha', model: 'm-a' } },
+        crossFamily: { enabled: true, minRisk: 'medium', pool: [{ provider: 'beta', model: 'm-c' }] },
+        ...(config ?? {}),
+      },
+      subagents: stubSubagents({ verdicts: [{ verdict: 'pass', note: 'ok' }] }),
+    })
+  }
+
+  it('(a) a dead provider in both pool and policy is NOT dispatched — inheritance retained, why names the liveness failure', async () => {
+    const f = fixture(MODELS, { kind: 'present', routes: [{ provider: 'beta', model: 'm-c' }] })
+    const h = autoHarness(f)
+    f.llm.dropProvider('beta')
+    await toExecuting(h)
+    // The authorized set is EMPTY after the live-catalog intersection, the
+    // core inherits, and the pool entry — policy-authorized but dead — is
+    // skipped instead of dispatched.
+    expect(h.subagents.auditOptions[0]).toBeUndefined()
+    const routing = routingOf(h, 'audit', 'plan-auditor')
+    expect(routing?.pin).toBeUndefined()
+    expect(routing?.why?.some(entry => entry.includes('pool route beta/m-c skipped') && entry.includes('not live in the catalog snapshot'))).toBe(true)
+    expect(routing?.why?.some(entry => entry.includes('the inheritance result stands'))).toBe(true)
+  })
+
+  it('(b) a LIVE pool route inside the policy dispatches as before — grant green, checks green', async () => {
+    const f = fixture(MODELS, { kind: 'present', routes: [{ provider: 'beta', model: 'm-c' }] })
+    const h = autoHarness(f)
+    await toExecuting(h)
+    expect(h.subagents.auditOptions[0]).toEqual({ provider: 'beta', model: 'm-c' })
+    const routing = routingOf(h, 'audit', 'plan-auditor')
+    expect(routing?.pin).toEqual({ provider: 'beta', model: 'm-c' })
+    expect(routing?.authorizationSource).toBe('plugin-config')
+    // The checks actually ran: the pool pick was preflighted like any explicit selection.
+    expect(f.llm.preflights.some(config => config.provider === 'beta' && config.model === 'm-c')).toBe(true)
+    // And nothing was skipped.
+    expect(routing?.why?.some(entry => entry.includes('skipped'))).toBe(false)
+  })
+
+  it('(c) a pool route whose preflight rejects is skipped with the reason recorded', async () => {
+    const f = fixture(MODELS, ABSENT)
+    f.llm.preflightRejects.set('beta/m-c', 'resolveCallConfig: effort unsupported on this route')
+    const h = autoHarness(f)
+    await toExecuting(h)
+    expect(h.subagents.auditOptions[0]).toBeUndefined()
+    const routing = routingOf(h, 'audit', 'plan-auditor')
+    expect(routing?.pin).toBeUndefined()
+    expect(routing?.why?.some(entry =>
+      entry.includes('pool route beta/m-c skipped')
+      && entry.includes('preflight rejected it')
+      && entry.includes('effort unsupported on this route'))).toBe(true)
+  })
+
+  it('(d) a dead first entry falls to the NEXT pool entry, with the skip named', async () => {
+    const models = [...MODELS, { provider: 'gamma', id: 'm-d', contextWindow: 131072 }]
+    const f = fixture(models, ABSENT)
+    f.llm.dropProvider('beta')
+    const h = autoHarness(f, { crossFamily: { enabled: true, minRisk: 'medium', pool: [{ provider: 'beta', model: 'm-c' }, { provider: 'gamma', model: 'm-d' }] } })
+    await toExecuting(h)
+    expect(h.subagents.auditOptions[0]).toEqual({ provider: 'gamma', model: 'm-d' })
+    const routing = routingOf(h, 'audit', 'plan-auditor')
+    expect(routing?.pin).toEqual({ provider: 'gamma', model: 'm-d' })
+    expect(routing?.authorizationSource).toBe('plugin-config')
+    expect(routing?.why?.some(entry => entry.includes('pool route beta/m-c skipped') && entry.includes('not live in the catalog snapshot'))).toBe(true)
+  })
+
+  it('(e) the grant rule stays FIRST: a pool entry outside a present policy still escalates, never dispatches', async () => {
+    const f = fixture(MODELS, { kind: 'present', routes: [{ provider: 'alpha', model: 'm-a' }] })
+    const h = autoHarness(f)
+    await h.engine.init(h.root, makeTriage(STANDARD), [undeclaredSeed('m1')])
+    await h.engine.declareUsage(h.root, makeUsageEntry({ id: 'm1' }))
+    await h.engine.submitPlan(h.root, 'plan')
+    await expect(h.engine.audit(h.root, { role: 'plan', prompt: 'packet' }))
+      .rejects.toThrowError(/outside the session model-selection policy/)
+    expect(h.engine.peek(h.root.id)?.phase).toBe('needs-owner-decision')
+    expect(h.subagents.auditOptions.length).toBe(0)
+  })
+
+  it('(f) no catalog port ⇒ the pool pick still dispatches (0.2.0 parity) with the skipped checks NAMED', async () => {
+    const h = makeHarness({
+      config: {
+        executor: { agentOptions: { provider: 'alpha', model: 'm-a' } },
+        crossFamily: { enabled: true, minRisk: 'medium', pool: [{ provider: 'beta', model: 'm-c' }] },
+      },
+      subagents: stubSubagents({ verdicts: [{ verdict: 'pass', note: 'ok' }] }),
+    })
+    await toExecuting(h)
+    expect(h.subagents.auditOptions[0]).toEqual({ provider: 'beta', model: 'm-c' })
+    const routing = routingOf(h, 'audit', 'plan-auditor')
+    expect(routing?.pin).toEqual({ provider: 'beta', model: 'm-c' })
+    expect(routing?.why?.some(entry => entry.includes('no catalog port wired — provider liveness not checked and dispatch preflight not run'))).toBe(true)
   })
 })

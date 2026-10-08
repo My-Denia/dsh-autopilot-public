@@ -867,6 +867,89 @@ export function routeStatusOf(childId: string, evidence: RouteEvidence): {
 }
 
 /**
+ * F6 (PR #2 Codex round 3): the executor's OBSERVED route leg, recaptured at
+ * execution-packet submission — a NEW evidence read, labeled as one.
+ *
+ * `startContinuable` resolves before the child's first turn (upstream: the
+ * promise settles at inbox acceptance), so the `running` record's observed
+ * read found no `request/header` yet and the record has sat `unverifiable`
+ * forever — packet submission and resume preserved it, and a later route
+ * mismatch was never recorded. By packet submission a request HAS run (the
+ * child is calling the packet tool), so the latest header is finally
+ * readable: this refresh re-reads it, recomputes `routeStatus` through the
+ * same {@link routeStatusOf} doctrine (never `verified` without three-leg
+ * agreement), and says IN the diagnostic that the observed leg was refreshed
+ * at packet submission — it never pretends the leg was there from the start.
+ * The recomputed `routeDiagnostic` REPLACES the capture-time one (which said
+ * the observed read had failed); the capture-time record — including any
+ * tool-surface note — stands unchanged in the snapshot beside this refresh.
+ *
+ * WHERE THE REFRESH LIVES (the fold-contract decision): the fold refuses
+ * executor mutation on `submit-packet` (`AP_EXECUTOR_MUTATED`), so the
+ * refreshed record rides as the ADDITIVE `routeRecapture` key on the
+ * submit-packet commit's detail — the established pattern
+ * (`withPlannerDetail`) — and the snapshot keeps the capture-time record
+ * unchanged beside it. A failed read keeps the prior record and records the
+ * failure the same way; nothing here can refuse a packet.
+ */
+export interface ExecutorRouteRecapture {
+  /** `refreshed` — an observed leg was read and the status recomputed. */
+  readonly outcome: 'refreshed'
+  /** The recomputed record: the prior record plus the observed leg and the recomputed status. */
+  readonly route: RouteRecord
+  /** The observed leg as re-read at submission (also on `route`). */
+  readonly observed: RoutingPin
+}
+
+/** The failed half of the packet-submission recapture: the read did not yield an observed leg. */
+export interface ExecutorRouteRecaptureFailed {
+  /** `unreadable` — no well-formed `request/header` was readable; the prior record stands. */
+  readonly outcome: 'unreadable'
+  /** Why the read failed; the prior record is kept unchanged. */
+  readonly reason: string
+}
+
+/** See {@link ExecutorRouteRecapture}. */
+function recapturedExecutorRoute(
+  childId: string,
+  record: RouteRecord,
+  session: SessionReadRef | undefined,
+): ExecutorRouteRecapture | ExecutorRouteRecaptureFailed {
+  const read = observedRouteOf(session)
+  if (read.observed === undefined) {
+    return { outcome: 'unreadable', reason: read.unreadable ?? 'observed route read failed' }
+  }
+  // The creation leg is the record's OWN (captured from the durable Agent
+  // options at dispatch) — re-reading a live agent object here could drift
+  // from what was actually dispatched, and the record is the durable fact.
+  const creation = record.routeProvider === 'unverified' && record.routeModel === 'unverified'
+    ? undefined
+    : {
+        ...(record.routeProvider === 'unverified' ? {} : { provider: record.routeProvider }),
+        ...(record.routeModel === 'unverified' ? {} : { model: record.routeModel }),
+      }
+  const status = routeStatusOf(childId, {
+    ...(record.selected === undefined ? {} : { selected: record.selected }),
+    ...(creation === undefined ? {} : { creation }),
+    observed: read.observed,
+  })
+  const diagnostic = [
+    'observed leg refreshed at execution-packet submission — a new evidence read (the running record was captured before the child\'s first request could exist)',
+    status.routeDiagnostic,
+  ].filter(Boolean).join('; ')
+  return {
+    outcome: 'refreshed',
+    route: {
+      ...record,
+      routeStatus: status.routeStatus,
+      routeDiagnostic: diagnostic,
+      observed: read.observed,
+    },
+    observed: read.observed,
+  }
+}
+
+/**
  * Capture one dispatched child's route record: creation from the durable Agent
  * options, observed from the child session's latest `request/header`, status
  * per plan v3 (see {@link routeStatusOf}), and the routing decision's record
@@ -1919,6 +2002,17 @@ export class AutopilotEngine {
         )
       }
 
+      // F6 (PR #2 Codex round 3): recapture the executor's OBSERVED route
+      // leg HERE — the first executor-bearing op where a request has
+      // actually run. `startContinuable` resolves before the child's first
+      // turn, so the `running` record could not carry this leg; the child
+      // submitting this packet has made at least one request, so its latest
+      // `request/header` is finally readable. The refreshed record is a NEW
+      // evidence read stamped as the ADDITIVE `routeRecapture` key on this
+      // commit (the fold refuses executor mutation on submit-packet), and a
+      // failed read keeps the prior record with the failure recorded — the
+      // recapture is evidence, never a gate: it cannot refuse a packet.
+      const recapture = recapturedExecutorRoute(prior.executor.childId, prior.executor.route, child.session)
       return await this.commit(prior, 'submit-packet', {
         ...prior,
         revision: prior.revision + 1,
@@ -1929,6 +2023,7 @@ export class AutopilotEngine {
         executionRevision: claimed,
         generation: prior.executor.generation,
         childId: prior.executor.childId,
+        routeRecapture: recapture,
       })
     })
   }
@@ -2993,42 +3088,129 @@ export class AutopilotEngine {
     // on a no-policy deployment this is exactly 0.2.0 dispatch behavior; on a
     // policy-bearing one a pool entry outside the policy escalates instead of
     // silently bypassing the native allowlist.
-    return this.carryRoutelessLegacy(role, roleRouting, this.poolFallback(role, prior, policy, core))
+    return this.carryRoutelessLegacy(role, roleRouting, await this.poolFallback(role, prior, policy, core))
   }
 
-  /** The 0.2.0 pool fallback over an inherit resolution, grant-checked. */
-  private poolFallback(
+  /**
+   * The 0.2.0 pool fallback over an inherit resolution, grant-checked.
+   *
+   * F7 (PR #2 Codex round 3): a pool pick now runs the SAME dispatch checks as
+   * every other explicit selection BEFORE it can be handed a dispatch —
+   * provider liveness against the catalog snapshot and
+   * `preflight`/`resolveCallConfig`. Before this, the fallback checked only
+   * the grant rule, so a pool entry that was policy-authorized but DEAD (a
+   * provider absent from the live catalog, or a route resolveCallConfig
+   * rejects) was dispatched anyway: auto mode could hand a dispatch to a
+   * route no live adapter can serve. A pool route failing these checks is
+   * skipped HONESTLY — the `why` names the failure, the walk falls to the
+   * NEXT pool entry outside the builder family, and the inheritance result
+   * is retained when none qualifies. The grant rule stays FIRST (policy
+   * membership / conflict escalation per the plan's one rule), and the
+   * 0.2.0-verbatim `off`-mode path is untouched: off mode dispatches legacy
+   * verbatim by design, so these checks apply to the auto-mode pool fallback
+   * only. With no catalog port wired the checks cannot run; the pick
+   * dispatches with the skips NAMED, exactly as a locked route does in the
+   * same state (0.2.0 dispatch parity) — never a silent claim.
+   */
+  private async poolFallback(
     role: Role,
     prior: Snapshot,
     policy: SessionPolicyState,
     inherit: Extract<RoleRouteResolution, { readonly kind: 'dispatch' }>,
-  ): RoleRouteResolution {
-    // ONLY the pool arm can produce a pick here: `configured` is undefined
-    // because the routing core inherited (an explicit role route would have
-    // made the role locked and never reached this line).
+  ): Promise<RoleRouteResolution> {
+    // The consultability gate is unchanged and pure: `selectCrossFamily`
+    // decides whether the pool is in play at all (enabled, the risk floor,
+    // an observable builder family) and supplies the outcome word the
+    // record cites. Its pick — the FIRST pool entry outside the builder
+    // family — is where the checked walk below STARTS; the walk may continue
+    // past it when the dispatch checks reject it.
     const choice = selectCrossFamily({
       risk: prior.triage.risk,
       configured: undefined,
       executor: this.config.executor.agentOptions,
       policy: this.config.crossFamily,
     })
-    const pick = toRoutePin(choice.agentOptions)
-    if (pick === undefined) return inherit
-    const verdict = resolvePluginGrant({ provider: pick.provider, model: pick.model, source: 'legacy-pool' }, policy)
-    if (verdict.kind === 'conflict') return { kind: 'escalate', reason: verdict.reason }
-    const effort = choice.agentOptions?.reasoningEffort
+    if (toRoutePin(choice.agentOptions) === undefined) return inherit
+    const catalog = this.routingPorts.catalog
+    const builder = familyOf(this.config.executor.agentOptions)
+    // F7: walk the pool in order over the entries the 0.2.0 rule considers —
+    // a well-formed route whose family differs from the builder's — so the
+    // first entry `selectCrossFamily` names is checked first and a dead one
+    // is stepped past, not dispatched.
+    const skipped: string[] = []
+    for (const entry of this.config.crossFamily.pool) {
+      const candidate = toRoutePin(entry)
+      if (candidate === undefined) continue
+      const family = familyOf(entry)
+      if (family === undefined || family === builder) continue
+      // The grant rule FIRST, per the plan's one rule ([R2-P1-1]): a pool
+      // entry a present policy excludes is an owner-vs-owner conflict that
+      // ESCALATES — never skipped past, never silently bypassed.
+      const verdict = resolvePluginGrant({ provider: candidate.provider, model: candidate.model, source: 'legacy-pool' }, policy)
+      if (verdict.kind === 'conflict') return { kind: 'escalate', reason: verdict.reason }
+      const effort = entry.reasoningEffort
+      const pin = { provider: candidate.provider, model: candidate.model, ...(effort === undefined ? {} : { reasoningEffort: effort }) }
+      const grantNote = `cross-family: the routing core terminated to inheritance; the 0.2.0 pool fallback supplied ${candidate.provider}/${candidate.model} as a plugin-config grant (${choice.outcome})`
+      if (catalog === undefined) {
+        return {
+          kind: 'dispatch',
+          agentOptions: entry,
+          routing: {
+            role,
+            pin,
+            why: [
+              ...(inherit.routing?.why ?? []),
+              ...verdict.why,
+              'catalog: no catalog port wired — provider liveness not checked and dispatch preflight not run (0.2.0 dispatch parity)',
+              grantNote,
+            ],
+            authorizationSource: 'plugin-config',
+          },
+        }
+      }
+      const snapshot = await catalog.snapshot()
+      if (!providerIsLive(snapshot, candidate.provider)) {
+        skipped.push(`cross-family: pool route ${candidate.provider}/${candidate.model} skipped — its provider is not live in the catalog snapshot`)
+        continue
+      }
+      try {
+        await catalog.preflight({
+          provider: candidate.provider,
+          model: candidate.model,
+          ...(effort === undefined ? {} : { reasoningEffort: effort }),
+        })
+      } catch (error) {
+        skipped.push(`cross-family: pool route ${candidate.provider}/${candidate.model} skipped — dispatch preflight rejected it (${errorMessage(error)})`)
+        continue
+      }
+      return {
+        kind: 'dispatch',
+        agentOptions: entry,
+        routing: {
+          role,
+          pin,
+          why: [
+            ...(inherit.routing?.why ?? []),
+            ...verdict.why,
+            ...(skipped.length > 0 ? [skipped.join('; ')] : []),
+            grantNote,
+          ],
+          authorizationSource: 'plugin-config',
+        },
+      }
+    }
+    // No pool entry survived the dispatch checks: the inheritance result is
+    // retained, with every skip named — never a silent reversion to it.
+    if (inherit.routing === undefined) return inherit
     return {
-      kind: 'dispatch',
-      agentOptions: choice.agentOptions,
+      ...inherit,
       routing: {
-        role,
-        pin: { provider: pick.provider, model: pick.model, ...(effort === undefined ? {} : { reasoningEffort: effort }) },
+        ...inherit.routing,
         why: [
-          ...(inherit.routing?.why ?? []),
-          ...verdict.why,
-          `cross-family: the routing core terminated to inheritance; the 0.2.0 pool fallback supplied ${pick.provider}/${pick.model} as a plugin-config grant (${choice.outcome})`,
+          ...inherit.routing.why,
+          ...skipped,
+          'cross-family: every pool entry outside the builder family failed the dispatch checks (provider liveness, preflight) — the inheritance result stands',
         ],
-        authorizationSource: 'plugin-config',
       },
     }
   }

@@ -16,12 +16,16 @@
  * wired at all — an empty catalog is the normal zero-config deployment).
  */
 
+import { readFileSync } from 'node:fs'
+import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
 import { observedRouteOf, routeStatusOf } from '../src/engine.js'
 import type { SessionReadRef } from '../src/engine.js'
+import { foldRun } from '../src/domain/fold.js'
+import type { RunEvent, Snapshot } from '../src/domain/types.js'
 import type { RoutingPin } from '../src/domain/types.js'
 import { fakeAgent, makeHarness, makeTriage, makeUsageEntry, stubSubagents, undeclaredSeed } from './helpers.js'
-import type { Harness } from './helpers.js'
+import type { FakeAgent, Harness } from './helpers.js'
 
 // ── observedRouteOf: the observed leg's read, including its failures ────────
 
@@ -235,5 +239,177 @@ describe('the engine records the observed route on dispatched children', () => {
     const route = h.engine.peek(h.root.id)?.audits[0]?.route as Record<string, unknown> | undefined
     expect(route?.routeStatus).toBe('mismatch')
     expect(String(route?.routeDiagnostic)).toContain('model')
+  })
+})
+
+// ── F6 (PR #2 Codex round 3): the observed leg is recaptured at packet submission ──
+//
+// `startContinuable` resolves before the child's first turn, so the running
+// record's observed read finds no `request/header` yet and sits
+// `unverifiable` forever — packet submission preserved it and a later route
+// mismatch was never recorded. The fix: packet submission is the first
+// executor-bearing op where a request has actually run, so the latest header
+// is re-read THERE, the status is recomputed through the same doctrine
+// (never `verified` without three-leg agreement), and the refresh is stamped
+// as the ADDITIVE `routeRecapture` key on the submit-packet commit — the
+// fold refuses executor mutation on that op, so the snapshot keeps the
+// capture-time record unchanged beside the refreshed one.
+
+interface PacketScript {
+  /** The child's creation options (`Agent.options`), registered at transport start. */
+  options?: { provider?: string; model?: string }
+  /** The header the child's first request logs — appended AFTER start, BEFORE packet submission. */
+  header?: { provider: string; model: string; reasoningEffort?: string } | null
+  /** The child session read throws (the unreadable-session case). */
+  throwingSession?: boolean
+}
+
+/** Start a delegated executor, then submit its packet; returns the capture-time record, the packet-time recapture, and the durable stream. */
+async function executorPacket(script: PacketScript, harness: Harness): Promise<{
+  running: Record<string, unknown> | undefined
+  submitted: Snapshot
+  recapture: Record<string, unknown> | undefined
+  events: RunEvent[]
+}> {
+  const h = harness
+  // The child Agent registers the moment the transport starts it; its session
+  // starts EMPTY (a continuable child's first turn begins only after
+  // startContinuable resolves), so the running capture cannot see a header.
+  ;(h.subagents as unknown as { startContinuable: (spec: { childId: string }) => Promise<unknown> })
+    .startContinuable = async (spec) => {
+      const base = fakeAgent(spec.childId, h.root.id)
+      const child = {
+        ...base,
+        ...(script.options === undefined ? {} : { options: script.options }),
+        ...(script.throwingSession === true
+          ? {
+            session: {
+              ...base.session,
+              snapshotEvents: () => { throw new Error('child session log unreadable (scripted)') },
+            },
+          }
+          : {}),
+      } as never
+      h.agents.add(child)
+      return {}
+    }
+  await h.engine.init(
+    h.root,
+    makeTriage({ size: 'standard', risk: 'medium', auditMode: 'independent', executionMode: 'delegated' }),
+    [undeclaredSeed('m1')],
+  )
+  await h.engine.declareUsage(h.root, makeUsageEntry({ id: 'm1' }))
+  await h.engine.submitPlan(h.root, 'plan')
+  await h.engine.audit(h.root, { role: 'plan', prompt: 'p' })
+  const started = await h.engine.startExecutor(h.root, { prompt: 'go', signal: SIGNAL })
+  expect(started.executor?.state).toBe('running')
+  const running = started.executor?.route as Record<string, unknown> | undefined
+  const childAgent = h.agents.get(started.executor?.childId as string) as FakeAgent | undefined
+  // The child's first request runs between start and packet submission.
+  if (script.header !== null && script.header !== undefined && childAgent !== undefined) {
+    childAgent.session.append('request/header', { header: { config: script.header }, reason: 'initial' })
+  }
+  const submitted = await h.engine.submitExecutionPacket(
+    h.agents.get(started.executor?.childId as string) as never,
+    { packet: 'did the work', residualRisks: [], executionRevision: 1 },
+  )
+  const events = readFileSync(join(h.storeDir, 'runs', h.root.id, 'events.jsonl'), 'utf8')
+    .trim().split('\n').map(line => JSON.parse(line) as RunEvent)
+  const packetEvent = events.find(event => event.op === 'submit-packet')
+  expect(packetEvent).toBeDefined()
+  return {
+    running,
+    submitted,
+    recapture: (packetEvent?.detail as { routeRecapture?: Record<string, unknown> } | undefined)?.routeRecapture,
+    events,
+  }
+}
+
+describe('F6: the executor observed route is recaptured at packet submission', () => {
+  it('(i) a header echoed by packet time ⇒ the recapture gains the observed leg and recomputes: agreeing ⇒ verified', async () => {
+    const h = makeHarness({
+      subagents: stubSubagents({ verdicts: [{ verdict: 'pass', note: 'plan ok' }] }),
+      config: { executor: { agentOptions: { provider: 'beta', model: 'm-c' } } },
+    })
+    const { running, submitted, recapture, events } = await executorPacket(
+      { options: { provider: 'beta', model: 'm-c' }, header: { provider: 'beta', model: 'm-c' } },
+      h,
+    )
+    // Capture time: no header could exist yet — honestly unverifiable, the
+    // record the F6 defect left stranded.
+    expect(running?.routeStatus).toBe('unverifiable')
+    // Packet time: the observed leg is a NEW evidence read, named as one.
+    expect(recapture?.outcome).toBe('refreshed')
+    expect(recapture?.observed).toEqual({ provider: 'beta', model: 'm-c' })
+    const route = recapture?.route as Record<string, unknown> | undefined
+    expect(route?.observed).toEqual({ provider: 'beta', model: 'm-c' })
+    expect(route?.selected).toEqual({ provider: 'beta', model: 'm-c' })
+    expect(route?.routeStatus).toBe('verified')
+    expect(String(route?.routeDiagnostic)).toContain('refreshed at execution-packet submission')
+    // The snapshot keeps the CAPTURE-TIME record (the fold forbids executor
+    // mutation on submit-packet); the refresh lives on the event beside it.
+    expect(submitted.executor?.route).toEqual(running)
+    // And the stamped stream still replays clean with the additive detail.
+    expect(() => foldRun(events)).not.toThrow()
+  })
+
+  it('(ii) an agreeing header with NO selection in play ⇒ honest unverified, never verified', async () => {
+    const h = makeHarness({ subagents: stubSubagents({ verdicts: [{ verdict: 'pass', note: 'plan ok' }] }) })
+    const { recapture } = await executorPacket(
+      { options: { provider: 'fake', model: 'fake-model' }, header: { provider: 'fake', model: 'fake-model' } },
+      h,
+    )
+    expect(recapture?.outcome).toBe('refreshed')
+    const route = recapture?.route as Record<string, unknown> | undefined
+    expect(route?.selected).toBeUndefined()
+    expect(route?.routeStatus).toBe('unverified')
+    expect(String(route?.routeDiagnostic)).toContain('no routing decision selected a route')
+  })
+
+  it('(iii) a diverging header ⇒ mismatch with the differing axis named — the record the defect lost', async () => {
+    const h = makeHarness({
+      subagents: stubSubagents({ verdicts: [{ verdict: 'pass', note: 'plan ok' }] }),
+      config: { executor: { agentOptions: { provider: 'beta', model: 'm-c' } } },
+    })
+    const { recapture } = await executorPacket(
+      { options: { provider: 'beta', model: 'm-c' }, header: { provider: 'beta', model: 'm-imposter' } },
+      h,
+    )
+    const route = recapture?.route as Record<string, unknown> | undefined
+    expect(route?.routeStatus).toBe('mismatch')
+    expect(route?.observed).toEqual({ provider: 'beta', model: 'm-imposter' })
+    expect(String(route?.routeDiagnostic)).toContain('model')
+    expect(String(route?.routeDiagnostic)).toContain('m-imposter')
+    // The refresh note rides ALONGSIDE the mismatch, never replacing it.
+    expect(String(route?.routeDiagnostic)).toContain('refreshed at execution-packet submission')
+  })
+
+  it('(iv) an unreadable child session ⇒ the prior record is kept and the failed read is recorded', async () => {
+    const h = makeHarness({
+      subagents: stubSubagents({ verdicts: [{ verdict: 'pass', note: 'plan ok' }] }),
+      config: { executor: { agentOptions: { provider: 'beta', model: 'm-c' } } },
+    })
+    const { running, submitted, recapture } = await executorPacket(
+      { options: { provider: 'beta', model: 'm-c' }, header: null, throwingSession: true },
+      h,
+    )
+    expect(recapture?.outcome).toBe('unreadable')
+    expect(String(recapture?.reason)).toContain('child session read failed')
+    expect(submitted.executor?.route).toEqual(running)
+  })
+
+  it('(v) no header yet ⇒ no change: the record stands and the absent read is recorded honestly', async () => {
+    const h = makeHarness({
+      subagents: stubSubagents({ verdicts: [{ verdict: 'pass', note: 'plan ok' }] }),
+      config: { executor: { agentOptions: { provider: 'beta', model: 'm-c' } } },
+    })
+    const { running, submitted, recapture } = await executorPacket(
+      { options: { provider: 'beta', model: 'm-c' }, header: null },
+      h,
+    )
+    expect(recapture?.outcome).toBe('unreadable')
+    expect(String(recapture?.reason)).toContain('no well-formed request/header')
+    expect(submitted.executor?.route).toEqual(running)
+    expect(running?.routeStatus).toBe('unverifiable')
   })
 })
