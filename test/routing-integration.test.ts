@@ -2200,3 +2200,107 @@ describe('F21 (PR #2 round 10): blank pool efforts normalize to absence before p
     expect(foldRun(eventsOf(h)).snapshot?.phase).toBe('closing')
   })
 })
+
+// ── F23 (PR #2 round 11): a catalog outage is not "all providers gone" for auto selection ──
+//
+// The last unguarded conflation of the F14/F17 class. When `listProviders`
+// throws, `RouteCatalog.snapshot()` degrades to `catalogStatus: 'unavailable'`
+// with an EMPTY provider list — and the auto path's eligibility intersection
+// read that empty list as "every policy provider is gone": a FRESH auto
+// dispatch inherited without ever attempting `resolveModelInfo` or preflight
+// (both of which run independently of the failed listing), and the evidence
+// never named the outage. The selector now branches on the snapshot's own
+// status BEFORE the intersection: under an outage the policy routes remain
+// candidates, preflight is the actual gate, and the outage rides `why` on
+// every outcome — a dispatched route and a retained inheritance alike.
+
+describe('F23 (PR #2 round 11): a catalog outage is not "all providers gone" for auto selection', () => {
+  /** A run driven to a passed plan with the plan auditor's dispatch still ahead. */
+  async function toPlannedAudit(h: Harness): Promise<void> {
+    await h.engine.init(h.root, makeTriage(STANDARD), [undeclaredSeed('m1')])
+    await h.engine.declareUsage(h.root, makeUsageEntry({ id: 'm1' }))
+    await h.engine.submitPlan(h.root, 'plan')
+  }
+
+  it('(a) fresh auto dispatch under an outage ⇒ the policy route is DISPATCHED (not inherited), why names the outage', async () => {
+    const f = fixture(MODELS, PRESENT_ABC)
+    const h = makeHarness({
+      routing: f.portsFor(),
+      subagents: stubSubagents({ verdicts: [{ verdict: 'pass', note: 'plan ok' }] }),
+    })
+    await toPlannedAudit(h)
+
+    const preflightsBefore = f.llm.preflights.length
+    f.llm.failProviders = true
+    f.catalog.invalidate()
+
+    await h.engine.audit(h.root, { role: 'plan', prompt: 'packet' })
+    // The outage did NOT terminate eligibility: the policy routes stayed
+    // candidates and the same route as the healthy-catalog run (i) was
+    // selected, preflight-gated, and dispatched explicitly.
+    expect(h.subagents.auditOptions[0]).toEqual({ provider: 'beta', model: 'm-c', reasoningEffort: 'high' })
+    const routing = routingOf(h, 'audit', 'plan-auditor')
+    expect(routing?.pin).toEqual({ provider: 'beta', model: 'm-c', reasoningEffort: 'high' })
+    expect(routing?.authorizationSource).toBe('session-policy')
+    expect(routing?.why?.some(entry =>
+      entry.includes('catalog: snapshot unavailable') && entry.includes('not evidence of provider absence'))).toBe(true)
+    expect(h.engine.peek(h.root.id)?.phase).not.toBe('needs-owner-decision')
+    // The gate actually ran AFTER the outage began — the read failed, not the
+    // route's ability to serve.
+    const afterOutage = f.llm.preflights.slice(preflightsBefore)
+    expect(afterOutage.some(config => config.provider === 'beta' && config.model === 'm-c')).toBe(true)
+  })
+
+  it('(b) outage + every policy route failing preflight ⇒ inheritance RETAINED with the outage and every skip named — no escalation', async () => {
+    const f = fixture(MODELS, PRESENT_ABC)
+    const h = makeHarness({
+      routing: f.portsFor(),
+      subagents: stubSubagents({ verdicts: [{ verdict: 'pass', note: 'plan ok' }] }),
+    })
+    await toPlannedAudit(h)
+
+    f.llm.preflightRejects.set('alpha/m-a', 'resolveCallConfig: scripted rejection under outage')
+    f.llm.preflightRejects.set('beta/m-c', 'resolveCallConfig: scripted rejection under outage')
+    f.llm.failProviders = true
+    f.catalog.invalidate()
+
+    await h.engine.audit(h.root, { role: 'plan', prompt: 'packet' })
+    // Pool-walk discipline: exhausting the ranked list on preflight-only
+    // evidence (no liveness leg was assertable) retains INHERITANCE — the
+    // dispatch carries no agentOptions and the run does NOT escalate.
+    expect(h.subagents.auditOptions[0]).toBeUndefined()
+    const routing = routingOf(h, 'audit', 'plan-auditor')
+    expect(routing?.pin).toBeUndefined()
+    expect(routing?.why?.some(entry =>
+      entry.includes('catalog: snapshot unavailable') && entry.includes('not evidence of provider absence'))).toBe(true)
+    expect(routing?.why?.some(entry =>
+      entry.includes('rejected all 2 ranked candidate(s) under the catalog outage')
+      && entry.includes('alpha/m-a') && entry.includes('beta/m-c')
+      && entry.includes('inheritance retained'))).toBe(true)
+    expect(h.engine.peek(h.root.id)?.phase).not.toBe('needs-owner-decision')
+    // The walk really attempted both candidates — the outage did not end it
+    // early at the intersection.
+    expect(f.llm.preflights.some(config => config.provider === 'alpha' && config.model === 'm-a')).toBe(true)
+    expect(f.llm.preflights.some(config => config.provider === 'beta' && config.model === 'm-c')).toBe(true)
+  })
+
+  it('(c) LIVE catalog + empty intersection ⇒ the pre-F23 inheritance stands, record unchanged', async () => {
+    // A live catalog that intersects nothing in the policy: on a successful
+    // read, absence IS evidence, and the empty-intersection inheritance is
+    // the honest termination — the F23 carve-out must not weaken it.
+    const f = fixture(MODELS, { kind: 'present', routes: [{ provider: 'gamma', model: 'm-g' }, { provider: 'delta', model: 'm-d' }] })
+    const h = makeHarness({
+      routing: f.portsFor(),
+      subagents: stubSubagents({ verdicts: [{ verdict: 'pass', note: 'plan ok' }] }),
+    })
+    await toPlannedAudit(h)
+
+    await h.engine.audit(h.root, { role: 'plan', prompt: 'packet' })
+    expect(h.subagents.auditOptions[0]).toBeUndefined()
+    const routing = routingOf(h, 'audit', 'plan-auditor')
+    expect(routing?.pin).toBeUndefined()
+    expect(routing?.why?.some(entry =>
+      entry.includes('authorized set is EMPTY after the live-catalog intersection'))).toBe(true)
+    expect(routing?.why?.some(entry => entry.includes('catalog: snapshot unavailable'))).toBe(false)
+  })
+})

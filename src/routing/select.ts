@@ -8,7 +8,10 @@
  *
  *  1. Eligibility — route ∈ authorized set; provider live in the catalog.
  *     An empty intersection terminates to INHERITANCE with the reason
- *     recorded ([R2-P2-2a]: an infrastructure fact, not a verdict).
+ *     recorded ([R2-P2-2a]: an infrastructure fact, not a verdict). A catalog
+ *     READ failure is the mirror case (F23): the outage SKIPS the
+ *     intersection — the policy routes stay candidates and preflight gates —
+ *     so an unreadable catalog is never mistaken for an empty one.
  *  2. Role floor — `minContext` (default executor/planner 131072, auditors
  *     65536). A KNOWN context window below the floor excludes the candidate;
  *     an UNKNOWN one keeps it eligible, ranked after every known-sufficient
@@ -45,11 +48,11 @@
 import { errorMessage } from '../domain/types.js'
 import type { Risk } from '../domain/types.js'
 import { catalogRank, providerIsLive } from './catalog.js'
-import type { LlmResolvedModelInfo, RouteCatalog } from './catalog.js'
+import type { CatalogSnapshot, LlmResolvedModelInfo, RouteCatalog } from './catalog.js'
 import { independenceOf, sameRoute, toRoutePin } from './identity.js'
 import type { IndependenceRecord, RoutePin, RouteRef } from './identity.js'
 import { authorizedAutoRoutes, resolvePluginGrant } from './authorize.js'
-import type { AuthorizationSource, SessionPolicyState } from './authorize.js'
+import type { AuthorizationSource, AutoAuthorization, SessionPolicyState } from './authorize.js'
 
 /** The roles GAH routes (plan "Roles and routing"); auditor roles carry the independence constraint. */
 export type Role = 'executor' | 'plan-auditor' | 'execution-auditor' | 'rules-auditor' | 'planner'
@@ -317,13 +320,113 @@ async function selectLocked(input: RouteSelectionInput): Promise<SelectionDecisi
 
 // ── Auto: the ordered rule table over policy ∩ live catalog ──
 
+/**
+ * F23 (PR #2 Codex round 11): what a catalog-read outage changes in the
+ * ranked walk. `note` rides `why` on EVERY outcome (selected route and
+ * retained inheritance alike) in the F14 wording family; `tieBreak` keeps
+ * the preference line from claiming an adapter-preferred order the outage
+ * made unobservable.
+ */
+interface CatalogOutageContext {
+  readonly note: string
+  readonly tieBreak: string
+}
+
+/**
+ * Trim, drop non-explicit, dedupe — preserving policy order: the same
+ * discipline as `normalizeRoutes` in `./authorize.ts` (module-private there,
+ * and `authorize.ts` is outside this fix's write surface). The outage path
+ * needs the normalized policy routes WITHOUT the live-provider intersection,
+ * so the normalization is restated here rather than reaching for the
+ * intersection just to borrow its cleanup.
+ */
+function policyRoutesVerbatim(routes: readonly RouteRef[]): readonly RoutePin[] {
+  const out: RoutePin[] = []
+  for (const route of routes) {
+    const pin = toRoutePin(route)
+    if (pin === undefined) continue
+    if (!out.some((kept) => sameRoute(kept, pin))) out.push(pin)
+  }
+  return out
+}
+
 async function selectAuto(input: RouteSelectionInput): Promise<SelectionDecision> {
   const snapshot = await input.catalog.snapshot()
+  // F23 (PR #2 Codex round 11): branch on the read's own status BEFORE the
+  // live-provider intersection — the F14/F17 conflation class on the last
+  // unguarded path. An `unavailable` snapshot (a `listProviders` throw)
+  // carries an EMPTY provider list, so intersecting it with the policy read
+  // "the catalog could not be read" as "every policy provider is gone": a
+  // fresh auto dispatch inherited WITHOUT attempting `resolveModelInfo` or
+  // preflight — both of which run independently of the failed listing — and
+  // the evidence never named the outage. Liveness is asserted only on a
+  // SUCCESSFUL read; under an outage the policy routes remain candidates and
+  // preflight is the actual gate, exactly as F14 made it for locks and pins
+  // and F17 for the pool walk.
+  if (snapshot.catalogStatus === 'unavailable') {
+    return selectAutoUnderCatalogOutage(input, snapshot)
+  }
   const live = new Set(snapshot.providers.map((provider) => provider.id.trim()).filter((id) => id.length > 0))
-  const authorized = authorizedAutoRoutes(input.policy, live)
+  return selectAutoRanked(input, snapshot, authorizedAutoRoutes(input.policy, live), undefined)
+}
+
+/**
+ * The auto rule table under a catalog READ failure. The empty-POLICY
+ * inheritance path (absent/unreachable policy) is unchanged — it never
+ * consults the catalog, so the outage changes nothing about it (the empty
+ * live set is inert on those branches of `authorizedAutoRoutes`). A PRESENT
+ * policy SKIPS the intersection — running it against the outage's
+ * provably-empty provider list would manufacture evidence of absence the
+ * read cannot support — and hands the normalized policy routes to the ranked
+ * walk, where `resolveModelInfo` supplies the facts and `resolveCallConfig`
+ * preflight is the gate.
+ */
+async function selectAutoUnderCatalogOutage(input: RouteSelectionInput, snapshot: CatalogSnapshot): Promise<SelectionDecision> {
+  const outage: CatalogOutageContext = {
+    note:
+      `catalog: snapshot unavailable (${snapshot.diagnostic ?? 'no diagnostic recorded'}) — ` +
+      'catalog read failed (infrastructure), not evidence of provider absence; ' +
+      'the policy routes remain candidates and preflight is the actual gate',
+    tieBreak: 'ties in policy order — the catalog listing is unavailable, so no adapter-preferred order exists to break them',
+  }
+  if (input.policy.kind !== 'present') {
+    return selectAutoRanked(input, snapshot, authorizedAutoRoutes(input.policy, new Set<string>()), undefined)
+  }
+  const normalized = policyRoutesVerbatim(input.policy.routes)
+  const droppedInvalid = input.policy.routes.length - normalized.length
+  const why: string[] = [
+    `authorization: session model-selection policy present — ${normalized.length} route(s) after normalization; ` +
+      'the live-catalog intersection is SKIPPED (catalog read failed — infrastructure, not evidence of provider absence)',
+  ]
+  if (droppedInvalid > 0) {
+    why.push(`authorization: ${droppedInvalid} policy entr(y|ies) lacked an explicit provider/model and were dropped`)
+  }
+  return selectAutoRanked(
+    input,
+    snapshot,
+    { inheritOnly: false, routes: normalized, authorizationSource: 'session-policy', why },
+    outage,
+  )
+}
+
+/**
+ * The ordered rule table (steps 1–6) over an already-resolved authorized
+ * set. With `outage === undefined` this is the live-catalog path,
+ * byte-identical to the pre-F23 behavior; an outage context only (a) names
+ * the outage on every outcome, (b) states the policy-order tie-break
+ * honestly, (c) rewords the empty-set reason (no intersection ran), and
+ * (d) retains INHERITANCE — the pool walk's skip discipline — when every
+ * candidate fails preflight on preflight-only evidence.
+ */
+async function selectAutoRanked(
+  input: RouteSelectionInput,
+  snapshot: CatalogSnapshot,
+  authorized: AutoAuthorization,
+  outage: CatalogOutageContext | undefined,
+): Promise<SelectionDecision> {
   const inheritDecision = (extraWhy: readonly string[]): SelectionDecision => ({
     kind: 'inherit',
-    why: [...authorized.why, ...extraWhy],
+    why: [...authorized.why, ...extraWhy, ...(outage !== undefined ? [outage.note] : [])],
     ...(authorized.authorizationSource !== undefined ? { authorizationSource: authorized.authorizationSource } : {}),
   })
   if (authorized.inheritOnly) {
@@ -332,7 +435,9 @@ async function selectAuto(input: RouteSelectionInput): Promise<SelectionDecision
   const why = [...authorized.why]
   if (authorized.routes.length === 0) {
     return inheritDecision([
-      'eligibility: the authorized set is EMPTY after the live-catalog intersection — terminating to inheritance per eligibility rule 1 (an infrastructure fact, not a verdict)',
+      outage !== undefined
+        ? 'eligibility: the policy holds NO explicit routes after normalization — nothing to rank, terminating to inheritance (no intersection ran; the catalog outage is not the cause)'
+        : 'eligibility: the authorized set is EMPTY after the live-catalog intersection — terminating to inheritance per eligibility rule 1 (an infrastructure fact, not a verdict)',
     ])
   }
   if (authorized.routes.length === 1) {
@@ -400,7 +505,7 @@ async function selectAuto(input: RouteSelectionInput): Promise<SelectionDecision
         : input.preference === 'quality'
           ? 'has-reasoning-efforts first, then contextWindow descending'
           : 'efforts preferred, then contextWindow descending') +
-      '; ties in adapter-preferred catalog order',
+      (outage !== undefined ? `; ${outage.tieBreak}` : '; ties in adapter-preferred catalog order'),
   )
   const orderedSufficient = byCatalog.filter((candidate) => contextWindowOf(candidate) !== undefined)
   if (input.preference === 'economy') {
@@ -465,6 +570,17 @@ async function selectAuto(input: RouteSelectionInput): Promise<SelectionDecision
   }
   if (chosen === undefined) {
     const chain = fallbackFrom.map((record) => `${record.provider}/${record.model}: ${record.reason}`).join('; ')
+    if (outage !== undefined) {
+      // F23, the pool walk's skip discipline (F17): exhausting the ranked
+      // list under an outage retains INHERITANCE with every skip named. The
+      // walk's evidence is preflight-only — no liveness leg was assertable —
+      // so escalating to the owner on partial evidence would read the
+      // outage as a verdict. A live read exhausting preflight stays
+      // `blocked` below, unchanged.
+      return inheritDecision([
+        `preflight: resolveCallConfig rejected all ${fallbackFrom.length} ranked candidate(s) under the catalog outage — skips: ${chain}; no route dispatched, inheritance retained`,
+      ])
+    }
     return {
       kind: 'blocked',
       reason: `every ranked candidate failed preflight — ${chain}`,
@@ -507,7 +623,7 @@ async function selectAuto(input: RouteSelectionInput): Promise<SelectionDecision
       ...(effort !== undefined ? { reasoningEffort: effort } : {}),
       ...(chosen.independence !== undefined ? { independence: chosen.independence } : {}),
     },
-    why,
+    why: [...why, ...(outage !== undefined ? [outage.note] : [])],
     candidatesConsidered: considered,
     authorizationSource: authorized.authorizationSource ?? 'session-policy',
     ...(fallbackFrom.length > 0 ? { fallbackFrom } : {}),

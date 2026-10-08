@@ -934,3 +934,134 @@ describe('src/routing structural guards (AC1/AC2)', () => {
     }
   })
 })
+
+describe('select: F23 (PR #2 round 11) — a catalog outage is not "all providers gone" for auto selection', () => {
+  /** Two policy routes over two providers, the whole-catalog READ failing. */
+  const OUTAGE_MODELS: readonly StubModel[] = [
+    { provider: 'alpha', id: 'm-a', contextWindow: 131072, efforts: ['high'], defaultEffort: 'high' },
+    { provider: 'beta', id: 'm-c', contextWindow: 200000, efforts: ['high'], defaultEffort: 'high' },
+  ]
+
+  it('outage + policy routes + preflight green ⇒ DISPATCHES the policy route (not inherit), why names the outage', async () => {
+    const stubbed = stubLlm(OUTAGE_MODELS, { failProviders: true })
+    const decision = await selectRoute(
+      selection({
+        policy: presentPolicy(['alpha', 'm-a'], ['beta', 'm-c']),
+        catalog: new RouteCatalog(stubbed),
+        executorPin: { provider: 'alpha', model: 'm-a' },
+      }),
+    )
+    const route = expectRoute(decision)
+    // The rule table ran on the policy routes: auditor independence at medium
+    // puts the both-axis-distinct beta/m-c first — a CHOICE was made, which
+    // the old empty-intersection inherit could never record.
+    expect(route.route).toMatchObject({ provider: 'beta', model: 'm-c', reasoningEffort: 'high' })
+    expect(route.route.independence).toEqual({ modelAxis: 'distinct', providerAxis: 'distinct', outcome: 'achieved' })
+    expect(route.authorizationSource).toBe('session-policy')
+    expectWhy(
+      decision,
+      /intersection is SKIPPED/,
+      /ties in policy order — the catalog listing is unavailable/,
+      /^catalog: snapshot unavailable/,
+      /not evidence of provider absence/,
+      /preflight: resolveCallConfig accepted beta\/m-c/,
+    )
+    // The gate actually ran despite the failed listing: facts resolution and
+    // preflight were both attempted (they talk to the host directly).
+    expect(stubbed.calls.listProviders).toBeGreaterThan(0)
+    expect(stubbed.calls.preflight.some((config) => config.provider === 'beta' && config.model === 'm-c')).toBe(true)
+  })
+
+  it('outage + every candidate failing preflight ⇒ INHERITANCE retained (pool-walk discipline), why names the outage and every skip — never blocked', async () => {
+    const stubbed = stubLlm(OUTAGE_MODELS, { failProviders: true, rejectPreflightFor: ['m-a', 'm-c'] })
+    const decision = await selectRoute(
+      selection({
+        role: 'executor',
+        policy: presentPolicy(['alpha', 'm-a'], ['beta', 'm-c']),
+        catalog: new RouteCatalog(stubbed),
+        executorPin: undefined,
+      }),
+    )
+    expect(decision.kind).toBe('inherit')
+    if (decision.kind === 'inherit') {
+      expect(decision.authorizationSource).toBe('session-policy')
+      expectWhy(
+        decision,
+        /rejected all 2 ranked candidate\(s\) under the catalog outage/,
+        /alpha\/m-a: resolveCallConfig rejected alpha\/m-a: scripted rejection/,
+        /beta\/m-c: resolveCallConfig rejected beta\/m-c: scripted rejection/,
+        /inheritance retained/,
+        /^catalog: snapshot unavailable/,
+      )
+    }
+    // The outage did not end the walk early at the intersection: every
+    // candidate was actually walked to preflight.
+    expect(stubbed.calls.preflight).toHaveLength(2)
+  })
+
+  it('outage + a single policy route ⇒ the fixture-(c) single-route inheritance stands, the outage named beside it', async () => {
+    const decision = await selectRoute(
+      selection({
+        policy: presentPolicy(['alpha', 'm-a']),
+        catalog: catalogOf([{ provider: 'alpha', id: 'm-a', contextWindow: 131072 }], { failProviders: true }),
+      }),
+    )
+    expect(decision.kind).toBe('inherit')
+    if (decision.kind === 'inherit') {
+      expect(decision.authorizationSource).toBe('session-policy')
+      expectWhy(decision, /single route \(alpha\/m-a\)/, /an explicit selection would claim a choice that never happened/, /^catalog: snapshot unavailable/)
+    }
+  })
+
+  it('outage + every candidate below the role floor ⇒ the floor inheritance stands, the outage named (floors unchanged)', async () => {
+    const decision = await selectRoute(
+      selection({
+        policy: presentPolicy(['alpha', 'm-tiny'], ['beta', 'm-small']),
+        catalog: catalogOf(
+          [
+            { provider: 'alpha', id: 'm-tiny', contextWindow: 1000 },
+            { provider: 'beta', id: 'm-small', contextWindow: 2000 },
+          ],
+          { failProviders: true },
+        ),
+      }),
+    )
+    expect(decision.kind).toBe('inherit')
+    if (decision.kind === 'inherit') {
+      expectWhy(decision, /every authorized route has a KNOWN context window below the floor/, /^catalog: snapshot unavailable/)
+    }
+  })
+
+  it('LIVE read + empty intersection ⇒ the exact pre-F23 inheritance record, byte for byte', async () => {
+    const decision = await selectRoute(
+      selection({
+        policy: presentPolicy(['gamma', 'm-1'], ['delta', 'm-2']),
+        catalog: catalogOf([{ provider: 'alpha', id: 'm-a' }]),
+      }),
+    )
+    expect(decision).toEqual({
+      kind: 'inherit',
+      authorizationSource: 'session-policy',
+      why: [
+        'authorization: session model-selection policy present — 2 route(s) after normalization, 0 with a live provider',
+        'authorization: no live provider for gamma/m-1, delta/m-2',
+        'eligibility: the authorized set is EMPTY after the live-catalog intersection — terminating to inheritance per eligibility rule 1 (an infrastructure fact, not a verdict)',
+      ],
+    })
+  })
+
+  it('outage + absent policy ⇒ the exact empty-POLICY inheritance record — the outage is not smuggled in', async () => {
+    const decision = await selectRoute(
+      selection({
+        policy: ABSENT_POLICY,
+        catalog: catalogOf(OUTAGE_MODELS, { failProviders: true }),
+      }),
+    )
+    expect(decision).toEqual({
+      kind: 'inherit',
+      why: [
+        'authorization: no session model-selection policy recorded (the native default) — auto mode performs inheritance only; settings are never consulted as authority',
+      ],
+    })
+  })
+})
