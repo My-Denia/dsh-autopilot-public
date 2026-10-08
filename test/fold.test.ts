@@ -2099,6 +2099,40 @@ describe('routing pins derive from dispatch detail.routing, last-wins per role',
       .toThrowError(/authorizationSource is required/)
   })
 
+  // ── F22 (PR #2 Codex round 10): 'unreachable-inherit' is pinless, on replay too ──
+
+  it('rejects a pin combined with authorizationSource "unreachable-inherit" (F22: that source cannot authorize a route)', () => {
+    const prior = makeSnapshot({ phase: 'plan-reviewing' }, STANDARD_TRIAGE)
+    expect(() => applyEvent(prior, auditWithRouting(prior, { role: 'plan-auditor', pin: PIN, why: ['x'], authorizationSource: 'unreachable-inherit' }, { 'plan-auditor': PIN })))
+      .toThrowError(/unreachable-inherit.*pin|pin.*unreachable-inherit/)
+  })
+
+  it('accepts a PINLESS unreachable-inherit decision — the real engine\'s only shape for that source (F22)', () => {
+    const prior = makeSnapshot({ phase: 'plan-reviewing' }, STANDARD_TRIAGE)
+    const next = applyEvent(prior, auditWithRouting(prior, { role: 'plan-auditor', why: ['authorization: session model-selection policy projection unreachable — inheritance only'], authorizationSource: 'unreachable-inherit' }, undefined))
+    expect(next.routingPins).toBeUndefined()
+  })
+
+  it('other sources with pins are unchanged by the F22 strictness', () => {
+    const prior = makeSnapshot({ phase: 'plan-reviewing' }, STANDARD_TRIAGE)
+    for (const source of ['session-policy', 'plugin-config'] as const) {
+      const next = applyEvent(prior, auditWithRouting(prior, { role: 'plan-auditor', pin: PIN, why: ['x'], authorizationSource: source }, { 'plan-auditor': PIN }))
+      expect(next.routingPins).toEqual({ 'plan-auditor': PIN })
+    }
+  })
+
+  it('a 0.2.0-shaped audit event (no detail.routing) folds unchanged — F22 rejects only the new combination (replay compat)', () => {
+    const prior = makeSnapshot({ phase: 'plan-reviewing' }, STANDARD_TRIAGE)
+    const next = applyEvent(prior, event('audit', makeSnapshot({
+      revision: prior.revision + 1,
+      phase: 'executing',
+      planGate: 'pass',
+      audits: prior.audits,
+    }, STANDARD_TRIAGE), prior.revision + 1))
+    expect(next.phase).toBe('executing')
+    expect(next.routingPins).toBeUndefined()
+  })
+
   it('rejects a non-auditor role on an audit op', () => {
     const prior = makeSnapshot({ phase: 'plan-reviewing' }, STANDARD_TRIAGE)
     expect(() => applyEvent(prior, auditWithRouting(prior, { role: 'executor', pin: PIN, why: ['x'], authorizationSource: 'plugin-config' }, { executor: PIN })))

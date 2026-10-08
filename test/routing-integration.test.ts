@@ -2098,3 +2098,105 @@ describe('F20 (PR #2 round 9): pin reuse over a pool grant recovers the complete
       && config.maxTokens === undefined && config.reasoningEffort === 'high')).toBe(true)
   })
 })
+
+// ── F21 (PR #2 Codex round 10): blank pool efforts normalize to absence ──
+//
+// The pool entry schema accepts `reasoningEffort: ''` (or whitespace) — a
+// blank string is a legal value. Before F21 the blank value was copied into
+// the routing PIN and dispatched verbatim, while the fold's detail validation
+// requires an effort to be a NON-EMPTY string when present: a completed plan
+// audit's verdict commit was then rejected by the fold AFTER the run had
+// already entered plan-reviewing, wedging the run there. The fix normalizes
+// blank/whitespace pool efforts to ABSENCE at the ONE construction seam
+// (the engine's normalized pool read), so dispatch options, the pin, the
+// preflight, and the fold's validation all agree that a blank pool effort
+// names no effort at all — exactly what a blank LOCK effort already meant
+// (lock resolution trims-or-drops, `effortOf` in resolveRouting).
+
+describe('F21 (PR #2 round 10): blank pool efforts normalize to absence before pin/dispatch', () => {
+  /** The F7(f) shape — NO routing ports, executor on the alpha family — with the pool entry's effort scripted. */
+  function blankEffortHarness(effort: string): Harness {
+    return makeHarness({
+      config: {
+        executor: { agentOptions: { provider: 'alpha', model: 'm-a' } },
+        crossFamily: { enabled: true, minRisk: 'medium', pool: [{ provider: 'beta', model: 'm-c', reasoningEffort: effort }] },
+      },
+      subagents: stubSubagents({ verdicts: [{ verdict: 'pass', note: 'ok' }] }),
+    })
+  }
+
+  it('(a) empty-string effort + no catalog port ⇒ dispatch and pin carry NO effort; the verdict commit folds and the run completes plan review', async () => {
+    const h = blankEffortHarness('')
+    // Before F21 this threw AP_ROUTING_DETAIL at the verdict commit with the
+    // run already wedged in plan-reviewing; now the plan gate completes.
+    await toExecuting(h)
+    expect(h.subagents.auditOptions[0]).toEqual({ provider: 'beta', model: 'm-c' })
+    const routing = routingOf(h, 'audit', 'plan-auditor')
+    expect(routing?.pin).toEqual({ provider: 'beta', model: 'm-c' })
+    expect('reasoningEffort' in (routing?.pin ?? {})).toBe(false)
+    expect(h.engine.peek(h.root.id)?.phase).toBe('executing')
+    expect(h.engine.peek(h.root.id)?.planGate).toBe('pass')
+    // The durable stream replays clean through the verdict commit: the fold
+    // accepted the routing detail the engine wrote.
+    expect(foldRun(eventsOf(h)).snapshot?.phase).toBe('executing')
+  })
+
+  it('(b) whitespace-only effort ⇒ same absence (a blank is a blank, trim-exact)', async () => {
+    const h = blankEffortHarness('   ')
+    await toExecuting(h)
+    expect(h.subagents.auditOptions[0]).toEqual({ provider: 'beta', model: 'm-c' })
+    const routing = routingOf(h, 'audit', 'plan-auditor')
+    expect(routing?.pin).toEqual({ provider: 'beta', model: 'm-c' })
+    expect(h.engine.peek(h.root.id)?.planGate).toBe('pass')
+    expect(foldRun(eventsOf(h)).snapshot?.planGate).toBe('pass')
+  })
+
+  it('(c) a non-empty effort is preserved verbatim on dispatch and pin (existing green, restated)', async () => {
+    const h = blankEffortHarness('high')
+    await toExecuting(h)
+    expect(h.subagents.auditOptions[0]).toEqual({ provider: 'beta', model: 'm-c', reasoningEffort: 'high' })
+    expect(routingOf(h, 'audit', 'plan-auditor')?.pin).toEqual({ provider: 'beta', model: 'm-c', reasoningEffort: 'high' })
+    expect(h.engine.peek(h.root.id)?.planGate).toBe('pass')
+  })
+
+  it('(d) a padded-but-present effort is TRIMMED to its value — the same normalization lock resolution applies (parity)', async () => {
+    const h = blankEffortHarness(' high ')
+    await toExecuting(h)
+    expect(h.subagents.auditOptions[0]).toEqual({ provider: 'beta', model: 'm-c', reasoningEffort: 'high' })
+    expect(routingOf(h, 'audit', 'plan-auditor')?.pin).toEqual({ provider: 'beta', model: 'm-c', reasoningEffort: 'high' })
+  })
+
+  it('(e) with a catalog wired, the WALK dispatch/pin/preflight AND the pool-authorized pin REUSE all carry no effort', async () => {
+    const llm = new StubLlm(MODELS)
+    const catalog = new RouteCatalog(llm)
+    const h = makeHarness({
+      routing: { catalog, policyReader: () => ABSENT },
+      config: {
+        executor: { agentOptions: { provider: 'alpha', model: 'm-a' } },
+        crossFamily: { enabled: true, minRisk: 'medium', pool: [{ provider: 'beta', model: 'm-c', reasoningEffort: '' }] },
+      },
+      subagents: stubSubagents({ verdicts: [
+        { verdict: 'pass', note: 'plan ok' },
+        { verdict: 'pass', note: 'exec ok' },
+        { verdict: 'pass', note: 'exec ok again' },
+      ] }),
+    })
+    await toClosing(h)
+    // The walk's first dispatches: the entry minus its blank effort.
+    expect(h.subagents.auditOptions[0]).toEqual({ provider: 'beta', model: 'm-c' })
+    expect(h.subagents.auditOptions[1]).toEqual({ provider: 'beta', model: 'm-c' })
+    expect(h.engine.peek(h.root.id)?.routingPins?.['execution-auditor']).toEqual({ provider: 'beta', model: 'm-c' })
+    // Every beta/m-c preflight ran on the effort-less shape too.
+    expect(llm.preflights.filter(config => config.provider === 'beta' && config.model === 'm-c')
+      .every(config => config.reasoningEffort === undefined)).toBe(true)
+
+    await h.engine.audit(h.root, { role: 'execution', prompt: 'again' })
+    // The pool-authorized REUSE (auditorPoolMatchFor) recovers the normalized
+    // entry: no blank effort rides the second dispatch, and the recorded pin
+    // stays effort-less instead of resurrecting the blank.
+    expect(h.subagents.auditOptions[2]).toEqual({ provider: 'beta', model: 'm-c' })
+    const details = routingDetails(h).filter(detail => detail.role === 'execution-auditor')
+    expect(details[details.length - 1]?.pin).toEqual({ provider: 'beta', model: 'm-c' })
+    expect(foldRun(eventsOf(h)).snapshot?.phase).toBe('closing')
+  })
+})

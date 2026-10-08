@@ -1527,7 +1527,11 @@ export class AutopilotEngine {
           risk: prior.triage.risk,
           configured: this.config.auditors[request.role]?.agentOptions,
           executor: this.config.executor.agentOptions,
-          policy: this.config.crossFamily,
+          // F21: the pool leg of the policy reads the normalized pool (the one
+          // seam), so a POOL pick's blank effort never reaches the pin built
+          // below; the legacy `configured` surface stays verbatim (0.2.0
+          // dispatch parity for mode 'off').
+          policy: { ...this.config.crossFamily, pool: this.normalizedPool() },
         })
         agentOptions = choice.agentOptions
         familyChoice = choice
@@ -2961,6 +2965,41 @@ export class AutopilotEngine {
   }
 
   /**
+   * F21 (PR #2 Codex round 10): the pool as the engine CONSTRUCTS from it —
+   * every entry's `reasoningEffort` normalized exactly the way lock
+   * resolution normalizes a lock's effort (`effortOf` in resolveRouting:
+   * trimmed when non-blank, ABSENCE when blank/whitespace). THE ONE SEAM:
+   * every place the engine converts a pool entry into a routing pin, dispatch
+   * agentOptions, or a preflight reads THIS pool — the walk in `poolFallback`,
+   * the reuse recovery in `auditorPoolMatchFor`, and both `selectCrossFamily`
+   * policy inputs — so dispatch, pin, preflight, and the fold's detail
+   * validation can never disagree about the effort a pool entry names. The
+   * config schema accepts `''`/whitespace efforts, and before this seam the
+   * blank value was copied into the pin AND dispatched while the fold rejects
+   * a pin whose effort is empty — a completed plan audit's verdict commit then
+   * failed AFTER the run had entered plan-reviewing, wedging it there. A
+   * blank pool effort now means what a blank lock effort already meant: the
+   * entry names no effort at all. `config.crossFamily.pool` itself is kept
+   * verbatim (resolved config is read-only, and in-place owner edits remain
+   * live — normalization is applied at consumption, per decision, not by
+   * mutating the resolved object); route identity (provider/model) is left
+   * as-written because the pin constructions downstream already normalize it
+   * through `toRoutePin`.
+   */
+  private normalizedPool(): readonly AgentOptionsLike[] {
+    return this.config.crossFamily.pool.map((entry) => {
+      const effort = entry.reasoningEffort
+      if (effort === undefined) return entry
+      const trimmed = effort.trim()
+      if (trimmed.length === 0) {
+        const { reasoningEffort: _blank, ...rest } = entry
+        return rest
+      }
+      return trimmed === effort ? entry : { ...entry, reasoningEffort: trimmed }
+    })
+  }
+
+  /**
    * F20 (PR #2 Codex round 9): the pool entry a pinned route currently
    * matches, when the pool is an authority for the role at all. The
    * pool-equality reclassification is AUDITOR-only (F9), so a non-auditor
@@ -2987,7 +3026,7 @@ export class AutopilotEngine {
     readonly dispatch: AgentOptionsLike & { readonly provider: string; readonly model: string }
   } | undefined {
     if (!AUDITOR_ROLE_SET.includes(role)) return undefined
-    const entry = this.config.crossFamily.pool.find(candidate => {
+    const entry = this.normalizedPool().find(candidate => {
       const route = toRoutePin(candidate)
       return route !== undefined && sameRoute(route, pin)
     })
@@ -3440,7 +3479,10 @@ export class AutopilotEngine {
       risk: prior.triage.risk,
       configured: undefined,
       executor: familySource,
-      policy: this.config.crossFamily,
+      // F21: the pool the choice consults is the same normalized pool the
+      // walk below iterates — one seam, so the pick the choice names and the
+      // entry the walk dispatches cannot disagree about effort.
+      policy: { ...this.config.crossFamily, pool: this.normalizedPool() },
     })
     if (toRoutePin(choice.agentOptions) === undefined) return inherit
     // F10: auditor-only. A non-auditor role (the executor) never dispatches
@@ -3475,7 +3517,7 @@ export class AutopilotEngine {
     // every iteration shares one read) and recorded on whichever resolution
     // the walk returns — never a silent skip of the liveness leg.
     let outage: string | undefined
-    for (const entry of this.config.crossFamily.pool) {
+    for (const entry of this.normalizedPool()) {
       const candidate = toRoutePin(entry)
       if (candidate === undefined) continue
       const family = familyOf(entry)

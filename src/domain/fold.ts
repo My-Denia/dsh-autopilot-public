@@ -213,6 +213,23 @@ function evidenceKindStamp(detail: unknown): 'absent' | 'invalid' | 'v1' {
  * with the same strictness: a fabricated considered set is as dishonest on
  * replay as a fabricated pin, entry by entry over closed vocabularies.
  *
+ * F22 (PR #2 Codex round 10), ADDITIVE STRICTNESS: a decision whose
+ * `authorizationSource` is `'unreachable-inherit'` must be PINLESS. That
+ * source exists to label one thing — an inheritance-only result of an
+ * unreadable policy projection — so it cannot be the recorded authority for
+ * an explicit route; accepting the combination would persist an
+ * authorization-bearing pin whose stated source cannot authorize it.
+ * Replay-compat, stated here because the rule narrows what replays: it only
+ * REJECTS combinations that (a) no 0.2.0 stream ever contained —
+ * `detail.routing` itself is new in this branch, so every 0.2.0 event takes
+ * the no-routing arm below and no historical fixture can carry the pair —
+ * and (b) no stream this branch's engine writes can contain, because the
+ * engine stamps `'unreachable-inherit'` only on inheritance resolutions,
+ * which are pinless by construction (the no-catalog auto-inherit branch and
+ * the selector's unreachable-projection inherit). The rule therefore rejects
+ * only hand-edited or foreign streams; the 0.2.0 fixture replay stays green
+ * (asserted alongside, and by the legacy suite).
+ *
  * Returns the VALIDATED detail, or `undefined` when no routing decision is
  * present (the 0.2.0 shape — every historical fixture takes this arm).
  */
@@ -273,6 +290,13 @@ function routingDecisionOf(op: Operation, detail: unknown): RoutingDecisionDetai
     if (typeof source !== 'string' || !ROUTING_AUTHORIZATION_SOURCES.includes(source)) {
       problems.push(
         `${where}.authorizationSource must be one of ${ROUTING_AUTHORIZATION_SOURCES.join('|')}, got ${JSON.stringify(source)}`,
+      )
+    } else if (source === 'unreachable-inherit' && record.pin !== undefined) {
+      // F22 (see the doc comment above): the source names an inheritance-only
+      // result of an unreadable policy projection — it cannot authorize a pin.
+      problems.push(
+        `${where}: authorizationSource "unreachable-inherit" cannot authorize the pin ${JSON.stringify(record.pin)} — `
+          + 'that source marks an inheritance-only result of an unreadable policy projection; a decision carrying a pin must name an authority that can authorize it (session-policy or plugin-config) or carry no pin at all',
       )
     }
   } else if ('pin' in record && record.pin !== undefined) {
