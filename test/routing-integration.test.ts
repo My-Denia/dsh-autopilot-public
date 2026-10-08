@@ -1333,3 +1333,217 @@ describe('F9/F10 (PR #2 round 4): auditor-only pool grants and pool fallback', (
     expect(h.engine.peek(h.root.id)?.routingPins?.['plan-auditor']).toEqual({ provider: 'beta', model: 'm-c' })
   })
 })
+
+// ── F11 (PR #2 Codex round 5): an equal-route lock rebuilds the ROUTE fields from the lock ──
+//
+// When the written lock's route EQUALS the legacy surface's route, the legacy
+// object used to be dispatched VERBATIM — including a legacy `reasoningEffort`
+// the lock deliberately omits, while preflight and route evidence ran on the
+// lock's fields (no effort): the dispatched child differed from both the
+// explicit lock and its recorded evidence. Now equal-route dispatch keeps the
+// legacy NON-ROUTE tuning (E2's 0.2.0 resolve contract: `maxTokens` and
+// siblings) but builds provider/model/reasoningEffort from the lock — an
+// effort present in legacy but absent from the lock is NOT dispatched. The
+// unequal/absent-legacy path is unchanged (the lock's own fields only).
+
+describe('F11 (PR #2 round 5): an equal-route lock rebuilds route identity fields from the lock', () => {
+  // alpha/m-a declares every effort the fixtures name; alpha/m-b declares
+  // none, so a lock on it preflights (and dispatches) with NO effort unless
+  // the lock names one — making effort absence assertable exactly.
+  const F11_MODELS: readonly StubModel[] = [
+    { provider: 'alpha', id: 'm-a', contextWindow: 131072, efforts: ['high', 'low'], defaultEffort: 'high' },
+    { provider: 'alpha', id: 'm-b', contextWindow: 131072 },
+  ]
+
+  /** Drive a delegated run to a passed plan gate, then start the (locked) executor once. */
+  async function startedExecutor(
+    agentOptions: AgentOptionsLike,
+    lock: { provider: string; model: string; reasoningEffort?: string },
+  ): Promise<{ readonly h: Harness; readonly f: Fixture }> {
+    const f = fixture(F11_MODELS, ABSENT)
+    const h = makeHarness({
+      routing: f.portsFor(),
+      config: {
+        executor: { agentOptions },
+        routing: { roles: { executor: { lock } } },
+      },
+      subagents: stubSubagents({ verdicts: [{ verdict: 'pass', note: 'plan ok' }] }),
+    })
+    const signal = new AbortController().signal
+    await h.engine.init(h.root, makeTriage(STANDARD_DELEGATED), [undeclaredSeed('m1')])
+    await h.engine.declareUsage(h.root, makeUsageEntry({ id: 'm1' }))
+    await h.engine.submitPlan(h.root, 'plan')
+    await h.engine.audit(h.root, { role: 'plan', prompt: 'packet' })
+    const started = await h.engine.startExecutor(h.root, { prompt: 'implement', signal })
+    expect(started.executor?.state).toBe('running')
+    return { h, f }
+  }
+
+  it('(i) equal route: legacy maxTokens rides, a legacy effort the lock omits is NOT dispatched, and pin/preflight agree with the dispatch', async () => {
+    const { h, f } = await startedExecutor(
+      { provider: 'alpha', model: 'm-b', maxTokens: 8192, reasoningEffort: 'high' },
+      { provider: 'alpha', model: 'm-b' },
+    )
+    // Non-route tuning rides; the route identity (including NO effort) is the lock's.
+    expect(h.subagents.continuableOptions[0]).toEqual({ provider: 'alpha', model: 'm-b', maxTokens: 8192 })
+    const routing = routingOf(h, 'start-executor', 'executor')
+    expect(routing?.pin).toEqual({ provider: 'alpha', model: 'm-b' })
+    expect(routing?.authorizationSource).toBe('plugin-config')
+    // The equal-route provenance note still fires ([R2-P1-1]).
+    expect(routing?.why?.some(entry => entry.includes('grant source is the legacy executor.agentOptions surface'))).toBe(true)
+    // Preflight ran on the LOCK's fields (m-b declares no default effort): no
+    // effort reached the check, exactly as none reached the dispatch.
+    expect(f.llm.preflights.some(config =>
+      config.provider === 'alpha' && config.model === 'm-b' && config.reasoningEffort === undefined)).toBe(true)
+  })
+
+  it('(ii) equal route with a lock-named effort: the lock’s effort WINS over a different legacy effort (tuning still rides)', async () => {
+    const { h } = await startedExecutor(
+      { provider: 'alpha', model: 'm-a', maxTokens: 2048, reasoningEffort: 'high' },
+      { provider: 'alpha', model: 'm-a', reasoningEffort: 'low' },
+    )
+    expect(h.subagents.continuableOptions[0]).toEqual({ provider: 'alpha', model: 'm-a', maxTokens: 2048, reasoningEffort: 'low' })
+    expect(routingOf(h, 'start-executor', 'executor')?.pin).toEqual({ provider: 'alpha', model: 'm-a', reasoningEffort: 'low' })
+  })
+
+  it('(iii) routeless legacy executor under an explicit lock: the E8 boundary holds — nothing rides, the lock’s fields only', async () => {
+    const { h } = await startedExecutor(
+      { provider: 'alpha' },
+      { provider: 'alpha', model: 'm-b' },
+    )
+    // Routeless legacy does NOT ride an explicit lock (the E8 decided
+    // boundary): the dispatch is exactly the lock's own fields.
+    expect(h.subagents.continuableOptions[0]).toEqual({ provider: 'alpha', model: 'm-b' })
+    expect(routingOf(h, 'start-executor', 'executor')?.pin).toEqual({ provider: 'alpha', model: 'm-b' })
+  })
+})
+
+// ── F12 (PR #2 Codex round 5): the pool fallback's builder family sees locks and pins ──
+//
+// The fallback's builder-family input used to come from the legacy
+// `executor.agentOptions` surface alone, so with a lock-only or pin-only
+// executor route `selectCrossFamily` read `unknown-family` and never consulted
+// a valid out-of-family pool entry. The family is now sourced through the F5
+// order — dispatch pin → live routing lock → legacy surface — with the
+// executor's own just-refused pin never counting as a declaration, and the
+// checked walk (grant → liveness → preflight) unchanged.
+
+describe('F12 (PR #2 round 5): the pool fallback builder family is sourced from the executor pin/lock', () => {
+  /** A policy cell the test can flip in place (same closure discipline as the F1/F9 blocks). */
+  function flippable(initial: SessionPolicyState): {
+    readonly llm: StubLlm
+    readonly ports: RoutingPorts
+    readonly flip: (next: SessionPolicyState) => void
+  } {
+    const cell: { policy: SessionPolicyState } = { policy: initial }
+    const llm = new StubLlm(MODELS)
+    const catalog = new RouteCatalog(llm)
+    return { llm, ports: { catalog, policyReader: () => cell.policy }, flip: next => { cell.policy = next } }
+  }
+
+  /** The last routing detail for one (op, role) pair in the durable stream. */
+  function lastRouting(h: Harness, op: string, role: string): RoutingDecisionDetail | undefined {
+    const details = routingDetails(h).filter(detail => detail.op === op && detail.role === role)
+    return details[details.length - 1]
+  }
+
+  it('(a) executor route via a routing lock ONLY (no legacy surface): the auditor’s inherit falls to the pool and the checked walk dispatches the pick', async () => {
+    const f = fixture(MODELS, ABSENT)
+    const h = makeHarness({
+      routing: f.portsFor(),
+      config: {
+        routing: { roles: { executor: { lock: { provider: 'alpha', model: 'm-a' } } } },
+        auditors: { plan: { agentOptions: { provider: 'alpha' } } },
+        crossFamily: { enabled: true, minRisk: 'medium', pool: [{ provider: 'beta', model: 'm-c' }] },
+      },
+      subagents: stubSubagents({ verdicts: [{ verdict: 'pass', note: 'ok' }] }),
+    })
+    await toExecuting(h)
+    expect(h.subagents.auditOptions[0]).toEqual({ provider: 'beta', model: 'm-c' })
+    const routing = routingOf(h, 'audit', 'plan-auditor')
+    expect(routing?.pin).toEqual({ provider: 'beta', model: 'm-c' })
+    expect(routing?.authorizationSource).toBe('plugin-config')
+    expect(routing?.why?.some(entry => entry.includes('the 0.2.0 pool fallback supplied beta/m-c as a plugin-config grant'))).toBe(true)
+    // The walk’s checks actually ran over the lock-sourced family: the pick
+    // was preflighted like any explicit selection.
+    expect(f.llm.preflights.some(config => config.provider === 'beta' && config.model === 'm-c')).toBe(true)
+    expect(h.engine.peek(h.root.id)?.routingPins?.['plan-auditor']).toEqual({ provider: 'beta', model: 'm-c' })
+    // The executor never dispatched: its family reached the walk through the LOCK alone.
+    expect(h.engine.peek(h.root.id)?.routingPins?.executor).toBeUndefined()
+    expect(h.engine.peek(h.root.id)?.audits[0]?.route?.crossFamily).toBe('achieved')
+  })
+
+  it('(b) executor route via an AUTO PIN only: after the policy flips absent, the re-selected auditor’s fallback sees the pin’s family and dispatches the out-of-family pool entry', async () => {
+    const wiring = flippable(PRESENT_ABC)
+    const h = makeHarness({
+      routing: wiring.ports,
+      config: {
+        auditors: { plan: { agentOptions: { provider: 'beta' } } },
+        crossFamily: { enabled: true, minRisk: 'medium', pool: [{ provider: 'alpha', model: 'm-a' }] },
+      },
+      subagents: stubSubagents({ verdicts: [
+        { verdict: 'pass', note: 'plan ok' },
+        { verdict: 'pass', note: 'plan ok again' },
+      ] }),
+    })
+    const signal = new AbortController().signal
+    await h.engine.init(h.root, makeTriage(STANDARD_DELEGATED), [undeclaredSeed('m1')])
+    await h.engine.declareUsage(h.root, makeUsageEntry({ id: 'm1' }))
+    await h.engine.submitPlan(h.root, 'plan')
+    // Audit #1: the auditor selects beta/m-c from the present policy (no
+    // executor pin/lock/legacy exists yet, so no axes input).
+    await h.engine.audit(h.root, { role: 'plan', prompt: 'packet' })
+    // The executor auto-selects beta/m-c and PINS it — the only place its
+    // route exists (no legacy surface, no lock).
+    await h.engine.startExecutor(h.root, { prompt: 'implement', signal })
+    const executorPin = { provider: 'beta', model: 'm-c', reasoningEffort: 'high' }
+    expect(h.engine.peek(h.root.id)?.routingPins?.executor).toEqual(executorPin)
+
+    await h.engine.replan(h.root, 'round two')
+    wiring.flip(ABSENT)
+    await h.engine.submitPlan(h.root, 'plan v2')
+    // Audit #2: the auditor’s own pin is refused on the absent policy ⇒ inherit
+    // ⇒ the fallback, whose builder family is the EXECUTOR PIN’s (’beta’).
+    await h.engine.audit(h.root, { role: 'plan', prompt: 'packet' })
+
+    expect(h.subagents.auditOptions[1]).toEqual({ provider: 'alpha', model: 'm-a' })
+    const second = lastRouting(h, 'audit', 'plan-auditor')
+    expect(second?.pin).toEqual({ provider: 'alpha', model: 'm-a' })
+    expect(second?.authorizationSource).toBe('plugin-config')
+    // The fallback ran on the auditor’s own conservative re-selection (the why
+    // names the refused pin — the pool record deliberately rebuilds the detail
+    // and keeps the re-selection provenance in `why`), and the walk preflighted
+    // the pick like any explicit selection.
+    expect(second?.why?.some(entry =>
+      entry.includes('pin: re-selecting') && entry.includes('refusing the pin conservatively'))).toBe(true)
+    expect(second?.why?.some(entry => entry.includes('the 0.2.0 pool fallback supplied alpha/m-a as a plugin-config grant'))).toBe(true)
+    // The walk’s checks ran on the pin-sourced family: the pick was preflighted
+    // like any explicit selection.
+    expect(wiring.llm.preflights.some(config => config.provider === 'alpha' && config.model === 'm-a')).toBe(true)
+    expect(h.engine.peek(h.root.id)?.routingPins?.executor).toEqual(executorPin)
+  })
+
+  it('(c) genuinely unrouted executor (no pin, no lock, no legacy surface): the honest unknown-family inheritance path is retained', async () => {
+    const f = fixture(MODELS, ABSENT)
+    const h = makeHarness({
+      routing: f.portsFor(),
+      config: {
+        auditors: { plan: { agentOptions: { provider: 'alpha' } } },
+        crossFamily: { enabled: true, minRisk: 'medium', pool: [{ provider: 'beta', model: 'm-c' }] },
+      },
+      subagents: stubSubagents({ verdicts: [{ verdict: 'pass', note: 'ok' }] }),
+    })
+    await toExecuting(h)
+    // No executor family is observable ⇒ the pool is not in play: the auditor
+    // inherits, its routeless legacy tuning carries, and the record says
+    // unknown-family instead of claiming a pick.
+    expect(h.subagents.auditOptions[0]).toEqual({ provider: 'alpha' })
+    const routing = routingOf(h, 'audit', 'plan-auditor')
+    expect(routing?.pin).toBeUndefined()
+    expect(routing?.authorizationSource).toBeUndefined()
+    expect(routing?.why?.some(entry => entry.includes('carried onto the inherit dispatch'))).toBe(true)
+    expect(routing?.why?.some(entry => entry.includes('pool fallback supplied'))).toBe(false)
+    expect(h.engine.peek(h.root.id)?.audits[0]?.route?.crossFamily).toBe('unknown-family')
+    expect(h.engine.peek(h.root.id)?.routingPins?.['plan-auditor']).toBeUndefined()
+  })
+})

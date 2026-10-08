@@ -2809,9 +2809,16 @@ export class AutopilotEngine {
   }
 
   /**
-   * The dispatch agentOptions for a locked role: the legacy object VERBATIM when
-   * its route equals the lock (its `maxTokens` and siblings keep their 0.2.0
-   * meaning — E2's resolve contract), else the lock's own fields.
+   * The dispatch agentOptions for a locked role. When the legacy surface's
+   * route EQUALS the lock, the legacy NON-ROUTE tuning rides (`maxTokens` and
+   * siblings keep their 0.2.0 meaning — E2's resolve contract) while the
+   * route identity fields — `provider`, `model`, AND `reasoningEffort` — are
+   * built from the lock itself (F11, PR #2 Codex round 5): an effort present
+   * in legacy but absent from the lock is NOT dispatched, because preflight
+   * and route evidence run on the lock's fields and the dispatched child must
+   * match both the explicit lock and its recorded evidence. When the legacy
+   * route is unequal or absent, the lock's own fields only — nothing rides
+   * from a legacy surface the lock did not confirm.
    */
   private lockedAgentOptions(role: Role, roleRouting: RoleRouting & { readonly mode: 'locked' }): AgentOptionsLike {
     const legacy = this.legacyOptionsFor(role)
@@ -2822,7 +2829,14 @@ export class AutopilotEngine {
       && legacyPin.provider === roleRouting.provider
       && legacyPin.model === roleRouting.model
     ) {
-      return roleRouting.reasoningEffort === undefined ? legacy : { ...legacy, reasoningEffort: roleRouting.reasoningEffort }
+      // Strip the legacy ROUTE identity; keep every other field as tuning.
+      const { provider: _legacyProvider, model: _legacyModel, reasoningEffort: _legacyEffort, ...tuning } = legacy
+      return {
+        ...tuning,
+        provider: roleRouting.provider,
+        model: roleRouting.model,
+        ...(roleRouting.reasoningEffort === undefined ? {} : { reasoningEffort: roleRouting.reasoningEffort }),
+      }
     }
     return {
       provider: roleRouting.provider,
@@ -3157,7 +3171,50 @@ export class AutopilotEngine {
    * never runs and the inheritance result stands, with the withheld pick
    * named honestly in `why`. The E11 checked walk (grant → liveness →
    * preflight) is unchanged for auditors.
+   *
+   * F12 (PR #2 Codex round 5): the builder family is sourced through
+   * `executorFamilySourceOf(prior)` — dispatch pin, then the live routing
+   * lock, then the legacy `executor.agentOptions` surface (the F5 order,
+   * with the legacy tail kept at 0.2.0 family granularity: a provider-only
+   * legacy executor still names its family) — not the legacy surface alone.
+   * Before, a lock-only or pin-only executor route made
+   * `familyOf(legacy-absent)` read `undefined`, so `selectCrossFamily` saw
+   * `unknown-family` and a valid out-of-family pool entry was never consulted;
+   * the executor's DECLARED family now reaches the choice and the walk. The
+   * genuinely unrouted executor (no pin, no lock, no legacy provider) keeps
+   * the honest `unknown-family` inheritance path, and the checked walk itself
+   * is unchanged.
    */
+  /**
+   * The executor's CURRENT family source for the pool fallback (F12): the F5
+   * order — dispatch pin, live routing lock, legacy surface — read at FAMILY
+   * granularity. `executorPinOf` walks pin → lock → a FULL legacy route; the
+   * legacy tail here keeps the 0.2.0 granularity `familyOf` always had: a
+   * provider-only legacy executor (`{ provider: 'alpha' }`, no model ⇒ no pin
+   * leg) still names its family (the F10(b)/(c) fixtures). Only an executor
+   * with no pin, no lock, and no legacy provider yields `undefined` — the
+   * honest `unknown-family` case.
+   *
+   * The PIN leg is skipped when THIS decision just refused the executor's own
+   * pin (`repinFrom` on the inherit resolution the fallback decorates — the
+   * executor role reaching here always arrives via that refusal): a refused
+   * pin names no family the fallback can consult, and letting the dead pin
+   * shadow the legacy surface would silently change which pool entries count
+   * as out-of-family exactly when the executor's route is least settled.
+   */
+  private executorFamilySourceOf(
+    prior: Snapshot,
+    refusedExecutorPin: RoutingPin | undefined,
+  ): AgentOptionsLike | undefined {
+    const pinned = refusedExecutorPin === undefined ? this.executorPinOf(prior) : undefined
+    if (pinned !== undefined) return pinned
+    const executorRouting = this.routingConfig().routing.roles.executor
+    if (executorRouting.mode === 'locked') {
+      return { provider: executorRouting.provider, model: executorRouting.model }
+    }
+    return this.config.executor.agentOptions
+  }
+
   private async poolFallback(
     role: Role,
     prior: Snapshot,
@@ -3169,11 +3226,18 @@ export class AutopilotEngine {
     // an observable builder family) and supplies the outcome word the
     // record cites. Its pick — the FIRST pool entry outside the builder
     // family — is where the checked walk below STARTS; the walk may continue
-    // past it when the dispatch checks reject it.
+    // past it when the dispatch checks reject it. F12: the builder family is
+    // the executor's CURRENT route (pin → live lock → legacy surface), so a
+    // lock-only or pin-only executor route is a real family input here — with
+    // the executor's own just-refused pin (repinFrom) never counting as one.
+    const familySource = this.executorFamilySourceOf(
+      prior,
+      role === 'executor' ? inherit.routing?.repinFrom : undefined,
+    )
     const choice = selectCrossFamily({
       risk: prior.triage.risk,
       configured: undefined,
-      executor: this.config.executor.agentOptions,
+      executor: familySource,
       policy: this.config.crossFamily,
     })
     if (toRoutePin(choice.agentOptions) === undefined) return inherit
@@ -3198,7 +3262,7 @@ export class AutopilotEngine {
       }
     }
     const catalog = this.routingPorts.catalog
-    const builder = familyOf(this.config.executor.agentOptions)
+    const builder = familyOf(familySource)
     // F7: walk the pool in order over the entries the 0.2.0 rule considers —
     // a well-formed route whose family differs from the builder's — so the
     // first entry `selectCrossFamily` names is checked first and a dead one
