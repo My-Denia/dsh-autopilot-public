@@ -2304,3 +2304,148 @@ describe('F23 (PR #2 round 11): a catalog outage is not "all providers gone" for
     expect(routing?.why?.some(entry => entry.includes('catalog: snapshot unavailable'))).toBe(false)
   })
 })
+
+// ── F24 (PR #2 Codex round 12): the pool walk dispatches the NORMALIZED route it preflighted ──
+//
+// `toRoutePin` trims provider/model, so the walk's grant, liveness, and
+// preflight legs all validate the NORMALIZED route — but the dispatch handed
+// the subagent start the RAW entry (`agentOptions: entry`): a pool entry
+// `{ provider: ' beta ', model: ' m-c ' }` passed every check as `beta/m-c`
+// while the child start received the padded strings — dispatch failure or
+// route-evidence mismatch. The walk now builds ONE normalized dispatch object
+// per candidate (route identity from the trimmed pin, non-route call-config
+// fields from the entry) and uses that SAME object for preflight AND the
+// dispatched agentOptions — including the no-catalog-port path, where no
+// preflight exists to disagree but the dispatched route still must be the one
+// the grant check authorized. Site audit: the F20 reuse recovery
+// (`auditorPoolMatchFor`) already composed its dispatch with provider/model
+// from the trimmed `toRoutePin` route, so it needed NO change — (b) locks
+// that invariant in. Blank-after-trim route fields stay malformed entries the
+// existing well-formedness gate rejects, unchanged.
+
+describe('F24 (PR #2 round 12): the pool walk dispatches the normalized route that passed preflight', () => {
+  it('(a) a padded pool entry ⇒ dispatched agentOptions carry the TRIMMED route, preflight received the identical object, evidence/pin record the normalized route', async () => {
+    const llm = new StubLlm(MODELS)
+    const catalog = new RouteCatalog(llm)
+    const h = makeHarness({
+      routing: { catalog, policyReader: () => ABSENT },
+      config: {
+        executor: { agentOptions: { provider: 'alpha', model: 'm-a' } },
+        crossFamily: {
+          enabled: true,
+          minRisk: 'medium',
+          // Padding on every route field: provider, model, AND effort (the
+          // effort arrives already trimmed through the F21 pool seam; the
+          // provider/model padding is what the raw-entry dispatch leaked).
+          pool: [{ provider: ' beta ', model: ' m-c ', maxTokens: 4321, reasoningEffort: ' high ' }],
+        },
+      },
+      subagents: stubSubagents({ verdicts: [{ verdict: 'pass', note: 'ok' }] }),
+    })
+    await toExecuting(h)
+
+    // The child start received the TRIMMED route identity — never the padded
+    // raw entry fields — with the entry's non-route tuning riding whole.
+    const dispatched = h.subagents.auditOptions[0]
+    expect(dispatched).toEqual({ provider: 'beta', model: 'm-c', maxTokens: 4321, reasoningEffort: 'high' })
+
+    // Preflight proven to have received the IDENTICAL object (fields equal —
+    // the F24 invariant: preflight exactly what you dispatch, normalization
+    // included)...
+    expect(llm.preflights.some(config =>
+      config.provider === dispatched?.provider
+      && config.model === dispatched?.model
+      && config.maxTokens === dispatched?.maxTokens
+      && config.reasoningEffort === dispatched?.reasoningEffort)).toBe(true)
+    // ...and NEVER the raw padded fields, on any leg of the walk.
+    expect(llm.preflights.some(config =>
+      config.provider !== config.provider.trim() || config.model !== config.model.trim())).toBe(false)
+
+    // Evidence/pin record the normalized route: the pin and the grant note
+    // name beta/m-c, and the durable stream folds the detail clean.
+    const routing = routingOf(h, 'audit', 'plan-auditor')
+    expect(routing?.pin).toEqual({ provider: 'beta', model: 'm-c', reasoningEffort: 'high' })
+    expect(routing?.authorizationSource).toBe('plugin-config')
+    expect(routing?.why?.some(entry => entry.includes('supplied beta/m-c as a plugin-config grant'))).toBe(true)
+    expect(h.engine.peek(h.root.id)?.routingPins?.['plan-auditor']).toEqual({ provider: 'beta', model: 'm-c', reasoningEffort: 'high' })
+    expect(foldRun(eventsOf(h)).snapshot?.phase).toBe('executing')
+  })
+
+  it('(b) pin-reuse recovery over a PADDED pool entry ⇒ the reuse dispatch carries the trimmed route (F20 site audited: already normalized)', async () => {
+    const llm = new StubLlm(MODELS)
+    const catalog = new RouteCatalog(llm)
+    const h = makeHarness({
+      routing: { catalog, policyReader: () => ABSENT },
+      config: {
+        executor: { agentOptions: { provider: 'alpha', model: 'm-a' } },
+        crossFamily: { enabled: true, minRisk: 'medium', pool: [{ provider: ' beta ', model: ' m-c ', maxTokens: 4321 }] },
+      },
+      subagents: stubSubagents({ verdicts: [
+        { verdict: 'pass', note: 'plan ok' },
+        { verdict: 'pass', note: 'exec ok' },
+        { verdict: 'pass', note: 'exec ok again' },
+      ] }),
+    })
+    await toClosing(h)
+    // The walk's dispatches pinned the NORMALIZED route...
+    expect(h.subagents.auditOptions[1]).toEqual({ provider: 'beta', model: 'm-c', maxTokens: 4321 })
+    expect(h.engine.peek(h.root.id)?.routingPins?.['execution-auditor']).toEqual({ provider: 'beta', model: 'm-c' })
+
+    const preflightsBefore = llm.preflights.length
+    await h.engine.audit(h.root, { role: 'execution', prompt: 'again' })
+
+    // ...and the F20 reuse recovery (auditorPoolMatchFor's pre-composed
+    // dispatch — audited for F24, already provider/model-from-the-trimmed-
+    // route) dispatches the trimmed route with the entry's tuning whole.
+    expect(h.subagents.auditOptions[2]).toEqual({ provider: 'beta', model: 'm-c', maxTokens: 4321 })
+    const details = routingDetails(h).filter(detail => detail.role === 'execution-auditor')
+    const last = details[details.length - 1]
+    expect(last?.pin).toEqual({ provider: 'beta', model: 'm-c' })
+    expect(last?.authorizationSource).toBe('plugin-config')
+    const reusePreflights = llm.preflights.slice(preflightsBefore)
+    expect(reusePreflights.some(config =>
+      config.provider === 'beta' && config.model === 'm-c' && config.maxTokens === 4321)).toBe(true)
+    expect(reusePreflights.some(config =>
+      config.provider !== config.provider.trim() || config.model !== config.model.trim())).toBe(false)
+  })
+
+  it('(c) no catalog port ⇒ the dispatch still carries the TRIMMED route (no preflight leg exists, but the grant check authorized beta/m-c)', async () => {
+    // The 0.2.0-parity path: with no catalog port there is no preflight to
+    // disagree with the dispatch — which is exactly why the raw entry used to
+    // leak here unchallenged. The dispatched route must still be the one the
+    // grant rule authorized: the normalized beta/m-c, never the padded entry.
+    const h = makeHarness({
+      config: {
+        executor: { agentOptions: { provider: 'alpha', model: 'm-a' } },
+        crossFamily: { enabled: true, minRisk: 'medium', pool: [{ provider: ' beta ', model: ' m-c ' }] },
+      },
+      subagents: stubSubagents({ verdicts: [{ verdict: 'pass', note: 'ok' }] }),
+    })
+    await toExecuting(h)
+    expect(h.subagents.auditOptions[0]).toEqual({ provider: 'beta', model: 'm-c' })
+    const routing = routingOf(h, 'audit', 'plan-auditor')
+    expect(routing?.pin).toEqual({ provider: 'beta', model: 'm-c' })
+    expect(routing?.why?.some(entry => entry.includes('supplied beta/m-c as a plugin-config grant'))).toBe(true)
+    expect(routing?.why?.some(entry => entry.includes('no catalog port wired'))).toBe(true)
+  })
+
+  it('(d) a clean entry ⇒ the composed dispatch is field-identical to the entry (0.2.0 behavior unchanged, restated)', async () => {
+    const llm = new StubLlm(MODELS)
+    const catalog = new RouteCatalog(llm)
+    const h = makeHarness({
+      routing: { catalog, policyReader: () => ABSENT },
+      config: {
+        executor: { agentOptions: { provider: 'alpha', model: 'm-a' } },
+        crossFamily: { enabled: true, minRisk: 'medium', pool: [{ provider: 'beta', model: 'm-c', maxTokens: 2048 }] },
+      },
+      subagents: stubSubagents({ verdicts: [{ verdict: 'pass', note: 'ok' }] }),
+    })
+    await toExecuting(h)
+    // Trimming a clean string is the identity: the normalization composition
+    // changes nothing for well-formed entries — byte-identical dispatch.
+    expect(h.subagents.auditOptions[0]).toEqual({ provider: 'beta', model: 'm-c', maxTokens: 2048 })
+    expect(routingOf(h, 'audit', 'plan-auditor')?.pin).toEqual({ provider: 'beta', model: 'm-c' })
+    expect(llm.preflights.some(config =>
+      config.provider === 'beta' && config.model === 'm-c' && config.maxTokens === 2048)).toBe(true)
+  })
+})

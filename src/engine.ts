@@ -3018,7 +3018,11 @@ export class AutopilotEngine {
    * when no current entry matches — the edit that removed it took the grant
    * with it, and the pin must stand on session-policy membership alone or
    * re-select; there is no entry to recover and no silent degradation back
-   * to a three-field reconstruction.
+   * to a three-field reconstruction. F24 (PR #2 Codex round 12) audited this
+   * composition for the raw-entry route-field leak fixed in the pool walk:
+   * this path needed NO change — provider/model are overridden from the
+   * trimmed `toRoutePin` route (and the effort from the F21-normalized pool),
+   * so the reuse dispatch can never carry untrimmed route fields.
    */
   private auditorPoolMatchFor(role: Role, pin: RoutingPin): {
     readonly entry: AgentOptionsLike
@@ -3529,11 +3533,39 @@ export class AutopilotEngine {
       if (verdict.kind === 'conflict') return { kind: 'escalate', reason: verdict.reason }
       const effort = entry.reasoningEffort
       const pin = { provider: candidate.provider, model: candidate.model, ...(effort === undefined ? {} : { reasoningEffort: effort }) }
+      // F24 (PR #2 Codex round 12): ONE normalized dispatch object per pool
+      // candidate — route identity (provider/model) from the trimmed pin the
+      // grant and liveness legs checked, every non-route call-config field
+      // from the entry itself (F15's full-field discipline; the effort is
+      // already the normalized value — F21's `normalizedPool` seam supplies
+      // these entries). Grant, liveness, and preflight all validate the
+      // NORMALIZED route, but the dispatch below used to hand the subagent
+      // start the RAW entry: a pool entry `{ provider: ' alpha ', model:
+      // ' model ' }` passed every check as `alpha/model` while the child start
+      // received the untrimmed strings — dispatch failure or route-evidence
+      // mismatch. The SAME object is now both preflighted and dispatched
+      // (preflight exactly what you dispatch, now including normalization),
+      // and it rides the no-catalog-port path too — there is no preflight leg
+      // there to disagree, but the dispatched route still must be the one the
+      // grant check authorized. For a clean entry the composition is
+      // field-identical to the entry (0.2.0 behavior unchanged). Site audit
+      // for the same leak: the F20 reuse recovery (`auditorPoolMatchFor`'s
+      // pre-composed dispatch) already builds its object with
+      // `provider`/`model` overridden from the trimmed `toRoutePin` route, so
+      // it needed NO change — this walk's two `agentOptions: entry` sites were
+      // the only raw-entry dispatch paths. Blank-after-trim route fields never
+      // reach here: `toRoutePin` returns `undefined` and the walk's
+      // well-formedness gate skips the entry, unchanged.
+      const dispatch: AgentOptionsLike & { readonly provider: string; readonly model: string } = {
+        ...entry,
+        provider: candidate.provider,
+        model: candidate.model,
+      }
       const grantNote = `cross-family: the routing core terminated to inheritance; the 0.2.0 pool fallback supplied ${candidate.provider}/${candidate.model} as a plugin-config grant (${choice.outcome})`
       if (catalog === undefined) {
         return {
           kind: 'dispatch',
-          agentOptions: entry,
+          agentOptions: dispatch,
           routing: {
             role,
             pin,
@@ -3580,20 +3612,19 @@ export class AutopilotEngine {
       // routed through `resolveCallConfig` WHOLE (route identity normalized
       // to the trimmed pin the grant/liveness legs checked): walk acceptance
       // now implies dispatch validity. Grant-first ordering and the honest
-      // skip records are unchanged.
+      // skip records are unchanged. F24: the object preflighted here is the
+      // SAME `dispatch` object the resolution below carries — never a
+      // parallel reconstruction that could drift (in fields or in
+      // normalization) from what the subagent start receives.
       try {
-        await catalog.preflight({
-          ...entry,
-          provider: candidate.provider,
-          model: candidate.model,
-        })
+        await catalog.preflight(dispatch)
       } catch (error) {
         skipped.push(`cross-family: pool route ${candidate.provider}/${candidate.model} skipped — dispatch preflight rejected it (${errorMessage(error)})`)
         continue
       }
       return {
         kind: 'dispatch',
-        agentOptions: entry,
+        agentOptions: dispatch,
         routing: {
           role,
           pin,
