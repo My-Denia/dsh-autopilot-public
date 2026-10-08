@@ -784,7 +784,11 @@ export function observedRouteOf(session: SessionReadRef | undefined): {
  *
  * `verified` ONLY when selected, creation, and observed are ALL present and
  * agree on every comparable axis (provider, model, and reasoningEffort where
- * both legs carry it). Any disagreement among the legs that ARE present ⇒
+ * both legs carry it — and the effort axis is only establishable when the
+ * observed `request/header` CARRIES the field: a selection that pins an
+ * effort while the observed header omits it is `unverifiable`, never
+ * `verified`, because the child's own evidence cannot show the selected
+ * effort ran). Any disagreement among the legs that ARE present ⇒
  * `mismatch` with the differing axes named — divergence is signal, recorded
  * and never hidden. A missing leg while a claim was in scope ⇒ `unverifiable`
  * naming which read failed: creation-only evidence is NEVER `verified` (the
@@ -839,13 +843,26 @@ export function routeStatusOf(childId: string, evidence: RouteEvidence): {
   const observedGap = observed === undefined
     ? `observed route not readable: ${evidence.observedUnreadable ?? 'unreadable'}`
     : undefined
+  // F18 (PR #2 Codex round 8): a comparable leg pinning an effort while the
+  // observed `request/header` OMITS the optional field leaves the effort axis
+  // unestablishable — the observed evidence cannot show the selected effort
+  // ran, so its silence must not read as agreement. Only the OBSERVED omission
+  // is a gap: an observed effort with no selected one keeps the existing
+  // handling (the axis is not comparable without both legs), and both absent
+  // means there is no effort axis to establish at all.
+  const effortGap = selected?.reasoningEffort !== undefined && observed !== undefined && observed.reasoningEffort === undefined
+    ? `child ${childId}: observed request/header omits reasoningEffort (selected ${selected.reasoningEffort}) — the selected effort is not observable from the child session; the leg is unverifiable, not agreed`
+    : undefined
   // 2 — a claim was in scope (a selection, or a full creation route to check).
   if (selected !== undefined || creationFull) {
     if (observed === undefined) {
       return { routeStatus: 'unverifiable', routeDiagnostic: [creationGap, observedGap].filter(Boolean).join('; ') }
     }
     if (selected !== undefined && !creationFull) {
-      return { routeStatus: 'unverifiable', routeDiagnostic: creationGap }
+      return { routeStatus: 'unverifiable', routeDiagnostic: [creationGap, effortGap].filter(Boolean).join('; ') }
+    }
+    if (effortGap !== undefined) {
+      return { routeStatus: 'unverifiable', routeDiagnostic: effortGap }
     }
     if (selected !== undefined) return { routeStatus: 'verified' }
     return {

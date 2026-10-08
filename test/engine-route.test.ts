@@ -100,6 +100,41 @@ describe('routeStatusOf implements the plan v3 status semantics', () => {
     expect(out.routeDiagnostic).toContain('reasoningEffort')
   })
 
+  it('F18: a selected effort the observed header OMITS is unverifiable, never verified — silence is not agreement', () => {
+    // Provider and model agree on every leg; the ONLY gap is the observed
+    // header lacking the optional reasoningEffort field. The old code skipped
+    // the comparison and returned `verified`, overstating what the child's
+    // evidence could establish: it cannot show the selected effort ran.
+    const out = routeStatusOf('c1', {
+      selected: PIN,
+      creation: CREATION,
+      observed: { provider: 'beta', model: 'm-c' },
+    })
+    expect(out.routeStatus).toBe('unverifiable')
+    expect(out.routeDiagnostic).toContain('observed request/header omits reasoningEffort')
+    expect(out.routeDiagnostic).toContain('high')
+    expect(out.routeDiagnostic).toContain('unverifiable, not agreed')
+  })
+
+  it('F18: the effort gap is named alongside the creation gap when the creation leg is also partial', () => {
+    const out = routeStatusOf('c1', {
+      selected: PIN,
+      observed: { provider: 'beta', model: 'm-c' },
+    })
+    expect(out.routeStatus).toBe('unverifiable')
+    expect(out.routeDiagnostic).toContain('not available from durable Agent options')
+    expect(out.routeDiagnostic).toContain('observed request/header omits reasoningEffort')
+  })
+
+  it('F18 symmetric guard: both legs omit the effort — no axis, agreement still verified', () => {
+    const out = routeStatusOf('c1', {
+      selected: { provider: 'beta', model: 'm-c' },
+      creation: CREATION,
+      observed: { provider: 'beta', model: 'm-c' },
+    })
+    expect(out).toEqual({ routeStatus: 'verified' })
+  })
+
   it('(ii) a provider-axis divergence between creation and observed is named even with no selection', () => {
     const out = routeStatusOf('c1', {
       creation: { provider: 'alpha', model: 'm-a' },

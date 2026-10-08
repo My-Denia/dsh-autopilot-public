@@ -1436,7 +1436,13 @@ export async function apply(rawCtx: unknown, config?: ConfigInput): Promise<() =
   // mount that never closed leaves the domain reserved for the life of the
   // process, and every later mount under storeKind "auto" quietly degrades
   // to the file backend. So the failure path closes what it opened, then
-  // rethrows the original error unchanged.
+  // rethrows the original error unchanged. F19 (PR #2 Codex round 8): the
+  // routing wiring is part of "what it opened" — once
+  // `createRoutingWiring` has subscribed `llm/adapters-updated` (and possibly
+  // registered the mirror projection), any LATER throw would leave those
+  // host-surface registrations behind, and every retry would stack another
+  // stale listener; the failure path holds its own reference and disposes it.
+  let wiringForFailure: RoutingWiring | undefined
   try {
     // Seam installation is PER ROOT AGENT, so the record of it is too: one
     // root's `tools/pre-execute` registration can succeed while another's
@@ -1458,6 +1464,7 @@ export async function apply(rawCtx: unknown, config?: ConfigInput): Promise<() =
     // what this mount can actually see. Disposers (adapters-updated
     // subscription, mirror projection registration) ride the plugin lifecycle.
     const routing = createRoutingWiring(rawCtx, message => warn(rawCtx, message))
+    wiringForFailure = routing
     // F3 (PR #2 Codex review): the planner installer port is a DYNAMIC
     // import away, and the engine must never be exposed before it is known —
     // a run entering planning at cold mount would otherwise record
@@ -1704,6 +1711,20 @@ export async function apply(rawCtx: unknown, config?: ConfigInput): Promise<() =
       if (store instanceof DomainRunStore) await store.close()
     }
   } catch (error: unknown) {
+    // F19 (PR #2 Codex round 8): release the wiring's host-surface
+    // registrations (the `llm/adapters-updated` subscription, the mirror
+    // projection) BEFORE the rethrow, alongside the store close — a failed
+    // mount must not leave them behind for the next one to stack on. The
+    // disposer is idempotent (`splice(0)` drains it once; the plugin
+    // lifecycle disposer calls it again safely) and it already swallows each
+    // inner disposer's throw; the belt-and-braces catch below only guards
+    // against the loop itself failing, so teardown can never mask the error
+    // that caused the unwind.
+    try {
+      wiringForFailure?.dispose()
+    } catch {
+      // A wiring teardown failure must not mask the original error.
+    }
     if (store instanceof DomainRunStore) {
       try {
         await store.close()
