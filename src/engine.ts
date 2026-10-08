@@ -58,7 +58,7 @@ import { SHELL_TOOLS, egressSegments, isEgressCommand } from './gate/decide.js'
 import { matchesAtTokenBoundary } from './outbound/manifest.js'
 import type { RunStoreLike } from './store/types.js'
 import { selectRoute } from './routing/select.js'
-import type { Role, RoleRouting, RoutePreference, SelectionDecision } from './routing/select.js'
+import type { Role, RoleRouting, RoutePreference, SelectedRoute, SelectionDecision } from './routing/select.js'
 import { resolvePluginGrant } from './routing/authorize.js'
 import type { GrantSource, SessionPolicyState } from './routing/authorize.js'
 import { RouteCatalog, providerIsLive } from './routing/catalog.js'
@@ -2883,29 +2883,52 @@ export class AutopilotEngine {
    * route EQUALS the lock, the legacy NON-ROUTE tuning rides (`maxTokens` and
    * siblings keep their 0.2.0 meaning — E2's resolve contract) while the
    * route identity fields — `provider`, `model`, AND `reasoningEffort` — are
-   * built from the lock itself (F11, PR #2 Codex round 5): an effort present
-   * in legacy but absent from the lock is NOT dispatched, because preflight
-   * and route evidence run on the lock's fields and the dispatched child must
-   * match both the explicit lock and its recorded evidence. When the legacy
-   * route is unequal or absent, the lock's own fields only — nothing rides
-   * from a legacy surface the lock did not confirm.
+   * composed from the SELECTOR'S route, never the legacy surface (F11, PR #2
+   * Codex round 5): an effort present in legacy but absent from the lock is
+   * NOT dispatched, because preflight and route evidence run on the selected
+   * route's fields and the dispatched child must match both the explicit
+   * lock and its recorded evidence. When the legacy route is unequal or
+   * absent, the selected route's own fields only — nothing rides from a
+   * legacy surface the lock did not confirm.
+   *
+   * F28 (PR #2 Codex round 15): the effort leg is composed from
+   * `decision.route`, which for a locked selection carries the lock-named
+   * effort OR — when the lock omits one — the adapter-declared `defaultEffort`
+   * the selector preflighted and claimed in `why`. The engine used to rebuild
+   * the dispatch from `roleRouting` alone, silently dropping that default:
+   * the child's adapter applied it at request time while the dispatch and
+   * the persisted pin omitted it, so the route could read `verified` without
+   * recording the effort that actually ran. Composing from the route keeps
+   * dispatch, pin, preflight and evidence on ONE effort value. The F11
+   * doctrine is untouched — the legacy effort stays stripped in the ride
+   * branch below, and only the selector-validated value (lock-named or
+   * adapter-declared, never invented) can reach the dispatch. With no route
+   * (the no-catalog 0.2.0 parity path, where no selector ran and no adapter
+   * default is knowable) the lock's own fields stand, exactly as before.
    */
-  private lockedAgentOptions(role: Role, roleRouting: RoleRouting & { readonly mode: 'locked' }): AgentOptionsLike {
+  private lockedAgentOptions(
+    role: Role,
+    roleRouting: RoleRouting & { readonly mode: 'locked' },
+    route?: SelectedRoute,
+  ): AgentOptionsLike {
     const legacy = this.legacyOptionsFor(role)
+    const provider = route?.provider ?? roleRouting.provider
+    const model = route?.model ?? roleRouting.model
+    const effort = route?.reasoningEffort ?? roleRouting.reasoningEffort
     if (this.legacyTuningRides(role, roleRouting) && legacy !== undefined) {
       // Strip the legacy ROUTE identity; keep every other field as tuning.
       const { provider: _legacyProvider, model: _legacyModel, reasoningEffort: _legacyEffort, ...tuning } = legacy
       return {
         ...tuning,
-        provider: roleRouting.provider,
-        model: roleRouting.model,
-        ...(roleRouting.reasoningEffort === undefined ? {} : { reasoningEffort: roleRouting.reasoningEffort }),
+        provider,
+        model,
+        ...(effort === undefined ? {} : { reasoningEffort: effort }),
       }
     }
     return {
-      provider: roleRouting.provider,
-      model: roleRouting.model,
-      ...(roleRouting.reasoningEffort === undefined ? {} : { reasoningEffort: roleRouting.reasoningEffort }),
+      provider,
+      model,
+      ...(effort === undefined ? {} : { reasoningEffort: effort }),
     }
   }
 
@@ -2930,6 +2953,12 @@ export class AutopilotEngine {
    * unequal/absent-legacy path it re-validates the bare lock the selector
    * just accepted (a redundant validation call, never a dispatch), and on
    * the equal-route path it is the FIRST time the riding tuning is checked.
+   * F28 (PR #2 Codex round 15): the composed object now also carries the
+   * adapter-declared `defaultEffort` when the lock omits an effort
+   * (`lockedAgentOptions` composes it from `decision.route`), so the
+   * invariant "preflight exactly what you dispatch" covers the default too
+   * — the spread below hands the preflight the composed effort along with
+   * the riding tuning, and the recorded note names the default when it rode.
    * `preflight`/`resolveCallConfig` validates without binding the later
    * dispatch (the port's upstream contract), so this is one more validation
    * call, not a double dispatch; grant and escalation semantics are
@@ -2951,6 +2980,9 @@ export class AutopilotEngine {
         // Route identity normalized to the lock's fields — the same values
         // `lockedAgentOptions` just wrote, pinned so the object satisfies the
         // port's required provider/model regardless of the optional mirror.
+        // F28: every other composed field — the riding legacy tuning AND the
+        // route-carried default effort — rides the spread, so the preflight
+        // sees exactly the dispatch object.
         provider: roleRouting.provider,
         model: roleRouting.model,
       })
@@ -2964,9 +2996,14 @@ export class AutopilotEngine {
       }
     }
     if (resolution.routing === undefined) return resolution
+    // F28: name the carried default when it rode — appended inside the
+    // parenthetical so the F16 wording (and its assertions) stands unchanged
+    // when the lock named its own effort or the adapter declares none.
+    const defaultEffortRode = roleRouting.reasoningEffort === undefined && composed.reasoningEffort !== undefined
+    const effortNote = defaultEffortRode ? ', the adapter-declared default effort carried from the selected route' : ''
     const note = this.legacyTuningRides(role, roleRouting)
-      ? 'preflight: resolveCallConfig accepted the composed dispatch (lock route + legacy non-route tuning) — the exact object the subagent start receives'
-      : 'preflight: resolveCallConfig accepted the composed dispatch (the lock\'s own fields — no legacy tuning rides)'
+      ? `preflight: resolveCallConfig accepted the composed dispatch (lock route + legacy non-route tuning${effortNote}) — the exact object the subagent start receives`
+      : `preflight: resolveCallConfig accepted the composed dispatch (the lock's own fields — no legacy tuning rides${effortNote})`
     return { ...resolution, routing: { ...resolution.routing, why: [...resolution.routing.why, note] } }
   }
 
@@ -3792,6 +3829,15 @@ export class AutopilotEngine {
     return 'routing-lock'
   }
 
+  /**
+   * The persisted pin for a locked role. F28 (PR #2 Codex round 15): on the
+   * SELECTED path the pin is composed from `decision.route` instead (see
+   * `resolutionOfDecision`) — `selectLocked` returns the adapter-declared
+   * `defaultEffort` there when the lock omits an effort, and a pin that
+   * drops what the selector selected makes the evidence dishonest. This
+   * lock-fields-only builder remains for the no-catalog 0.2.0 parity path,
+   * where no selector ran and no adapter default is knowable.
+   */
   private lockPin(roleRouting: RoleRouting & { readonly mode: 'locked' }): RoutingPin {
     return {
       provider: roleRouting.provider,
@@ -3824,26 +3870,35 @@ export class AutopilotEngine {
     const why = [...decision.why]
     const note = this.legacyLockNote(role, roleRouting)
     if (note !== undefined) why.push(note)
+    // F28 (PR #2 Codex round 15): the pin — and, for a locked role, the
+    // dispatch agentOptions — are composed from `decision.route`, ONE
+    // definition for both. For a locked selection the route carries the
+    // lock-named effort OR the adapter-declared `defaultEffort` the selector
+    // preflighted (its `why` claims it was selected); the engine used to
+    // rebuild both from `roleRouting`, discarding that default — the child's
+    // adapter applied it at request time while dispatch and pin omitted it,
+    // so the route could read `verified` without recording the effort that
+    // actually ran. Auto selections already composed from the route; the
+    // locked path now does too, so dispatch, pin, preflight and evidence can
+    // never disagree on the effort. The F11 doctrine is preserved in
+    // `lockedAgentOptions` (a stale legacy effort the lock omits stays
+    // excluded; legacy non-route tuning still rides on the equal-route
+    // branch), and a lock that names an effort is unchanged — the route
+    // carries the lock's own value.
+    const routePin: RoutingPin = {
+      provider: decision.route.provider,
+      model: decision.route.model,
+      ...(decision.route.reasoningEffort === undefined ? {} : { reasoningEffort: decision.route.reasoningEffort }),
+    }
     return {
       kind: 'dispatch',
       agentOptions:
         roleRouting.mode === 'locked'
-          ? this.lockedAgentOptions(role, roleRouting)
-          : {
-              provider: decision.route.provider,
-              model: decision.route.model,
-              ...(decision.route.reasoningEffort === undefined ? {} : { reasoningEffort: decision.route.reasoningEffort }),
-            },
+          ? this.lockedAgentOptions(role, roleRouting, decision.route)
+          : routePin,
       routing: {
         role,
-        pin:
-          roleRouting.mode === 'locked'
-            ? this.lockPin(roleRouting)
-            : {
-                provider: decision.route.provider,
-                model: decision.route.model,
-                ...(decision.route.reasoningEffort === undefined ? {} : { reasoningEffort: decision.route.reasoningEffort }),
-              },
+        pin: routePin,
         why,
         authorizationSource: decision.authorizationSource,
         ...(decision.fallbackFrom === undefined ? {} : { fallbackFrom: decision.fallbackFrom }),

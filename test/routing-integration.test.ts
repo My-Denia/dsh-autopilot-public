@@ -320,7 +320,11 @@ describe('routing integration: repin on adapter loss', () => {
       ] }),
     })
     await toClosing(h)
-    expect(h.subagents.auditOptions[1]).toEqual({ provider: 'alpha', model: 'm-a' })
+    // F28 (round 15): the lock names no effort and m-a's adapter declares
+    // `defaultEffort: 'high'` — the selector selected and preflighted it, so
+    // the dispatch (and the pin) carry it: never `verified` on an effort the
+    // record omits.
+    expect(h.subagents.auditOptions[1]).toEqual({ provider: 'alpha', model: 'm-a', reasoningEffort: 'high' })
 
     f.llm.dropProvider('alpha')
     f.catalog.invalidate()
@@ -376,12 +380,16 @@ describe('routing integration: legacy auditor config maps to a locked role', () 
     })
     await toExecuting(h)
 
-    expect(h.subagents.auditOptions[0]).toEqual({ provider: 'alpha', model: 'm-a', maxTokens: 1234 })
+    // F28 (round 15): the legacy surface names no effort, so the mapped lock
+    // omits one and m-a's adapter-declared default ('high') — the value the
+    // selector preflighted — rides the dispatch and the pin (maxTokens still
+    // rides as tuning, E2).
+    expect(h.subagents.auditOptions[0]).toEqual({ provider: 'alpha', model: 'm-a', maxTokens: 1234, reasoningEffort: 'high' })
     const routing = routingOf(h, 'audit', 'plan-auditor')
-    expect(routing?.pin).toEqual({ provider: 'alpha', model: 'm-a' })
+    expect(routing?.pin).toEqual({ provider: 'alpha', model: 'm-a', reasoningEffort: 'high' })
     expect(routing?.authorizationSource).toBe('plugin-config')
     expect(routing?.why?.some(entry => entry.includes('legacy auditors.plan.agentOptions'))).toBe(true)
-    expect(h.engine.peek(h.root.id)?.routingPins?.['plan-auditor']).toEqual({ provider: 'alpha', model: 'm-a' })
+    expect(h.engine.peek(h.root.id)?.routingPins?.['plan-auditor']).toEqual({ provider: 'alpha', model: 'm-a', reasoningEffort: 'high' })
   })
 })
 
@@ -498,19 +506,21 @@ describe('routing integration: mode off', () => {
     expect(record?.selected).toEqual(routing?.pin)
   })
 
-  it('(vii-f) F27: a blank effort on the pick dispatches and pins NO effort (absence, not blank) — the fold-legal pin', async () => {
+  it('(vii-f) F27: a blank effort on the pick dispatches and pins NO blank — absence normalized, then the adapter default carried (F28)', async () => {
     // A whitespace-only effort names no effort at all (the F21 rule applied
-    // at the off-mode seam): the dispatch carries no `reasoningEffort` key
-    // and the pin omits it — the fold rejects a blank-effort pin, and before
-    // F27 the verbatim configured pick copied `'  '` into both.
+    // at the off-mode seam): the blank never reaches dispatch or pin (the
+    // fold rejects a blank-effort pin). F28 (round 15): the resolved absence
+    // is a lock that omits the effort, and m-c's adapter declares
+    // `defaultEffort: 'high'` — the selector selected and preflighted it, so
+    // dispatch and pin carry the DEFAULT, never the blank: the recorded
+    // route keeps naming the effort the child actually runs.
     const h = offF27Harness({ planAuditor: { provider: ' beta ', model: ' m-c ', reasoningEffort: '  ' } })
     await toExecuting(h)
     const dispatched = h.subagents.auditOptions[0]
-    expect(dispatched).toEqual({ provider: 'beta', model: 'm-c' })
-    expect('reasoningEffort' in (dispatched ?? {})).toBe(false)
+    expect(dispatched).toEqual({ provider: 'beta', model: 'm-c', reasoningEffort: 'high' })
+    expect(dispatched?.reasoningEffort).not.toBe('  ')
     const routing = routingOf(h, 'audit', 'plan-auditor')
-    expect(routing?.pin).toEqual({ provider: 'beta', model: 'm-c' })
-    expect(routing?.pin?.reasoningEffort).toBeUndefined()
+    expect(routing?.pin).toEqual({ provider: 'beta', model: 'm-c', reasoningEffort: 'high' })
     const record = h.engine.peek(h.root.id)?.audits[0]?.route
     expect(record?.routeStatus).toBe('verified')
   })
@@ -1009,14 +1019,17 @@ describe('F2 (PR #2 review): a volatile routing patch reaches the NEXT dispatch 
     patch(h.routingRefs.roles.executionAuditor?.lock as Ref, { provider: 'alpha', model: 'm-a' })
     await h.engine.audit(h.root, { role: 'execution', prompt: 'again' })
     // The lock is INSIDE the policy ⇒ the grant stands and the dispatch follows it.
-    // A lock names no effort here, and the locked dispatch carries exactly the
-    // lock's own fields (no adapter default invented).
-    expect(h.subagents.auditOptions[2]).toEqual({ provider: 'alpha', model: 'm-a' })
+    // F28 (round 15): the lock names no effort, and m-a's adapter declares
+    // `defaultEffort: 'high'` — the selector selected and preflighted it, so
+    // the dispatch and the pin carry that default (the recorded route keeps
+    // naming the effort the child actually runs; nothing is invented beyond
+    // the adapter's own declaration).
+    expect(h.subagents.auditOptions[2]).toEqual({ provider: 'alpha', model: 'm-a', reasoningEffort: 'high' })
     const details = routingDetails(h).filter(detail => detail.role === 'execution-auditor')
     const last = details[details.length - 1]
     expect(last?.authorizationSource).toBe('plugin-config')
-    expect(last?.pin).toEqual({ provider: 'alpha', model: 'm-a' })
-    expect(h.engine.peek(h.root.id)?.routingPins?.['execution-auditor']).toEqual({ provider: 'alpha', model: 'm-a' })
+    expect(last?.pin).toEqual({ provider: 'alpha', model: 'm-a', reasoningEffort: 'high' })
+    expect(h.engine.peek(h.root.id)?.routingPins?.['execution-auditor']).toEqual({ provider: 'alpha', model: 'm-a', reasoningEffort: 'high' })
   })
 
   it('a patch to an INVALID mode refuses the route at the next decision: inherit, recorded, no crash, stream replays', async () => {
@@ -1688,7 +1701,10 @@ describe('F14 (PR #2 round 6): a catalog outage is infrastructure, not provider 
       ] }),
     })
     await toClosing(h)
-    expect(h.subagents.auditOptions[1]).toEqual({ provider: 'alpha', model: 'm-a' })
+    // F28 (round 15): both locked dispatches carry m-a's adapter-declared
+    // default effort — the value the selector preflighted under the outage
+    // too (resolveModelInfo is independent of the failed listing).
+    expect(h.subagents.auditOptions[1]).toEqual({ provider: 'alpha', model: 'm-a', reasoningEffort: 'high' })
 
     f.llm.failProviders = true
     f.catalog.invalidate()
@@ -1696,9 +1712,9 @@ describe('F14 (PR #2 round 6): a catalog outage is infrastructure, not provider 
     // The outage is infrastructure, not evidence the provider is gone: the
     // locked dispatch PROCEEDS instead of escalating needs-owner-decision.
     await h.engine.audit(h.root, { role: 'execution', prompt: 'again' })
-    expect(h.subagents.auditOptions[2]).toEqual({ provider: 'alpha', model: 'm-a' })
+    expect(h.subagents.auditOptions[2]).toEqual({ provider: 'alpha', model: 'm-a', reasoningEffort: 'high' })
     const last = lastDetail(h, 'execution-auditor')
-    expect(last?.pin).toEqual({ provider: 'alpha', model: 'm-a' })
+    expect(last?.pin).toEqual({ provider: 'alpha', model: 'm-a', reasoningEffort: 'high' })
     expect(last?.repinFrom).toBeUndefined()
     expect(last?.why?.some(entry =>
       entry.includes('catalog: snapshot unavailable') && entry.includes('not evidence the provider is gone'))).toBe(true)
@@ -2530,5 +2546,153 @@ describe('F24 (PR #2 round 12): the pool walk dispatches the normalized route th
     expect(routingOf(h, 'audit', 'plan-auditor')?.pin).toEqual({ provider: 'beta', model: 'm-c' })
     expect(llm.preflights.some(config =>
       config.provider === 'beta' && config.model === 'm-c' && config.maxTokens === 2048)).toBe(true)
+  })
+})
+
+// ── F28 (PR #2 Codex round 15): the locked dispatch and pin carry the adapter default effort ──
+//
+// `selectLocked` returns the adapter-declared `defaultEffort` in
+// `decision.route` when the lock omits an effort (its preflight validated it
+// and its `why` claims it was selected), but the engine rebuilt the dispatch
+// from `roleRouting` alone and `lockPin` dropped it from the evidence: the
+// child's adapter applied the default at request time while the dispatch and
+// the persisted pin omitted it — the route could read `verified` without
+// recording the effort that actually ran. The dispatch agentOptions AND the
+// pin are now composed from `decision.route` (the F11 doctrine intact: a
+// stale legacy effort the lock omits stays excluded, legacy non-route tuning
+// still rides on the equal-route branch), and the F16 composed preflight
+// covers the carried default — it validates the exact object dispatched.
+
+describe('F28 (PR #2 round 15): a locked dispatch without a lock-named effort carries the adapter default', () => {
+  // m-a declares efforts with defaultEffort 'high'; m-b declares none — a
+  // lock on m-b makes effort absence assertable exactly (the F11 fixtures).
+  const F28_MODELS: readonly StubModel[] = [
+    { provider: 'alpha', id: 'm-a', contextWindow: 131072, efforts: ['high', 'low'], defaultEffort: 'high' },
+    { provider: 'alpha', id: 'm-b', contextWindow: 131072 },
+  ]
+
+  /** A locked plan-auditor plan audit over F28_MODELS, one scripted dispatch. */
+  function lockedAuditHarness(options: {
+    readonly lock: { provider: string; model: string; reasoningEffort?: string }
+    readonly legacy?: AgentOptionsLike
+    /** Scripted observed `request/header` — defaults to agreeing with the dispatch. */
+    readonly requestHeader?: { provider?: string; model?: string; reasoningEffort?: string } | null
+  }): { readonly h: Harness; readonly f: Fixture } {
+    const f = fixture(F28_MODELS, ABSENT)
+    const h = makeHarness({
+      routing: f.portsFor(),
+      config: {
+        ...(options.legacy === undefined ? {} : { auditors: { plan: { agentOptions: options.legacy } } }),
+        routing: { roles: { planAuditor: { lock: options.lock } } },
+      },
+      subagents: stubSubagents({
+        verdicts: [{
+          verdict: 'pass',
+          note: 'ok',
+          ...(options.requestHeader === undefined ? {} : { requestHeader: options.requestHeader }),
+        }],
+      }),
+    })
+    return { h, f }
+  }
+
+  /** Drive a run to the plan audit (the locked dispatch under test). */
+  async function planAudit(h: Harness): Promise<void> {
+    await h.engine.init(h.root, makeTriage(STANDARD), [undeclaredSeed('m1')])
+    await h.engine.declareUsage(h.root, makeUsageEntry({ id: 'm1' }))
+    await h.engine.submitPlan(h.root, 'plan')
+    await h.engine.audit(h.root, { role: 'plan', prompt: 'packet' })
+  }
+
+  it('(a) lock omits the effort + adapter declares a default ⇒ dispatch, pin, and persisted pin carry it; why stays honest; three-leg verified WITH the default recorded', async () => {
+    // The observed header is scripted to what a real host's adapter does when
+    // agentOptions omit the effort: it applies its declared default at
+    // request time. Pre-fix, the pin omitted the effort while this header
+    // carried it — the record read `verified` without the effort that ran.
+    const { h } = lockedAuditHarness({
+      lock: { provider: 'alpha', model: 'm-a' },
+      requestHeader: { provider: 'alpha', model: 'm-a', reasoningEffort: 'high' },
+    })
+    await planAudit(h)
+    expect(h.subagents.auditOptions[0]).toEqual({ provider: 'alpha', model: 'm-a', reasoningEffort: 'high' })
+    const routing = routingOf(h, 'audit', 'plan-auditor')
+    expect(routing?.pin).toEqual({ provider: 'alpha', model: 'm-a', reasoningEffort: 'high' })
+    expect(h.engine.peek(h.root.id)?.routingPins?.['plan-auditor']).toEqual({ provider: 'alpha', model: 'm-a', reasoningEffort: 'high' })
+    // Honest why: the selector names the effort as the ADAPTER's declared
+    // default — the record never claims the lock named one.
+    expect(routing?.why?.some(entry => entry.includes('effort: "high" is the route\'s adapter-declared defaultEffort'))).toBe(true)
+    // Three-leg agreement WITH the effort recorded: the selected leg carries
+    // the default, the observed leg (the request the child actually sent)
+    // matches it — verified on an establishable effort axis.
+    const record = h.engine.peek(h.root.id)?.audits[0]?.route
+    expect(record?.selected).toEqual({ provider: 'alpha', model: 'm-a', reasoningEffort: 'high' })
+    expect(record?.observed).toEqual({ provider: 'alpha', model: 'm-a', reasoningEffort: 'high' })
+    expect(record?.routeStatus).toBe('verified')
+  })
+
+  it('(b) equal-route legacy tuning rides while the legacy effort stays excluded: dispatch and pin carry the ADAPTER default, and the F16 composed preflight saw tuning + default together', async () => {
+    const { h, f } = lockedAuditHarness({
+      lock: { provider: 'alpha', model: 'm-a' },
+      legacy: { provider: 'alpha', model: 'm-a', maxTokens: 8192, reasoningEffort: 'low' },
+    })
+    await planAudit(h)
+    // E2/F11: maxTokens rides as tuning; the legacy effort 'low' is NOT
+    // dispatched (the lock omits an effort — a stale legacy value stays
+    // excluded); the adapter default 'high' the selector preflighted carries.
+    expect(h.subagents.auditOptions[0]).toEqual({ provider: 'alpha', model: 'm-a', maxTokens: 8192, reasoningEffort: 'high' })
+    const routing = routingOf(h, 'audit', 'plan-auditor')
+    expect(routing?.pin).toEqual({ provider: 'alpha', model: 'm-a', reasoningEffort: 'high' })
+    // F16 covers the carried default (preflight exactly what you dispatch):
+    // the engine's composed preflight received the riding maxTokens AND the
+    // default in ONE object — the exact dispatch, never a parallel rebuild.
+    expect(f.llm.preflights.some(config =>
+      config.provider === 'alpha' && config.model === 'm-a' && config.maxTokens === 8192 && config.reasoningEffort === 'high')).toBe(true)
+    // And the composed-preflight note names BOTH legs it validated.
+    expect(routing?.why?.some(entry =>
+      entry.includes('accepted the composed dispatch')
+      && entry.includes('legacy non-route tuning, the adapter-declared default effort carried from the selected route'))).toBe(true)
+  })
+
+  it('(c) a lock that NAMES an effort is unchanged: the lock’s effort dispatches and pins (decision.route carries it; the adapter default does not override)', async () => {
+    const { h } = lockedAuditHarness({ lock: { provider: 'alpha', model: 'm-a', reasoningEffort: 'low' } })
+    await planAudit(h)
+    expect(h.subagents.auditOptions[0]).toEqual({ provider: 'alpha', model: 'm-a', reasoningEffort: 'low' })
+    const routing = routingOf(h, 'audit', 'plan-auditor')
+    expect(routing?.pin).toEqual({ provider: 'alpha', model: 'm-a', reasoningEffort: 'low' })
+    expect(h.engine.peek(h.root.id)?.routingPins?.['plan-auditor']).toEqual({ provider: 'alpha', model: 'm-a', reasoningEffort: 'low' })
+    // The selector’s why names the LOCK as the source — the honest record.
+    expect(routing?.why?.some(entry => entry.includes('named by the role lock (overrides the adapter default)'))).toBe(true)
+  })
+
+  it('(d) lock omits the effort + the adapter declares none ⇒ unchanged: no effort dispatched, pinned, or claimed (the F11 absence case, existing green restated)', async () => {
+    const { h } = lockedAuditHarness({ lock: { provider: 'alpha', model: 'm-b' } })
+    await planAudit(h)
+    const dispatched = h.subagents.auditOptions[0]
+    expect(dispatched).toEqual({ provider: 'alpha', model: 'm-b' })
+    expect('reasoningEffort' in (dispatched ?? {})).toBe(false)
+    const routing = routingOf(h, 'audit', 'plan-auditor')
+    expect(routing?.pin).toEqual({ provider: 'alpha', model: 'm-b' })
+    expect(routing?.why?.some(entry => entry.includes('effort: none declared and none named — omitted, never invented'))).toBe(true)
+    // With no effort on any leg there is no effort axis to establish: the
+    // record stays verified exactly as before.
+    const record = h.engine.peek(h.root.id)?.audits[0]?.route
+    expect(record?.selected).toEqual({ provider: 'alpha', model: 'm-b' })
+    expect(record?.routeStatus).toBe('verified')
+  })
+
+  it('(e) the recorded default is a REAL evidence axis: an observed effort diverging from it is a mismatch naming the axis (pre-fix this read verified)', async () => {
+    // The adapter applies 'medium' where the record says the selector chose
+    // the declared default 'high': with the default now recorded, the effort
+    // axis is comparable and the divergence is a MISMATCH — before F28 the
+    // effortless pin made the axis uncomparable and this silently read
+    // `verified`. Route status never gates the verdict (provenance only).
+    const { h } = lockedAuditHarness({
+      lock: { provider: 'alpha', model: 'm-a' },
+      requestHeader: { provider: 'alpha', model: 'm-a', reasoningEffort: 'medium' },
+    })
+    await planAudit(h)
+    const record = h.engine.peek(h.root.id)?.audits[0]?.route
+    expect(record?.routeStatus).toBe('mismatch')
+    expect(record?.routeDiagnostic).toContain('reasoningEffort: selected high vs observed medium')
   })
 })
