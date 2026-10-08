@@ -2809,6 +2809,18 @@ export class AutopilotEngine {
   }
 
   /**
+   * Whether the legacy surface's route EQUALS the lock — E2's riding
+   * condition: exactly then the legacy NON-ROUTE tuning rides the locked
+   * dispatch (`lockedAgentOptions`). One definition of the equal-route
+   * branch so the dispatch composition and the F16 composed-preflight note
+   * can never disagree about what rode.
+   */
+  private legacyTuningRides(role: Role, roleRouting: RoleRouting & { readonly mode: 'locked' }): boolean {
+    const legacyPin = toRoutePin(this.legacyOptionsFor(role))
+    return legacyPin !== undefined && legacyPin.provider === roleRouting.provider && legacyPin.model === roleRouting.model
+  }
+
+  /**
    * The dispatch agentOptions for a locked role. When the legacy surface's
    * route EQUALS the lock, the legacy NON-ROUTE tuning rides (`maxTokens` and
    * siblings keep their 0.2.0 meaning — E2's resolve contract) while the
@@ -2822,13 +2834,7 @@ export class AutopilotEngine {
    */
   private lockedAgentOptions(role: Role, roleRouting: RoleRouting & { readonly mode: 'locked' }): AgentOptionsLike {
     const legacy = this.legacyOptionsFor(role)
-    const legacyPin = toRoutePin(legacy)
-    if (
-      legacy !== undefined
-      && legacyPin !== undefined
-      && legacyPin.provider === roleRouting.provider
-      && legacyPin.model === roleRouting.model
-    ) {
+    if (this.legacyTuningRides(role, roleRouting) && legacy !== undefined) {
       // Strip the legacy ROUTE identity; keep every other field as tuning.
       const { provider: _legacyProvider, model: _legacyModel, reasoningEffort: _legacyEffort, ...tuning } = legacy
       return {
@@ -2843,6 +2849,67 @@ export class AutopilotEngine {
       model: roleRouting.model,
       ...(roleRouting.reasoningEffort === undefined ? {} : { reasoningEffort: roleRouting.reasoningEffort }),
     }
+  }
+
+  /**
+   * F16 (PR #2 Codex round 7): preflight the FULLY COMPOSED locked dispatch —
+   * the exact object the subagent start receives — BEFORE it is dispatched.
+   *
+   * The seam decision, documented: `selectLocked`'s preflight validates the
+   * LOCK's route fields (provider/model/reasoningEffort — existing behavior,
+   * unchanged), but the dispatch object is composed ENGINE-side by
+   * `lockedAgentOptions`, which rides the legacy NON-ROUTE tuning
+   * (`maxTokens` and siblings) onto the equal-route branch. The selector is
+   * pure w.r.t. that composition (it is E2/engine knowledge — the selector
+   * must stay free of legacy-surface concerns), so its preflight can only
+   * ever see the bare lock: an adapter-INVALID retained `maxTokens` passed
+   * routing preflight and failed the actual dispatch mid-run. The honest
+   * place to validate the composed object is therefore the engine's locked
+   * dispatch call site (the engine holds the catalog port). The check runs
+   * UNIFORMLY for every locked dispatch — the invariant is "the engine
+   * preflights exactly what it dispatches", with no conditional logic that
+   * could drift from `lockedAgentOptions`'s own branch — so on the
+   * unequal/absent-legacy path it re-validates the bare lock the selector
+   * just accepted (a redundant validation call, never a dispatch), and on
+   * the equal-route path it is the FIRST time the riding tuning is checked.
+   * `preflight`/`resolveCallConfig` validates without binding the later
+   * dispatch (the port's upstream contract), so this is one more validation
+   * call, not a double dispatch; grant and escalation semantics are
+   * untouched — a rejection takes the existing owner-escalation exit BEFORE
+   * any subagent start, with the adapter's reason named, instead of a
+   * mid-run failure at the audit/executor dispatch.
+   */
+  private async preflightComposedLockedDispatch(
+    role: Role,
+    roleRouting: RoleRouting & { readonly mode: 'locked' },
+    resolution: Extract<RoleRouteResolution, { readonly kind: 'dispatch' }>,
+    catalog: RouteCatalog,
+  ): Promise<RoleRouteResolution> {
+    const composed = resolution.agentOptions
+    if (composed === undefined) return resolution
+    try {
+      await catalog.preflight({
+        ...composed,
+        // Route identity normalized to the lock's fields — the same values
+        // `lockedAgentOptions` just wrote, pinned so the object satisfies the
+        // port's required provider/model regardless of the optional mirror.
+        provider: roleRouting.provider,
+        model: roleRouting.model,
+      })
+    } catch (error) {
+      return {
+        kind: 'escalate',
+        reason:
+          `locked route ${roleRouting.provider}/${roleRouting.model} dispatch config failed preflight (${errorMessage(error)}) — ` +
+          'the routing core validated the lock\'s route fields, but the composed dispatch (lock route + riding legacy non-route tuning) is not adapter-valid; ' +
+          'a lock has no fallback candidate — dispatch blocked BEFORE start',
+      }
+    }
+    if (resolution.routing === undefined) return resolution
+    const note = this.legacyTuningRides(role, roleRouting)
+      ? 'preflight: resolveCallConfig accepted the composed dispatch (lock route + legacy non-route tuning) — the exact object the subagent start receives'
+      : 'preflight: resolveCallConfig accepted the composed dispatch (the lock\'s own fields — no legacy tuning rides)'
+    return { ...resolution, routing: { ...resolution.routing, why: [...resolution.routing.why, note] } }
   }
 
   /**
@@ -3136,6 +3203,14 @@ export class AutopilotEngine {
       }
     } else {
       core = this.resolutionOfDecision(role, roleRouting, await this.selectForRole(role, routing.preference, roleRouting, prior, policy, catalog), undefined)
+      // F16 (PR #2 Codex round 7): a locked dispatch is COMPOSED here
+      // (lock route + riding legacy tuning — `lockedAgentOptions`), and the
+      // composed object — not just the bare lock the selector validated — is
+      // what must pass preflight before the subagent start receives it. See
+      // {@link preflightComposedLockedDispatch} for the seam decision.
+      if (roleRouting.mode === 'locked' && core.kind === 'dispatch' && core.agentOptions !== undefined) {
+        core = await this.preflightComposedLockedDispatch(role, roleRouting, core, catalog)
+      }
     }
 
     if (core.kind === 'escalate') return core
@@ -3283,6 +3358,11 @@ export class AutopilotEngine {
     // first entry `selectCrossFamily` names is checked first and a dead one
     // is stepped past, not dispatched.
     const skipped: string[] = []
+    // F17: the outage note for the CURRENT walk, set by the iteration that
+    // read an `unavailable` snapshot (the catalog is cached per commit, so
+    // every iteration shares one read) and recorded on whichever resolution
+    // the walk returns — never a silent skip of the liveness leg.
+    let outage: string | undefined
     for (const entry of this.config.crossFamily.pool) {
       const candidate = toRoutePin(entry)
       if (candidate === undefined) continue
@@ -3314,7 +3394,25 @@ export class AutopilotEngine {
         }
       }
       const snapshot = await catalog.snapshot()
-      if (!providerIsLive(snapshot, candidate.provider)) {
+      // F17 (PR #2 Codex round 7): the liveness skip is asserted only on a
+      // SUCCESSFUL read — the same outage-vs-disappearance split F14 made for
+      // locks and pins. An `unavailable` snapshot (a `listProviders` throw)
+      // carries an EMPTY provider list, so the old unconditional
+      // `providerIsLive` skip read "the catalog could not be read" as "every
+      // pool provider is gone" and one hiccup ended the walk with plain
+      // inheritance, never attempting the preflight that was still available
+      // (`resolveCallConfig` runs independently of the failed listing). Under
+      // an outage the liveness leg is SKIPPED, preflight decides, and the
+      // outage is recorded below in the wording F14 established: a catalog
+      // read failure (infrastructure), not evidence the provider is gone.
+      // A live read that lacks the provider keeps the unchanged skip.
+      if (snapshot.catalogStatus === 'unavailable') {
+        outage =
+          `cross-family: provider liveness NOT assertable for the pool walk — catalog unavailable ` +
+          `(${snapshot.diagnostic ?? 'no diagnostic recorded'}): a catalog read failure (infrastructure), ` +
+          'not evidence the provider is gone; the liveness leg is skipped and preflight decides'
+      }
+      if (snapshot.catalogStatus === 'live' && !providerIsLive(snapshot, candidate.provider)) {
         skipped.push(`cross-family: pool route ${candidate.provider}/${candidate.model} skipped — its provider is not live in the catalog snapshot`)
         continue
       }
@@ -3348,6 +3446,7 @@ export class AutopilotEngine {
           why: [
             ...(inherit.routing?.why ?? []),
             ...verdict.why,
+            ...(outage !== undefined ? [outage] : []),
             ...(skipped.length > 0 ? [skipped.join('; ')] : []),
             grantNote,
           ],
@@ -3365,6 +3464,10 @@ export class AutopilotEngine {
         why: [
           ...inherit.routing.why,
           ...skipped,
+          // F17: when the walk ran under an outage, the retained-inheritance
+          // record names it too — the skips above are preflight verdicts, and
+          // no liveness leg was (or could be) run.
+          ...(outage !== undefined ? [outage] : []),
           'cross-family: every pool entry outside the builder family failed the dispatch checks (provider liveness, preflight) — the inheritance result stands',
         ],
       },

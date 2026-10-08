@@ -1744,3 +1744,223 @@ describe('F15 (PR #2 round 6): the pool walk preflights every dispatched call-co
       && config.maxTokens === 512 && config.reasoningEffort === 'high')).toBe(true)
   })
 })
+
+// ── F16 (PR #2 Codex round 7): preflight the FULLY COMPOSED locked dispatch ──
+//
+// `selectLocked` preflights the LOCK's route fields (provider/model/effort),
+// but the dispatch object is composed ENGINE-side: on the equal-route branch
+// `lockedAgentOptions` rides the legacy NON-ROUTE tuning (`maxTokens` and
+// siblings) onto the lock's route — fields the selector never sees and never
+// checks. An adapter-INVALID retained maxTokens therefore passed routing
+// preflight and failed the actual audit/executor dispatch MID-RUN. The
+// composed object is now preflighted at the engine's locked dispatch call
+// site (the selector stays pure w.r.t. legacy composition — it is E2/engine
+// knowledge), so a rejection blocks BEFORE the subagent start with the
+// adapter's reason named, exactly like every other locked-route refusal. The
+// selector's own bare-lock preflight is unchanged (the lock's fields stay
+// validated — F14(b) and the selector unit tests keep proving it).
+
+describe('F16 (PR #2 round 7): the engine preflights the composed locked agentOptions before dispatch', () => {
+  const F16_MODELS: readonly StubModel[] = [
+    { provider: 'alpha', id: 'm-a', contextWindow: 131072, efforts: ['high', 'low'], defaultEffort: 'high' },
+    { provider: 'alpha', id: 'm-b', contextWindow: 131072 },
+  ]
+
+  /** A delegated run at a passed plan gate, executor locked, with the stub preflight armed per test. */
+  function lockedHarness(
+    agentOptions: AgentOptionsLike,
+    lock: { provider: string; model: string; reasoningEffort?: string },
+  ): { readonly h: Harness; readonly f: Fixture } {
+    const f = fixture(F16_MODELS, ABSENT)
+    const h = makeHarness({
+      routing: f.portsFor(),
+      config: {
+        executor: { agentOptions },
+        routing: { roles: { executor: { lock } } },
+      },
+      subagents: stubSubagents({ verdicts: [{ verdict: 'pass', note: 'plan ok' }] }),
+    })
+    return { h, f }
+  }
+
+  async function toPassedPlanGate(h: Harness): Promise<void> {
+    await h.engine.init(h.root, makeTriage(STANDARD_DELEGATED), [undeclaredSeed('m1')])
+    await h.engine.declareUsage(h.root, makeUsageEntry({ id: 'm1' }))
+    await h.engine.submitPlan(h.root, 'plan')
+    await h.engine.audit(h.root, { role: 'plan', prompt: 'packet' })
+  }
+
+  it('(a) equal route + a legacy maxTokens the adapter rejects ⇒ blocked BEFORE start and escalated with the reason named, never a mid-run failure', async () => {
+    const { h, f } = lockedHarness(
+      { provider: 'alpha', model: 'm-b', maxTokens: 8192, reasoningEffort: 'high' },
+      { provider: 'alpha', model: 'm-b' },
+    )
+    f.llm.maxTokensRejects.add('alpha/m-b')
+    await toPassedPlanGate(h)
+
+    // The composed dispatch fails the engine-side preflight: the run
+    // escalates needs-owner-decision BEFORE any subagent start — the exact
+    // pre-start failure the finding demands, in the existing escalation shape.
+    const signal = new AbortController().signal
+    await expect(h.engine.startExecutor(h.root, { prompt: 'implement', signal }))
+      .rejects.toThrowError(/failed preflight.*maxTokens 8192 is invalid/s)
+    const snapshot = h.engine.peek(h.root.id)
+    expect(snapshot?.phase).toBe('needs-owner-decision')
+    expect(snapshot?.diagnostic?.startsWith('routing-escalation:')).toBe(true)
+    expect(snapshot?.diagnostic).toContain('maxTokens 8192 is invalid on alpha/m-b')
+    // BEFORE start, literally: nothing was handed to the subagent manager,
+    // and no executor pin was written for a dispatch that never happened.
+    expect(h.subagents.continuableOptions.length).toBe(0)
+    expect(snapshot?.routingPins?.executor).toBeUndefined()
+    // Both legs ran, in the honest order: the selector validated the bare
+    // lock (no maxTokens, no effort — the lock names none), and the engine
+    // then preflighted the COMPOSED object that carries the riding tuning.
+    expect(f.llm.preflights.some(config =>
+      config.provider === 'alpha' && config.model === 'm-b'
+      && config.maxTokens === undefined && config.reasoningEffort === undefined)).toBe(true)
+    expect(f.llm.preflights.some(config =>
+      config.provider === 'alpha' && config.model === 'm-b' && config.maxTokens === 8192)).toBe(true)
+  })
+
+  it('(b) equal route + VALID tuning ⇒ dispatched, the composed object proven to have passed preflight whole', async () => {
+    const { h, f } = lockedHarness(
+      { provider: 'alpha', model: 'm-b', maxTokens: 8192 },
+      { provider: 'alpha', model: 'm-b' },
+    )
+    await toPassedPlanGate(h)
+    const signal = new AbortController().signal
+    await h.engine.startExecutor(h.root, { prompt: 'implement', signal })
+
+    expect(h.subagents.continuableOptions[0]).toEqual({ provider: 'alpha', model: 'm-b', maxTokens: 8192 })
+    // Walk acceptance implies dispatch validity: the preflight saw the riding
+    // maxTokens, not just the lock's route fields.
+    expect(f.llm.preflights.some(config =>
+      config.provider === 'alpha' && config.model === 'm-b' && config.maxTokens === 8192)).toBe(true)
+    const routing = routingOf(h, 'start-executor', 'executor')
+    expect(routing?.pin).toEqual({ provider: 'alpha', model: 'm-b' })
+    expect(routing?.why?.some(entry =>
+      entry.includes('accepted the composed dispatch')
+      && entry.includes('the exact object the subagent start receives'))).toBe(true)
+  })
+
+  it('(c) unequal legacy route ⇒ the lock’s own fields dispatch, the composed leg re-validating exactly them (no tuning rides)', async () => {
+    const { h } = lockedHarness(
+      { provider: 'beta', model: 'm-c', maxTokens: 4096 },
+      { provider: 'alpha', model: 'm-b' },
+    )
+    await toPassedPlanGate(h)
+    const signal = new AbortController().signal
+    await h.engine.startExecutor(h.root, { prompt: 'implement', signal })
+
+    // The E8/F11 boundary: nothing rides from an unconfirmed legacy surface —
+    // and the composed preflight therefore validated exactly the lock's fields.
+    expect(h.subagents.continuableOptions[0]).toEqual({ provider: 'alpha', model: 'm-b' })
+    const routing = routingOf(h, 'start-executor', 'executor')
+    expect(routing?.pin).toEqual({ provider: 'alpha', model: 'm-b' })
+    expect(routing?.why?.some(entry =>
+      entry.includes('accepted the composed dispatch') && entry.includes('the lock\'s own fields — no legacy tuning rides'))).toBe(true)
+  })
+})
+
+// ── F17 (PR #2 Codex round 7): the pool liveness skip splits outage from absence ──
+//
+// The pool walk's `providerIsLive` skip was unconditional, but an
+// `unavailable` snapshot (a `listProviders` throw) carries an EMPTY provider
+// list — so one transient catalog read failure read as "every pool provider
+// is gone" and the walk ended in plain inheritance without ever attempting
+// the preflight that was still available (resolveCallConfig runs
+// independently of the failed listing). The liveness skip is now gated on a
+// SUCCESSFUL read (`catalogStatus: 'live'`), the F14 split applied to the
+// last remaining unconditional liveness check: under an outage the liveness
+// leg is skipped, preflight decides, and the outage is recorded in the
+// decision's `why` in the F14 wording family. A live read that genuinely
+// lacks the provider keeps the unchanged skip (F7(a) keeps proving it).
+
+describe('F17 (PR #2 round 7): the pool liveness skip distinguishes a catalog outage from a vanished provider', () => {
+  const F17_MODELS: readonly StubModel[] = [
+    ...MODELS,
+    { provider: 'gamma', id: 'm-d', contextWindow: 131072 },
+  ]
+
+  /** An auto-mode harness whose plan auditor falls to the pool (executor on the alpha family, absent policy). */
+  function poolHarness(llm: StubLlm, pool: readonly AgentOptionsLike[]): { readonly h: Harness; readonly catalog: RouteCatalog } {
+    const catalog = new RouteCatalog(llm)
+    const h = makeHarness({
+      routing: { catalog, policyReader: () => ABSENT },
+      config: {
+        executor: { agentOptions: { provider: 'alpha', model: 'm-a' } },
+        crossFamily: { enabled: true, minRisk: 'medium', pool: [...pool] },
+      },
+      subagents: stubSubagents({ verdicts: [{ verdict: 'pass', note: 'ok' }] }),
+    })
+    return { h, catalog }
+  }
+
+  it('(a) outage + a pool entry preflight accepts ⇒ DISPATCHED with the outage recorded and the liveness leg skipped', async () => {
+    const llm = new StubLlm(F17_MODELS)
+    llm.failProviders = true
+    const { h, catalog } = poolHarness(llm, [{ provider: 'gamma', model: 'm-d', maxTokens: 512 }])
+    await toExecuting(h)
+
+    // Under the old unconditional skip this was plain inheritance: every
+    // entry "not live" on the empty outage snapshot. Now preflight decides.
+    expect(h.subagents.auditOptions[0]).toEqual({ provider: 'gamma', model: 'm-d', maxTokens: 512 })
+    const routing = routingOf(h, 'audit', 'plan-auditor')
+    expect(routing?.pin).toEqual({ provider: 'gamma', model: 'm-d' })
+    expect(routing?.authorizationSource).toBe('plugin-config')
+    expect(routing?.why?.some(entry =>
+      entry.includes('provider liveness NOT assertable for the pool walk')
+      && entry.includes('catalog unavailable')
+      && entry.includes('not evidence the provider is gone')
+      && entry.includes('the liveness leg is skipped and preflight decides'))).toBe(true)
+    // No liveness skip was recorded — the leg never ran — and the outage is
+    // the infrastructure fact it is (F14 wording family), on the cached read.
+    expect(routing?.why?.some(entry => entry.includes('is not live in the catalog snapshot'))).toBe(false)
+    expect(catalog.snapshot()).resolves.toMatchObject({ catalogStatus: 'unavailable' })
+    // Preflight was the actual gate: resolveCallConfig ran for the pick.
+    expect(llm.preflights.some(config => config.provider === 'gamma' && config.model === 'm-d')).toBe(true)
+  })
+
+  it('(b) outage + preflight failure ⇒ skipped with the preflight reason; the inheritance result stands, the outage named', async () => {
+    const llm = new StubLlm(F17_MODELS)
+    llm.failProviders = true
+    llm.preflightRejects.set('gamma/m-d', 'resolveCallConfig: scripted rejection under outage')
+    const { h } = poolHarness(llm, [{ provider: 'gamma', model: 'm-d' }])
+    await toExecuting(h)
+
+    // Nothing dispatched: the audit that runs is the INHERIT one (no route
+    // options), and the skip carries the PREFLIGHT verdict (the only leg that
+    // ran), never a liveness claim the outage could not support.
+    expect(h.subagents.auditOptions[0]).toBeUndefined()
+    const routing = routingOf(h, 'audit', 'plan-auditor')
+    expect(routing?.pin).toBeUndefined()
+    expect(routing?.why?.some(entry =>
+      entry.includes('pool route gamma/m-d skipped')
+      && entry.includes('dispatch preflight rejected it')
+      && entry.includes('scripted rejection under outage'))).toBe(true)
+    expect(routing?.why?.some(entry =>
+      entry.includes('provider liveness NOT assertable for the pool walk')
+      && entry.includes('catalog unavailable'))).toBe(true)
+    expect(routing?.why?.some(entry => entry.includes('is not live in the catalog snapshot'))).toBe(false)
+    expect(h.engine.peek(h.root.id)?.phase).toBe('executing')
+  })
+
+  it('(c) live catalog + a provider genuinely absent ⇒ the liveness skip is unchanged', async () => {
+    const llm = new StubLlm(F17_MODELS)
+    const { h, catalog } = poolHarness(llm, [{ provider: 'beta', model: 'm-c' }])
+    // A LIVE read whose listing omits the provider — the real disappearance
+    // the skip exists for. Drop beta BEFORE any catalog read this run.
+    llm.dropProvider('beta')
+    catalog.invalidate()
+    await toExecuting(h)
+
+    expect(h.subagents.auditOptions[0]).toBeUndefined()
+    const routing = routingOf(h, 'audit', 'plan-auditor')
+    expect(routing?.pin).toBeUndefined()
+    expect(routing?.why?.some(entry =>
+      entry.includes('pool route beta/m-c skipped')
+      && entry.includes('its provider is not live in the catalog snapshot'))).toBe(true)
+    // The liveness leg decided — preflight was never reached for the entry.
+    expect(llm.preflights.some(config => config.provider === 'beta' && config.model === 'm-c')).toBe(false)
+  })
+})
