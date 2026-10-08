@@ -2961,6 +2961,53 @@ export class AutopilotEngine {
   }
 
   /**
+   * F20 (PR #2 Codex round 9): the pool entry a pinned route currently
+   * matches, when the pool is an authority for the role at all. The
+   * pool-equality reclassification is AUDITOR-only (F9), so a non-auditor
+   * role never recovers an entry — its pin stands or falls on session-policy
+   * membership alone. For an auditor the FIRST match in the pool's own order
+   * (the walk's order) is returned WHOLE, with the dispatch object the reuse
+   * path carries: the COMPLETE entry — provider, model, reasoningEffort,
+   * maxTokens and every other call-config field — composed exactly as the
+   * E11/F15 walk dispatches it (route identity normalized to the trimmed
+   * pin), with one documented rider: the PIN's own reasoningEffort survives
+   * only where the current entry names none (a pin settled by policy
+   * selection can carry an effort a coincidentally route-equal pool entry
+   * omits — dropping it would be the same silent-degradation class this
+   * recovery exists to close). A pool edit that changed the entry's own
+   * fields is followed, not averaged: the current entry wins. `undefined`
+   * when no current entry matches — the edit that removed it took the grant
+   * with it, and the pin must stand on session-policy membership alone or
+   * re-select; there is no entry to recover and no silent degradation back
+   * to a three-field reconstruction.
+   */
+  private auditorPoolMatchFor(role: Role, pin: RoutingPin): {
+    readonly entry: AgentOptionsLike
+    readonly route: RoutePin
+    readonly dispatch: AgentOptionsLike & { readonly provider: string; readonly model: string }
+  } | undefined {
+    if (!AUDITOR_ROLE_SET.includes(role)) return undefined
+    const entry = this.config.crossFamily.pool.find(candidate => {
+      const route = toRoutePin(candidate)
+      return route !== undefined && sameRoute(route, pin)
+    })
+    const route = entry === undefined ? undefined : toRoutePin(entry)
+    if (entry === undefined || route === undefined) return undefined
+    return {
+      entry,
+      route,
+      dispatch: {
+        ...entry,
+        provider: route.provider,
+        model: route.model,
+        ...(entry.reasoningEffort === undefined && pin.reasoningEffort !== undefined
+          ? { reasoningEffort: pin.reasoningEffort }
+          : {}),
+      },
+    }
+  }
+
+  /**
    * Whether the executor pin is still authorized, for the reuse path: a
    * plugin-config pin re-runs the one grant rule, and a session-policy pin
    * must still be a member of the (write-once, but re-read) policy set. A pin
@@ -2993,11 +3040,11 @@ export class AutopilotEngine {
   private pinStillAuthorized(role: Role, pin: RoutePin, policy: SessionPolicyState): string | undefined {
     // F9: pool equality reclassifies a pin as a plugin-config grant for
     // AUDITORS only — for every other role the pool is not an authority and
-    // the pin must survive on session-policy membership alone.
-    const poolHit = AUDITOR_ROLE_SET.includes(role) && this.config.crossFamily.pool.some(entry => {
-      const candidate = toRoutePin(entry)
-      return candidate !== undefined && sameRoute(candidate, pin)
-    })
+    // the pin must survive on session-policy membership alone. F20: the SAME
+    // match rule `auditorPoolMatchFor` applies on the reuse dispatch — one
+    // rule, two consumers, so the authority check and the entry recovery can
+    // never disagree about which entry (if any) authorizes the pin.
+    const poolHit = this.auditorPoolMatchFor(role, pin) !== undefined
     if (poolHit) {
       const verdict = resolvePluginGrant({ provider: pin.provider, model: pin.model, source: 'legacy-pool' }, policy)
       return verdict.kind === 'conflict' ? verdict.reason : undefined
@@ -3134,6 +3181,22 @@ export class AutopilotEngine {
       const pin = prior.routingPins?.[role]
       if (pin !== undefined) {
         const pinRoute: RoutePin = { provider: pin.provider, model: pin.model }
+        // F20 (PR #2 Codex round 9): recover the pool entry BEFORE the checks,
+        // because when a pool grant is what authorizes this pin (the auditor
+        // pool-equality branch `pinStillAuthorized` re-runs below) the COMPLETE
+        // entry is what the dispatch carries — so the preflight leg and the
+        // reuse dispatch below are both built from this one recovered object:
+        // preflight exactly what you dispatch (the F15 discipline). The first
+        // dispatch of a pool-picked route carries the entry whole (`agentOptions:
+        // entry` in the pool walk — maxTokens and every call-config field), but
+        // this reuse path used to rebuild agentOptions from the pin's three
+        // fields alone, silently dropping the entry's tuning after the first
+        // dispatch. An entry whose extra fields fail preflight kills the pin
+        // (dead below ⇒ re-selection with `repinFrom`), never a silent fall
+        // back to the bare reconstruction; an entry that no longer matches
+        // leaves the pin standing (or falling) on session-policy membership
+        // alone, exactly as before.
+        const poolMatch = this.auditorPoolMatchFor(role, pin)
         const snapshot = await catalog.snapshot()
         let dead: string | undefined
         // F14 (PR #2 Codex round 6): an `unavailable` snapshot (a catalog read
@@ -3148,13 +3211,18 @@ export class AutopilotEngine {
           dead = `pinned provider "${pin.provider}" is no longer live in the catalog (llm/adapters-updated refreshed it)`
         } else {
           try {
-            await catalog.preflight({
+            // F20: the preflight carries EXACTLY what the dispatch will — the
+            // complete recovered pool entry when a pool grant authorizes the
+            // pin (maxTokens and every call-config field ride, route identity
+            // normalized to the trimmed pin the liveness leg checked), the
+            // pin's own three fields otherwise.
+            await catalog.preflight(poolMatch?.dispatch ?? {
               provider: pin.provider,
               model: pin.model,
               ...(pin.reasoningEffort === undefined ? {} : { reasoningEffort: pin.reasoningEffort }),
             })
           } catch (error) {
-            dead = `pinned route ${pin.provider}/${pin.model} failed dispatch preflight (${errorMessage(error)})`
+            dead = `pinned route ${pin.provider}/${pin.model} failed dispatch preflight${poolMatch === undefined ? '' : ' on the complete pool entry that authorizes it'} (${errorMessage(error)})`
           }
         }
         if (dead === undefined) {
@@ -3177,10 +3245,18 @@ export class AutopilotEngine {
           // else — which is what a non-auditor pin must now pass to be here at
           // all. If the pin shape ever persists a source, prefer it over this
           // inference whenever the two disagree.
-          const poolHit = AUDITOR_ROLE_SET.includes(role) && this.config.crossFamily.pool.some(entry => {
-            const candidate = toRoutePin(entry)
-            return candidate !== undefined && sameRoute(candidate, pinRoute)
-          })
+          //
+          // F20 (PR #2 Codex round 9): that same inference now decides WHAT is
+          // dispatched, not just how it is labeled. A pool grant authorizes
+          // the COMPLETE entry, so the pool-authorized reuse dispatches the
+          // recovered entry whole (`poolMatch.dispatch` — maxTokens and every
+          // call-config field, the pin's own effort riding only where the
+          // entry names none), and the preflight above proved exactly those
+          // fields. The recorded pin carries the effort actually dispatched —
+          // the entry's when it names one, the pin's own otherwise. A pin
+          // with NO matching entry never takes this branch: it kept (or lost)
+          // its authority on session-policy membership alone and keeps the
+          // existing provider/model/effort reconstruction below unchanged.
           // F14: the reuse record states liveness only when the read could
           // assert it; an unavailable catalog is named as the outage it is —
           // never dressed up as "provider live" (nothing was proven) and
@@ -3188,6 +3264,25 @@ export class AutopilotEngine {
           const livenessNote = snapshot.catalogStatus === 'live'
             ? 'provider live'
             : `provider liveness NOT assertable — catalog unavailable (${snapshot.diagnostic ?? 'no diagnostic recorded'}): a catalog read failure (infrastructure), not evidence the provider is gone`
+          if (poolMatch !== undefined) {
+            const pinEffortRides = poolMatch.entry.reasoningEffort === undefined && pin.reasoningEffort !== undefined
+            return {
+              kind: 'dispatch',
+              agentOptions: poolMatch.dispatch,
+              routing: {
+                role,
+                pin: {
+                  provider: poolMatch.route.provider,
+                  model: poolMatch.route.model,
+                  ...(poolMatch.dispatch.reasoningEffort === undefined ? {} : { reasoningEffort: poolMatch.dispatch.reasoningEffort }),
+                },
+                why: [
+                  `pin: reusing the role pin — ${livenessNote}, preflight accepted on the COMPLETE pool entry, authority intact (a plugin-config pool grant — the matching pool entry recovered at reuse: maxTokens ${poolMatch.entry.maxTokens === undefined ? 'unset' : String(poolMatch.entry.maxTokens)}${pinEffortRides ? ', the pin\'s own reasoningEffort riding where the entry names none' : ''}; never a provider/model/effort reconstruction)`,
+                ],
+                authorizationSource: 'plugin-config',
+              },
+            }
+          }
           return {
             kind: 'dispatch',
             agentOptions: {
@@ -3199,9 +3294,9 @@ export class AutopilotEngine {
               role,
               pin,
               why: [
-                `pin: reusing the role pin — ${livenessNote}, preflight accepted, authority intact (${poolHit ? 'a plugin-config pool grant' : 'authorized by the session policy when selected'})`,
+                `pin: reusing the role pin — ${livenessNote}, preflight accepted, authority intact (authorized by the session policy when selected)`,
               ],
-              authorizationSource: poolHit ? 'plugin-config' : 'session-policy',
+              authorizationSource: 'session-policy',
             },
           }
         }

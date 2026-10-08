@@ -1964,3 +1964,137 @@ describe('F17 (PR #2 round 7): the pool liveness skip distinguishes a catalog ou
     expect(llm.preflights.some(config => config.provider === 'beta' && config.model === 'm-c')).toBe(false)
   })
 })
+
+// ── F20 (PR #2 Codex round 9): a pool-authorized pin reuse carries the COMPLETE entry ──
+//
+// The pool fallback dispatches the COMPLETE pool entry (`agentOptions: entry`
+// — maxTokens and every call-config field), but the pin it records is the
+// trimmed route ({provider, model, reasoningEffort?}). A SUBSEQUENT dispatch
+// for the same role reused that pin and reconstructed agentOptions from only
+// provider/model/effort — the entry's tuning (a configured token cap) was
+// silently dropped after the first dispatch. On the reuse path, when the
+// pool grant is what authorizes the pin (the auditor pool-equality branch),
+// the matching entry is now recovered and dispatched WHOLE, with the
+// preflight carrying the same complete fields (the F15 discipline applied to
+// reuse). An entry that no longer matches takes its grant with it: the pin
+// must stand on session-policy membership alone or re-select (repinFrom
+// recorded) — never a silent degradation to the bare reconstruction.
+
+describe('F20 (PR #2 round 9): pin reuse over a pool grant recovers the complete pool entry', () => {
+  /** An absent-policy auto run whose plan/execution auditors fall to the pool (executor named to the alpha family). */
+  function poolRun(pool: readonly AgentOptionsLike[]): { readonly h: Harness; readonly llm: StubLlm } {
+    const llm = new StubLlm(MODELS)
+    const catalog = new RouteCatalog(llm)
+    const h = makeHarness({
+      routing: { catalog, policyReader: () => ABSENT },
+      config: {
+        executor: { agentOptions: { provider: 'alpha', model: 'm-a' } },
+        crossFamily: { enabled: true, minRisk: 'medium', pool: [...pool] },
+      },
+      subagents: stubSubagents({ verdicts: [
+        { verdict: 'pass', note: 'plan ok' },
+        { verdict: 'pass', note: 'exec ok' },
+        { verdict: 'pass', note: 'exec ok again' },
+      ] }),
+    })
+    return { h, llm }
+  }
+
+  /** The last execution-auditor routing detail in the durable stream. */
+  function lastExecDetail(h: Harness): RoutingDecisionDetail | undefined {
+    const details = routingDetails(h).filter(detail => detail.role === 'execution-auditor')
+    return details[details.length - 1]
+  }
+
+  it('(a) a pool entry with maxTokens ⇒ BOTH sequential dispatches carry it, and the reuse\'s preflight received the complete fields', async () => {
+    const { h, llm } = poolRun([{ provider: 'beta', model: 'm-c', maxTokens: 4321 }])
+    await toClosing(h)
+    // First dispatch: the pool walk hands the COMPLETE entry to the start...
+    expect(h.subagents.auditOptions[1]).toEqual({ provider: 'beta', model: 'm-c', maxTokens: 4321 })
+    // ...and pins the trimmed route (the pin shape carries no maxTokens).
+    expect(h.engine.peek(h.root.id)?.routingPins?.['execution-auditor']).toEqual({ provider: 'beta', model: 'm-c' })
+
+    const preflightsBefore = llm.preflights.length
+    await h.engine.audit(h.root, { role: 'execution', prompt: 'again' })
+
+    // The REUSE recovers the complete entry: the token cap is NOT silently
+    // dropped after the first dispatch (before F20 this was {beta, m-c} only).
+    expect(h.subagents.auditOptions[2]).toEqual({ provider: 'beta', model: 'm-c', maxTokens: 4321 })
+    const last = lastExecDetail(h)
+    expect(last?.authorizationSource).toBe('plugin-config')
+    expect(last?.repinFrom).toBeUndefined()
+    expect(last?.pin).toEqual({ provider: 'beta', model: 'm-c' })
+    expect(last?.why?.some(entry =>
+      entry.includes('preflight accepted on the COMPLETE pool entry') && entry.includes('maxTokens 4321'))).toBe(true)
+    // Preflight proven to have received it: the reuse's resolveCallConfig ran
+    // on the complete fields — and NEVER on a bare provider/model fallback.
+    const reusePreflights = llm.preflights.slice(preflightsBefore)
+    expect(reusePreflights.some(config =>
+      config.provider === 'beta' && config.model === 'm-c' && config.maxTokens === 4321)).toBe(true)
+    expect(reusePreflights.some(config =>
+      config.provider === 'beta' && config.model === 'm-c' && config.maxTokens === undefined)).toBe(false)
+    // The pin rides unchanged: same route, no repin.
+    expect(h.engine.peek(h.root.id)?.routingPins?.['execution-auditor']).toEqual({ provider: 'beta', model: 'm-c' })
+  })
+
+  it('(b) the pool entry VANISHES between dispatches ⇒ the grant died with it: re-selection with repinFrom, not a silent pin ride', async () => {
+    const { h } = poolRun([{ provider: 'beta', model: 'm-c' }])
+    await toClosing(h)
+    expect(h.engine.peek(h.root.id)?.routingPins?.['execution-auditor']).toEqual({ provider: 'beta', model: 'm-c' })
+
+    // The owner edits the pool between dispatches: the entry whose grant kept
+    // the pin authorized is GONE (the engine reads the live pool at each
+    // decision, so the in-place edit is the next dispatch's truth).
+    ;(h.engine.config.crossFamily.pool as AgentOptionsLike[]).pop()
+    expect(h.engine.config.crossFamily.pool).toHaveLength(0)
+
+    await h.engine.audit(h.root, { role: 'execution', prompt: 'again' })
+    // NOT a silent degradation to a bare reconstruction: the pin's authority
+    // is gone with the entry, the conservative F1 refusal fired, and the
+    // re-selection inherited (nothing explicit left to dispatch).
+    expect(h.subagents.auditOptions[2]).toBeUndefined()
+    const last = lastExecDetail(h)
+    expect(last?.pin).toBeUndefined()
+    expect(last?.repinFrom).toEqual({ provider: 'beta', model: 'm-c' })
+    expect(last?.authorizationSource).toBeUndefined()
+    expect(last?.why?.some(entry =>
+      entry.includes('cannot re-establish its session-policy authorization') && entry.includes('absent'))).toBe(true)
+    // The pin is cleared in the snapshot — the fold re-derives it from the pinless record.
+    expect(h.engine.peek(h.root.id)?.routingPins?.['execution-auditor']).toBeUndefined()
+  })
+
+  it('(c) a session-policy pin with NO matching pool entry keeps the existing reconstruction — the pool never widens into it', async () => {
+    const f = fixture([...MODELS, { provider: 'gamma', id: 'm-d', contextWindow: 131072 }], PRESENT_ABC)
+    const h = makeHarness({
+      routing: f.portsFor(),
+      config: {
+        executor: { agentOptions: { provider: 'alpha', model: 'm-a' } },
+        crossFamily: { enabled: true, minRisk: 'medium', pool: [{ provider: 'gamma', model: 'm-d', maxTokens: 999 }] },
+      },
+      subagents: stubSubagents({ verdicts: [
+        { verdict: 'pass', note: 'plan ok' },
+        { verdict: 'pass', note: 'exec ok' },
+        { verdict: 'pass', note: 'exec ok again' },
+      ] }),
+    })
+    await toClosing(h)
+    // The pin was settled by POLICY SELECTION (beta/m-c, effort from the
+    // adapter default) — the pool entry (gamma) does not match its route.
+    expect(h.engine.peek(h.root.id)?.routingPins?.['execution-auditor']).toEqual({ provider: 'beta', model: 'm-c', reasoningEffort: 'high' })
+
+    const preflightsBefore = f.llm.preflights.length
+    await h.engine.audit(h.root, { role: 'execution', prompt: 'again' })
+
+    // Existing reconstruction, unchanged: provider/model/effort from the pin —
+    // the non-matching entry's maxTokens never rides, and no pool claim appears.
+    expect(h.subagents.auditOptions[2]).toEqual({ provider: 'beta', model: 'm-c', reasoningEffort: 'high' })
+    const last = lastExecDetail(h)
+    expect(last?.authorizationSource).toBe('session-policy')
+    expect(last?.repinFrom).toBeUndefined()
+    expect(last?.why?.some(entry => entry.includes('authorized by the session policy when selected'))).toBe(true)
+    expect(last?.why?.some(entry => entry.includes('COMPLETE pool entry'))).toBe(false)
+    expect(f.llm.preflights.slice(preflightsBefore).some(config =>
+      config.provider === 'beta' && config.model === 'm-c'
+      && config.maxTokens === undefined && config.reasoningEffort === 'high')).toBe(true)
+  })
+})
