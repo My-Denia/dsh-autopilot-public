@@ -2166,7 +2166,11 @@ describe('routing pins derive from dispatch detail.routing, last-wins per role',
 
   it('a start-executor routing decision must name the executor role', () => {
     const prior = makeSnapshot({ phase: 'executing', planGate: 'pass' }, STANDARD_TRIAGE)
-    const executor: ExecutorRecord = { childId: 'c1', generation: 1, executionRevision: 1, state: 'starting', route: { provider: 'spawn', routeProvider: 'p', routeModel: 'm', routeStatus: 'verified' } }
+    // F26: the route carries `selected` because the engine's writer stamps the
+    // detail's pin onto the record it appends (`withRoutingRecord`) — present
+    // iff the pin is. A pinned detail with a selectedless record is now (round
+    // 13) a rejected contradiction, so the LEGAL fixture is the real shape.
+    const executor: ExecutorRecord = { childId: 'c1', generation: 1, executionRevision: 1, state: 'starting', route: { provider: 'spawn', routeProvider: 'p', routeModel: 'm', routeStatus: 'verified', selected: PIN } }
     const ok = applyEvent(prior, event('start-executor', makeSnapshot({
       revision: prior.revision + 1,
       phase: 'executing',
@@ -2184,5 +2188,153 @@ describe('routing pins derive from dispatch detail.routing, last-wins per role',
       routingPins: { executor: PIN },
     }, STANDARD_TRIAGE), prior.revision + 1, { stage: 'starting', childId: 'c1', routing: { role: 'plan-auditor', pin: PIN, why: ['x'], authorizationSource: 'session-policy' } })))
       .toThrowError(/must be "executor"/)
+  })
+})
+
+// ── F26 (PR #2 Codex round 13): the routing detail must bind the appended record ──
+//
+// Replay validated `detail.routing` and derived the pin state from it, but
+// never compared it to the AuditRecord/ExecutorRecord the SAME commit appends
+// — a foreign event could append an execution-auditor pass whose RouteRecord
+// claims route B `verified` while the validated detail names plan-auditor
+// pin A. The fold now requires, when BOTH sides are present on one dispatch
+// commit: the detail's role names the appended record's role (auditor roles
+// mapped plan-auditor→plan, execution-auditor→execution,
+// rules-auditor→rules — the engine's `routeRoleOf`), and the detail's pin and
+// the record's `selected` are the same route, present on both or neither (the
+// engine's writer stamps `selected` from the pin via `withRoutingRecord`, so
+// the lockstep is the writer's own shape). Detail-only and record-only events
+// fold exactly as before — the strictness is additive.
+
+describe('F26: a routing detail binds the appended record it stamps', () => {
+  const PIN = { provider: 'beta', model: 'm-c', reasoningEffort: 'high' } as const
+  const OTHER = { provider: 'gamma', model: 'm-g' } as const
+  const TRIAGE = makeTriage({ size: 'standard', risk: 'medium', executionMode: 'inline', auditMode: 'independent' })
+
+  /** An audit event from `executing` appending exactly one record, carrying a routing detail. */
+  function auditAppendingRecord(
+    prior: Snapshot,
+    routing: unknown,
+    record: AuditRecord,
+    pins: Snapshot['routingPins'],
+  ): RunEvent {
+    return event('audit', makeSnapshot({
+      revision: prior.revision + 1,
+      phase: 'executing',
+      planGate: 'pass',
+      audits: [...prior.audits, record],
+      routingPins: pins,
+    }, TRIAGE), prior.revision + 1, { routing })
+  }
+
+  /** The engine's real execution-audit shape: the record mirrors the decision. */
+  function engineShapeRecord(route: Record<string, unknown> = {}): AuditRecord {
+    return passAudit('execution', 0, {
+      route: {
+        provider: 'spawn', routeProvider: 'beta', routeModel: 'm-c', routeStatus: 'verified',
+        selected: PIN, authorizationSource: 'session-policy', why: ['policy allows beta'],
+        ...route,
+      },
+    })
+  }
+
+  it('rejects a foreign event whose detail names one role and whose appended record another', () => {
+    const prior = makeSnapshot({ phase: 'executing', planGate: 'pass' }, TRIAGE)
+    // The record is an EXECUTION pass; the validated detail names plan-auditor.
+    expect(() => applyEvent(prior, auditAppendingRecord(
+      prior,
+      { role: 'plan-auditor', pin: PIN, why: ['x'], authorizationSource: 'session-policy' },
+      engineShapeRecord(),
+      { 'plan-auditor': PIN },
+    ))).toThrowError(/names role "plan-auditor".*audit record 0 has role "execution"/)
+  })
+
+  it('rejects a pin that contradicts the appended record\'s selected route', () => {
+    const prior = makeSnapshot({ phase: 'executing', planGate: 'pass' }, TRIAGE)
+    expect(() => applyEvent(prior, auditAppendingRecord(
+      prior,
+      { role: 'execution-auditor', pin: PIN, why: ['x'], authorizationSource: 'session-policy' },
+      engineShapeRecord({ selected: OTHER }),
+      { 'execution-auditor': PIN },
+    ))).toThrowError(/pins role "execution-auditor".*selected .*gamma.*same route/s)
+  })
+
+  it('rejects a pinned detail whose record carries no selected (the writer stamps selected iff a pin exists)', () => {
+    const prior = makeSnapshot({ phase: 'executing', planGate: 'pass' }, TRIAGE)
+    expect(() => applyEvent(prior, auditAppendingRecord(
+      prior,
+      { role: 'execution-auditor', pin: PIN, why: ['x'], authorizationSource: 'session-policy' },
+      engineShapeRecord({ selected: undefined }),
+      { 'execution-auditor': PIN },
+    ))).toThrowError(/present on both or neither/)
+  })
+
+  it('rejects a pinless (inherit) detail whose record claims a selected route anyway', () => {
+    const prior = makeSnapshot({ phase: 'executing', planGate: 'pass' }, TRIAGE)
+    expect(() => applyEvent(prior, auditAppendingRecord(
+      prior,
+      { role: 'execution-auditor', why: ['inheriting'] },
+      engineShapeRecord(),
+      undefined,
+    ))).toThrowError(/present on both or neither/)
+  })
+
+  it('rejects the same contradictions on the executor record of a start-executor', () => {
+    const prior = makeSnapshot({ phase: 'executing', planGate: 'pass' }, TRIAGE)
+    const executor: ExecutorRecord = { childId: 'c1', generation: 1, executionRevision: 1, state: 'starting', route: { provider: 'spawn', routeProvider: 'gamma', routeModel: 'm-g', routeStatus: 'verified', selected: OTHER } }
+    expect(() => applyEvent(prior, event('start-executor', makeSnapshot({
+      revision: prior.revision + 1,
+      phase: 'executing',
+      planGate: 'pass',
+      executor,
+      routingPins: { executor: PIN },
+    }, TRIAGE), prior.revision + 1, { stage: 'starting', childId: 'c1', routing: { role: 'executor', pin: PIN, why: ['x'], authorizationSource: 'session-policy' } })))
+      .toThrowError(/executor record's route record carries selected/)
+  })
+
+  it('accepts the engine\'s real shape: matching role, pin === selected', () => {
+    const prior = makeSnapshot({ phase: 'executing', planGate: 'pass' }, TRIAGE)
+    const next = applyEvent(prior, auditAppendingRecord(
+      prior,
+      { role: 'execution-auditor', pin: PIN, why: ['policy allows beta'], authorizationSource: 'session-policy' },
+      engineShapeRecord(),
+      { 'execution-auditor': PIN },
+    ))
+    expect(next.audits).toHaveLength(1)
+    expect(next.routingPins).toEqual({ 'execution-auditor': PIN })
+  })
+
+  it('an inherit detail with a selectedless record folds (both sides absent is the legal inherit shape)', () => {
+    const prior = makeSnapshot({ phase: 'executing', planGate: 'pass' }, TRIAGE)
+    const next = applyEvent(prior, auditAppendingRecord(
+      prior,
+      { role: 'execution-auditor', why: ['no route authorized — inheriting the deployment default'], authorizationSource: 'unreachable-inherit' },
+      passAudit('execution', 0, { route: { provider: 'spawn', routeProvider: 'unverified', routeModel: 'unverified', routeStatus: 'unverified' } }),
+      undefined,
+    ))
+    expect(next.audits).toHaveLength(1)
+  })
+
+  it('routing-detail-only and record-only events fold unchanged (additive strictness, 0.2.0 replay intact)', () => {
+    const prior = makeSnapshot({ phase: 'executing', planGate: 'pass' }, TRIAGE)
+    // Detail-only: a routing decision with NO appended record (no record to
+    // contradict) — the fold pins/derives as before.
+    const detailOnly = applyEvent(prior, event('audit', makeSnapshot({
+      revision: prior.revision + 1,
+      phase: 'executing',
+      planGate: 'pass',
+      audits: prior.audits,
+      routingPins: { 'rules-auditor': PIN },
+    }, TRIAGE), prior.revision + 1, { routing: { role: 'rules-auditor', pin: PIN, why: ['x'], authorizationSource: 'plugin-config' } }))
+    expect(detailOnly.routingPins).toEqual({ 'rules-auditor': PIN })
+    // Record-only: the 0.2.0 shape — an appended record with no detail.routing.
+    const recordOnly = applyEvent(prior, event('audit', makeSnapshot({
+      revision: prior.revision + 1,
+      phase: 'executing',
+      planGate: 'pass',
+      audits: [...prior.audits, engineShapeRecord()],
+    }, TRIAGE), prior.revision + 1))
+    expect(recordOnly.audits).toHaveLength(1)
+    expect(recordOnly.routingPins).toBeUndefined()
   })
 })

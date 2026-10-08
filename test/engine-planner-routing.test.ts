@@ -22,7 +22,7 @@ import type { RoutingPorts } from '../src/engine.js'
 import { AutopilotEngine } from '../src/engine.js'
 import { apply, resolveConfig } from '../src/index.js'
 import { RouteCatalog } from '../src/routing/catalog.js'
-import type { LlmRuntimeSubset } from '../src/routing/catalog.js'
+import type { LlmCallConfig, LlmModelInfo, LlmResolvedModelInfo, LlmRuntimeSubset } from '../src/routing/catalog.js'
 import { RunStore } from '../src/store/file.js'
 import type { RunEvent } from '../src/domain/types.js'
 import { makeHarness, makeTriage, makeUsageEntry, stubSubagents, undeclaredSeed, FakeAgents, fakeAgent } from './helpers.js'
@@ -83,7 +83,7 @@ function eventsOf(h: { readonly storeDir: string; readonly root: { readonly id: 
 }
 
 /** The init event's detail (line 1 of events.jsonl), as persisted. */
-function initEventDetail(h: { readonly storeDir: string; readonly root: { readonly id: string } }): { plannerRouting?: { status?: string; route?: unknown } } | undefined {
+function initEventDetail(h: { readonly storeDir: string; readonly root: { readonly id: string } }): { plannerRouting?: { status?: string; route?: unknown; why?: readonly string[] } } | undefined {
   return eventsOf(h)[0]?.detail as { plannerRouting?: { status?: string; route?: unknown } } | undefined
 }
 
@@ -800,5 +800,146 @@ describe('F4 (PR #2 review, round 2): the planner install follows live routing p
     await h.engine.selfCheck(h.root, { role: 'plan', verdict: 'pass', note: 'ok' })
     expect(h.engine.peek(h.root.id)?.phase).toBe('executing')
     expect(installer.disposes()).toBe(1) // the failed arm left no disposer to fire
+  })
+})
+
+// ── F25 (PR #2 Codex round 13): planner installs must not reappear during teardown ──
+//
+// dispose() swept the planner installs once, then waited for the in-flight
+// transaction tail — but a transaction awaiting planner route resolution
+// (catalog/policy awaits that never observe the abort) could land its arm
+// AFTER the sweep, leaving a live model selection that survives the plugin
+// unload/reload. Two-sided fix, defense in depth: the ARM GUARD refuses any
+// install once the lifecycle signal aborted (recording the refusal honestly
+// as `unsupported` on the deciding commit's durable detail), and dispose()
+// RE-SWEEPS after the tail settles, so it owns the zero-live-installs
+// invariant mechanically instead of trusting the guard alone.
+
+describe('F25: planner installs cannot reappear during dispose()', () => {
+  /** A gated `ctx.llm` subset: every async catalog read/preflight awaits the current gate. */
+  class GatedLlm implements LlmRuntimeSubset {
+    private gate: Promise<void> = Promise.resolve()
+    /** Make every subsequent async read hang until `promise` settles. */
+    hangOn(promise: Promise<void>): void { this.gate = promise }
+    listProviders() { return [{ id: 'planner-p', name: 'planner-p' }] }
+    async listModels(): Promise<readonly LlmModelInfo[]> {
+      await this.gate
+      return [{ provider: 'planner-p', id: 'planner-m', name: 'planner-m' }]
+    }
+    async resolveModelInfo(): Promise<LlmResolvedModelInfo> {
+      await this.gate
+      return { provider: 'planner-p', id: 'planner-m', name: 'planner-m' }
+    }
+    async resolveCallConfig(config: LlmCallConfig): Promise<LlmCallConfig> {
+      await this.gate
+      return config
+    }
+  }
+
+  /** A deferred the test releases on purpose. */
+  function deferred(): { promise: Promise<void>; release: () => void } {
+    let release!: () => void
+    const promise = new Promise<void>(resolve => { release = resolve })
+    return { promise, release }
+  }
+
+  it('an arm still resolving when dispose() swept is refused: never installed, refusal recorded honestly on the durable event', async () => {
+    const installer = stubInstaller()
+    const llm = new GatedLlm()
+    const catalog = new RouteCatalog(llm)
+    const slow = deferred()
+    llm.hangOn(slow.promise)
+    const h = makeHarness({ config: LOCKED_PLANNER, rootCtx: ROOT_CTX, routing: { modelSelectionInstaller: installer.port, catalog } })
+
+    // init's commit enters the planner arm and hangs on the catalog read...
+    const initCall = h.engine.init(h.root, makeTriage())
+    // ...the engine is torn down under it (abort + first sweep + tail wait)...
+    const disposeCall = h.engine.dispose()
+    // ...and only THEN does the resolution land — post-abort, post-sweep.
+    slow.release()
+    await disposeCall
+    await initCall
+
+    // The arm was refused after the abort: the installer was NEVER called, so
+    // no model selection exists for teardown to have missed, and dispose()
+    // returned with zero live installs (the re-sweep finds nothing because
+    // the guard already refused — defense in depth holds either way).
+    expect(installer.calls).toHaveLength(0)
+    expect(installer.disposes()).toBe(0)
+    // The refusal is the honest durable record on the deciding (init) event...
+    const record = initEventDetail(h)?.plannerRouting
+    expect(record?.status).toBe('unsupported')
+    expect(record?.route).toEqual(LOCKED_ROUTE)
+    expect(record?.why?.join('\n')).toContain('the engine was disposed while the route was resolving')
+    // ...the run itself completed normally, and the disposed state projects
+    // nothing on the live status surface (the absent field is the honest record).
+    expect(h.engine.peek(h.root.id)?.phase).toBe('planning')
+    expect(h.engine.status(h.root)?.plannerRouting).toBeUndefined()
+  })
+
+  it('a live install is swept by dispose() while a REFRESH of it is still resolving; the refresh arms nothing after', async () => {
+    const installer = stubInstaller()
+    const llm = new GatedLlm()
+    const catalog = new RouteCatalog(llm)
+    const storeDir = mkdtempSync(join(tmpdir(), 'dsh-autopilot-f25-'))
+    const agents = new FakeAgents()
+    const root = fakeAgent('root-1', undefined, undefined, ROOT_CTX)
+    agents.add(root)
+    let routing = resolveConfig(LOCKED_PLANNER).routing
+    const engine = new AutopilotEngine(
+      agents, stubSubagents(), new RunStore(storeDir), resolveConfig(LOCKED_PLANNER), () => true, {},
+      { modelSelectionInstaller: installer.port, catalog },
+      () => routing,
+    )
+
+    // Armed normally at init (the gate starts open)...
+    await engine.init(root, makeTriage())
+    expect(installer.calls).toHaveLength(1)
+
+    // ...then the lock is patched mid-planning and the catalog read goes
+    // slow, so the next planning commit's REFRESH hangs mid-resolution.
+    const slow = deferred()
+    catalog.invalidate()
+    llm.hangOn(slow.promise)
+    routing = resolveConfig({
+      routing: { roles: { planner: { mode: 'locked' as const, lock: { provider: 'other-p', model: 'other-m' } } } },
+    }).routing
+    const submitCall = engine.submitPlan(root, 'plan v2')
+
+    const disposeCall = engine.dispose() // the first sweep takes the LIVE install
+    slow.release() // the refresh resolution lands — post-abort
+    await disposeCall
+    await submitCall
+
+    // Only the init install ever existed: swept exactly once by dispose's
+    // sweep, and the post-abort refresh armed nothing (guard) — zero live
+    // installs when dispose() returned, and none appeared after.
+    expect(installer.calls).toHaveLength(1)
+    expect(installer.disposes()).toBe(1)
+    expect(engine.peek(root.id)?.phase).toBe('planning')
+  })
+
+  it('a clean dispose does not poison the next engine: reload re-arm still works (the guard is per-lifecycle)', async () => {
+    const installer = stubInstaller()
+    const h = makeHarness({ config: LOCKED_PLANNER, rootCtx: ROOT_CTX, routing: { modelSelectionInstaller: installer.port } })
+    await h.engine.init(h.root, makeTriage())
+    expect(installer.calls).toHaveLength(1)
+    await h.engine.dispose() // clean: the live install is swept exactly once
+    expect(installer.disposes()).toBe(1)
+
+    const installer2 = stubInstaller()
+    const agents = new FakeAgents()
+    const root2 = fakeAgent(h.root.id, undefined, undefined, ROOT_CTX)
+    agents.add(root2)
+    const engine2 = new AutopilotEngine(
+      agents, stubSubagents(), new RunStore(h.storeDir), resolveConfig(LOCKED_PLANNER), () => true, {},
+      { modelSelectionInstaller: installer2.port },
+    )
+    expect(engine2.peek(h.root.id)?.phase).toBe('planning')
+    // P2-3 reload re-arm fires on the fresh lifecycle, un-refused.
+    await vi.waitFor(() => expect(installer2.calls).toHaveLength(1))
+    expect(installer2.calls[0]?.route).toEqual(LOCKED_ROUTE)
+    await engine2.dispose()
+    expect(installer2.disposes()).toBe(1)
   })
 })

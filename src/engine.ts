@@ -1376,7 +1376,9 @@ export class AutopilotEngine {
   async dispose(): Promise<void> {
     this.lifecycle.abort(new AutopilotError('autopilot engine disposed', 'AP_DISPOSED'))
     // M6: no planner model selection may outlive the engine that installed
-    // it — mount teardown disposes every armed install exactly once.
+    // it — mount teardown disposes every armed install exactly once. The
+    // sweep runs EAGERLY (before the tail wait) so a live install is released
+    // immediately even when an in-flight transaction hangs past the 5s bound.
     for (const runId of [...this.plannerInstalls.keys()]) this.disposePlanner(runId)
     const pending = [...this.tails.values()]
     if (pending.length === 0) return
@@ -1387,6 +1389,15 @@ export class AutopilotEngine {
         if (typeof timer === 'object' && 'unref' in timer) timer.unref()
       }),
     ])
+    // F25 (PR #2 Codex round 13): RE-SWEEP after the tail settles. A
+    // transaction that was mid-planner-route-resolution when the first sweep
+    // ran resumes during the wait above; the arm guard refuses its install,
+    // but dispose() OWNS the zero-live-installs invariant mechanically rather
+    // than trusting every arm path to have observed the guard — so whatever
+    // appeared after the first sweep is disposed here, and dispose() returns
+    // with no live install either way. (Idempotent by deletion: a no-op when
+    // nothing appeared, as the guard alone guarantees.)
+    for (const runId of [...this.plannerInstalls.keys()]) this.disposePlanner(runId)
   }
 
   // ── Public state machine operations (root authority) ─────────────────────
@@ -3982,7 +3993,19 @@ export class AutopilotEngine {
   private async armPlannerDecision(runId: RunId, decision: PlannerRouteDecision): Promise<PlannerRoutingRecord | undefined> {
     const root = this.agents.get(runId)
     const decisionKey = plannerDecisionKeyOf(decision)
+    // F25 (PR #2 Codex round 13): the arm may land here AFTER dispose()
+    // swept — the caller awaited planner route resolution (catalog/policy
+    // awaits that do not observe the abort), and the engine was torn down
+    // under it. Past the abort, arming is REFUSED at every state write below:
+    // no installer call, no map entry — a model selection installed now would
+    // survive plugin unload/reload and outlive the engine that owns it. The
+    // refusal is still RECORDED for installable decisions (the least-surprising
+    // existing shape: `unsupported`, why naming the disposal) so the deciding
+    // commit can stamp it durably; an inherit decision records nothing,
+    // exactly as a live-arm inherit does. Each guarded stretch is synchronous,
+    // so once past its guard no abort can interleave before the write.
     if (decision.kind === 'inherit') {
+      if (this.lifecycle.signal.aborted) return undefined
       this.plannerInstalls.set(runId, { kind: 'inherit' })
       return undefined
     }
@@ -3991,6 +4014,12 @@ export class AutopilotEngine {
       ...(decision.kind === 'degraded' && decision.route === undefined ? {} : { route: decision.route }),
       why,
     })
+    if (this.lifecycle.signal.aborted) {
+      return record('unsupported', [
+        ...decision.why,
+        'planner: the engine was disposed while the route was resolving — arming refused so no model selection outlives the engine (degraded to inheritance)',
+      ])
+    }
     // A decision that already refused to name an installable route degrades
     // whatever the port situation — the refusal reasons are the record.
     if (decision.kind === 'degraded') {
@@ -4058,6 +4087,13 @@ export class AutopilotEngine {
     const previousDecision: PlannerDecisionKey = state.kind === 'inherit' ? { kind: 'inherit' } : state.decision
     const decision = await this.resolvePlannerRoute(this.agents.get(runId), next)
     if (samePlannerDecision(previousDecision, plannerDecisionKeyOf(decision))) return undefined
+    // F25: the re-resolution awaited catalog/policy facts, and the engine may
+    // have been disposed under it — the old install was already taken by
+    // dispose()'s sweep (disposePlanner is idempotent, so the one below is a
+    // no-op then). On a disposed engine there is nothing left to churn: no
+    // dispose/re-arm dance, no state entry, no record — the arm guard in
+    // {@link armPlannerDecision} refuses whatever a later path would try.
+    if (this.lifecycle.signal.aborted) return undefined
     const from = state.kind === 'inherit'
       ? 'inherit'
       : `${state.record.status} ${plannerRouteLabel(state.record.route)}`

@@ -26,7 +26,7 @@ import {
   isAbsoluteShapedBearer,
   usageDeclarationProblems,
 } from './types.js'
-import type { Operation, Phase, RunEvent, RoutingDecisionDetail, Snapshot } from './types.js'
+import type { AuditRole, Operation, Phase, RouteRecord, RunEvent, RoutingDecisionDetail, RoutingPin, Snapshot } from './types.js'
 
 /** Operations legal from each phase (undefined prior state only admits init). */
 const LEGAL_OPS: Record<Phase, readonly Operation[]> = {
@@ -406,6 +406,96 @@ function routingDecisionOf(op: Operation, detail: unknown): RoutingDecisionDetai
   return record as unknown as RoutingDecisionDetail
 }
 
+/**
+ * The audit role each auditor routing role names — the domain-side mirror of
+ * the engine's `routeRoleOf` (the fold may not import the engine that imports
+ * it; the mapping is the one rule both sides share, so it is stated once here
+ * and must move with the role vocabularies).
+ */
+const AUDIT_ROLE_OF_ROUTING_ROLE: Readonly<Record<string, AuditRole>> = {
+  'plan-auditor': 'plan',
+  'execution-auditor': 'execution',
+  'rules-auditor': 'rules',
+}
+
+/** Field-wise pin equality: provider, model, and effort (absent equals absent). */
+function sameRoutePin(a: RoutingPin, b: RoutingPin): boolean {
+  return a.provider === b.provider && a.model === b.model && a.reasoningEffort === b.reasoningEffort
+}
+
+/**
+ * F26 (PR #2 Codex round 13), ADDITIVE STRICTNESS: when one dispatch commit
+ * carries BOTH a validated `detail.routing` AND a record the same commit
+ * appends (an AuditRecord on `audit`, the ExecutorRecord on `start-executor`),
+ * the two must agree — the detail's role names the appended record's role, and
+ * the detail's pin and the record's `selected` route are the SAME route.
+ * Before this, replay validated the detail and derived the pin state from it
+ * but never compared it to the appended record, so a foreign event could
+ * append an execution-auditor pass whose RouteRecord claims route B while the
+ * validated detail names plan-auditor pin A — and the fold accepted the
+ * contradictory canonical state.
+ *
+ * THE EXACT COMPARISON, per the engine's own stamp shapes (they define the
+ * legal space): the writer merges the decision onto the record it appends
+ * (`withRoutingRecord`), so an engine-written record's `selected` IS the
+ * detail's pin — present iff the pin is — and an audit detail's role is
+ * `routeRoleOf(record.role)`. Legitimate omissions are therefore exactly the
+ * ones the writer can produce: the record carries route-evidence legs the
+ * detail has no counterpart for (`observed`, `routeStatus`,
+ * `routeProvider`/`routeModel`, `crossFamily`, …) and mirrors the detail's
+ * decision fields under its own names (`why`, `authorizationSource`,
+ * `fallbackFrom`, `candidatesConsidered`) — those pairs are deliberately NOT
+ * compared. What is a genuine contradiction on either side: a role naming a
+ * different dispatch than the record it appends, a `selected` route with no
+ * pin behind it, a pin whose record carries a different `selected`, or the
+ * two routes differing on any axis (provider, model, effort — absent effort
+ * on one side and present on the other is a difference).
+ *
+ * Replay-compat, same argument as F22 above: the rule fires only when BOTH
+ * sides are present. `detail.routing` is new in this branch, so no 0.2.0
+ * event can carry it (every historical fixture takes the no-binding arm),
+ * and this branch's writer satisfies the equality by construction. A
+ * routing-detail-only event (a decision with no appended record) and every
+ * record-only event (all of 0.2.0, self-check, external countersigns) fold
+ * exactly as before.
+ */
+function bindRoutingDetailToRecords(
+  event: RunEvent,
+  routing: RoutingDecisionDetail,
+  prior: Snapshot,
+  next: Snapshot,
+): void {
+  if (event.op !== 'audit' && event.op !== 'start-executor') return // unreachable: callers pass only dispatch ops
+  const op = event.op
+  const pinEqualsSelected = (label: string, route: RouteRecord): void => {
+    if (routing.pin === undefined && route.selected === undefined) return
+    if (routing.pin !== undefined && route.selected !== undefined && sameRoutePin(routing.pin, route.selected)) return
+    fail(
+      `${op} detail.routing pins role "${routing.role}" to ${JSON.stringify(routing.pin)} but the appended ${label}'s route record carries selected ${JSON.stringify(route.selected)} — the decision and the record it stamps must name the same route, present on both or neither`,
+      'AP_ROUTING_RECORD_MISMATCH',
+    )
+  }
+  if (op === 'audit') {
+    for (let i = prior.audits.length; i < next.audits.length; i++) {
+      const record = next.audits[i]
+      if (record === undefined) continue // the array is index-validated elsewhere; nothing to bind
+      const expectedRole = AUDIT_ROLE_OF_ROUTING_ROLE[routing.role]
+      if (expectedRole === undefined || expectedRole !== record.role) {
+        fail(
+          `audit detail.routing names role "${routing.role}" but appended audit record ${i} has role "${record.role}" — one dispatch, one role: the decision must bind the record it appends`,
+          'AP_ROUTING_RECORD_MISMATCH',
+        )
+      }
+      pinEqualsSelected(`audit record ${i}`, record.route)
+    }
+    return
+  }
+  // start-executor: `routingDecisionOf` already held the detail to the
+  // 'executor' role on this op; the binding left to check is pin ↔ the
+  // executor record's own route.
+  if (next.executor !== undefined) pinEqualsSelected('executor record', next.executor.route)
+}
+
 /** Assert one event is a legal successor of the prior snapshot; returns the new snapshot. */
 export function applyEvent(prior: Snapshot | undefined, event: RunEvent): Snapshot {
   if (event.v !== 1) fail(`unsupported event version ${String((event as { v: unknown }).v)}`, 'AP_EVENT_VERSION')
@@ -450,13 +540,15 @@ export function applyEvent(prior: Snapshot | undefined, event: RunEvent): Snapsh
   // arithmetic. Events without `detail.routing` replay exactly as 0.2.0: the
   // pin state must be byte-stable across them, which is also what makes a
   // legacy stream with no pins at all fold unchanged.
+  const dispatchRouting = event.op === 'audit' || event.op === 'start-executor'
+    ? routingDecisionOf(event.op, event.detail)
+    : undefined
   if (event.op === 'audit' || event.op === 'start-executor') {
-    const routing = routingDecisionOf(event.op, event.detail)
-    const expected = routing !== undefined ? applyRoutingDecision(prior.routingPins, routing) : prior.routingPins
+    const expected = dispatchRouting !== undefined ? applyRoutingDecision(prior.routingPins, dispatchRouting) : prior.routingPins
     if (!sameRoutingPins(expected, next.routingPins)) {
       fail(
-        routing !== undefined
-          ? `routingPins do not match detail.routing for role "${routing.role}" (expected ${JSON.stringify(expected)}, got ${JSON.stringify(next.routingPins)})`
+        dispatchRouting !== undefined
+          ? `routingPins do not match detail.routing for role "${dispatchRouting.role}" (expected ${JSON.stringify(expected)}, got ${JSON.stringify(next.routingPins)})`
           : `routingPins mutated without a routing decision (expected ${JSON.stringify(prior.routingPins)}, got ${JSON.stringify(next.routingPins)})`,
         'AP_ROUTING_PINS',
       )
@@ -474,6 +566,13 @@ export function applyEvent(prior: Snapshot | undefined, event: RunEvent): Snapsh
     if (JSON.stringify(next.audits[i]) !== JSON.stringify(prior.audits[i])) {
       fail(`audit record ${i} was modified`, 'AP_AUDITS_MODIFIED')
     }
+  }
+
+  // F26: bind a present routing detail to the record(s) this same commit
+  // appends (see bindRoutingDetailToRecords for the exact comparison and the
+  // replay-compat argument). Fires only when BOTH sides are present.
+  if (dispatchRouting !== undefined) {
+    bindRoutingDetailToRecords(event, dispatchRouting, prior, next)
   }
 
   // An owner countersign is validated ON REPLAY, not only where it was written.
