@@ -67,7 +67,7 @@ interface RecordedChild {
   agent?: unknown
 }
 
-function fakeCtx(storeRoot: string, options: { storageDomain?: unknown; seamThrows?: boolean; child?: ChildInjection } = {}) {
+function fakeCtx(storeRoot: string, options: { storageDomain?: unknown; seamThrows?: boolean; child?: ChildInjection; llm?: unknown } = {}) {
   const recorded: Recorded = {
     toolNames: [],
     guards: 0,
@@ -129,6 +129,12 @@ function fakeCtx(storeRoot: string, options: { storageDomain?: unknown; seamThro
   const disposedListeners: Array<(payload: { agent: unknown }) => void> = []
   const recordedChild: RecordedChild = { toolNames: [], disposed: [] }
   /**
+   * Every `ctx.on` subscription with its disposal count — F19 observes the
+   * routing wiring's `llm/adapters-updated` listener through this ledger: a
+   * listener the failed mount forgot to release keeps `disposals: 0`.
+   */
+  const subscriptions: Array<{ event: string; disposals: number }> = []
+  /**
    * The rc.1 publication path, reduced to what the plugin can observe: the
    * subagent manager creates the child agent (setup, then `agent/created`
    * announced SYNCHRONOUSLY through the registered listeners) and a listener
@@ -175,6 +181,10 @@ function fakeCtx(storeRoot: string, options: { storageDomain?: unknown; seamThro
 
   const ctx = {
     ...(options.storageDomain === undefined ? {} : { storageDomain: options.storageDomain }),
+    // F19: an `llm` runtime on the host makes `createRoutingWiring` build a
+    // catalog and subscribe `llm/adapters-updated` — the listener whose
+    // lifecycle the wiring-dispose tests below observe.
+    ...(options.llm === undefined ? {} : { llm: options.llm }),
     agents: {
       get: (id: string) => (
         id === rootAgent.id ? rootAgent : id === otherRoot.id ? otherRoot : id === childAgent.id ? childAgent : undefined
@@ -235,7 +245,9 @@ function fakeCtx(storeRoot: string, options: { storageDomain?: unknown; seamThro
     on(event: string, listener: (payload: { agent: unknown }) => void) {
       if (event === 'agent/created') created.push(listener)
       if (event === 'agent/disposed') disposedListeners.push(listener)
-      return () => {}
+      const subscription = { event, disposals: 0 }
+      subscriptions.push(subscription)
+      return () => { subscription.disposals += 1 }
     },
   }
 
@@ -250,6 +262,10 @@ function fakeCtx(storeRoot: string, options: { storageDomain?: unknown; seamThro
     announce: (agent: unknown) => { for (const listener of created) listener({ agent }) },
     dispose: (agent: unknown) => { for (const listener of disposedListeners) listener({ agent }) },
     child: recordedChild,
+    /** Disposal counts, in subscription order, for one host event (F19). */
+    subscriptionDisposals: (event: string) => subscriptions.filter(s => s.event === event).map(s => s.disposals),
+    /** How many listeners for one host event are still live (F19: no stale stacking). */
+    liveSubscriptions: (event: string) => subscriptions.filter(s => s.event === event && s.disposals === 0).length,
   }
 }
 
@@ -279,6 +295,20 @@ function countingFacility() {
         }
       },
     },
+  }
+}
+
+/**
+ * The four `LlmRuntime` members `probeLlmRuntime` demands (F19 tests): gives
+ * `createRoutingWiring` a catalog to build and an `llm/adapters-updated`
+ * listener to subscribe. No member is ever called — these mounts never route.
+ */
+function stubLlmRuntime() {
+  return {
+    listProviders: () => [],
+    listModels: async () => [],
+    resolveModelInfo: async () => ({}),
+    resolveCallConfig: async () => ({}),
   }
 }
 
@@ -378,6 +408,56 @@ describe('apply', () => {
       .rejects.toThrowError(/systemPrompt refused the section/)
     expect(counter.opens()).toBe(1)
     expect(counter.closes()).toBe(1)
+  })
+
+  // ── F19 (PR #2 Codex round 8): the routing wiring is released on failure ──
+  //
+  // `createRoutingWiring` subscribes `llm/adapters-updated` (and may register
+  // the mirror projection) BEFORE any of the registrations that can throw. A
+  // failed mount that forgot the wiring disposer left those host-surface
+  // registrations behind, and every retry stacked one more stale listener.
+  // The tests give the host an `llm` runtime so the wiring has something to
+  // subscribe, and observe the subscription ledger above.
+  it('F19: a mount that throws AFTER the wiring exists disposes it exactly once, closes the store, and rethrows unchanged', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'dsh-autopilot-apply-'))
+    const counter = countingFacility()
+    const host = fakeCtx(root, { storageDomain: counter.facility, llm: stubLlmRuntime() })
+    host.ctx.systemPrompt.section = () => { throw new Error('systemPrompt refused the section') }
+    await expect(apply(host.ctx, { storeRoot: root, storeKind: 'auto', skillInstall: 'off' }))
+      .rejects.toThrowError(/systemPrompt refused the section/)
+    // The wiring subscribed exactly once and its disposer ran exactly once.
+    expect(host.subscriptionDisposals('llm/adapters-updated')).toEqual([1])
+    // The store discipline from the test above is unchanged by the new teardown.
+    expect(counter.opens()).toBe(1)
+    expect(counter.closes()).toBe(1)
+  })
+
+  it('F19: a CLEAN mount does not dispose the wiring at apply time — only at plugin lifecycle dispose', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'dsh-autopilot-apply-'))
+    const host = fakeCtx(root, { llm: stubLlmRuntime() })
+    const dispose = await apply(host.ctx, { storeRoot: root, storeKind: 'file', skillInstall: 'off' })
+    // Live after a successful mount: the subscription rides the lifecycle.
+    expect(host.subscriptionDisposals('llm/adapters-updated')).toEqual([0])
+    await dispose()
+    expect(host.subscriptionDisposals('llm/adapters-updated')).toEqual([1])
+  })
+
+  it('F19: a remount after a failed mount accumulates no duplicate llm/adapters-updated listener', async () => {
+    const failRoot = mkdtempSync(join(tmpdir(), 'dsh-autopilot-apply-'))
+    const retryRoot = mkdtempSync(join(tmpdir(), 'dsh-autopilot-apply-'))
+    const host = fakeCtx(failRoot, { llm: stubLlmRuntime() })
+    const originalSection = host.ctx.systemPrompt.section.bind(host.ctx.systemPrompt)
+    host.ctx.systemPrompt.section = () => { throw new Error('systemPrompt refused the section') }
+    await expect(apply(host.ctx, { storeRoot: failRoot, storeKind: 'file', skillInstall: 'off' }))
+      .rejects.toThrowError(/systemPrompt refused the section/)
+    host.ctx.systemPrompt.section = originalSection
+    const dispose = await apply(host.ctx, { storeRoot: retryRoot, storeKind: 'file', skillInstall: 'off' })
+    // Two subscriptions were made, but only the SECOND is still live — the
+    // failed mount's listener was released instead of stacking beneath it.
+    expect(host.subscriptionDisposals('llm/adapters-updated')).toEqual([1, 0])
+    expect(host.liveSubscriptions('llm/adapters-updated')).toBe(1)
+    await dispose()
+    expect(host.liveSubscriptions('llm/adapters-updated')).toBe(0)
   })
 
   it('positive control: a clean mount closes the store exactly once, at disposal', async () => {

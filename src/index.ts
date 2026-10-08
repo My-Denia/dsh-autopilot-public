@@ -15,14 +15,19 @@
  *   auditors: { plan|execution|rules: { provider?, agentOptions? { provider, model, maxTokens? } } }
  *   executor: { agentOptions?, persona?, toolAllowList? }
  *   crossFamily: { enabled?, minRisk?, pool? } — seek an auditor outside the executor's family
+ *   routing: { mode? auto|off, preference? balanced|economy|quality, roles? { executor, planner,
+ *             planAuditor, executionAuditor, rulesAuditor: { mode? auto|inherit|locked,
+ *             lock? { provider, model, reasoningEffort? }, minContext? } } } — role-true model routing
  *   gate: { sandboxCoupling?, toolDeny?, egressDeny?, stopReminder?, strictShell?, restoreMode? }
  *   storeKind: 'auto' | 'file' | 'domain' (default 'auto')
  *   storeRoot: run directory root (default $DSH_HOME/storages/dsh-autopilot)
- *   skillInstall: 'auto' | 'off' (default 'auto') — copy bundled SKILL.md into the skill-scan root
+ *   skillInstall: 'auto' | 'off' (default 'auto') — publish the bundled SKILL.md through the
+ *               native skill registry (ctx.skills) when that service is present, else copy it
+ *               into the skill-scan root; 'off' publishes through neither channel
  */
 
 import { AutopilotEngine } from './engine.js'
-import type { AgentOptionsLike, AgentRef, EnvironmentProbes, ResolvedConfig } from './engine.js'
+import type { AgentOptionsLike, AgentRef, EnvironmentProbes, ResolvedConfig, ResolvedRouting, RoutingPorts } from './engine.js'
 import { installChildEgressGuard, installRootGate } from './gate/install.js'
 import type { GateAgentRef } from './gate/install.js'
 import { installPreExecuteGate } from './gate/preexecute.js'
@@ -37,7 +42,15 @@ import type { DomainFacilityLike } from './store/domain.js'
 import type { RunStoreLike } from './store/types.js'
 import { installRootTools, packetToolDefinition } from './tools.js'
 import { DEFAULT_EXECUTOR_TOOLS } from './config.js'
-import { syncBundledSkill } from './skill-install.js'
+import { BUNDLED_SKILL_PROVIDER_NAME, BUNDLED_SKILL_PROVIDER_RANK, publishBundledSkill } from './skill-register.js'
+import type { SkillPublicationResult, SkillRegistryLike } from './skill-register.js'
+import type { SkillSyncResult } from './skill-install.js'
+import { DEFAULT_ROLE_MIN_CONTEXT } from './routing/select.js'
+import type { Role, RoleRouting, RoutePreference } from './routing/select.js'
+import { toRoutePin } from './routing/identity.js'
+import { RouteCatalog } from './routing/catalog.js'
+import type { LlmRuntimeSubset } from './routing/catalog.js'
+import type { SessionPolicyState } from './routing/authorize.js'
 import type { AuditRole, EgressChannel, StoreKind, Risk } from './domain/types.js'
 
 export * from './domain/types.js'
@@ -50,8 +63,8 @@ export {
   validateUsageEntry,
 } from './domain/usage.js'
 export type { SettleUsageOptions, UsageArtifactRead } from './domain/usage.js'
-export { AutopilotEngine, approvalAuthorizes, effectiveSandboxMode } from './engine.js'
-export type { EnvironmentProbes, ResolvedConfig, StatusView } from './engine.js'
+export { AutopilotEngine, approvalAuthorizes, effectiveSandboxMode, routeRoleOf } from './engine.js'
+export type { EnvironmentProbes, ResolvedConfig, ResolvedRouting, RoutingPorts, StatusView } from './engine.js'
 export { RunStore, defaultStoreRoot } from './store/file.js'
 export { AUTOPILOT_DOMAIN_SPEC, DomainRunStore, eventKey, parseEventKey } from './store/domain.js'
 export type { DomainFacilityLike } from './store/domain.js'
@@ -91,6 +104,7 @@ export {
 } from './web.js'
 export type { AutopilotWebRoute, EnforcementProjection, RunProjection, RunsBody } from './web.js'
 export { Config, DEFAULT_EXECUTOR_TOOLS, StoreKindSchema } from './config.js'
+export type { Role, RoleRouting, RoutePreference } from './routing/select.js'
 export {
   SKILL_HOME_ENV,
   SKILL_RELATIVE,
@@ -99,6 +113,32 @@ export {
   syncBundledSkill,
 } from './skill-install.js'
 export type { DestKind, SkillInstallStatus, SkillSyncIo, SkillSyncResult } from './skill-install.js'
+export {
+  BUNDLED_SKILL_PROVIDER_NAME,
+  BUNDLED_SKILL_PROVIDER_RANK,
+  BUNDLED_SKILL_PROVIDER_SOURCE,
+  FILE_SCAN_BUNDLED_RANK,
+  createBundledSkillProvider,
+  parseBundledSkillFrontmatter,
+  publishBundledSkill,
+} from './skill-register.js'
+export type {
+  BundledSkillLocator,
+  ParsedBundledSkill,
+  PublishBundledSkillOptions,
+  SkillCandidate,
+  SkillDefinition,
+  SkillInvocationPolicy,
+  SkillLookupOptions,
+  SkillProvider,
+  SkillProviderControl,
+  SkillProviderObservation,
+  SkillPublicationResult,
+  SkillRegistryLike,
+  SkillResourceBase,
+  SkillSource,
+  SkillSummary,
+} from './skill-register.js'
 
 /** Cordis plugin name. */
 export const name = 'dsh-autopilot'
@@ -112,6 +152,19 @@ export const name = 'dsh-autopilot'
  * by the base bundle; listing either would make the plugin fail to load on the
  * profiles that lack it. Both are PROBED at mount instead, and what the probe
  * saw is recorded in `Enforcement`.
+ *
+ * `llm` and `sessionProjections` (model routing, M3b) are absent FOR THE SAME
+ * REASON and resolved the same way — through {@link lookupService}. Verified
+ * against the installed packages: `llm` IS a declared Context key
+ * (`@deepseek-ai/dsh-llm` 0.2.0-rc.2 `lib/types/index.d.ts` declares
+ * `Context.llm: LlmRuntime`), but `@deepseek-ai/dsh-session-projection` is
+ * NOT among this package's installed dependencies, so `sessionProjections`
+ * has no declared Context key in the installed type universe at all. Both are
+ * therefore PROBED: a hard `inject` entry is a fiber-blocking requirement
+ * (cordis 4 keeps a plugin INACTIVE until every injected service exists —
+ * `Fiber._checkImpl`/`_refresh`), so a profile or host mount harness without
+ * the service must still get the plugin, with routing degrading to
+ * 0.2.0/inherit dispatch behavior (see `RoutingPorts`).
  */
 export const inject = ['agents', 'subagents', 'tools', 'systemPrompt']
 
@@ -119,14 +172,26 @@ export const inject = ['agents', 'subagents', 'tools', 'systemPrompt']
 export interface ConfigInput {
   readonly auditProvider?: string
   readonly executorProvider?: string
-  readonly auditors?: Partial<Record<AuditRole, { provider?: string; agentOptions?: AgentOptionsLike }>>
-  readonly executor?: { agentOptions?: AgentOptionsLike; persona?: string; toolAllowList?: readonly string[] }
+  readonly auditors?: Partial<Record<AuditRole, { provider?: string; agentOptions?: AgentOptionsInput }>>
+  readonly executor?: { agentOptions?: AgentOptionsInput; persona?: string; toolAllowList?: readonly string[] }
   /**
    * Cross-family review. A blind spot shared by one provider passes both gates
    * unchallenged, so past a risk floor the reviewer should not come from the
    * family that built. Strategy, not gate — the outcome is RECORDED per audit.
    */
-  readonly crossFamily?: { enabled?: boolean; minRisk?: Risk; pool?: readonly AgentOptionsLike[] }
+  readonly crossFamily?: { enabled?: boolean; minRisk?: Risk; pool?: readonly AgentOptionsInput[] }
+  /**
+   * Role-true model routing (plan v3 "Config"). Legacy fields keep their 0.2.0
+   * meaning; `routing` is the new surface, and `resolveConfig` maps legacy
+   * explicit routes onto it (see {@link ResolvedRouting}).
+   *
+   * AT RUNTIME the loader path hands `apply()` these fields as volatile
+   * references (cosmokit `Volatile`, read via `.get()`) because the schema
+   * marks every routing leaf `.volatile()`; this interface stays the PLAIN
+   * contract a programmatic caller writes, and `resolveConfig` unwraps
+   * references structurally so both paths produce the same resolved config.
+   */
+  readonly routing?: RoutingInput
   readonly gate?: {
     sandboxCoupling?: boolean
     toolDeny?: boolean
@@ -139,12 +204,62 @@ export interface ConfigInput {
   readonly storeKind?: 'auto' | 'file' | 'domain'
   readonly storeRoot?: string
   /**
-   * Copy the bundled SKILL.md into dsh's skill-scan root on mount (`auto`),
-   * or leave the scan root untouched (`off`). Default `auto`. Drift never
-   * overwrites; a differing dest is a warning.
+   * Publish the bundled SKILL.md on mount (`auto`) or publish nothing
+   * (`off`). Default `auto`. `auto` prefers the NATIVE skill registry:
+   * when `ctx.skills` is observable, a provider serves the in-package file
+   * (rank 700 — any file copy wins the duplicate name, so an installed or
+   * drifted copy is never silently overridden) and NO filesystem copy is
+   * made; a registration failure falls back to the 0.2.0 filesystem copy
+   * with the failure warned. On a profile without the skill service the
+   * filesystem copy is the channel, unchanged: drift never overwrites, and
+   * a differing dest is a warning.
    */
   readonly skillInstall?: 'auto' | 'off'
 }
+
+/**
+ * Explicit LLM route for a dispatched child, widened at the config layer:
+ * [R2-P3-1] adds `reasoningEffort`. `AgentOptionsLike` in `./engine.ts` is
+ * widened to match since M3b, so this input shape and the engine's dispatch
+ * shape carry the same field.
+ */
+export interface AgentOptionsInput extends AgentOptionsLike {
+  readonly reasoningEffort?: string
+}
+
+/** One explicit route lock as a profile may write it (`routing.roles.<role>.lock`). */
+export interface RouteLockInput {
+  readonly provider: string
+  readonly model: string
+  readonly reasoningEffort?: string
+}
+
+/** Per-role routing as a profile may write it (`routing.roles.<role>`). */
+export interface RoleRoutingInput {
+  readonly mode?: 'auto' | 'inherit' | 'locked'
+  readonly lock?: RouteLockInput
+  readonly minContext?: number
+}
+
+/** The `routing` section as a profile may write it. */
+export interface RoutingInput {
+  readonly mode?: 'auto' | 'off'
+  readonly preference?: 'balanced' | 'economy' | 'quality'
+  readonly roles?: {
+    readonly executor?: RoleRoutingInput
+    readonly planner?: RoleRoutingInput
+    readonly planAuditor?: RoleRoutingInput
+    readonly executionAuditor?: RoleRoutingInput
+    readonly rulesAuditor?: RoleRoutingInput
+  }
+}
+
+/**
+ * Resolved routing is declared in `./engine.ts` (with `ResolvedConfig.routing`)
+ * since M3b — the engine is its consumer — and re-exported above for API
+ * stability; `resolveRouting` below is still the one place the `routing`
+ * section and the legacy surfaces are mapped onto it.
+ */
 
 /**
  * An optional nested object, with EMPTY treated as ABSENT.
@@ -170,9 +285,9 @@ function presentOrAbsent<T extends object>(value: T | undefined): T | undefined 
 /** Normalize the auditor routing table, dropping roles that carry no routing at all. */
 function compactAuditors(
   input: ConfigInput['auditors'],
-): Partial<Record<AuditRole, { provider?: string; agentOptions?: AgentOptionsLike }>> {
-  const out: Partial<Record<AuditRole, { provider?: string; agentOptions?: AgentOptionsLike }>> = {}
-  for (const [role, route] of Object.entries(input ?? {}) as Array<[AuditRole, { provider?: string; agentOptions?: AgentOptionsLike } | undefined]>) {
+): Partial<Record<AuditRole, { provider?: string; agentOptions?: AgentOptionsInput }>> {
+  const out: Partial<Record<AuditRole, { provider?: string; agentOptions?: AgentOptionsInput }>> = {}
+  for (const [role, route] of Object.entries(input ?? {}) as Array<[AuditRole, { provider?: string; agentOptions?: AgentOptionsInput } | undefined]>) {
     if (route === undefined) continue
     const agentOptions = presentOrAbsent(route.agentOptions)
     const entry = {
@@ -183,6 +298,224 @@ function compactAuditors(
     out[role] = entry
   }
   return out
+}
+
+// ── Routing resolution (packet E2; plan v3 "Config" + "Roles and routing") ──
+
+/**
+ * Structural mirror of the volatile reference schemastery wraps every
+ * `.volatile()` leaf's resolved value in (cosmokit `Volatile`; the loader
+ * hands `apply()` these wrappers — measured against
+ * @deepseek-ai/schemastery 3.18.4 and cordis's `resolveConfig`). Detected
+ * through the shared registered symbol so no new dependency is introduced;
+ * a plain value passes through unchanged, which is what every non-loader
+ * caller hands us.
+ */
+interface VolatileRef {
+  readonly get: () => unknown
+}
+
+const VOLATILE_WRITE = Symbol.for('cosmokit.volatile.write')
+
+function isVolatileRef(value: unknown): value is VolatileRef {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    VOLATILE_WRITE in value &&
+    typeof (value as unknown as VolatileRef).get === 'function'
+  )
+}
+
+/** Read one routing setting whether it arrived plain or as a volatile reference. */
+function readSetting<T>(value: T | VolatileRef): T {
+  return isVolatileRef(value) ? (value.get() as T) : value
+}
+
+/**
+ * F2 (PR #2 Codex review): whether ANY leaf under the `routing` section
+ * arrived as a volatile reference. Bounded depth (the section is three
+ * levels deep: section → role → leaf) and cycle-safe by construction — a
+ * volatile reference is returned on sight and never descended into.
+ */
+function containsVolatileRef(value: unknown, depth = 0): boolean {
+  if (value === null || typeof value !== 'object' || depth > 4) return false
+  if (isVolatileRef(value)) return true
+  if (Array.isArray(value)) return value.some(item => containsVolatileRef(item, depth + 1))
+  return Object.values(value as Record<string, unknown>).some(item => containsVolatileRef(item, depth + 1))
+}
+
+/**
+ * F2 (PR #2 Codex review): the per-decision routing re-read for the engine.
+ *
+ * THE DEFECT THIS CLOSES: `resolveConfig` is evaluated ONCE at mount, and on
+ * the Cordis loader path the routing leaves arrive as volatile REFERENCES —
+ * precisely so a config PATCH can update them in place WITHOUT remounting the
+ * plugin fiber. Unwrapping them into `ResolvedConfig.routing` at mount froze
+ * mode/lock/preference at their mount values: a patched `routing.mode` or a
+ * patched lock had no effect until a remount, while the legacy
+ * `executor.agentOptions` surface stayed live through its own remount path.
+ *
+ * THE SHAPE, AND WHY NOT A FIELD ON `ResolvedRouting`: the raw `ConfigInput`
+ * is kept and re-resolved by {@link resolveRouting} at each routing decision
+ * (the packet's second suggested shape). Carrying the refs INSIDE
+ * `ResolvedRouting` would put a live closure into a value the suite asserts
+ * by deep equality against the plain path (`test/config.test.ts`), so the
+ * accessor travels beside the resolved config instead — `apply()` hands it
+ * to the engine as its optional `routingSource`, and the resolved config
+ * stays pure data on BOTH paths.
+ *
+ * The PLAIN path is untouched by construction: no volatile references ⇒
+ * `undefined` ⇒ the engine keeps reading its mount-time `config.routing`,
+ * byte-identical to the pre-F2 behavior. On the loader path the closure
+ * re-runs the SAME resolution (defaults, legacy mapping, fail-closed
+ * validation), so a patch that makes the section invalid surfaces at the
+ * next decision — where the engine degrades honestly instead of throwing
+ * mid-commit (see the engine's `routingConfig`); the mount-time
+ * fail-fast on an invalid INITIAL config is unchanged.
+ */
+export function volatileRoutingAccess(input?: ConfigInput): (() => ResolvedRouting) | undefined {
+  if (!containsVolatileRef(input?.routing)) return undefined
+  return () => resolveRouting(input)
+}
+
+/** The five per-role config keys, in schema declaration order. */
+const ROLE_CONFIG_KEYS = ['executor', 'planner', 'planAuditor', 'executionAuditor', 'rulesAuditor'] as const
+
+type RoleConfigKey = (typeof ROLE_CONFIG_KEYS)[number]
+
+/** Config key → routing-core role name (`Role` uses the hyphenated auditor names). */
+const ROLE_OF: Readonly<Record<RoleConfigKey, Role>> = {
+  executor: 'executor',
+  planner: 'planner',
+  planAuditor: 'plan-auditor',
+  executionAuditor: 'execution-auditor',
+  rulesAuditor: 'rules-auditor',
+}
+
+/**
+ * Shipped per-role mode defaults: the planner IS the root agent, so it
+ * INHERITS unless opted in (plan "Roles and routing"); every other role
+ * defaults to `auto` under the conservative authorization model.
+ */
+const DEFAULT_ROLE_MODE: Readonly<Record<Role, 'auto' | 'inherit'>> = {
+  executor: 'auto',
+  planner: 'inherit',
+  'plan-auditor': 'auto',
+  'execution-auditor': 'auto',
+  'rules-auditor': 'auto',
+}
+
+/** Trimmed non-blank effort, or `undefined`. */
+function effortOf(value: string | undefined): string | undefined {
+  const trimmed = value?.trim()
+  return trimmed !== undefined && trimmed.length > 0 ? trimmed : undefined
+}
+
+/** A lock input normalized to the routing core's locked shape, or `undefined` when it names no route. */
+function lockRouteOf(lock: { provider?: string; model?: string; reasoningEffort?: string } | undefined):
+  { provider: string; model: string; reasoningEffort?: string } | undefined {
+  const pin = toRoutePin(lock)
+  if (pin === undefined) return undefined
+  const effort = effortOf(lock?.reasoningEffort)
+  return { provider: pin.provider, model: pin.model, ...(effort !== undefined ? { reasoningEffort: effort } : {}) }
+}
+
+/**
+ * The legacy explicit route for one role, if any ([R2-P1-1] surfaces:
+ * `executor.agentOptions` and `auditors[role].agentOptions`). The planner has
+ * no legacy surface — it did not exist as a routed role in 0.2.0.
+ *
+ * `maxTokens` (and any future non-route field) is deliberately NOT mapped:
+ * a lock is a ROUTE grant; the legacy agentOptions object itself stays in
+ * `ResolvedConfig` with its 0.2.0 meaning for the engine's dispatch
+ * composition (packet E3). A legacy agentOptions with fields set but NO
+ * explicit provider/model route (e.g. `maxTokens` alone) maps to NO lock —
+ * there is no route to lock, and the routing core refuses to guess one
+ * (`resolvePluginGrant`'s own rule); the role keeps its default mode.
+ */
+function legacyRouteFor(role: Role, input?: ConfigInput): { provider: string; model: string; reasoningEffort?: string } | undefined {
+  const options: AgentOptionsInput | undefined =
+    role === 'executor'
+      ? input?.executor?.agentOptions
+      : role === 'plan-auditor'
+        ? input?.auditors?.plan?.agentOptions
+        : role === 'execution-auditor'
+          ? input?.auditors?.execution?.agentOptions
+          : role === 'rules-auditor'
+            ? input?.auditors?.rules?.agentOptions
+            : undefined
+  return lockRouteOf(options)
+}
+
+/**
+ * Resolve the `routing` section onto exactly what the routing core consumes.
+ *
+ * LEGACY MAPPING (resolve-time, per the packet): a legacy explicit route maps
+ * to `locked` and WINS over the shipped default mode; an explicit new
+ * `routing.roles.<role>` route decision — a written lock, or a written mode
+ * that differs from the role's default — wins over legacy. `minContext` alone
+ * tunes a floor and names no route, so it does NOT displace a legacy lock.
+ *
+ * THE EXPLICITNESS CEILING, stated honestly: schemastery fills declared
+ * defaults before `apply()` sees the value, so a mode WRITTEN as exactly the
+ * role's default ('auto' for executor/auditors) is indistinguishable from an
+ * absent one on the loader path — and resolveConfig must treat both paths
+ * identically (the deep-equality fixture), so "written-default" deliberately
+ * counts as not explicit and legacy wins. Writing a non-default mode
+ * ('inherit' for executor/auditors, 'auto'/'locked' for planner) IS
+ * distinguishable on both paths and wins.
+ *
+ * `mode: 'locked'` without a lock route throws (fail-closed: a locked role
+ * with nothing to lock is an owner config error, and mount refuses rather
+ * than silently auto-routing while claiming locked). A written lock alongside
+ * an explicitly non-locked mode throws for the same reason — inert config is
+ * the pseudo-active defect this repository keeps paying for. `minContext`
+ * written alongside a resolved locked/inherit role is dropped, not honored:
+ * the floor governs auto selections only (a locked route is an explicit
+ * owner selection and an inherited dispatch runs on the deployment default).
+ */
+function resolveRouting(input?: ConfigInput): ResolvedRouting {
+  const routing = input?.routing
+  const mode = readSetting(routing?.mode) ?? 'auto'
+  const preference = readSetting(routing?.preference) ?? 'balanced'
+  if (mode !== 'auto' && mode !== 'off') throw new Error(`routing.mode must be 'auto' or 'off' (got ${JSON.stringify(mode)})`)
+  if (preference !== 'balanced' && preference !== 'economy' && preference !== 'quality') {
+    throw new Error(`routing.preference must be 'balanced', 'economy' or 'quality' (got ${JSON.stringify(preference)})`)
+  }
+  const roles = {} as Record<Role, RoleRouting>
+  for (const key of ROLE_CONFIG_KEYS) {
+    const role = ROLE_OF[key]
+    const entry = readSetting(routing?.roles?.[key])
+    const entryMode = readSetting(entry?.mode)
+    const lockRoute = lockRouteOf(readSetting(entry?.lock))
+    const minContext = readSetting(entry?.minContext)
+    const modeIsExplicit = entryMode !== undefined && entryMode !== DEFAULT_ROLE_MODE[role]
+    if (entryMode === 'locked' && lockRoute === undefined) {
+      throw new Error(`routing.roles.${key}.mode is "locked" but lock names no provider/model route — refusing to guess a route`)
+    }
+    if (lockRoute !== undefined && modeIsExplicit && entryMode !== 'locked') {
+      throw new Error(`routing.roles.${key}: mode "${entryMode}" contradicts a written lock — a lock selects a route only in locked mode`)
+    }
+    if (lockRoute !== undefined) {
+      roles[role] = { mode: 'locked', ...lockRoute }
+      continue
+    }
+    // Absent mode means the role's shipped default (the loader fills the same
+    // default, so both paths land here identically); an explicit 'inherit'
+    // wins over legacy for the same reason any explicit new mode does.
+    const effectiveMode = entryMode ?? DEFAULT_ROLE_MODE[role]
+    if (effectiveMode === 'inherit') {
+      roles[role] = { mode: 'inherit' }
+      continue
+    }
+    const legacy = legacyRouteFor(role, input)
+    if (legacy !== undefined) {
+      roles[role] = { mode: 'locked', ...legacy }
+      continue
+    }
+    roles[role] = { mode: 'auto', minContext: minContext ?? DEFAULT_ROLE_MIN_CONTEXT[role] }
+  }
+  return { mode, preference, roles }
 }
 
 /** Resolve raw config with defaults (manual, defensive — the schema governs writes, this governs reads). */
@@ -202,6 +535,7 @@ export function resolveConfig(input?: ConfigInput): ResolvedConfig {
       minRisk: input?.crossFamily?.minRisk ?? 'medium',
       pool: [...(input?.crossFamily?.pool ?? [])],
     },
+    routing: resolveRouting(input),
     gate: {
       sandboxCoupling: input?.gate?.sandboxCoupling ?? true,
       toolDeny: input?.gate?.toolDeny ?? true,
@@ -280,6 +614,23 @@ function warn(rawCtx: unknown, message: string): void {
   try {
     const logger = lookupService(rawCtx, 'logger') as { warn?: (message: string) => void } | undefined
     logger?.warn?.(message)
+  } catch {
+    // A logger that throws is still only a logger.
+  }
+}
+
+/**
+ * Emit one deployment diagnostic at info level, defensively — the level a
+ * SUCCESSFUL channel choice deserves (the {@link warn} channel is reserved
+ * for degradations), with the same non-guarantees as its sibling: a host
+ * without an `info` member drops the message and changes nothing else.
+ * `apply()` uses it to say WHICH path published the bundled skill, so the
+ * publication channel is diagnosable without waiting for a degrade.
+ */
+function info(rawCtx: unknown, message: string): void {
+  try {
+    const logger = lookupService(rawCtx, 'logger') as { info?: (message: string) => void } | undefined
+    logger?.info?.(message)
   } catch {
     // A logger that throws is still only a logger.
   }
@@ -440,6 +791,303 @@ export function probeStorageDomain(rawCtx: unknown): DomainFacilityLike | undefi
     return facility as DomainFacilityLike
   } catch {
     return undefined
+  }
+}
+
+// ── Model-routing wiring (M3b): the two probed services feeding `RoutingPorts` ──
+
+/**
+ * The four `LlmRuntime` members the catalog port touches — the probe's proof
+ * that what `ctx.get('llm')` returned is really a runtime and not a truthy
+ * stand-in. The compile-time bearer for the MEMBER shapes lives in
+ * `test/routing-boundary.test.ts`; this is the runtime presence check.
+ * @returns the runtime subset, or `undefined` when the service is absent or malformed.
+ */
+export function probeLlmRuntime(rawCtx: unknown): LlmRuntimeSubset | undefined {
+  try {
+    const llm = lookupService(rawCtx, 'llm')
+    if (llm === null || typeof llm !== 'object') return undefined
+    const candidate = llm as Record<string, unknown>
+    for (const member of ['listProviders', 'listModels', 'resolveModelInfo', 'resolveCallConfig'] as const) {
+      if (typeof candidate[member] !== 'function') return undefined
+    }
+    return llm as LlmRuntimeSubset
+  } catch {
+    return undefined
+  }
+}
+
+/** The structural mirror of `SessionProjectionRegistry` the policy reader touches. */
+interface SessionProjectionRegistryLike {
+  stateOf(session: unknown, key: string): unknown
+  register(definition: unknown): () => void
+}
+
+/**
+ * The registry behind `ctx.sessionProjections`, or `undefined` when the
+ * service is absent/malformed on this profile. `sessionProjections` is NOT a
+ * declared Context key in the installed type universe (see {@link inject}),
+ * so this probe is the only read path.
+ */
+export function probeSessionProjections(rawCtx: unknown): SessionProjectionRegistryLike | undefined {
+  try {
+    const service = lookupService(rawCtx, 'sessionProjections')
+    if (service === null || typeof service !== 'object') return undefined
+    const candidate = service as { stateOf?: unknown; register?: unknown }
+    if (typeof candidate.stateOf !== 'function' || typeof candidate.register !== 'function') return undefined
+    return service as SessionProjectionRegistryLike
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * The `ctx.skills` registry (`@deepseek-ai/dsh-skill`'s `SkillRegistry`),
+ * or `undefined` when the service is absent/malformed on this profile.
+ * Probed through {@link lookupService} for the same reason every sibling is
+ * (see {@link inject}): a hard `inject` entry would make the plugin a
+ * fiber-blocking REQUIREMENT consumer of a service the headless profile
+ * does not compose, and the skill must degrade to the file copy there —
+ * never block the mount. The member check (`registerProvider` is a
+ * function) is the same proof {@link probeLlmRuntime} demands: a truthy
+ * service that cannot register providers is not a registry, and treating it
+ * as one would silently skip the file copy with nothing published instead.
+ */
+export function probeSkillRegistry(rawCtx: unknown): SkillRegistryLike | undefined {
+  try {
+    const registry = lookupService(rawCtx, 'skills')
+    if (registry === null || typeof registry !== 'object') return undefined
+    if (typeof (registry as { registerProvider?: unknown }).registerProvider !== 'function') return undefined
+    return registry as SkillRegistryLike
+  } catch {
+    return undefined
+  }
+}
+
+/** The projection key and session event the durable model-selection policy lives behind (upstream names, mirrored). */
+const MODEL_SELECTION_POLICY_KEY = 'subagentModelSelectionPolicy'
+const MODEL_SELECTION_POLICY_EVENT = 'subagent/model-selection-policy'
+
+/**
+ * Whether a value is a policy route list: non-empty entries of non-empty
+ * `{provider, model}` and nothing else. A structural mirror of upstream's
+ * `assertAllowedModelRoutes` + the zod state schema
+ * (`packages/subagent/tool-subagent/src/model-selection-state.ts`, read
+ * 2026-10-07) — NOTHING is imported from a dsh package.
+ */
+function validPolicyRoutes(value: unknown): value is readonly { provider: string; model: string }[] {
+  if (!Array.isArray(value) || value.length === 0) return false
+  for (const entry of value) {
+    if (entry === null || typeof entry !== 'object' || Array.isArray(entry)) return false
+    const route = entry as Record<string, unknown>
+    if (Object.keys(route).some(key => key !== 'provider' && key !== 'model')) return false
+    if (typeof route.provider !== 'string' || route.provider.length === 0) return false
+    if (typeof route.model !== 'string' || route.model.length === 0) return false
+  }
+  return true
+}
+
+/**
+ * GAH's own projection over the durable `subagent/model-selection-policy`
+ * event, registered ONLY when the key is not already served — the shape
+ * mirrors upstream's `subagentModelSelectionProjectionDefinition` structurally
+ * (same key, same `stateVersion: 1`, write-once apply, non-empty strict
+ * routes; `stateSchema.parse` mirrors zod's parse-or-throw over restored
+ * cache rows). Same key + same version means a later native registration
+ * MERGES with ours by ref-count instead of conflicting.
+ */
+const MIRROR_MODEL_SELECTION_PROJECTION = {
+  key: MODEL_SELECTION_POLICY_KEY,
+  stateVersion: 1,
+  stateSchema: {
+    parse(value: unknown): unknown {
+      if (value === null) return null
+      if (!validPolicyRoutes(value)) {
+        throw new Error(`${MODEL_SELECTION_POLICY_KEY}: persisted state must be null or a non-empty array of {provider, model} routes`)
+      }
+      return value
+    },
+  },
+  init: () => null,
+  apply: (state: unknown, event: { readonly type: string; readonly data: unknown }) => {
+    if (state !== null || event.type !== MODEL_SELECTION_POLICY_EVENT) return state
+    const data = event.data as { allowedModels?: unknown } | undefined
+    const routes = data?.allowedModels
+    if (!validPolicyRoutes(routes)) {
+      throw new Error(`${MODEL_SELECTION_POLICY_EVENT} requires at least one non-empty {provider, model} route`)
+    }
+    return routes.map((route: { provider: string; model: string }) => ({ provider: route.provider, model: route.model }))
+  },
+}
+
+/** What {@link createRoutingWiring} built, for the engine and the lifecycle. */
+export interface RoutingWiring {
+  readonly ports: RoutingPorts
+  /**
+   * F3 (PR #2 Codex review): settles when the late-bound planner installer
+   * import has resolved OR irrecoverably failed — never rejects. `apply()`
+   * AWAITS this before constructing the engine, so the engine is never
+   * exposed before the installer port is known: a run entering planning at
+   * cold mount can no longer record `plannerRouting: 'unsupported'` because
+   * the dynamic import had not settled yet (the fire-and-forget race).
+   * Direct constructor callers (tests) that never await it keep the previous
+   * semantics — the port simply appears when the import lands.
+   */
+  readonly installerReady: Promise<void>
+  /** Releases the mirror projection registration and the adapters-updated subscription. */
+  dispose: () => void
+}
+
+/** The host's `installModelSelection` as this plugin may call it (M6). */
+type HostModelSelectionInstall = (
+  agentCtx: unknown,
+  selection: {
+    current: { provider: string; model: string; reasoningEffort?: string } | undefined
+    assembled: unknown
+  },
+) => () => void
+
+/**
+ * Build the engine's routing ports from what the mount can actually SEE:
+ *
+ * - `catalog` from probed `ctx.llm` (absent ⇒ NO catalog port ⇒ the engine's
+ *   0.2.0/inherit parity path, not an empty-but-present catalog that would
+ *   escalate every locked route); `llm/adapters-updated` (payload-free by
+ *   design) drops the snapshot cache, whose disposers ride the plugin lifecycle.
+ * - `policyReader` from probed `ctx.sessionProjections`: `stateOf` on
+ *   `'subagentModelSelectionPolicy'`; when the key is not registered (the
+ *   subagent tool package is not composed on this profile), GAH registers its
+ *   own structurally-mirrored projection over the same durable event. A
+ *   service that is absent, fails to register, or answers unreadably is
+ *   `'unreachable'` — inheritance only, recorded honestly.
+ * - `modelSelectionInstaller` (M6) from the host's own `installModelSelection`
+ *   export, late-bound by DYNAMIC import (see the wiring below); absence of
+ *   the export leaves the port `undefined` and the engine records the
+ *   degradation only when a non-inherit planner decision makes it matter.
+ *   F3 (PR #2 Codex review): the import is AWAITED during mount through the
+ *   returned `installerReady` promise, so a run entering planning at cold
+ *   mount finds the port already resolved (or honestly `undefined`) — the
+ *   fire-and-forget race that could permanently record `unsupported` for a
+ *   healthy host is closed at the only place ordering is enforceable.
+ */
+export function createRoutingWiring(rawCtx: unknown, onWarn: (message: string) => void = () => {}): RoutingWiring {
+  const llm = probeLlmRuntime(rawCtx)
+  const catalog = llm === undefined ? undefined : new RouteCatalog(llm)
+  const projections = probeSessionProjections(rawCtx)
+  const disposers: Array<() => void> = []
+  if (catalog !== undefined && llm !== undefined) {
+    try {
+      disposers.push(
+        (rawCtx as { on?: (event: string, listener: () => void) => () => void }).on?.('llm/adapters-updated', () => {
+          catalog.invalidate()
+        }) ?? (() => {}),
+      )
+    } catch {
+      // A host that cannot be subscribed keeps its cached catalog — recorded
+      // by the projection's own diagnostics, never by a crash at mount.
+    }
+  }
+  let mirrorRegistered = false
+  let warnedUnreachable = false
+  const policyReader = (root: AgentRef): SessionPolicyState => {
+    if (projections === undefined) return { kind: 'unreachable' }
+    try {
+      const session = root.session
+      let state = projections.stateOf(session, MODEL_SELECTION_POLICY_KEY)
+      if (state === undefined && !mirrorRegistered) {
+        mirrorRegistered = true
+        try {
+          disposers.push(projections.register(MIRROR_MODEL_SELECTION_PROJECTION))
+        } catch (error) {
+          onWarn(`dsh-autopilot: could not register the model-selection policy projection (${describeError(error)}); treating the policy as unreachable`)
+        }
+        state = projections.stateOf(session, MODEL_SELECTION_POLICY_KEY)
+      }
+      if (state === undefined) {
+        if (!warnedUnreachable) {
+          warnedUnreachable = true
+          onWarn('dsh-autopilot: sessionProjections answered no state for subagentModelSelectionPolicy; treating the policy as unreachable')
+        }
+        return { kind: 'unreachable' }
+      }
+      if (state === null) return { kind: 'absent' }
+      if (validPolicyRoutes(state)) {
+        return { kind: 'present', routes: state.map((route: { provider: string; model: string }) => ({ provider: route.provider, model: route.model })) }
+      }
+      return { kind: 'unreachable' }
+    } catch {
+      return { kind: 'unreachable' }
+    }
+  }
+  const ports: {
+    catalog?: RouteCatalog
+    policyReader?: (root: AgentRef) => SessionPolicyState
+    modelSelectionInstaller?: RoutingPorts['modelSelectionInstaller']
+  } = {
+    ...(catalog === undefined ? {} : { catalog }),
+    policyReader,
+  }
+  // M6 planner install port (engine-local role routing): the host's
+  // `installModelSelection`, late-bound by DYNAMIC import — never a static
+  // import, because this plugin must keep mounting on hosts whose package
+  // graph resolves differently from its own declared dependencies (the
+  // plugin runs INSIDE the host process, so the host's own copy answers).
+  // Absence of the export, or an unresolvable module, leaves the port
+  // `undefined` — the engine then records `plannerRouting: 'unsupported'`
+  // and continues with inheritance; the mount NEVER fails over this.
+  //
+  // F3 (PR #2 Codex review): the promise is RETURNED as `installerReady` and
+  // `apply()` awaits it BEFORE constructing the engine. It used to be
+  // fire-and-forget (`void import(...)`), and a run entering planning before
+  // it settled recorded `plannerRouting: 'unsupported'` — never retried
+  // within the planning phase — on a perfectly healthy host; awaiting the
+  // port at mount is the decided fix (the alternative, re-arming planner
+  // selections when the installer arrives, would have to un-write the
+  // already-recorded `unsupported` state, which is exactly the kind of
+  // record-rewriting this repository refuses).
+  const installerReady: Promise<void> = import('@deepseek-ai/dsh-agent').then((module) => {
+    const install = (module as { installModelSelection?: unknown }).installModelSelection as HostModelSelectionInstall | undefined
+    if (typeof install !== 'function') return
+    ports.modelSelectionInstaller = (agentCtx, route) => {
+      // The host contract wants a MUTABLE selection ref the caller owns:
+      // `current` is the planner route for every step that enters prompt
+      // assembly while the install is live. The returned disposer is wrapped
+      // so clearing the selection rides the engine's dispose too.
+      const selection: {
+        current: { provider: string; model: string; reasoningEffort?: string } | undefined
+        assembled: unknown
+      } = {
+        current: {
+          provider: route.provider,
+          model: route.model,
+          ...(route.reasoningEffort === undefined ? {} : { reasoningEffort: route.reasoningEffort }),
+        },
+        assembled: undefined,
+      }
+      const hostDispose = install(agentCtx, selection)
+      return () => {
+        selection.current = undefined
+        hostDispose()
+      }
+    }
+  }, () => {
+    // Not resolvable from this plugin's location on this deployment — the
+    // normal shape for a host profile without the agent package above it.
+    // The degradation is recorded by the engine ('unsupported') exactly
+    // when a non-inherit planner decision makes it matter, not here.
+  })
+  return {
+    ports,
+    installerReady,
+    dispose: () => {
+      for (const dispose of disposers.splice(0).reverse()) {
+        try {
+          dispose()
+        } catch {
+          // A disposer that throws on teardown must not block its siblings.
+        }
+      }
+    },
   }
 }
 
@@ -788,7 +1436,13 @@ export async function apply(rawCtx: unknown, config?: ConfigInput): Promise<() =
   // mount that never closed leaves the domain reserved for the life of the
   // process, and every later mount under storeKind "auto" quietly degrades
   // to the file backend. So the failure path closes what it opened, then
-  // rethrows the original error unchanged.
+  // rethrows the original error unchanged. F19 (PR #2 Codex round 8): the
+  // routing wiring is part of "what it opened" — once
+  // `createRoutingWiring` has subscribed `llm/adapters-updated` (and possibly
+  // registered the mirror projection), any LATER throw would leave those
+  // host-surface registrations behind, and every retry would stack another
+  // stale listener; the failure path holds its own reference and disposes it.
+  let wiringForFailure: RoutingWiring | undefined
   try {
     // Seam installation is PER ROOT AGENT, so the record of it is too: one
     // root's `tools/pre-execute` registration can succeed while another's
@@ -806,6 +1460,21 @@ export async function apply(rawCtx: unknown, config?: ConfigInput): Promise<() =
       egressChannel: (rootSessionId) => resolveEgressChannel(seamByRoot.get(rootSessionId), resolved.gate.egressDeny),
       serviceRegistered: () => serviceRegistered,
     }
+    // Routing ports (M3b): the live catalog + the session policy reader, from
+    // what this mount can actually see. Disposers (adapters-updated
+    // subscription, mirror projection registration) ride the plugin lifecycle.
+    const routing = createRoutingWiring(rawCtx, message => warn(rawCtx, message))
+    wiringForFailure = routing
+    // F3 (PR #2 Codex review): the planner installer port is a DYNAMIC
+    // import away, and the engine must never be exposed before it is known —
+    // a run entering planning at cold mount would otherwise record
+    // `plannerRouting: 'unsupported'` for a healthy host and never retry
+    // within the planning phase. `apply()` is already the async mount
+    // barrier the store relies on (the fiber awaits it before the plugin is
+    // ACTIVE), so the import settles HERE: the promise never rejects (an
+    // unresolvable module keeps the port honestly `undefined`), hence this
+    // await cannot unwind the mount.
+    await routing.installerReady
     const engine = new AutopilotEngine(
       ctx.agents as never,
       ctx.subagents as never,
@@ -813,6 +1482,12 @@ export async function apply(rawCtx: unknown, config?: ConfigInput): Promise<() =
       resolved,
       () => probeSandbox(rawCtx),
       probes,
+      routing.ports,
+      // F2 (PR #2 Codex review): the per-decision routing re-read — wired
+      // exactly when the routing leaves arrived as volatile references (the
+      // Cordis loader path); `undefined` on the plain path, whose
+      // `config.routing` snapshot is therefore still the live truth.
+      volatileRoutingAccess(config),
     )
 
     // ── Policy prompt section (zero tokens without a run) ──────────────────
@@ -853,6 +1528,8 @@ export async function apply(rawCtx: unknown, config?: ConfigInput): Promise<() =
     // ── Per-root controller surface (tools + guard + native egress seam) ───
     const installed = new Map<unknown, () => void>()
     const maybeInstall = (agent: unknown): void => {
+      // `ctx` rides AgentRef itself since M6 ([R2-P3-1]); the intersection
+      // here narrows it to the tools/pre-execute surface this mount touches.
       const rootAgent = agent as AgentRef & GateAgentRef & {
         ctx: { tools: { register(d: unknown): () => void } } & PreExecuteHost
       }
@@ -971,19 +1648,50 @@ export async function apply(rawCtx: unknown, config?: ConfigInput): Promise<() =
       for (const agent of [...childInstalled.keys()]) disposeChild(agent)
     }
 
-    // Skill-scan install is best-effort and runs only after every required
-    // registration succeeded, so a failed mount does not persist SKILL.md.
-    // Drift never overwrites.
+    // ── Bundled-skill publication: native registry first, file fallback ───
+    //
+    // Skill publication is best-effort and runs only after every required
+    // registration succeeded, so a failed mount persists nothing. Exactly one
+    // channel is ever active (plan v3 "Skill"):
+    //
+    // - `ctx.skills` PROBED (never injected — see {@link probeSkillRegistry})
+    //   and present ⇒ `registerProvider` serves the in-package SKILL.md with
+    //   NO filesystem copy; the disposer rides the plugin lifecycle. Rank 700
+    //   loses to every file-scan rank, so an owner's installed or drifted
+    //   file copy still wins the name (the anti-silent-override rule,
+    //   `src/skill-register.ts` module header).
+    // - registration THREW ⇒ the 0.2.0 filesystem copy runs instead, with the
+    //   failure recorded in the publication result and warned here.
+    // - no skill service on this profile ⇒ the unchanged filesystem path.
+    // - `skillInstall: 'off'` ⇒ none of the above (neither channel).
+    let disposeSkillProvider: (() => void) | undefined
     if (resolved.skillInstall !== 'off') {
-      const skill = syncBundledSkill({ enabled: true })
-      // 'unsupported' warns for the same reason the other two do: the model is
-      // NOT going to be told to start a run on this host, and a silent mount
-      // would hide that. The mount itself still succeeds.
-      if (skill.status === 'drift' || skill.status === 'error' || skill.status === 'unsupported') {
-        warn(
+      const publication: SkillPublicationResult = publishBundledSkill(probeSkillRegistry(rawCtx))
+      if (publication.status === 'provider-registered') {
+        disposeSkillProvider = publication.dispose
+        // WHICH path published — the honest diagnosis the packet requires;
+        // info, not warn, because nothing degraded.
+        info(
           rawCtx,
-          `dsh-autopilot: skill install ${skill.status}${skill.detail !== undefined ? `: ${skill.detail}` : ''}`,
+          `dsh-autopilot: bundled skill published through the native skill registry (provider "${BUNDLED_SKILL_PROVIDER_NAME}", rank ${BUNDLED_SKILL_PROVIDER_RANK}; serving ${publication.path}); no filesystem copy was made`,
         )
+      } else {
+        if (publication.status === 'provider-failed-fallback') {
+          warn(
+            rawCtx,
+            `dsh-autopilot: native skill registration failed (${publication.failure}); fell back to the filesystem skill copy`,
+          )
+        }
+        // The filesystem result's own warning, byte-identical to the 0.2.0
+        // behavior for the statuses where the model is NOT going to be told
+        // to start a run on this host and a silent mount would hide that.
+        const skill: SkillSyncResult = publication.status === 'provider-failed-fallback' ? publication.fallback : publication
+        if (skill.status === 'drift' || skill.status === 'error' || skill.status === 'unsupported') {
+          warn(
+            rawCtx,
+            `dsh-autopilot: skill install ${skill.status}${skill.detail !== undefined ? `: ${skill.detail}` : ''}`,
+          )
+        }
       }
     }
 
@@ -991,6 +1699,8 @@ export async function apply(rawCtx: unknown, config?: ConfigInput): Promise<() =
       disposeSection()
       registration.dispose()
       disposeRoutes()
+      routing.dispose()
+      disposeSkillProvider?.()
       disposeCreated()
       disposeDisposed()
       disposeChildSetup()
@@ -1001,6 +1711,20 @@ export async function apply(rawCtx: unknown, config?: ConfigInput): Promise<() =
       if (store instanceof DomainRunStore) await store.close()
     }
   } catch (error: unknown) {
+    // F19 (PR #2 Codex round 8): release the wiring's host-surface
+    // registrations (the `llm/adapters-updated` subscription, the mirror
+    // projection) BEFORE the rethrow, alongside the store close — a failed
+    // mount must not leave them behind for the next one to stack on. The
+    // disposer is idempotent (`splice(0)` drains it once; the plugin
+    // lifecycle disposer calls it again safely) and it already swallows each
+    // inner disposer's throw; the belt-and-braces catch below only guards
+    // against the loop itself failing, so teardown can never mask the error
+    // that caused the unwind.
+    try {
+      wiringForFailure?.dispose()
+    } catch {
+      // A wiring teardown failure must not mask the original error.
+    }
     if (store instanceof DomainRunStore) {
       try {
         await store.close()

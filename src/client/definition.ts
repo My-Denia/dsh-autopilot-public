@@ -123,6 +123,42 @@ export interface AutopilotAuditRow {
   readonly failed: boolean
 }
 
+/** What the card renders beside a route model for one route status (M4). */
+export interface RouteStatusView {
+  /** Suffix appended after the route model; '' renders plain (no claim). */
+  readonly suffix: string
+  /** Hover text; carried only when the record explains itself. */
+  readonly title?: string
+}
+
+/**
+ * The route-status rendering rule, PURE so it is testable without mounting
+ * the card (react is host-provided; see the card's own header).
+ *
+ * FALSE-STATEMENT DOCTRINE, same as every other card decision: `verified`
+ * renders PLAIN (the record claims nothing to correct), `unverified` keeps
+ * the 0.2.0 suffix verbatim, `mismatch`/`unverifiable` say so and carry the
+ * record's diagnostic as the hover title — the diagnostic is the only place
+ * the differing axes are named, and this function must not paraphrase them
+ * into a softer claim. Anything unrecognised (an old record, a foreign shape)
+ * stays PLAIN rather than guessing a mood.
+ */
+export function routeStatusView(route: unknown): RouteStatusView {
+  if (!isPlainObject(route)) return { suffix: '' }
+  const diagnostic = typeof route.routeDiagnostic === 'string' ? route.routeDiagnostic : undefined
+  const titled = diagnostic === undefined ? {} : { title: diagnostic }
+  switch (route.routeStatus) {
+    case 'unverified':
+      return { suffix: ' (unverified route)' }
+    case 'mismatch':
+      return { suffix: ' (route mismatch)', ...titled }
+    case 'unverifiable':
+      return { suffix: ' (route unverifiable)', ...titled }
+    default:
+      return { suffix: '' }
+  }
+}
+
 /** Triage as DECLARED AT INIT. Immutable per DESIGN §3; source is init's call arguments. */
 export interface AutopilotTriageView {
   readonly objective?: string

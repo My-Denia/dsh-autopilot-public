@@ -205,7 +205,14 @@ describe('independent audits (stubbed subagents)', () => {
     const snapshot = h.engine.peek(h.root.id)
     expect(snapshot?.planGate).toBe('pass')
     expect(snapshot?.phase).toBe('executing')
-    expect(snapshot?.audits[0]?.route.routeStatus).toBe('verified')
+    // RE-SPECIFIED (plan v3 M4 / [R1-P1]): `verified` now requires an explicit
+    // selection to have been honored end-to-end. This dispatch INHERITED the
+    // deployment default (no routing decision pinned a route), so even with
+    // creation and observed agreeing on stub-model the honest status is
+    // `unverified` — no route claim was in play to verify. The old assertion
+    // (`'verified'` from creation options alone) was exactly the creation-only
+    // defect plan v3 fixes.
+    expect(snapshot?.audits[0]?.route.routeStatus).toBe('unverified')
     expect(snapshot?.audits[0]?.route.routeModel).toBe('stub-model')
   })
 
@@ -1009,27 +1016,41 @@ describe('the configured executor route says only what was configured', () => {
     return starting.snapshot.executor?.route
   }
 
-  it('provider AND model configured: verified, and it names both', async () => {
+  it('provider AND model configured: unverifiable at starting (creation-only is never verified — plan v3 M4 / R1-P1); the running record carries the observed leg', async () => {
     const route = await startingRoute({ provider: 'anthropic', model: 'claude-x' })
-    expect(route?.routeStatus).toBe('verified')
+    // RE-SPECIFIED (plan v3 M4 / [R1-P1]): the starting record is written
+    // BEFORE the child exists, so only the creation leg is present; a
+    // creation-only record used to read `verified` — the confidence the code
+    // could not observe. Under the new semantics it is honestly
+    // `unverifiable`, naming that the observed route was not readable yet.
+    expect(route?.routeStatus).toBe('unverifiable')
     expect(route?.routeProvider).toBe('anthropic')
     expect(route?.routeModel).toBe('claude-x')
-    expect(route?.routeDiagnostic).toBeUndefined()
+    expect(route?.routeDiagnostic).toContain('observed route not readable')
   })
 
   it('provider ONLY: unverified, and neither half is presented as observed', async () => {
     const route = await startingRoute({ provider: 'anthropic' })
     expect(route?.routeStatus).toBe('unverified')
-    expect(route?.routeProvider).toBe('unverified')
+    // P2-1 (execution-audit r1): the ROUTELESS legacy object now rides the
+    // inherit dispatch in auto mode exactly as mode off always dispatched it,
+    // so the configured half is the honest creation leg. The protective claims
+    // are unchanged: no selection leg, `unverified` status, the missing half
+    // still named — a half-route is still never presented as verified/observed.
+    expect(route?.routeProvider).toBe('anthropic')
     expect(route?.routeModel).toBe('unverified')
-    expect(route?.routeDiagnostic).toContain('inherits the deployment default')
+    // RE-SPECIFIED (plan v3 M4): the half-route diagnostic joins the shared
+    // captureRoute vocabulary instead of the executor-only inherit text; a
+    // partial creation route still inherits the missing half by default.
+    expect(route?.routeDiagnostic).toContain('not available from durable Agent options')
   })
 
   it('model ONLY: unverified, the mirror of the case above', async () => {
     const route = await startingRoute({ model: 'claude-x' })
     expect(route?.routeStatus).toBe('unverified')
+    // P2-1: the carried routeless object's model half is the creation leg.
     expect(route?.routeProvider).toBe('unverified')
-    expect(route?.routeModel).toBe('unverified')
+    expect(route?.routeModel).toBe('claude-x')
   })
 
   it('NOTHING configured: unverified with the inherit diagnostic', async () => {
@@ -1078,12 +1099,18 @@ describe('captureRoute records only what the durable Agent exposes', () => {
     return started.executor?.route
   }
 
-  it('both halves observable on the child Agent: verified', async () => {
+  it('both halves observable on the child Agent but NO request/header: unverifiable (plan v3 M4 / R1-P1 — creation-only is never verified)', async () => {
     const route = await runningRoute({ provider: 'deepseek-official', model: 'deepseek-chat' })
-    expect(route?.routeStatus).toBe('verified')
+    // RE-SPECIFIED (plan v3 M4 / [R1-P1]): this fake child exposes creation
+    // options but its session logs NO `request/header`, so the observed leg is
+    // unreadable. The old assertion (`verified`) was the creation-only defect
+    // this milestone fixes; the honest record is `unverifiable`, naming the
+    // failed read. The agreement case — creation AND a matching header — is
+    // asserted in test/engine-route.test.ts (i).
+    expect(route?.routeStatus).toBe('unverifiable')
     expect(route?.routeProvider).toBe('deepseek-official')
     expect(route?.routeModel).toBe('deepseek-chat')
-    expect(route?.routeDiagnostic).toBeUndefined()
+    expect(route?.routeDiagnostic).toContain('no well-formed request/header event')
   })
 
   it('provider only: unverified, and the missing half says so', async () => {

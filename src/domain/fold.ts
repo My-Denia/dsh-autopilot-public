@@ -11,6 +11,14 @@
 
 import {
   AutopilotError,
+  ROUTING_AUDITOR_ROLES,
+  ROUTING_AUTHORIZATION_SOURCES,
+  ROUTING_CANDIDATE_DISPOSITIONS,
+  ROUTING_IDENTITY_AXES,
+  ROUTING_INDEPENDENCE_OUTCOMES,
+  ROUTING_ROLES,
+  applyRoutingDecision,
+  sameRoutingPins,
   validateExternalReview,
   TERMINAL_PHASES,
   evaluateCompletion,
@@ -18,7 +26,7 @@ import {
   isAbsoluteShapedBearer,
   usageDeclarationProblems,
 } from './types.js'
-import type { Operation, Phase, RunEvent, Snapshot } from './types.js'
+import type { AuditRole, Operation, Phase, RouteRecord, RunEvent, RoutingDecisionDetail, RoutingPin, Snapshot } from './types.js'
 
 /** Operations legal from each phase (undefined prior state only admits init). */
 const LEGAL_OPS: Record<Phase, readonly Operation[]> = {
@@ -195,6 +203,401 @@ function evidenceKindStamp(detail: unknown): 'absent' | 'invalid' | 'v1' {
   return (detail as { evidenceKinds?: unknown }).evidenceKinds === 1 ? 'v1' : 'invalid'
 }
 
+/**
+ * The routing decision on a dispatch commit's `detail.routing`, STRICTLY
+ * validated (packet M3b): `{role, pin?, why, authorizationSource,
+ * fallbackFrom?, repinFrom?, candidates?}` and nothing else. Malformed ⇒ fold
+ * error — a routing decision is authorization-bearing state, and a hand-edited
+ * or foreign stream must be rejected loudly rather than folded into a pin the
+ * engine never wrote. The `candidates` set (execution-audit P2-2) is validated
+ * with the same strictness: a fabricated considered set is as dishonest on
+ * replay as a fabricated pin, entry by entry over closed vocabularies.
+ *
+ * F22 (PR #2 Codex round 10), ADDITIVE STRICTNESS: a decision whose
+ * `authorizationSource` is `'unreachable-inherit'` must be PINLESS. That
+ * source exists to label one thing — an inheritance-only result of an
+ * unreadable policy projection — so it cannot be the recorded authority for
+ * an explicit route; accepting the combination would persist an
+ * authorization-bearing pin whose stated source cannot authorize it.
+ * Replay-compat, stated here because the rule narrows what replays: it only
+ * REJECTS combinations that (a) no 0.2.0 stream ever contained —
+ * `detail.routing` itself is new in this branch, so every 0.2.0 event takes
+ * the no-routing arm below and no historical fixture can carry the pair —
+ * and (b) no stream this branch's engine writes can contain, because the
+ * engine stamps `'unreachable-inherit'` only on inheritance resolutions,
+ * which are pinless by construction (the no-catalog auto-inherit branch and
+ * the selector's unreachable-projection inherit). The rule therefore rejects
+ * only hand-edited or foreign streams; the 0.2.0 fixture replay stays green
+ * (asserted alongside, and by the legacy suite).
+ *
+ * F30 (PR #2 Codex round 16), ADDITIVE STRICTNESS — CANONICAL (TRIMMED)
+ * ROUTE FIELDS: every route-identity string in a routing detail — the pin's
+ * and `repinFrom`'s provider/model/reasoningEffort, and the provider/model
+ * of each `candidates` entry and `fallbackFrom` record, where those fields
+ * form pin state — must EQUAL ITS TRIMMED FORM (non-empty after trim, effort
+ * absent or non-empty). Replay used to persist these verbatim, so a padded
+ * pin (`' alpha '`/`' model '`/`' high '`) folded clean while every consumer
+ * compares trimmed: on reuse, policy membership and catalog liveness matched
+ * `alpha/model` but the preflight and the dispatched agentOptions received
+ * the RAW pin — authorized as one route, dispatched as another. The engine
+ * cannot write the rejected shape: every pin, candidate, and fallback field
+ * it stamps passes through `toRoutePin` (or the trimmed compositions at the
+ * engine's own seams), so only hand-edited or foreign streams are refused.
+ * Replay-compat is the F22 argument verbatim: `detail.routing` is new in this
+ * branch, no 0.2.0 event carries it, and no stream this branch's engine
+ * writes can fail the rule — the 0.2.0 fixtures take the no-routing arm.
+ *
+ * F31 (PR #2 Codex round 16), ADDITIVE STRICTNESS — THE CANDIDATES SET'S
+ * `selected` IS BOUND TO THE PIN: when a detail carries BOTH `candidates`
+ * and a pin, EXACTLY ONE entry may carry disposition `selected`, and its
+ * provider/model must be the pinned route (the effort comparison is vacuous
+ * today: the candidate vocabulary carries no effort field — an effort key on
+ * a candidate is an unknown-key rejection above — and must extend to it if
+ * the vocabulary ever grows one). Dispositions used to be vocabulary-checked
+ * only, so a foreign event could mark candidate B `selected` while the pin
+ * said A, or mark zero/several selected — a considered set that contradicts
+ * the decision it rides. The engine always emits exactly one selected entry
+ * matching the pin when the set is present (the selector marks the chosen
+ * candidate; the walk's dedupe keeps one entry per route), so no stream this
+ * branch writes can fail the rule; pinless details keep the current rules
+ * (no pin to bind). Same replay-compat argument as F22/F30.
+ *
+ * Returns the VALIDATED detail, or `undefined` when no routing decision is
+ * present (the 0.2.0 shape — every historical fixture takes this arm).
+ */
+function routingDecisionOf(op: Operation, detail: unknown): RoutingDecisionDetail | undefined {
+  if (detail === null || typeof detail !== 'object' || !('routing' in detail)) return undefined
+  const routing = (detail as { routing?: unknown }).routing
+  if (routing === undefined) return undefined
+  const where = `${op} detail.routing`
+  const problems: string[] = []
+  if (routing === null || typeof routing !== 'object' || Array.isArray(routing)) {
+    fail(`${where} must be an object, got ${typeof routing}`, 'AP_ROUTING_DETAIL')
+  }
+  const record = routing as Record<string, unknown>
+  const known: readonly string[] = ['role', 'pin', 'why', 'authorizationSource', 'fallbackFrom', 'repinFrom', 'candidates']
+  for (const key of Object.keys(record)) {
+    if (!known.includes(key)) problems.push(`${where} has an unknown key "${key}"`)
+  }
+  const pinProblems = (label: string, value: unknown): string[] => {
+    if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+      return [`${where}.${label} must be an object`]
+    }
+    const pin = value as Record<string, unknown>
+    const out: string[] = []
+    for (const key of Object.keys(pin)) {
+      if (key !== 'provider' && key !== 'model' && key !== 'reasoningEffort') {
+        out.push(`${where}.${label} has an unknown key "${key}"`)
+      }
+    }
+    for (const field of ['provider', 'model'] as const) {
+      const raw = pin[field]
+      if (typeof raw !== 'string' || raw.trim().length === 0) {
+        out.push(`${where}.${label}.${field} must be a non-empty string`)
+      } else if (raw !== raw.trim()) {
+        // F30 (PR #2 Codex round 16): a padded pin authorizes one route
+        // (membership/liveness compare trimmed) and dispatches another (the
+        // raw fields ride preflight/agentOptions) — noncanonical pin state.
+        out.push(
+          `${where}.${label}.${field} must equal its trimmed form, got ${JSON.stringify(raw)} — ` +
+            'padded route fields are not canonical pin state (authorization compares trimmed; the pin must be the route it dispatches)',
+        )
+      }
+    }
+    const effort = pin.reasoningEffort
+    if (effort !== undefined && (typeof effort !== 'string' || effort.trim().length === 0)) {
+      out.push(`${where}.${label}.reasoningEffort must be a non-empty string when present`)
+    } else if (typeof effort === 'string' && effort !== effort.trim()) {
+      // F30: same canonicality rule on the effort axis — a padded effort is
+      // dispatched raw while the fold's pin comparisons run exact.
+      out.push(
+        `${where}.${label}.reasoningEffort must equal its trimmed form, got ${JSON.stringify(effort)} — ` +
+          'padded route fields are not canonical pin state (authorization compares trimmed; the pin must be the route it dispatches)',
+      )
+    }
+    return out
+  }
+  const role = record.role
+  if (typeof role !== 'string' || !ROUTING_ROLES.includes(role)) {
+    problems.push(`${where}.role must be one of ${ROUTING_ROLES.join('|')}, got ${JSON.stringify(role)}`)
+  } else if (op === 'start-executor') {
+    if (role !== 'executor') problems.push(`${where}.role must be "executor" on a start-executor op, got "${role}"`)
+  } else if (op === 'audit') {
+    if (!ROUTING_AUDITOR_ROLES.includes(role)) {
+      problems.push(`${where}.role must be an auditor role (${ROUTING_AUDITOR_ROLES.join('|')}) on an audit op, got "${role}"`)
+    }
+  }
+  if ('pin' in record && record.pin !== undefined) problems.push(...pinProblems('pin', record.pin))
+  const why = record.why
+  if (!Array.isArray(why) || why.length === 0 || why.some((entry) => typeof entry !== 'string')) {
+    problems.push(`${where}.why must be a non-empty array of strings`)
+  }
+  const source = record.authorizationSource
+  if (source !== undefined) {
+    if (typeof source !== 'string' || !ROUTING_AUTHORIZATION_SOURCES.includes(source)) {
+      problems.push(
+        `${where}.authorizationSource must be one of ${ROUTING_AUTHORIZATION_SOURCES.join('|')}, got ${JSON.stringify(source)}`,
+      )
+    } else if (source === 'unreachable-inherit' && record.pin !== undefined) {
+      // F22 (see the doc comment above): the source names an inheritance-only
+      // result of an unreadable policy projection — it cannot authorize a pin.
+      problems.push(
+        `${where}: authorizationSource "unreachable-inherit" cannot authorize the pin ${JSON.stringify(record.pin)} — `
+          + 'that source marks an inheritance-only result of an unreadable policy projection; a decision carrying a pin must name an authority that can authorize it (session-policy or plugin-config) or carry no pin at all',
+      )
+    }
+  } else if ('pin' in record && record.pin !== undefined) {
+    // An explicit route always has an authority; an inherit under an absent
+    // policy has none (see RoutingDecisionDetail). REQUIRE it exactly there.
+    problems.push(`${where}.authorizationSource is required when a pin is present`)
+  }
+  if ('fallbackFrom' in record && record.fallbackFrom !== undefined) {
+    const fallback = record.fallbackFrom
+    if (!Array.isArray(fallback)) {
+      problems.push(`${where}.fallbackFrom must be an array`)
+    } else {
+      for (const entry of fallback) {
+        if (entry === null || typeof entry !== 'object' || Array.isArray(entry)) {
+          problems.push(`${where}.fallbackFrom entries must be objects`)
+          continue
+        }
+        const item = entry as Record<string, unknown>
+        for (const key of Object.keys(item)) {
+          if (key !== 'provider' && key !== 'model' && key !== 'reason') {
+            problems.push(`${where}.fallbackFrom entry has an unknown key "${key}"`)
+          }
+        }
+        for (const field of ['provider', 'model', 'reason'] as const) {
+          const raw = item[field]
+          if (typeof raw !== 'string' || raw.trim().length === 0) {
+            problems.push(`${where}.fallbackFrom entry .${field} must be a non-empty string`)
+          } else if (field !== 'reason' && raw !== raw.trim()) {
+            // F30 (PR #2 Codex round 16): fallbackFrom route fields are pin-
+            // state-adjacent route identity; padded values are noncanonical.
+            // (`reason` is prose, not a route field — exempt.)
+            problems.push(
+              `${where}.fallbackFrom entry .${field} must equal its trimmed form, got ${JSON.stringify(raw)} — ` +
+                'padded route fields are not canonical routing state',
+            )
+          }
+        }
+      }
+    }
+  }
+  if ('repinFrom' in record && record.repinFrom !== undefined) {
+    problems.push(...pinProblems('repinFrom', record.repinFrom))
+  }
+  if ('candidates' in record && record.candidates !== undefined) {
+    const candidates = record.candidates
+    if (!Array.isArray(candidates)) {
+      problems.push(`${where}.candidates must be an array`)
+    } else {
+      for (const entry of candidates) {
+        if (entry === null || typeof entry !== 'object' || Array.isArray(entry)) {
+          problems.push(`${where}.candidates entries must be objects`)
+          continue
+        }
+        const item = entry as Record<string, unknown>
+        const entryKeys: readonly string[] = ['provider', 'model', 'contextWindow', 'hasReasoningEfforts', 'independence', 'disposition', 'note']
+        for (const key of Object.keys(item)) {
+          if (!entryKeys.includes(key)) problems.push(`${where}.candidates entry has an unknown key "${key}"`)
+        }
+        for (const field of ['provider', 'model'] as const) {
+          const raw = item[field]
+          if (typeof raw !== 'string' || raw.trim().length === 0) {
+            problems.push(`${where}.candidates entry .${field} must be a non-empty string`)
+          } else if (raw !== raw.trim()) {
+            // F30 (PR #2 Codex round 16): candidate route fields form the
+            // considered set the pin binds to (F31 below) — padded values are
+            // noncanonical routing state, same rule as the pin's own fields.
+            problems.push(
+              `${where}.candidates entry .${field} must equal its trimmed form, got ${JSON.stringify(raw)} — ` +
+                'padded route fields are not canonical routing state',
+            )
+          }
+        }
+        const disposition = item.disposition
+        if (typeof disposition !== 'string' || !ROUTING_CANDIDATE_DISPOSITIONS.includes(disposition)) {
+          problems.push(
+            `${where}.candidates entry .disposition must be one of ${ROUTING_CANDIDATE_DISPOSITIONS.join('|')}, got ${JSON.stringify(disposition)}`,
+          )
+        }
+        const window = item.contextWindow
+        if (window !== undefined && (typeof window !== 'number' || !Number.isInteger(window) || window <= 0)) {
+          problems.push(`${where}.candidates entry .contextWindow must be a positive integer when present`)
+        }
+        if (typeof item.hasReasoningEfforts !== 'boolean') {
+          problems.push(`${where}.candidates entry .hasReasoningEfforts must be a boolean`)
+        }
+        const note = item.note
+        if (note !== undefined && (typeof note !== 'string' || note.trim().length === 0)) {
+          problems.push(`${where}.candidates entry .note must be a non-empty string when present`)
+        }
+        const independence = item.independence
+        if (independence !== undefined) {
+          if (independence === null || typeof independence !== 'object' || Array.isArray(independence)) {
+            problems.push(`${where}.candidates entry .independence must be an object`)
+          } else {
+            const axes = independence as Record<string, unknown>
+            for (const key of Object.keys(axes)) {
+              if (key !== 'modelAxis' && key !== 'providerAxis' && key !== 'outcome') {
+                problems.push(`${where}.candidates entry .independence has an unknown key "${key}"`)
+              }
+            }
+            for (const axis of ['modelAxis', 'providerAxis'] as const) {
+              const raw = axes[axis]
+              if (typeof raw !== 'string' || !ROUTING_IDENTITY_AXES.includes(raw)) {
+                problems.push(
+                  `${where}.candidates entry .independence.${axis} must be one of ${ROUTING_IDENTITY_AXES.join('|')}, got ${JSON.stringify(raw)}`,
+                )
+              }
+            }
+            const outcome = axes.outcome
+            if (typeof outcome !== 'string' || !ROUTING_INDEPENDENCE_OUTCOMES.includes(outcome)) {
+              problems.push(
+                `${where}.candidates entry .independence.outcome must be one of ${ROUTING_INDEPENDENCE_OUTCOMES.join('|')}, got ${JSON.stringify(outcome)}`,
+              )
+            }
+          }
+        }
+      }
+      // F31 (PR #2 Codex round 16), ADDITIVE STRICTNESS: bind the candidates
+      // set's `selected` entry to the pin when the detail carries BOTH. The
+      // engine always stamps exactly one selected entry matching the pin (the
+      // selector marks the chosen candidate; the walk dedupes routes), so a
+      // set marking another route selected, or zero/several, is a foreign or
+      // hand-edited stream contradicting the decision it rides. The
+      // comparison is trim-tolerant on purpose (canonicality is F30's own
+      // rejection above; this rule is about WHICH candidate is selected), and
+      // pinless details keep the current rules — there is no pin to bind.
+      // Effort: the candidate vocabulary carries no effort field (an effort
+      // key is an unknown-key rejection above), so provider/model is the
+      // whole binding today; if the vocabulary ever grows an effort field,
+      // the comparison must extend to it when named on both sides.
+      if (record.pin !== undefined && record.pin !== null && typeof record.pin === 'object') {
+        const pinFields = record.pin as { provider?: unknown; model?: unknown }
+        const pinProvider = typeof pinFields.provider === 'string' ? pinFields.provider.trim() : undefined
+        const pinModel = typeof pinFields.model === 'string' ? pinFields.model.trim() : undefined
+        const pinLabel = pinProvider !== undefined && pinModel !== undefined ? `${pinProvider}/${pinModel}` : JSON.stringify(record.pin)
+        const selectedEntries = candidates.filter(
+          (entry) => entry !== null && typeof entry === 'object' && !Array.isArray(entry)
+            && (entry as Record<string, unknown>).disposition === 'selected',
+        )
+        if (selectedEntries.length !== 1) {
+          problems.push(
+            `${where}: the decision pins ${pinLabel} but its candidates set marks ${String(selectedEntries.length)} entr${selectedEntries.length === 1 ? 'y' : 'ies'} selected — ` +
+              'exactly ONE selected entry is required, and it must be the pinned route',
+          )
+        } else {
+          const entry = selectedEntries[0] as { provider?: unknown; model?: unknown }
+          const entryProvider = typeof entry.provider === 'string' ? entry.provider.trim() : undefined
+          const entryModel = typeof entry.model === 'string' ? entry.model.trim() : undefined
+          if (entryProvider !== pinProvider || entryModel !== pinModel) {
+            problems.push(
+              `${where}: the candidates set marks ${String(entryProvider)}/${String(entryModel)} selected but the decision pins ${pinLabel} — ` +
+                'the selected candidate must be the pinned route (the engine stamps exactly one selected entry, matching the pin)',
+            )
+          }
+        }
+      }
+    }
+  }
+  if (problems.length > 0) {
+    fail(`${where} is malformed: ${problems.join('; ')}`, 'AP_ROUTING_DETAIL')
+  }
+  return record as unknown as RoutingDecisionDetail
+}
+
+/**
+ * The audit role each auditor routing role names — the domain-side mirror of
+ * the engine's `routeRoleOf` (the fold may not import the engine that imports
+ * it; the mapping is the one rule both sides share, so it is stated once here
+ * and must move with the role vocabularies).
+ */
+const AUDIT_ROLE_OF_ROUTING_ROLE: Readonly<Record<string, AuditRole>> = {
+  'plan-auditor': 'plan',
+  'execution-auditor': 'execution',
+  'rules-auditor': 'rules',
+}
+
+/** Field-wise pin equality: provider, model, and effort (absent equals absent). */
+function sameRoutePin(a: RoutingPin, b: RoutingPin): boolean {
+  return a.provider === b.provider && a.model === b.model && a.reasoningEffort === b.reasoningEffort
+}
+
+/**
+ * F26 (PR #2 Codex round 13), ADDITIVE STRICTNESS: when one dispatch commit
+ * carries BOTH a validated `detail.routing` AND a record the same commit
+ * appends (an AuditRecord on `audit`, the ExecutorRecord on `start-executor`),
+ * the two must agree — the detail's role names the appended record's role, and
+ * the detail's pin and the record's `selected` route are the SAME route.
+ * Before this, replay validated the detail and derived the pin state from it
+ * but never compared it to the appended record, so a foreign event could
+ * append an execution-auditor pass whose RouteRecord claims route B while the
+ * validated detail names plan-auditor pin A — and the fold accepted the
+ * contradictory canonical state.
+ *
+ * THE EXACT COMPARISON, per the engine's own stamp shapes (they define the
+ * legal space): the writer merges the decision onto the record it appends
+ * (`withRoutingRecord`), so an engine-written record's `selected` IS the
+ * detail's pin — present iff the pin is — and an audit detail's role is
+ * `routeRoleOf(record.role)`. Legitimate omissions are therefore exactly the
+ * ones the writer can produce: the record carries route-evidence legs the
+ * detail has no counterpart for (`observed`, `routeStatus`,
+ * `routeProvider`/`routeModel`, `crossFamily`, …) and mirrors the detail's
+ * decision fields under its own names (`why`, `authorizationSource`,
+ * `fallbackFrom`, `candidatesConsidered`) — those pairs are deliberately NOT
+ * compared. What is a genuine contradiction on either side: a role naming a
+ * different dispatch than the record it appends, a `selected` route with no
+ * pin behind it, a pin whose record carries a different `selected`, or the
+ * two routes differing on any axis (provider, model, effort — absent effort
+ * on one side and present on the other is a difference).
+ *
+ * Replay-compat, same argument as F22 above: the rule fires only when BOTH
+ * sides are present. `detail.routing` is new in this branch, so no 0.2.0
+ * event can carry it (every historical fixture takes the no-binding arm),
+ * and this branch's writer satisfies the equality by construction. A
+ * routing-detail-only event (a decision with no appended record) and every
+ * record-only event (all of 0.2.0, self-check, external countersigns) fold
+ * exactly as before.
+ */
+function bindRoutingDetailToRecords(
+  event: RunEvent,
+  routing: RoutingDecisionDetail,
+  prior: Snapshot,
+  next: Snapshot,
+): void {
+  if (event.op !== 'audit' && event.op !== 'start-executor') return // unreachable: callers pass only dispatch ops
+  const op = event.op
+  const pinEqualsSelected = (label: string, route: RouteRecord): void => {
+    if (routing.pin === undefined && route.selected === undefined) return
+    if (routing.pin !== undefined && route.selected !== undefined && sameRoutePin(routing.pin, route.selected)) return
+    fail(
+      `${op} detail.routing pins role "${routing.role}" to ${JSON.stringify(routing.pin)} but the appended ${label}'s route record carries selected ${JSON.stringify(route.selected)} — the decision and the record it stamps must name the same route, present on both or neither`,
+      'AP_ROUTING_RECORD_MISMATCH',
+    )
+  }
+  if (op === 'audit') {
+    for (let i = prior.audits.length; i < next.audits.length; i++) {
+      const record = next.audits[i]
+      if (record === undefined) continue // the array is index-validated elsewhere; nothing to bind
+      const expectedRole = AUDIT_ROLE_OF_ROUTING_ROLE[routing.role]
+      if (expectedRole === undefined || expectedRole !== record.role) {
+        fail(
+          `audit detail.routing names role "${routing.role}" but appended audit record ${i} has role "${record.role}" — one dispatch, one role: the decision must bind the record it appends`,
+          'AP_ROUTING_RECORD_MISMATCH',
+        )
+      }
+      pinEqualsSelected(`audit record ${i}`, record.route)
+    }
+    return
+  }
+  // start-executor: `routingDecisionOf` already held the detail to the
+  // 'executor' role on this op; the binding left to check is pin ↔ the
+  // executor record's own route.
+  if (next.executor !== undefined) pinEqualsSelected('executor record', next.executor.route)
+}
+
 /** Assert one event is a legal successor of the prior snapshot; returns the new snapshot. */
 export function applyEvent(prior: Snapshot | undefined, event: RunEvent): Snapshot {
   if (event.v !== 1) fail(`unsupported event version ${String((event as { v: unknown }).v)}`, 'AP_EVENT_VERSION')
@@ -207,6 +610,9 @@ export function applyEvent(prior: Snapshot | undefined, event: RunEvent): Snapsh
     if (next.planGate !== 'pending' || next.executionGate !== 'pending') fail('init gates must be pending', 'AP_INIT_GATES')
     if (next.audits.length !== 0) fail('init audits must be empty', 'AP_INIT_AUDITS')
     if (next.executor !== undefined) fail('init executor must be absent', 'AP_INIT_EXECUTOR')
+    if (next.routingPins !== undefined) {
+      fail('init routingPins must be absent — pins derive from dispatch detail.routing only', 'AP_INIT_ROUTING_PINS')
+    }
     if (next.bearerBase !== undefined) {
       if (next.bearerBase.length === 0) fail('init bearerBase must not be empty when present', 'AP_BEARER_BASE_EMPTY')
       if (!isAbsoluteShapedBearer(next.bearerBase)) {
@@ -228,12 +634,47 @@ export function applyEvent(prior: Snapshot | undefined, event: RunEvent): Snapsh
     fail(`op ${event.op} is illegal in phase ${prior.phase}`, 'AP_ILLEGAL_OP')
   }
 
+  // Routing pins derive from dispatch-op `detail.routing` ONLY (plan "Route
+  // records and stability", refined pinning delta): last-wins per role — set on
+  // a `route` decision, cleared on an `inherit`. The engine builds the committed
+  // snapshot with the SAME shared derivation (`applyRoutingDecision`), so this
+  // check holds every event to the one rule rather than trusting the writer's
+  // arithmetic. Events without `detail.routing` replay exactly as 0.2.0: the
+  // pin state must be byte-stable across them, which is also what makes a
+  // legacy stream with no pins at all fold unchanged.
+  const dispatchRouting = event.op === 'audit' || event.op === 'start-executor'
+    ? routingDecisionOf(event.op, event.detail)
+    : undefined
+  if (event.op === 'audit' || event.op === 'start-executor') {
+    const expected = dispatchRouting !== undefined ? applyRoutingDecision(prior.routingPins, dispatchRouting) : prior.routingPins
+    if (!sameRoutingPins(expected, next.routingPins)) {
+      fail(
+        dispatchRouting !== undefined
+          ? `routingPins do not match detail.routing for role "${dispatchRouting.role}" (expected ${JSON.stringify(expected)}, got ${JSON.stringify(next.routingPins)})`
+          : `routingPins mutated without a routing decision (expected ${JSON.stringify(prior.routingPins)}, got ${JSON.stringify(next.routingPins)})`,
+        'AP_ROUTING_PINS',
+      )
+    }
+  } else if (!sameRoutingPins(prior.routingPins, next.routingPins)) {
+    fail(
+      `routingPins mutated via op ${event.op} (pins derive from audit/start-executor detail.routing only)`,
+      'AP_ROUTING_PINS_MUTATED',
+    )
+  }
+
   // Audit history is append-only.
   if (next.audits.length < prior.audits.length) fail('audit history shrank', 'AP_AUDITS_SHRANK')
   for (let i = 0; i < prior.audits.length; i++) {
     if (JSON.stringify(next.audits[i]) !== JSON.stringify(prior.audits[i])) {
       fail(`audit record ${i} was modified`, 'AP_AUDITS_MODIFIED')
     }
+  }
+
+  // F26: bind a present routing detail to the record(s) this same commit
+  // appends (see bindRoutingDetailToRecords for the exact comparison and the
+  // replay-compat argument). Fires only when BOTH sides are present.
+  if (dispatchRouting !== undefined) {
+    bindRoutingDetailToRecords(event, dispatchRouting, prior, next)
   }
 
   // An owner countersign is validated ON REPLAY, not only where it was written.

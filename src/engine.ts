@@ -41,6 +41,8 @@ import type {
   Operation,
   OwnerApproval,
   RouteRecord,
+  RoutingDecisionDetail,
+  RoutingPin,
   RunEvent,
   RunId,
   Snapshot,
@@ -50,10 +52,19 @@ import type {
   UsageEvidence,
   Verdict,
 } from './domain/types.js'
+import { applyRoutingDecision } from './domain/types.js'
 import { settleExternalReviews, settleUsageArtifacts, usageDeclarationProblems, validateUsageEntry } from './domain/usage.js'
 import { SHELL_TOOLS, egressSegments, isEgressCommand } from './gate/decide.js'
 import { matchesAtTokenBoundary } from './outbound/manifest.js'
 import type { RunStoreLike } from './store/types.js'
+import { selectRoute } from './routing/select.js'
+import type { Role, RoleRouting, RoutePreference, SelectedRoute, SelectionDecision } from './routing/select.js'
+import { resolvePluginGrant } from './routing/authorize.js'
+import type { GrantSource, SessionPolicyState } from './routing/authorize.js'
+import { RouteCatalog, providerIsLive } from './routing/catalog.js'
+import type { LlmCallConfig } from './routing/catalog.js'
+import { independenceOf, sameRoute, toRoutePin } from './routing/identity.js'
+import type { RoutePin } from './routing/identity.js'
 
 // ── Structural platform types (subset of dsh surfaces the engine touches) ──
 
@@ -96,6 +107,16 @@ export interface AgentRef {
   readonly id: string
   readonly session: SessionRef
   readonly options?: { readonly provider?: string; readonly model?: string }
+  /**
+   * The agent's scoped context ([R2-P3-1], M6): present on REAL host agents
+   * (upstream `Agent.ctx`), absent in tests unless deliberately stubbed. The
+   * M6 planner install passes the ROOT agent's ctx to the
+   * `modelSelectionInstaller` port (`installModelSelection` is agent-scoped);
+   * nothing else in this plugin reads it. `unknown` on purpose: the host's
+   * Context type is not imported here, and the engine never touches it beyond
+   * handing it to the port.
+   */
+  readonly ctx?: unknown
 }
 
 /** Structural subset of ctx.agents. */
@@ -159,6 +180,32 @@ export interface AgentOptionsLike {
   readonly provider?: string
   readonly model?: string
   readonly maxTokens?: number
+  /**
+   * Reasoning effort ([R2-P3-1]): adapter-declared `defaultEffort` or a
+   * lock-named value, validated at dispatch preflight (`resolveCallConfig`)
+   * and NEVER invented. Wider than the 0.2.0 shape; the host's subagent
+   * `agentOptions` capability accepts it.
+   */
+  readonly reasoningEffort?: string
+}
+
+/**
+ * Resolved routing: EXACTLY what the routing core consumes —
+ * `selectRoute`'s `roleRouting` (`RoleRouting` values, keys in the core's
+ * role vocabulary) plus the section-level `mode` and `preference`
+ * (`RouteSelectionInput.preference`). Built by `resolveConfig` in
+ * `./index.ts` (which maps legacy explicit routes onto locked roles) and
+ * consumed here without re-deriving anything.
+ *
+ * `mode: 'off'` reproduces 0.2.0 dispatch semantics on deployments without a
+ * session model-selection policy — while the per-role table still resolves,
+ * so locks stay visible (and enforced as plugin-config grants) in every mode.
+ */
+export interface ResolvedRouting {
+  readonly mode: 'auto' | 'off'
+  readonly preference: RoutePreference
+  /** Every role is always present, resolved to its effective routing. */
+  readonly roles: Readonly<Record<Role, RoleRouting>>
 }
 
 /** Resolved plugin configuration. */
@@ -172,6 +219,8 @@ export interface ResolvedConfig {
     readonly toolAllowList: readonly string[]
   }
   readonly crossFamily: CrossFamilyPolicy
+  /** Role-true model routing, resolved (legacy explicit routes map to locked roles). */
+  readonly routing: ResolvedRouting
   readonly gate: {
     readonly sandboxCoupling: boolean
     readonly toolDeny: boolean
@@ -608,19 +657,386 @@ export function effectiveSandboxMode(events: ReadonlyArray<{ type: string; data:
   return mode
 }
 
-function captureRoute(childId: string, provider: string, agent: AgentRef | undefined): RouteRecord {
-  const routeProvider = agent?.options?.provider
-  const routeModel = agent?.options?.model
-  if (routeProvider !== undefined && routeModel !== undefined) {
-    return { provider, routeProvider, routeModel, routeStatus: 'verified' }
-  }
+// ── Role-true routing (plan v3; packet M3b) ─────────────────────────────
+
+/** The routing-core role a dispatch's audit role corresponds to. */
+export function routeRoleOf(role: AuditRole): Role {
+  if (role === 'plan') return 'plan-auditor'
+  if (role === 'execution') return 'execution-auditor'
+  return 'rules-auditor'
+}
+
+const AUDITOR_ROLE_SET: readonly Role[] = ['plan-auditor', 'execution-auditor', 'rules-auditor']
+
+/** Whether routing is ACTIVE for one role's dispatch: mode `auto`, or a role that is locked/inherit. */
+function routingActive(routing: ResolvedRouting, role: Role): boolean {
+  if (routing.mode === 'auto') return true
+  return routing.roles[role].mode !== 'auto'
+}
+
+/**
+ * F2 (PR #2 Codex review): the conservative routing an INVALID live section
+ * degrades to — mode `off` with every role `inherit`, i.e. "route nothing
+ * explicitly". Only its ACTIVITY is ever consumed (the dispatch gates and the
+ * planner re-arm check); every decision path that would act on it returns the
+ * recorded refusal instead, so this shape can never select, lock, or pin
+ * anything. It exists so the gates have a total function to read even when
+ * the real section cannot be resolved at all.
+ */
+const REFUSED_ROUTING: ResolvedRouting = {
+  mode: 'off',
+  preference: 'balanced',
+  roles: {
+    executor: { mode: 'inherit' },
+    planner: { mode: 'inherit' },
+    'plan-auditor': { mode: 'inherit' },
+    'execution-auditor': { mode: 'inherit' },
+    'rules-auditor': { mode: 'inherit' },
+  },
+}
+
+/** What one dispatch runs on, after routing decided (or recorded parity). */
+export interface DispatchRouting {
+  /** The agentOptions the child dispatches with; `undefined` = inherit the deployment default. */
+  readonly agentOptions: AgentOptionsLike | undefined
+  /** The `detail.routing` for the dispatch commits; ABSENT when routing made no decision (pure 0.2.0 parity). */
+  readonly routing?: RoutingDecisionDetail
+  /** The cross-family outcome for the audit's RouteRecord (absent on the executor's own record). */
+  readonly crossFamily?: CrossFamilyOutcome
+  readonly crossFamilyDiagnostic?: string
+}
+
+/** One role dispatch's routing resolution: dispatch, or the owner-escalation exit. */
+export type RoleRouteResolution =
+  | ({ readonly kind: 'dispatch' } & DispatchRouting)
+  | { readonly kind: 'escalate'; readonly reason: string }
+
+/** Merge a routing decision's record fields onto a captured route record. */
+function withRoutingRecord(route: RouteRecord, routing: RoutingDecisionDetail | undefined): RouteRecord {
+  if (routing === undefined) return route
   return {
-    provider,
-    routeProvider: routeProvider ?? 'unverified',
-    routeModel: routeModel ?? 'unverified',
-    routeStatus: 'unverified',
-    routeDiagnostic: `child ${childId}: provider/model not available from durable Agent options`,
+    ...route,
+    ...(routing.pin === undefined ? {} : { selected: routing.pin }),
+    ...(routing.authorizationSource === undefined ? {} : { authorizationSource: routing.authorizationSource }),
+    ...(routing.fallbackFrom === undefined ? {} : { fallbackFrom: routing.fallbackFrom }),
+    ...(routing.candidates === undefined ? {} : { candidatesConsidered: routing.candidates }),
+    why: [...routing.why],
   }
+}
+
+// ── Observed-route evidence (plan v3 M4; [R1-P1-5], [R2-P3-3]) ────────────
+
+/** The three legs of route evidence for one dispatched child, as reads see them. */
+export interface RouteEvidence {
+  /** What the routing decision selected; absent on inherit/parity dispatches. */
+  readonly selected?: RoutingPin
+  /** Creation route (`Agent.options`); partial when the host exposes half of it. */
+  readonly creation?: { readonly provider?: string; readonly model?: string }
+  /** Observed route (latest `request/header`); absent when the read failed. */
+  readonly observed?: RoutingPin
+  /** Why the observed read failed, when it did — the honest `unverifiable` reason. */
+  readonly observedUnreadable?: string
+}
+
+/**
+ * The latest `request/header` route from a child session — the OBSERVED leg of
+ * route evidence.
+ *
+ * `request/header` is a durable session event (`{header: {config: {provider,
+ * model, reasoningEffort?, …}}, reason}`); the LATEST snapshot reconstructs
+ * the request the child actually sent, which is the only proof of the request
+ * route (`Agent.options` prove creation only — plan-gate R1 P1). The read is
+ * defensive by contract: an unreadable session, a throwing `snapshotEvents`,
+ * or a header with no well-formed config degrades to `{unreadable}` naming
+ * which read failed, NEVER to a throw — route evidence must not be able to
+ * break a verdict path ([R2-P3-3]: the feature degrades, it does not block).
+ */
+export function observedRouteOf(session: SessionReadRef | undefined): {
+  readonly observed?: RoutingPin
+  readonly unreadable?: string
+} {
+  if (session === undefined) return { unreadable: 'child session not readable' }
+  let events: ReadonlyArray<{ readonly type: string; readonly data: unknown }>
+  try {
+    events = session.snapshotEvents()
+  } catch (error) {
+    return { unreadable: `child session read failed: ${errorMessage(error)}` }
+  }
+  let observed: RoutingPin | undefined
+  for (const event of events) {
+    if (event.type !== 'request/header') continue
+    const config = (event.data as {
+      readonly header?: { readonly config?: { readonly provider?: unknown; readonly model?: unknown; readonly reasoningEffort?: unknown } }
+    } | undefined)?.header?.config
+    if (config === undefined || typeof config.provider !== 'string' || typeof config.model !== 'string') continue
+    observed = {
+      provider: config.provider,
+      model: config.model,
+      ...(typeof config.reasoningEffort === 'string' ? { reasoningEffort: config.reasoningEffort } : {}),
+    }
+  }
+  return observed === undefined
+    ? { unreadable: 'no well-formed request/header event in the child session' }
+    : { observed }
+}
+
+/**
+ * Route status under plan v3 semantics — the R1-P1 fix.
+ *
+ * `verified` ONLY when selected, creation, and observed are ALL present and
+ * agree on every comparable axis (provider, model, and reasoningEffort where
+ * both legs carry it — and the effort axis is only establishable when the
+ * observed `request/header` CARRIES the field: a selection that pins an
+ * effort while the observed header omits it is `unverifiable`, never
+ * `verified`, because the child's own evidence cannot show the selected
+ * effort ran). Any disagreement among the legs that ARE present ⇒
+ * `mismatch` with the differing axes named — divergence is signal, recorded
+ * and never hidden. A missing leg while a claim was in scope ⇒ `unverifiable`
+ * naming which read failed: creation-only evidence is NEVER `verified` (the
+ * defect this replaces). `unverified` keeps the 0.2.0 meaning — no route claim
+ * was in play to verify (inheritance without a readable creation route).
+ */
+export function routeStatusOf(childId: string, evidence: RouteEvidence): {
+  readonly routeStatus: RouteRecord['routeStatus']
+  readonly routeDiagnostic?: string
+} {
+  const { selected, creation, observed } = evidence
+  const creationFull = creation?.provider !== undefined && creation?.model !== undefined
+  // 1 — disagreements among the legs that are present, axis by axis.
+  const axes: string[] = []
+  if (selected !== undefined) {
+    if (creation?.provider !== undefined && creation.provider !== selected.provider) {
+      axes.push(`provider: selected ${selected.provider} vs creation ${creation.provider}`)
+    }
+    if (creation?.model !== undefined && creation.model !== selected.model) {
+      axes.push(`model: selected ${selected.model} vs creation ${creation.model}`)
+    }
+    if (observed !== undefined) {
+      if (observed.provider !== selected.provider) {
+        axes.push(`provider: selected ${selected.provider} vs observed ${observed.provider}`)
+      }
+      if (observed.model !== selected.model) {
+        axes.push(`model: selected ${selected.model} vs observed ${observed.model}`)
+      }
+      if (selected.reasoningEffort !== undefined && observed.reasoningEffort !== undefined
+        && selected.reasoningEffort !== observed.reasoningEffort) {
+        axes.push(`reasoningEffort: selected ${selected.reasoningEffort} vs observed ${observed.reasoningEffort}`)
+      }
+    }
+  }
+  if (creation !== undefined && observed !== undefined) {
+    if (creation.provider !== undefined && creation.provider !== observed.provider) {
+      axes.push(`provider: creation ${creation.provider} vs observed ${observed.provider}`)
+    }
+    if (creation.model !== undefined && creation.model !== observed.model) {
+      axes.push(`model: creation ${creation.model} vs observed ${observed.model}`)
+    }
+  }
+  if (axes.length > 0) {
+    return {
+      routeStatus: 'mismatch',
+      routeDiagnostic: `route mismatch — the dispatch did not run the recorded route: ${axes.join('; ')}`,
+    }
+  }
+  const creationGap = creationFull
+    ? undefined
+    : `child ${childId}: provider/model not available from durable Agent options`
+  const observedGap = observed === undefined
+    ? `observed route not readable: ${evidence.observedUnreadable ?? 'unreadable'}`
+    : undefined
+  // F18 (PR #2 Codex round 8): a comparable leg pinning an effort while the
+  // observed `request/header` OMITS the optional field leaves the effort axis
+  // unestablishable — the observed evidence cannot show the selected effort
+  // ran, so its silence must not read as agreement. Only the OBSERVED omission
+  // is a gap: an observed effort with no selected one keeps the existing
+  // handling (the axis is not comparable without both legs), and both absent
+  // means there is no effort axis to establish at all.
+  const effortGap = selected?.reasoningEffort !== undefined && observed !== undefined && observed.reasoningEffort === undefined
+    ? `child ${childId}: observed request/header omits reasoningEffort (selected ${selected.reasoningEffort}) — the selected effort is not observable from the child session; the leg is unverifiable, not agreed`
+    : undefined
+  // 2 — a claim was in scope (a selection, or a full creation route to check).
+  if (selected !== undefined || creationFull) {
+    if (observed === undefined) {
+      return { routeStatus: 'unverifiable', routeDiagnostic: [creationGap, observedGap].filter(Boolean).join('; ') }
+    }
+    if (selected !== undefined && !creationFull) {
+      return { routeStatus: 'unverifiable', routeDiagnostic: [creationGap, effortGap].filter(Boolean).join('; ') }
+    }
+    if (effortGap !== undefined) {
+      return { routeStatus: 'unverifiable', routeDiagnostic: effortGap }
+    }
+    if (selected !== undefined) return { routeStatus: 'verified' }
+    return {
+      routeStatus: 'unverified',
+      routeDiagnostic: 'no routing decision selected a route (inheritance); creation and observed routes agree',
+    }
+  }
+  // 3 — no selection and no readable creation route: the 0.2.0 record stands,
+  // with the observed leg named either way.
+  return {
+    routeStatus: 'unverified',
+    routeDiagnostic: [
+      creationGap,
+      observed === undefined
+        ? observedGap
+        : `observed route ${observed.provider}/${observed.model} recorded from the child request header`,
+    ].filter(Boolean).join('; '),
+  }
+}
+
+/**
+ * F6 (PR #2 Codex round 3): the executor's OBSERVED route leg, recaptured at
+ * execution-packet submission — a NEW evidence read, labeled as one.
+ *
+ * `startContinuable` resolves before the child's first turn (upstream: the
+ * promise settles at inbox acceptance), so the `running` record's observed
+ * read found no `request/header` yet and the record has sat `unverifiable`
+ * forever — packet submission and resume preserved it, and a later route
+ * mismatch was never recorded. By packet submission a request HAS run (the
+ * child is calling the packet tool), so the latest header is finally
+ * readable: this refresh re-reads it, recomputes `routeStatus` through the
+ * same {@link routeStatusOf} doctrine (never `verified` without three-leg
+ * agreement), and says IN the diagnostic that the observed leg was refreshed
+ * at packet submission — it never pretends the leg was there from the start.
+ * The recomputed `routeDiagnostic` REPLACES the capture-time one (which said
+ * the observed read had failed); the capture-time record — including any
+ * tool-surface note — stands unchanged in the snapshot beside this refresh.
+ *
+ * WHERE THE REFRESH LIVES (the fold-contract decision): the fold refuses
+ * executor mutation on `submit-packet` (`AP_EXECUTOR_MUTATED`), so the
+ * refreshed record rides as the ADDITIVE `routeRecapture` key on the
+ * submit-packet commit's detail — the established pattern
+ * (`withPlannerDetail`) — and the snapshot keeps the capture-time record
+ * unchanged beside it. A failed read keeps the prior record and records the
+ * failure the same way; nothing here can refuse a packet.
+ */
+export interface ExecutorRouteRecapture {
+  /** `refreshed` — an observed leg was read and the status recomputed. */
+  readonly outcome: 'refreshed'
+  /** The recomputed record: the prior record plus the observed leg and the recomputed status. */
+  readonly route: RouteRecord
+  /** The observed leg as re-read at submission (also on `route`). */
+  readonly observed: RoutingPin
+}
+
+/** The failed half of the packet-submission recapture: the read did not yield an observed leg. */
+export interface ExecutorRouteRecaptureFailed {
+  /** `unreadable` — no well-formed `request/header` was readable; the prior record stands. */
+  readonly outcome: 'unreadable'
+  /** Why the read failed; the prior record is kept unchanged. */
+  readonly reason: string
+}
+
+/** See {@link ExecutorRouteRecapture}. */
+function recapturedExecutorRoute(
+  childId: string,
+  record: RouteRecord,
+  session: SessionReadRef | undefined,
+): ExecutorRouteRecapture | ExecutorRouteRecaptureFailed {
+  const read = observedRouteOf(session)
+  if (read.observed === undefined) {
+    return { outcome: 'unreadable', reason: read.unreadable ?? 'observed route read failed' }
+  }
+  // The creation leg is the record's OWN (captured from the durable Agent
+  // options at dispatch) — re-reading a live agent object here could drift
+  // from what was actually dispatched, and the record is the durable fact.
+  const creation = record.routeProvider === 'unverified' && record.routeModel === 'unverified'
+    ? undefined
+    : {
+        ...(record.routeProvider === 'unverified' ? {} : { provider: record.routeProvider }),
+        ...(record.routeModel === 'unverified' ? {} : { model: record.routeModel }),
+      }
+  const status = routeStatusOf(childId, {
+    ...(record.selected === undefined ? {} : { selected: record.selected }),
+    ...(creation === undefined ? {} : { creation }),
+    observed: read.observed,
+  })
+  const diagnostic = [
+    'observed leg refreshed at execution-packet submission — a new evidence read (the running record was captured before the child\'s first request could exist)',
+    status.routeDiagnostic,
+  ].filter(Boolean).join('; ')
+  return {
+    outcome: 'refreshed',
+    route: {
+      ...record,
+      routeStatus: status.routeStatus,
+      routeDiagnostic: diagnostic,
+      observed: read.observed,
+    },
+    observed: read.observed,
+  }
+}
+
+/**
+ * Capture one dispatched child's route record: creation from the durable Agent
+ * options, observed from the child session's latest `request/header`, status
+ * per plan v3 (see {@link routeStatusOf}), and the routing decision's record
+ * fields (`selected`/`why`/`authorizationSource`/`fallbackFrom`) merged in.
+ *
+ * @param childId - the dispatched child's id, for read-failure diagnostics.
+ * @param provider - the provider the dispatch was issued through.
+ * @param creation - the creation route (`Agent.options`), when the child (or a
+ * pre-dispatch config expectation) exposes one.
+ * @param session - the child session to read the observed route from; pass
+ * `undefined` before the child exists (the `starting` executor record).
+ * @param routing - the dispatch's routing decision, when routing made one.
+ * @param note - an extra diagnostic prepended for pre-dispatch records.
+ */
+function captureRoute(
+  childId: string,
+  provider: string,
+  creation: { readonly provider?: string; readonly model?: string } | undefined,
+  session: SessionReadRef | undefined,
+  routing?: RoutingDecisionDetail,
+  note?: string,
+): RouteRecord {
+  const read = observedRouteOf(session)
+  const status = routeStatusOf(childId, {
+    ...(routing?.pin === undefined ? {} : { selected: routing.pin }),
+    ...(creation === undefined ? {} : { creation }),
+    ...(read.observed === undefined ? {} : { observed: read.observed }),
+    ...(read.unreadable === undefined ? {} : { observedUnreadable: read.unreadable }),
+  })
+  const diagnostic = [note, status.routeDiagnostic].filter(Boolean).join('; ')
+  return withRoutingRecord({
+    provider,
+    routeProvider: creation?.provider ?? 'unverified',
+    routeModel: creation?.model ?? 'unverified',
+    routeStatus: status.routeStatus,
+    ...(diagnostic === '' ? {} : { routeDiagnostic: diagnostic }),
+    ...(read.observed === undefined ? {} : { observed: read.observed }),
+  }, routing)
+}
+
+/**
+ * Stamp one routing decision's pin onto a snapshot — the WRITER half of the
+ * shared derivation (`applyRoutingDecision` is the rule; the fold re-derives
+ * and holds the event to it). A decision without a pin CLEARS the role's pin:
+ * a reload must not resurrect a route the live run replaced with inheritance.
+ */
+function withRoutingDecision(snapshot: Snapshot, routing: RoutingDecisionDetail | undefined): Snapshot {
+  if (routing === undefined) return snapshot
+  const pins = applyRoutingDecision(snapshot.routingPins, routing)
+  if (pins === undefined) {
+    if (snapshot.routingPins === undefined) return snapshot
+    const { routingPins: _dropped, ...rest } = snapshot
+    return rest
+  }
+  return { ...snapshot, routingPins: pins }
+}
+
+/**
+ * Stamp the M6 planner record onto a commit's detail (additive key).
+ *
+ * The fold validates `detail.routing` STRICTLY on `audit`/`start-executor`
+ * commits and validates `detail` for `submit-packet`/`submit-evidence` stamps
+ * only — an additive `plannerRouting` key folds through untouched everywhere
+ * (the durable degradation record the packet requires). Never mutates the
+ * caller's detail object.
+ */
+function withPlannerDetail(detail: unknown, record: PlannerRoutingRecord): unknown {
+  if (detail === null || typeof detail !== 'object' || Array.isArray(detail)) return { plannerRouting: record }
+  return { ...(detail as Record<string, unknown>), plannerRouting: record }
 }
 
 /** Model-facing status projection. */
@@ -644,6 +1060,16 @@ export interface StatusView {
   readonly executor?: { generation: number; state: string }
   readonly enforcement: Enforcement
   readonly closeoutSubmitted: boolean
+  /**
+   * The M6 planner model-routing record, present exactly while the run sits
+   * in a planning phase with a NON-inherit planner decision (routed or
+   * unsupported). An inherit decision (the shipped default) and every
+   * disposed state project NOTHING — the absent field is the honest record.
+   * (The record vocabulary's `inherit` status is a DURABLE-only shape — the
+   * mid-planning refresh-into-inherit record of F4 — and never projects
+   * here.)
+   */
+  readonly plannerRouting?: PlannerRoutingRecord
   readonly diagnostic?: string
 }
 
@@ -731,6 +1157,144 @@ function resolveBearerBase(sessionCwd: string | undefined): string {
   return fallback
 }
 
+/** The phases whose actor is the PLANNER (the root agent itself). */
+const PLANNING_PHASES: readonly Snapshot['phase'][] = ['planning', 'plan-reviewing', 'replanning']
+
+/**
+ * The one-shot reload re-arm note (P2-3), stamped on the first planning-phase
+ * commit after an engine load re-armed (or still owes) the planner install.
+ * Honest by construction: it claims only what the engine can observe — that
+ * the previous process's install died with it and this arm re-resolved
+ * against current facts — and names the unrouted window as a possibility,
+ * never as a fact.
+ */
+const PLANNER_REARM_NOTE =
+  'planner: install re-armed after an engine reload of a planning-phase run — the previous process\u2019s install died with it; '
+  + 'this arm was re-resolved against CURRENT policy/catalog facts, and planning turns between the reload and the re-arm (if any) ran on the deployment default'
+
+/**
+ * The planner's model-routing record (M6), engine-local and per run.
+ *
+ * The planner is the one role that is NEVER dispatched — it IS the root
+ * agent — so its route never becomes `agentOptions`, never pins
+ * `routingPins` (the fold derives those from dispatch `detail.routing` only),
+ * and never touches the audit/executor route records. When routing resolves
+ * the planner to a route, the route is INSTALLED on the root agent's scoped
+ * ctx via the `modelSelectionInstaller` port for exactly the planning phases
+ * (plan "Roles and routing"); the record here is what the run says about it.
+ *
+ * `status` kinds are exact:
+ *  - `routed` — installed; the root agent plans on `route` until the run
+ *    leaves the planning phases.
+ *  - `unsupported` — a NON-inherit planner decision that could not be
+ *    installed (no installer port, no root ctx, a grant/preflight refusal,
+ *    or a declining/throwing installer). The run CONTINUES WITH INHERITANCE —
+ *    degradation is recorded, never silent, never fatal.
+ *  - `inherit` — ONLY the durable record of a mid-planning REFRESH INTO
+ *    inherit (F4): the previous install existed and was disposed because the
+ *    live routing decision changed to inherit. This status never appears on
+ *    the LIVE status surface (an inherit install projects nothing there) —
+ *    it exists so the disposal is recorded, exactly as a dispose on leaving
+ *    planning needs no record but a dispose INSIDE planning does.
+ *
+ * Steady-state `inherit` decisions (the shipped default) still record NOTHING
+ * beyond the normal routing detail — the absent field IS that record; only a
+ * transition AWAY from a live install carries the `inherit` status.
+ */
+export interface PlannerRoutingRecord {
+  readonly status: 'routed' | 'unsupported' | 'inherit'
+  /** The route the decision named; present whenever one was resolved. */
+  readonly route?: { readonly provider: string; readonly model: string; readonly reasoningEffort?: string }
+  /** The rule trace, same vocabulary as the routing details' `why`. */
+  readonly why: readonly string[]
+}
+
+/** A planner route as the install decision names it (provider/model/effort). */
+interface PlannerRoute {
+  readonly provider: string
+  readonly model: string
+  readonly reasoningEffort?: string
+}
+
+/** The resolved planner decision, reduced to what change detection needs (F4). */
+interface PlannerDecisionKey {
+  readonly kind: 'inherit' | 'route' | 'degraded'
+  readonly route?: PlannerRoute
+}
+
+/** Trim-exact equality of a planner route's full identity, effort included. */
+function samePlannerRoute(a: PlannerRoute | undefined, b: PlannerRoute | undefined): boolean {
+  if (a === undefined || b === undefined) return a === b
+  return a.provider === b.provider && a.model === b.model && a.reasoningEffort === b.reasoningEffort
+}
+
+/**
+ * Whether a planning-phase re-resolution is the SAME decision the current
+ * install was armed from (F4): kind and full route identity equal, `why`
+ * prose deliberately ignored — a changed refusal REASON under the same kind
+ * and route is not a re-arm event, so unchanged config can never churn the
+ * install (no extra install/dispose, no extra record).
+ */
+function samePlannerDecision(a: PlannerDecisionKey, b: PlannerDecisionKey): boolean {
+  if (a.kind !== b.kind) return false
+  return samePlannerRoute(a.route, b.route)
+}
+
+/** One planner route's compact identity, for from→to refresh notes (F4). */
+function plannerRouteLabel(route: PlannerRoute | undefined): string {
+  if (route === undefined) return '(no route named)'
+  return `${route.provider}/${route.model}${route.reasoningEffort === undefined ? '' : ` @ ${route.reasoningEffort}`}`
+}
+
+/** What one run's live planner install state is (engine-internal). */
+type PlannerInstallState =
+  | { readonly kind: 'armed'; readonly record: PlannerRoutingRecord; readonly dispose?: () => void; readonly decision: PlannerDecisionKey }
+  | { readonly kind: 'inherit' }
+
+/** The resolved planner decision in full: the arm instruction plus its rule trace. */
+type PlannerRouteDecision =
+  | { readonly kind: 'inherit' }
+  | { readonly kind: 'route'; readonly route: PlannerRoute; readonly why: readonly string[] }
+  | { readonly kind: 'degraded'; readonly route?: PlannerRoute; readonly why: readonly string[] }
+
+/** The decision reduced to its change-detection key (F4). */
+function plannerDecisionKeyOf(decision: PlannerRouteDecision): PlannerDecisionKey {
+  if (decision.kind === 'inherit') return { kind: 'inherit' }
+  return { kind: decision.kind, ...(decision.route === undefined ? {} : { route: decision.route }) }
+}
+
+/**
+ * Routing ports (M3b): the live facts the routing core needs that the
+ * engine cannot derive — the catalog of live routes, the session
+ * model-selection policy, and (M6) the planner's model-selection installer.
+ * ALL OPTIONAL AND DEFENSIVE BY DESIGN: a test (or a host profile with neither
+ * `llm` nor `sessionProjections` observable) constructs the engine unchanged,
+ * and absent ports mean routing resolves to 0.2.0/inherit dispatch behavior
+ * with `authorizationSource: 'unreachable-inherit'` recorded on auto
+ * decisions — never a blocked dispatch that 0.2.0 would have made. An absent
+ * installer port likewise degrades a non-inherit planner decision to
+ * inheritance with `plannerRouting: 'unsupported'` recorded (M6).
+ */
+export interface RoutingPorts {
+  /** The E1 catalog port (snapshot cache + exact facts + preflight). `undefined` ⇒ no explicit selection or preflight. */
+  readonly catalog?: RouteCatalog
+  /** Reads the durable session model-selection policy for the run's root session. */
+  readonly policyReader?: (root: AgentRef) => SessionPolicyState
+  /**
+   * M6 planner install port: couples a model selection to one agent's scoped
+   * ctx (the host's `installModelSelection`). Returns the DISPOSER, or
+   * `undefined` when the installer declines — both outcomes the engine
+   * records; a THROWING installer is caught and recorded, never fatal. The
+   * durable model-switch notice is the host's own; GAH adds nothing to the
+   * session. Wired by DYNAMIC import in `./index.ts`; absence of the host
+   * export leaves this port `undefined`.
+   */
+  readonly modelSelectionInstaller?: (
+    agentCtx: unknown,
+    route: { readonly provider: string; readonly model: string; readonly reasoningEffort?: string },
+  ) => (() => void) | undefined
+}
+
 /** The autopilot run engine. One instance per plugin mount. */
 export class AutopilotEngine {
   private readonly cache = new Map<RunId, Snapshot>()
@@ -743,6 +1307,30 @@ export class AutopilotEngine {
    * exactly one dispatch anywhere should ever have to pay for the lesson.
    */
   private learnedToolNames: readonly string[] | undefined
+  /**
+   * The live planner installs (M6), per run. An entry exists exactly while
+   * the run sits in a planning phase: armed (with the disposer when the
+   * install happened) or the recorded `inherit` no-op. Deleted on every exit
+   * from the planning phases (dispose first, idempotent by deletion) and on
+   * engine dispose, so a stale model selection can never outlive its run's
+   * planning window — and a fresh entry (re-arm) is re-resolved from CURRENT
+   * policy/catalog facts on re-entry, never resurrected.
+   *
+   * P2-3 (execution-audit r1): the map is ENGINE-LOCAL, so an engine restart
+   * with a run parked in a planning phase loses the install while the durable
+   * stream still says `plannerRouting: 'routed'`. The reload re-arm below
+   * (`schedulePlannerRearm`) closes that gap at the earliest moment a new
+   * engine can observe the run, and `plannerReloadStamps` makes the next
+   * commit say so once, durably.
+   */
+  private readonly plannerInstalls = new Map<RunId, PlannerInstallState>()
+  /**
+   * Runs whose planning-phase install was re-armed (or must be re-armed) after
+   * an engine reload and whose NEXT planning-phase commit still owes the
+   * durable re-arm record (P2-3). Consumed exactly once by that commit and
+   * cleared whenever the planning window closes without one.
+   */
+  private readonly plannerReloadStamps = new Set<RunId>()
 
   constructor(
     private readonly agents: AgentsRef,
@@ -764,6 +1352,20 @@ export class AutopilotEngine {
      * assumed to provide.
      */
     private readonly environment: EnvironmentProbes = {},
+    /** Routing ports (M3b). Absent ⇒ 0.2.0/inherit dispatch behavior, recorded honestly. */
+    private readonly routingPorts: RoutingPorts = {},
+    /**
+     * F2 (PR #2 Codex review): re-resolves the routing section from the raw
+     * config at each routing decision. Wired by `apply()` exactly when the
+     * routing leaves arrived as volatile references (the Cordis loader
+     * path), where a config PATCH updates the refs in place WITHOUT
+     * remounting the plugin — a mount-time snapshot would freeze
+     * mode/lock/preference at their mount values while the legacy surfaces
+     * follow their patches through the remount. Absent (every plain-object
+     * caller, and the whole pre-F2 test suite) ⇒ `config.routing` IS the
+     * live routing, byte-identical to the previous behavior.
+     */
+    private readonly routingSource: (() => ResolvedRouting) | undefined = undefined,
   ) {}
 
   /**
@@ -774,6 +1376,11 @@ export class AutopilotEngine {
    */
   async dispose(): Promise<void> {
     this.lifecycle.abort(new AutopilotError('autopilot engine disposed', 'AP_DISPOSED'))
+    // M6: no planner model selection may outlive the engine that installed
+    // it — mount teardown disposes every armed install exactly once. The
+    // sweep runs EAGERLY (before the tail wait) so a live install is released
+    // immediately even when an in-flight transaction hangs past the 5s bound.
+    for (const runId of [...this.plannerInstalls.keys()]) this.disposePlanner(runId)
     const pending = [...this.tails.values()]
     if (pending.length === 0) return
     await Promise.race([
@@ -783,6 +1390,15 @@ export class AutopilotEngine {
         if (typeof timer === 'object' && 'unref' in timer) timer.unref()
       }),
     ])
+    // F25 (PR #2 Codex round 13): RE-SWEEP after the tail settles. A
+    // transaction that was mid-planner-route-resolution when the first sweep
+    // ran resumes during the wait above; the arm guard refuses its install,
+    // but dispose() OWNS the zero-live-installs invariant mechanically rather
+    // than trusting every arm path to have observed the guard — so whatever
+    // appeared after the first sweep is disposed here, and dispose() returns
+    // with no live install either way. (Idempotent by deletion: a no-op when
+    // nothing appeared, as the guard alone guarantees.)
+    for (const runId of [...this.plannerInstalls.keys()]) this.disposePlanner(runId)
   }
 
   // ── Public state machine operations (root authority) ─────────────────────
@@ -884,19 +1500,103 @@ export class AutopilotEngine {
       if (request.prompt.trim().length === 0) throw new AutopilotError('audit prompt is empty', 'AP_INVALID_ARGUMENT')
 
       const provider = request.provider ?? this.config.auditors[request.role]?.provider ?? this.config.auditProvider
-      // Cross-family review: past the risk floor, prefer a reviewer the
-      // executor is not from. The CHOICE is recorded on the audit's route
-      // whatever it turns out to be, including the two ways it can fail to
-      // happen — a silent fallback to the builder's own family would be the
-      // pseudo-active defect class this repo keeps paying for.
-      const choice = selectCrossFamily({
-        risk: prior.triage.risk,
-        configured: this.config.auditors[request.role]?.agentOptions,
-        executor: this.config.executor.agentOptions,
-        policy: this.config.crossFamily,
-      })
-      const agentOptions = choice.agentOptions
+      const roleKey = routeRoleOf(request.role)
       const schema = request.role === 'plan' ? PLAN_VERDICT_SCHEMA : EXECUTION_VERDICT_SCHEMA
+
+      // ── Route resolution (M3b) ──
+      // Routing ACTIVE (mode auto, or this role locked/inherit): the E1/E2 core
+      // decides — `selectCrossFamily` is fully subsumed there (independence is
+      // the core's step 4 over the authorized set; pool entries are
+      // plugin-config grants that never widen it). Mode OFF with a default-auto
+      // role: the 0.2.0 flow VERBATIM, then the pick through the one grant rule
+      // ([R2-P1-1]) — on a no-policy deployment that is byte-for-byte 0.2.0
+      // dispatch parity, and on a policy-bearing one a grant outside the policy
+      // escalates instead of silently bypassing the native allowlist.
+      let agentOptions: AgentOptionsLike | undefined
+      let routingDetail: RoutingDecisionDetail | undefined
+      let familyChoice: CrossFamilyChoice
+      // F2: the gate reads the CURRENT routing (a volatile patch lands
+      // without remount); an invalid live section reads as the conservative
+      // all-inherit shape, which routes every role INTO resolveRoleRoute so
+      // the refusal is recorded on the dispatch instead of silently taking
+      // the 0.2.0 pool path under a config the code cannot validate.
+      if (routingActive(this.routingConfig().routing, roleKey)) {
+        const resolution = await this.resolveRoleRoute(root, roleKey, prior)
+        if (resolution.kind === 'escalate') {
+          return await this.routingEscalation(root, prior, resolution.reason)
+        }
+        agentOptions = resolution.agentOptions
+        routingDetail = resolution.routing
+        const family = this.crossFamilyOfResolution(resolution, roleKey, prior)
+        familyChoice = { agentOptions, outcome: family.outcome, ...(family.diagnostic === undefined ? {} : { diagnostic: family.diagnostic }) }
+      } else {
+        // Cross-family review: past the risk floor, prefer a reviewer the
+        // executor is not from. The CHOICE is recorded on the audit's route
+        // whatever it turns out to be, including the two ways it can fail to
+        // happen — a silent fallback to the builder's own family would be the
+        // pseudo-active defect class this repo keeps paying for.
+        const choice = selectCrossFamily({
+          risk: prior.triage.risk,
+          configured: this.config.auditors[request.role]?.agentOptions,
+          executor: this.config.executor.agentOptions,
+          // F21: the pool leg of the policy reads the normalized pool (the one
+          // seam), so a POOL pick's blank effort never reaches the pin built
+          // below; the legacy `configured` surface feeds the CHOICE verbatim
+          // (0.2.0 selection parity for mode 'off') — the picked route is
+          // normalized at dispatch below (F27).
+          policy: { ...this.config.crossFamily, pool: this.normalizedPool() },
+        })
+        agentOptions = choice.agentOptions
+        familyChoice = choice
+        const pickSource = choice.agentOptions
+        const pick = toRoutePin(pickSource)
+        if (pick !== undefined && pickSource !== undefined) {
+          // An explicit pick is a plugin-config grant ([R2-P1-1]) — checked in
+          // EVERY mode. A routeless pick (inheritance, tuning-only options)
+          // names no route and checks nothing: 0.2.0 parity.
+          const verdict = resolvePluginGrant(
+            { provider: pick.provider, model: pick.model, source: 'legacy-pool' },
+            this.readPolicy(root),
+          )
+          if (verdict.kind === 'conflict') {
+            return await this.routingEscalation(root, prior, verdict.reason)
+          }
+          // F27 (PR #2 Codex round 14): dispatch the route the grant above
+          // authorized — the F24 one-object discipline, at the off-mode seam.
+          // The grant check and the pin/evidence below all name the TRIMMED
+          // route (`toRoutePin`), but 0.2.0 dispatched `choice.agentOptions`
+          // verbatim, so a whitespace-padded entry (pool or configured) was
+          // granted and recorded as `alpha/model` while the child start
+          // received `" alpha "/" model "` — a start failure or a
+          // creation-route mismatch against `detail.routing.pin`. The dispatch
+          // now carries route identity from the trimmed pick and the effort
+          // under the F21 normalization (trimmed when non-blank, ABSENT when
+          // blank — the fold rejects a blank-effort pin, and the pin below is
+          // built from the SAME value, so dispatch, grant, and evidence can
+          // never disagree), with every other call-config field riding the
+          // entry verbatim. Documented deviation from the 0.2.0-verbatim
+          // path: 0.2.0 dispatched raw; we dispatch what the grant authorized.
+          // For a clean entry the composition is field-identical to the entry
+          // (0.2.0 behavior unchanged).
+          const effort = pickSource.reasoningEffort?.trim()
+          const carriesEffort = effort !== undefined && effort.length > 0
+          if (carriesEffort) {
+            agentOptions = { ...pickSource, provider: pick.provider, model: pick.model, reasoningEffort: effort }
+          } else {
+            const { reasoningEffort: _blank, ...rest } = pickSource
+            agentOptions = { ...rest, provider: pick.provider, model: pick.model }
+          }
+          routingDetail = {
+            role: roleKey,
+            pin: { provider: pick.provider, model: pick.model, ...(carriesEffort ? { reasoningEffort: effort } : {}) },
+            why: [
+              ...verdict.why,
+              `cross-family: routed by the 0.2.0 pool fallback (${choice.outcome})${choice.diagnostic === undefined ? '' : ` — ${choice.diagnostic}`}`,
+            ],
+            authorizationSource: 'plugin-config',
+          }
+        }
+      }
 
       let run: SubagentRunRef | undefined
       let toolDiagnostic: string | undefined
@@ -958,10 +1658,18 @@ export class AutopilotEngine {
 
         // The narrowing rides on the audit's own route record, so a reader of
         // the durable stream can see that THIS verdict came from an auditor
-        // whose surface was reduced, and by what.
+        // whose surface was reduced, and by what. `run.result` has settled by
+        // this point, so the observed leg (`request/header`) is read from the
+        // child session HERE — the latest header is the only proof of the
+        // request route (plan v3 M4; `Agent.options` prove creation only).
+        // Route status never gates the verdict below: it is provenance for the
+        // auditor's reader, including when it records a mismatch.
         const route = withCrossFamily(
-          withToolDiagnostic(captureRoute(run.id, provider, run.localAgent), toolDiagnostic),
-          choice,
+          withToolDiagnostic(
+            captureRoute(run.id, provider, run.localAgent?.options, run.localAgent?.session, routingDetail),
+            toolDiagnostic,
+          ),
+          familyChoice,
         )
         return await this.applyVerdict(root, live, {
           role: request.role,
@@ -970,6 +1678,7 @@ export class AutopilotEngine {
           auditorId: run.id,
           route,
           captured,
+          ...(routingDetail === undefined ? {} : { routing: routingDetail }),
         })
       } finally {
         if (run !== undefined) await run.dispose()
@@ -1122,21 +1831,63 @@ export class AutopilotEngine {
       }
 
       const provider = request.provider ?? this.config.executorProvider
-      const agentOptions = this.config.executor.agentOptions
+      // ── Route resolution (M3b): the executor role resolves the same way
+      // (independence N/A — it is not an auditor). Routing INACTIVE (mode off
+      // with a default-auto executor) keeps the 0.2.0 composition verbatim;
+      // note an explicit legacy executor route makes the role LOCKED at
+      // resolve, which activates routing even in off mode — so the grant rule
+      // still covers every config-sourced explicit route in every mode.
+      let agentOptions: AgentOptionsLike | undefined
+      let routingDetail: RoutingDecisionDetail | undefined
+      // F2: same live gate read as the audit path above.
+      if (routingActive(this.routingConfig().routing, 'executor')) {
+        const resolution = await this.resolveRoleRoute(root, 'executor', prior)
+        if (resolution.kind === 'escalate') {
+          return await this.routingEscalation(root, prior, resolution.reason)
+        }
+        agentOptions = resolution.agentOptions
+        routingDetail = resolution.routing
+      } else {
+        agentOptions = this.config.executor.agentOptions
+      }
       const executor: ExecutorRecord = {
         childId,
         generation: prior.executor === undefined ? 1 : prior.executor.generation + 1,
         executionRevision: 1,
         state: 'starting',
-        route: agentOptions?.provider !== undefined && agentOptions.model !== undefined
-          ? { provider, routeProvider: agentOptions.provider, routeModel: agentOptions.model, routeStatus: 'verified' }
-          : { provider, routeProvider: 'unverified', routeModel: 'unverified', routeStatus: 'unverified', routeDiagnostic: 'executor route inherits the deployment default' },
+        // The starting record is PRE-DISPATCH: creation is the configured/
+        // resolved expectation, the child session does not exist yet, so the
+        // observed leg cannot have been read. Under plan v3 that is honest
+        // `unverifiable` (creation-only evidence is never `verified` — the
+        // R1-P1 fix); the running commit below re-captures with the real child.
+        route: (() => {
+          const creation = agentOptions === undefined ? undefined : {
+            ...(agentOptions.provider === undefined ? {} : { provider: agentOptions.provider }),
+            ...(agentOptions.model === undefined ? {} : { model: agentOptions.model }),
+          }
+          return captureRoute(
+            childId,
+            provider,
+            creation,
+            undefined,
+            routingDetail,
+            [
+              'executor starting record: the child is dispatched after this commit; the running record re-reads creation and the observed request route',
+              ...(creation === undefined ? ['executor route inherits the deployment default'] : []),
+            ].join('; '),
+          )
+        })(),
       }
-      const starting = await this.commit(prior, 'start-executor', {
-        ...prior,
-        revision: prior.revision + 1,
-        executor,
-      }, { stage: 'starting', childId })
+      const starting = await this.commit(
+        prior,
+        'start-executor',
+        withRoutingDecision({
+          ...prior,
+          revision: prior.revision + 1,
+          executor,
+        }, routingDetail),
+        { stage: 'starting', childId, ...(routingDetail === undefined ? {} : { routing: routingDetail }) },
+      )
 
       try {
         // `autopilot_submit_packet` IS DELIBERATELY ABSENT from this list, and
@@ -1190,21 +1941,32 @@ export class AutopilotEngine {
             signal: request.signal,
           }),
         )
+        // A continuable child's first turn starts only AFTER `startContinuable`
+        // resolves (upstream: the promise settles at inbox acceptance), so on a
+        // real host the observed read here usually finds no header yet —
+        // honestly `unverifiable` at this instant. Whatever IS in the child
+        // session at commit time is captured; a malformed or absent session
+        // degrades the same way it does for audits.
+        const child = this.agents.get(childId)
         const route = withToolDiagnostic(
-          captureRoute(childId, provider, this.agents.get(childId)),
+          captureRoute(childId, provider, child?.options, child?.session, routingDetail),
           dispatched.resolution.diagnostic,
         )
         return await this.commit(starting, 'start-executor', {
           ...starting,
           revision: starting.revision + 1,
           executor: { ...executor, state: 'running', route },
-        }, { stage: 'running', childId })
+        }, { stage: 'running', childId, ...(routingDetail === undefined ? {} : { routing: routingDetail }) })
       } catch (error: unknown) {
         // Record the reason ON THE EXECUTOR RECORD, not only in the run-level
         // `diagnostic`. A revoked executor is the artefact a later reader
         // inspects to ask "why did delegation never start", and the run-level
         // field is transition-scoped (see `commit`) so it does not survive the
-        // next revision. `route.routeDiagnostic` does.
+        // next revision. `route.routeDiagnostic` does. The revoked route keeps
+        // the starting record: upstream, a failed `startContinuable` rolls the
+        // child back entirely, so there is no child session left to read an
+        // observed route from — the honest status is the starting record's
+        // `unverifiable` plus this failure note, never a fabricated observed.
         await this.commit(starting, 'start-executor', {
           ...starting,
           revision: starting.revision + 1,
@@ -1214,7 +1976,7 @@ export class AutopilotEngine {
             route: withToolDiagnostic(executor.route, `executor startup failed: ${errorMessage(error)}`),
           },
           diagnostic: `executor startup failed: ${errorMessage(error)}`,
-        }, { stage: 'revoked', childId })
+        }, { stage: 'revoked', childId, ...(routingDetail === undefined ? {} : { routing: routingDetail }) })
         throw error
       }
     })
@@ -1299,6 +2061,17 @@ export class AutopilotEngine {
         )
       }
 
+      // F6 (PR #2 Codex round 3): recapture the executor's OBSERVED route
+      // leg HERE — the first executor-bearing op where a request has
+      // actually run. `startContinuable` resolves before the child's first
+      // turn, so the `running` record could not carry this leg; the child
+      // submitting this packet has made at least one request, so its latest
+      // `request/header` is finally readable. The refreshed record is a NEW
+      // evidence read stamped as the ADDITIVE `routeRecapture` key on this
+      // commit (the fold refuses executor mutation on submit-packet), and a
+      // failed read keeps the prior record with the failure recorded — the
+      // recapture is evidence, never a gate: it cannot refuse a packet.
+      const recapture = recapturedExecutorRoute(prior.executor.childId, prior.executor.route, child.session)
       return await this.commit(prior, 'submit-packet', {
         ...prior,
         revision: prior.revision + 1,
@@ -1309,6 +2082,7 @@ export class AutopilotEngine {
         executionRevision: claimed,
         generation: prior.executor.generation,
         childId: prior.executor.childId,
+        routeRecapture: recapture,
       })
     })
   }
@@ -1738,8 +2512,83 @@ export class AutopilotEngine {
     const cached = this.cache.get(runId)
     if (cached !== undefined) return cached
     const loaded = this.store.load(runId)
-    if (loaded !== undefined) this.cache.set(runId, loaded)
+    if (loaded !== undefined) {
+      this.cache.set(runId, loaded)
+      // P2-3: engine load is the earliest moment a fresh process can observe a
+      // parked planning-phase run — and the moment its lost planner install
+      // (which died with the previous process) becomes re-armable.
+      this.schedulePlannerRearm(runId, loaded)
+    }
     return loaded
+  }
+
+  /**
+   * Whether the planner role's routing is ACTIVE for reload re-arm purposes
+   * (P2-3): a non-inherit planner mode under an active routing section. The
+   * shipped default (planner inherit) never schedules anything, so zero-config
+   * deployments are untouched by the reload path.
+   */
+  private plannerRoutingActive(): boolean {
+    // F2: the CURRENT routing decides — an invalid live section reads as the
+    // conservative all-inherit shape ⇒ inactive, so no re-arm is scheduled on
+    // config the code cannot validate.
+    const routing = this.routingConfig().routing
+    return routing.roles.planner.mode !== 'inherit' && routingActive(routing, 'planner')
+  }
+
+  /**
+   * The reload re-arm (P2-3, execution-audit r1; the plan-faithful variant).
+   *
+   * `plannerInstalls` is engine-local; after a restart with a run parked in a
+   * planning phase, the durable stream says `plannerRouting: 'routed'` while
+   * this process holds no install — the next planning turns would run on the
+   * deployment default. On ENGINE LOAD of such a run:
+   *
+   *  1. the run is marked for a one-shot durable re-arm record on its next
+   *     planning-phase commit (`plannerReloadStamps`) — the honest record
+   *     either way, because a re-arm that DEGRADED (the route is no longer
+   *     resolvable against current facts) must not leave the old `routed`
+   *     claim standing unqualified;
+   *  2. when the live root agent is already registered, the install is
+   *     re-armed IMMEDIATELY — re-resolved against CURRENT policy/catalog
+   *     facts, never resurrected — through `transact`, so it serializes with
+   *     commits instead of racing them. A queued arm that finds the state
+   *     already present (a commit armed first) is a no-op; one that finds the
+   *     run left planning is a no-op; a throw is swallowed — the commit
+   *     chokepoint remains the mechanical enforcer of the arm invariant.
+   *
+   * When the root is NOT observable at load (a read-only peek on a fresh web
+   * process), arming now would record a FALSE `unsupported` degradation ("no
+   * scoped ctx" for an agent that is merely unregistered), so the re-arm
+   * defers to the commit chokepoint, where every op has a resolveRoot-verified
+   * live agent — and the one-shot stamp still names the reload there.
+   */
+  private schedulePlannerRearm(runId: RunId, loaded: Snapshot): void {
+    if (!PLANNING_PHASES.includes(loaded.phase)) return
+    if (!this.plannerRoutingActive()) return
+    this.plannerReloadStamps.add(runId)
+    if (this.plannerInstalls.has(runId)) return
+    if (this.agents.get(runId) === undefined) return
+    void this.transact(runId, async () => {
+      if (this.lifecycle.signal.aborted) return
+      if (this.plannerInstalls.has(runId)) return
+      const snapshot = this.current(runId)
+      if (snapshot === undefined || !PLANNING_PHASES.includes(snapshot.phase)) return
+      await this.armPlannerSelection(runId, snapshot)
+    }).catch(() => {
+      // Never fatal on this fire-and-forget path: the commit chokepoint will
+      // re-attempt the arm and unwind it on failure, exactly as before.
+    })
+  }
+
+  /**
+   * Consume a pending reload stamp (P2-3): the first planning-phase commit
+   * after the re-arm records it ONCE, durably, with the honest caveat that
+   * turns between the reload and the re-arm may have run on the default.
+   */
+  private notePlannerReload(runId: RunId, record: PlannerRoutingRecord): PlannerRoutingRecord {
+    if (!this.plannerReloadStamps.delete(runId)) return record
+    return { ...record, why: [...record.why, PLANNER_REARM_NOTE] }
   }
 
   /**
@@ -1830,17 +2679,76 @@ export class AutopilotEngine {
     const scoped = prior !== undefined && next.diagnostic !== undefined && next.diagnostic === prior.diagnostic
       ? withoutDiagnostic(next)
       : next
+    // ── M6 planner install (engine-local; plan "Roles and routing") ──────
+    //
+    // The planner IS the root agent, so its route is a model selection
+    // INSTALLED on the root's scoped ctx, not a dispatch. This is the one
+    // choke point every transition passes through, so the invariant is
+    // enforced mechanically: the install is armed exactly while the run sits
+    // in a planning phase. ARM runs BEFORE the event is validated/persisted so
+    // the record stamped on this event reflects the LIVE install (and a fold
+    // or store failure unwinds a fresh install rather than orphaning it);
+    // DISPOSE runs only AFTER the transition persisted — a rejected transition
+    // must not leave planning without its model selection.
+    //
+    // F4 (PR #2 Codex review, round 2): an EXISTING install is re-evaluated
+    // here too — the decision is re-resolved from CURRENT facts at every
+    // planning-phase commit, and only a CHANGED decision churns the install
+    // (dispose + re-arm, recorded from→to). Unchanged decisions keep the
+    // arm-once economics: no extra install/dispose, no extra record.
+    const wasPlanning = prior !== undefined && PLANNING_PHASES.includes(prior.phase)
+    const isPlanning = PLANNING_PHASES.includes(scoped.phase)
+    let stampedDetail = detail
+    let armedHere = false
+    if (isPlanning && !this.plannerInstalls.has(scoped.runId)) {
+      armedHere = true
+      const record = await this.armPlannerSelection(scoped.runId, scoped)
+      if (record !== undefined) {
+        // Additive key on the event's detail; the fold validates
+        // `detail.routing` on dispatch ops only and ignores this everywhere,
+        // and `init`'s detail is unchecked — the durable degradation record
+        // the packet requires ("recorded, never silent, never fatal"). A
+        // reload re-arm (P2-3) carries the one-shot reload note here too.
+        stampedDetail = withPlannerDetail(detail, this.notePlannerReload(scoped.runId, record))
+      }
+    } else if (isPlanning) {
+      const refreshed = await this.refreshPlannerInstall(scoped.runId, scoped)
+      if (refreshed !== undefined) {
+        // A changed decision re-armed the install: the new record (from→to in
+        // its `why`) is this commit's durable plannerRouting, and a failed
+        // commit unwinds the re-arm exactly as it unwinds a fresh one.
+        armedHere = true
+        stampedDetail = withPlannerDetail(detail, this.notePlannerReload(scoped.runId, refreshed))
+      } else if (this.plannerReloadStamps.has(scoped.runId)) {
+        // P2-3: the install was re-armed at ENGINE LOAD of this planning-phase
+        // run — before this commit — so this commit owes the durable re-arm
+        // record once (the armed state itself stamps nothing on later commits).
+        const state = this.plannerInstalls.get(scoped.runId)
+        if (state?.kind === 'armed') {
+          stampedDetail = withPlannerDetail(detail, this.notePlannerReload(scoped.runId, state.record))
+        }
+      }
+    }
     const candidate: RunEvent = {
       v: 1,
       op,
       revision: scoped.revision,
       time: new Date().toISOString(),
       snapshot: scoped,
-      ...(detail === undefined ? {} : { detail }),
+      ...(stampedDetail === undefined ? {} : { detail: stampedDetail }),
     }
-    applyEvent(prior, candidate)
-    await this.store.commit(scoped.runId, op, scoped, detail)
+    try {
+      applyEvent(prior, candidate)
+      await this.store.commit(scoped.runId, op, scoped, stampedDetail)
+    } catch (error: unknown) {
+      // The transition did not happen; whatever arm state this call created
+      // must not survive it (disposed AND deleted — a retried transition
+      // re-resolves from current facts instead of trusting a stale arm).
+      if (armedHere) this.disposePlanner(scoped.runId)
+      throw error
+    }
     this.cache.set(scoped.runId, scoped)
+    if (wasPlanning && !isPlanning) this.disposePlanner(scoped.runId)
     return scoped
   }
 
@@ -1906,6 +2814,1587 @@ export class AutopilotEngine {
       const repaired = resolveToolAllow(spec.requested, parsed.known, spec.required, spec.label)
       if (repaired.allow.join('\u0000') === first.allow.join('\u0000')) throw error
       return { value: await dispatch(repaired.allow), resolution: repaired }
+    }
+  }
+
+  // ── Role-true routing resolution (plan v3 "Roles and routing" + "Route records and stability") ──
+
+  /**
+   * The session policy, read defensively: an absent or throwing reader is an
+   * UNREACHABLE projection (inheritance only, recorded `unreachable-inherit`),
+   * never a guess and never a blocked dispatch.
+   */
+  private readPolicy(root: AgentRef): SessionPolicyState {
+    const reader = this.routingPorts.policyReader
+    if (reader === undefined) return { kind: 'unreachable' }
+    try {
+      return reader(root)
+    } catch {
+      return { kind: 'unreachable' }
+    }
+  }
+
+  /** The legacy agentOptions surface for one role, if any (E2 leaves it here with its 0.2.0 meaning). */
+  private legacyOptionsFor(role: Role): AgentOptionsLike | undefined {
+    if (role === 'executor') return this.config.executor.agentOptions
+    if (role === 'plan-auditor') return this.config.auditors.plan?.agentOptions
+    if (role === 'execution-auditor') return this.config.auditors.execution?.agentOptions
+    if (role === 'rules-auditor') return this.config.auditors.rules?.agentOptions
+    return undefined
+  }
+
+  /** The config-surface name of one role's legacy route, for provenance notes. */
+  private legacySurfaceOf(role: Role): string {
+    if (role === 'executor') return 'executor.agentOptions'
+    if (role === 'plan-auditor') return 'auditors.plan.agentOptions'
+    if (role === 'execution-auditor') return 'auditors.execution.agentOptions'
+    return 'auditors.rules.agentOptions'
+  }
+
+  /**
+   * The [R2-P1-1] provenance note: a locked role whose lock equals the legacy
+   * explicit route was mapped from the legacy surface at resolve, and the
+   * record says so — `resolveConfig` collapses `routing-lock` and `legacy-role`
+   * into one `locked` shape, so this engine-side comparison is the only place
+   * the true grant source can still be named without re-widening the routing
+   * core's `RoleRouting` shape.
+   */
+  private legacyLockNote(role: Role, roleRouting: RoleRouting): string | undefined {
+    if (roleRouting.mode !== 'locked') return undefined
+    const legacy = toRoutePin(this.legacyOptionsFor(role))
+    if (legacy === undefined) return undefined
+    if (legacy.provider !== roleRouting.provider || legacy.model !== roleRouting.model) return undefined
+    return `authorization: grant source is the legacy ${this.legacySurfaceOf(role)} surface — mapped to a locked role at config resolve ([R2-P1-1]: a plugin-config grant under the one rule)`
+  }
+
+  /**
+   * Whether the legacy surface's route EQUALS the lock — E2's riding
+   * condition: exactly then the legacy NON-ROUTE tuning rides the locked
+   * dispatch (`lockedAgentOptions`). One definition of the equal-route
+   * branch so the dispatch composition and the F16 composed-preflight note
+   * can never disagree about what rode.
+   */
+  private legacyTuningRides(role: Role, roleRouting: RoleRouting & { readonly mode: 'locked' }): boolean {
+    const legacyPin = toRoutePin(this.legacyOptionsFor(role))
+    return legacyPin !== undefined && legacyPin.provider === roleRouting.provider && legacyPin.model === roleRouting.model
+  }
+
+  /**
+   * The dispatch agentOptions for a locked role. When the legacy surface's
+   * route EQUALS the lock, the legacy NON-ROUTE tuning rides (`maxTokens` and
+   * siblings keep their 0.2.0 meaning — E2's resolve contract) while the
+   * route identity fields — `provider`, `model`, AND `reasoningEffort` — are
+   * composed from the SELECTOR'S route, never the legacy surface (F11, PR #2
+   * Codex round 5): an effort present in legacy but absent from the lock is
+   * NOT dispatched, because preflight and route evidence run on the selected
+   * route's fields and the dispatched child must match both the explicit
+   * lock and its recorded evidence. When the legacy route is unequal or
+   * absent, the selected route's own fields only — nothing rides from a
+   * legacy surface the lock did not confirm.
+   *
+   * F28 (PR #2 Codex round 15): the effort leg is composed from
+   * `decision.route`, which for a locked selection carries the lock-named
+   * effort OR — when the lock omits one — the adapter-declared `defaultEffort`
+   * the selector preflighted and claimed in `why`. The engine used to rebuild
+   * the dispatch from `roleRouting` alone, silently dropping that default:
+   * the child's adapter applied it at request time while the dispatch and
+   * the persisted pin omitted it, so the route could read `verified` without
+   * recording the effort that actually ran. Composing from the route keeps
+   * dispatch, pin, preflight and evidence on ONE effort value. The F11
+   * doctrine is untouched — the legacy effort stays stripped in the ride
+   * branch below, and only the selector-validated value (lock-named or
+   * adapter-declared, never invented) can reach the dispatch. With no route
+   * (the no-catalog 0.2.0 parity path, where no selector ran and no adapter
+   * default is knowable) the lock's own fields stand, exactly as before.
+   */
+  private lockedAgentOptions(
+    role: Role,
+    roleRouting: RoleRouting & { readonly mode: 'locked' },
+    route?: SelectedRoute,
+  ): AgentOptionsLike {
+    const legacy = this.legacyOptionsFor(role)
+    const provider = route?.provider ?? roleRouting.provider
+    const model = route?.model ?? roleRouting.model
+    const effort = route?.reasoningEffort ?? roleRouting.reasoningEffort
+    if (this.legacyTuningRides(role, roleRouting) && legacy !== undefined) {
+      // Strip the legacy ROUTE identity; keep every other field as tuning.
+      const { provider: _legacyProvider, model: _legacyModel, reasoningEffort: _legacyEffort, ...tuning } = legacy
+      return {
+        ...tuning,
+        provider,
+        model,
+        ...(effort === undefined ? {} : { reasoningEffort: effort }),
+      }
+    }
+    return {
+      provider,
+      model,
+      ...(effort === undefined ? {} : { reasoningEffort: effort }),
+    }
+  }
+
+  /**
+   * F16 (PR #2 Codex round 7): preflight the FULLY COMPOSED locked dispatch —
+   * the exact object the subagent start receives — BEFORE it is dispatched.
+   *
+   * The seam decision, documented: `selectLocked`'s preflight validates the
+   * LOCK's route fields (provider/model/reasoningEffort — existing behavior,
+   * unchanged), but the dispatch object is composed ENGINE-side by
+   * `lockedAgentOptions`, which rides the legacy NON-ROUTE tuning
+   * (`maxTokens` and siblings) onto the equal-route branch. The selector is
+   * pure w.r.t. that composition (it is E2/engine knowledge — the selector
+   * must stay free of legacy-surface concerns), so its preflight can only
+   * ever see the bare lock: an adapter-INVALID retained `maxTokens` passed
+   * routing preflight and failed the actual dispatch mid-run. The honest
+   * place to validate the composed object is therefore the engine's locked
+   * dispatch call site (the engine holds the catalog port). The check runs
+   * UNIFORMLY for every locked dispatch — the invariant is "the engine
+   * preflights exactly what it dispatches", with no conditional logic that
+   * could drift from `lockedAgentOptions`'s own branch — so on the
+   * unequal/absent-legacy path it re-validates the bare lock the selector
+   * just accepted (a redundant validation call, never a dispatch), and on
+   * the equal-route path it is the FIRST time the riding tuning is checked.
+   * F28 (PR #2 Codex round 15): the composed object now also carries the
+   * adapter-declared `defaultEffort` when the lock omits an effort
+   * (`lockedAgentOptions` composes it from `decision.route`), so the
+   * invariant "preflight exactly what you dispatch" covers the default too
+   * — the spread below hands the preflight the composed effort along with
+   * the riding tuning, and the recorded note names the default when it rode.
+   * `preflight`/`resolveCallConfig` validates without binding the later
+   * dispatch (the port's upstream contract), so this is one more validation
+   * call, not a double dispatch; grant and escalation semantics are
+   * untouched — a rejection takes the existing owner-escalation exit BEFORE
+   * any subagent start, with the adapter's reason named, instead of a
+   * mid-run failure at the audit/executor dispatch.
+   */
+  private async preflightComposedLockedDispatch(
+    role: Role,
+    roleRouting: RoleRouting & { readonly mode: 'locked' },
+    resolution: Extract<RoleRouteResolution, { readonly kind: 'dispatch' }>,
+    catalog: RouteCatalog,
+  ): Promise<RoleRouteResolution> {
+    const composed = resolution.agentOptions
+    if (composed === undefined) return resolution
+    // F29 (PR #2 Codex round 16): RETAIN the successful preflight result and
+    // compose the dispatch's ROUTE fields (and the recorded pin's) from it —
+    // an adapter that materializes its default `reasoningEffort` only in the
+    // resolved config dispatched that effort while pin and `why` recorded
+    // none. The locked dispatch always carries provider/model
+    // (`lockedAgentOptions` writes them from the route or the lock), so the
+    // cast is safe; the adoption guard (`retainPreflightRoute`) never lets a
+    // divergent echo rewrite what the lock named, and an echo composes the
+    // identical object — byte-identical behavior, existing green.
+    let resolved: LlmCallConfig | undefined
+    try {
+      resolved = await catalog.preflight({
+        ...composed,
+        // Route identity normalized to the lock's fields — the same values
+        // `lockedAgentOptions` just wrote, pinned so the object satisfies the
+        // port's required provider/model regardless of the optional mirror.
+        // F28: every other composed field — the riding legacy tuning AND the
+        // route-carried default effort — rides the spread, so the preflight
+        // sees exactly the dispatch object.
+        provider: roleRouting.provider,
+        model: roleRouting.model,
+      })
+    } catch (error) {
+      return {
+        kind: 'escalate',
+        reason:
+          `locked route ${roleRouting.provider}/${roleRouting.model} dispatch config failed preflight (${errorMessage(error)}) — ` +
+          'the routing core validated the lock\'s route fields, but the composed dispatch (lock route + riding legacy non-route tuning) is not adapter-valid; ' +
+          'a lock has no fallback candidate — dispatch blocked BEFORE start',
+      }
+    }
+    const retained = this.retainPreflightRoute(
+      composed as AgentOptionsLike & { readonly provider: string; readonly model: string },
+      resolved,
+    )
+    if (resolution.routing === undefined) {
+      return retained.dispatch === composed ? resolution : { ...resolution, agentOptions: retained.dispatch }
+    }
+    // F28: name the carried default when it rode — appended inside the
+    // parenthetical so the F16 wording (and its assertions) stands unchanged
+    // when the lock named its own effort or the adapter declares none.
+    const defaultEffortRode = roleRouting.reasoningEffort === undefined && composed.reasoningEffort !== undefined
+    // F29: name the MATERIALIZED default too — the adapter supplied at this
+    // preflight an effort neither the lock, the facts, nor the selected route
+    // named; the dispatch and the pin now carry it, so the record must too.
+    const effortNote = retained.materializedEffort !== undefined
+      ? `, the adapter materialized its default reasoningEffort "${retained.materializedEffort}" at preflight — the dispatch and the recorded pin carry it`
+      : defaultEffortRode
+        ? ', the adapter-declared default effort carried from the selected route'
+        : ''
+    const note = this.legacyTuningRides(role, roleRouting)
+      ? `preflight: resolveCallConfig accepted the composed dispatch (lock route + legacy non-route tuning${effortNote}) — the exact object the subagent start receives`
+      : `preflight: resolveCallConfig accepted the composed dispatch (the lock's own fields — no legacy tuning rides${effortNote})`
+    return {
+      ...resolution,
+      agentOptions: retained.dispatch,
+      routing: {
+        ...resolution.routing,
+        ...(resolution.routing.pin === undefined ? {} : {
+          pin: {
+            provider: retained.dispatch.provider,
+            model: retained.dispatch.model,
+            ...(retained.dispatch.reasoningEffort === undefined ? {} : { reasoningEffort: retained.dispatch.reasoningEffort }),
+          },
+        }),
+        why: [...resolution.routing.why, note],
+      },
+    }
+  }
+
+  /**
+   * Resolve one role's route for dispatch, implementing the plan's rule table
+   * through the E1/E2 core. Decision kinds map exactly: `route` ⇒ agentOptions
+   * + pin write; `inherit` ⇒ no agentOptions (still a dispatch — recorded);
+   * `escalate-owner`/`blocked` ⇒ the owner-escalation exit, with the reason.
+   */
+  /**
+   * The executor's CURRENT route for auditor-independence axes, in fallback
+   * order: the dispatch pin when one exists; else the CURRENT live routing
+   * lock for the executor (`routing.roles.executor` under `mode: 'locked'` —
+   * F5, PR #2 Codex review round 2: a lock is a DECLARED family even before
+   * the executor's first dispatch, so a medium+ plan audit dispatched before
+   * the executor still gets real axes instead of `unknown` on every
+   * candidate); else the legacy `executor.agentOptions` surface (the 0.2.0
+   * family source — an executor that has not dispatched yet still has a
+   * declared family). Recomputed at every dispatch; never a stored judgment.
+   * The routing leg is the per-decision LIVE read (F2): a volatile lock patch
+   * reaches the next audit's axes without a remount, and an invalid live
+   * section reads as the all-inherit `REFUSED_ROUTING` shape, so no lock is
+   * claimed from config the code cannot validate.
+   */
+  private executorPinOf(prior: Snapshot): RoutePin | undefined {
+    const pinned = prior.routingPins?.executor
+    if (pinned !== undefined) return toRoutePin(pinned)
+    const executorRouting = this.routingConfig().routing.roles.executor
+    if (executorRouting.mode === 'locked') {
+      return { provider: executorRouting.provider, model: executorRouting.model }
+    }
+    return toRoutePin(this.config.executor.agentOptions)
+  }
+
+  /**
+   * F21 (PR #2 Codex round 10): the pool as the engine CONSTRUCTS from it —
+   * every entry's `reasoningEffort` normalized exactly the way lock
+   * resolution normalizes a lock's effort (`effortOf` in resolveRouting:
+   * trimmed when non-blank, ABSENCE when blank/whitespace). THE ONE SEAM:
+   * every place the engine converts a pool entry into a routing pin, dispatch
+   * agentOptions, or a preflight reads THIS pool — the walk in `poolFallback`,
+   * the reuse recovery in `auditorPoolMatchFor`, and both `selectCrossFamily`
+   * policy inputs — so dispatch, pin, preflight, and the fold's detail
+   * validation can never disagree about the effort a pool entry names. The
+   * config schema accepts `''`/whitespace efforts, and before this seam the
+   * blank value was copied into the pin AND dispatched while the fold rejects
+   * a pin whose effort is empty — a completed plan audit's verdict commit then
+   * failed AFTER the run had entered plan-reviewing, wedging it there. A
+   * blank pool effort now means what a blank lock effort already meant: the
+   * entry names no effort at all. `config.crossFamily.pool` itself is kept
+   * verbatim (resolved config is read-only, and in-place owner edits remain
+   * live — normalization is applied at consumption, per decision, not by
+   * mutating the resolved object); route identity (provider/model) is left
+   * as-written because the pin constructions downstream already normalize it
+   * through `toRoutePin`.
+   */
+  private normalizedPool(): readonly AgentOptionsLike[] {
+    return this.config.crossFamily.pool.map((entry) => {
+      const effort = entry.reasoningEffort
+      if (effort === undefined) return entry
+      const trimmed = effort.trim()
+      if (trimmed.length === 0) {
+        const { reasoningEffort: _blank, ...rest } = entry
+        return rest
+      }
+      return trimmed === effort ? entry : { ...entry, reasoningEffort: trimmed }
+    })
+  }
+
+  /**
+   * F20 (PR #2 Codex round 9): the pool entry a pinned route currently
+   * matches, when the pool is an authority for the role at all. The
+   * pool-equality reclassification is AUDITOR-only (F9), so a non-auditor
+   * role never recovers an entry — its pin stands or falls on session-policy
+   * membership alone. For an auditor the FIRST match in the pool's own order
+   * (the walk's order) is returned WHOLE, with the dispatch object the reuse
+   * path carries: the COMPLETE entry — provider, model, reasoningEffort,
+   * maxTokens and every other call-config field — composed exactly as the
+   * E11/F15 walk dispatches it (route identity normalized to the trimmed
+   * pin), with one documented rider: the PIN's own reasoningEffort survives
+   * only where the current entry names none (a pin settled by policy
+   * selection can carry an effort a coincidentally route-equal pool entry
+   * omits — dropping it would be the same silent-degradation class this
+   * recovery exists to close). A pool edit that changed the entry's own
+   * fields is followed, not averaged: the current entry wins. `undefined`
+   * when no current entry matches — the edit that removed it took the grant
+   * with it, and the pin must stand on session-policy membership alone or
+   * re-select; there is no entry to recover and no silent degradation back
+   * to a three-field reconstruction. F24 (PR #2 Codex round 12) audited this
+   * composition for the raw-entry route-field leak fixed in the pool walk:
+   * this path needed NO change — provider/model are overridden from the
+   * trimmed `toRoutePin` route (and the effort from the F21-normalized pool),
+   * so the reuse dispatch can never carry untrimmed route fields.
+   */
+  private auditorPoolMatchFor(role: Role, pin: RoutingPin): {
+    readonly entry: AgentOptionsLike
+    readonly route: RoutePin
+    readonly dispatch: AgentOptionsLike & { readonly provider: string; readonly model: string }
+  } | undefined {
+    if (!AUDITOR_ROLE_SET.includes(role)) return undefined
+    const entry = this.normalizedPool().find(candidate => {
+      const route = toRoutePin(candidate)
+      return route !== undefined && sameRoute(route, pin)
+    })
+    const route = entry === undefined ? undefined : toRoutePin(entry)
+    if (entry === undefined || route === undefined) return undefined
+    return {
+      entry,
+      route,
+      dispatch: {
+        ...entry,
+        provider: route.provider,
+        model: route.model,
+        ...(entry.reasoningEffort === undefined && pin.reasoningEffort !== undefined
+          ? { reasoningEffort: pin.reasoningEffort }
+          : {}),
+      },
+    }
+  }
+
+  /**
+   * Whether the executor pin is still authorized, for the reuse path: a
+   * plugin-config pin re-runs the one grant rule, and a session-policy pin
+   * must still be a member of the (write-once, but re-read) policy set. A pin
+   * that fails either check re-selects — recorded as a repin, not a crash.
+   *
+   * F1 (PR #2 Codex review): a NON-pool pin whose policy is `absent` or
+   * `unreachable` is refused too. Before, that case fell through to
+   * `undefined` (authorized) and the auto reuse branch dispatched the pin
+   * labeled `session-policy` although current authorization could not be
+   * established — the pin's authority evaporated with the policy read. The
+   * refusal names the policy state and lets the existing re-selection
+   * machinery apply unchanged (absent/unreachable ⇒ the selector terminates
+   * to inheritance, the pin is cleared, `repinFrom` records the dead pin). A
+   * POOL pin is untouched: a plugin-config grant already escalates under an
+   * absent policy per the plan's one rule, so it is reused on the grant, not
+   * silently inherited.
+   *
+   * F9 (PR #2 Codex round 4): the pool-grant reclassification is AUDITOR-only.
+   * `crossFamily.pool` is defined as candidate AUDITOR routes — a
+   * plugin-config grant for a reviewer the executor should not share a family
+   * with — never an EXECUTOR authorization. The check below used to be
+   * role-agnostic, so an executor pin that happened to equal a pool entry was
+   * treated as pool-authorized and kept dispatching explicitly after the
+   * session policy went absent/unreachable (the P3-3 provenance blur with a
+   * concrete failure path). For a non-auditor role the pool branch does not
+   * fire at all: the pin stands or falls on its own authority — session-policy
+   * membership when the policy is present, the F1 conservative refusal
+   * otherwise. Auditor pool semantics are unchanged.
+   */
+  private pinStillAuthorized(role: Role, pin: RoutePin, policy: SessionPolicyState): string | undefined {
+    // F9: pool equality reclassifies a pin as a plugin-config grant for
+    // AUDITORS only — for every other role the pool is not an authority and
+    // the pin must survive on session-policy membership alone. F20: the SAME
+    // match rule `auditorPoolMatchFor` applies on the reuse dispatch — one
+    // rule, two consumers, so the authority check and the entry recovery can
+    // never disagree about which entry (if any) authorizes the pin.
+    const poolHit = this.auditorPoolMatchFor(role, pin) !== undefined
+    if (poolHit) {
+      const verdict = resolvePluginGrant({ provider: pin.provider, model: pin.model, source: 'legacy-pool' }, policy)
+      return verdict.kind === 'conflict' ? verdict.reason : undefined
+    }
+    if (policy.kind !== 'present') {
+      return `pinned route ${pin.provider}/${pin.model} cannot re-establish its session-policy authorization — the session policy is ${policy.kind}; refusing the pin conservatively`
+    }
+    const member = policy.routes.some(route => {
+      const candidate = toRoutePin(route)
+      return candidate !== undefined && sameRoute(candidate, pin)
+    })
+    if (!member) return `pinned route ${pin.provider}/${pin.model} is no longer in the session model-selection policy set`
+    return undefined
+  }
+
+  /**
+   * F29 (PR #2 Codex round 16): compose a dispatch's ROUTE fields from a
+   * RETAINED successful preflight (`resolveCallConfig`) result, at the three
+   * engine seams whose preflight input is a full dispatch object — the pin
+   * reuse, the composed locked dispatch, and the pool walk. Before this, each
+   * site awaited `catalog.preflight(...)` and DISCARDED the resolved config,
+   * so an adapter that materializes its default `reasoningEffort` only there
+   * (nothing in `resolveModelInfo`'s facts names it) dispatched that effort
+   * while the persisted pin and `why` recorded none — and `routeStatusOf`
+   * treats observed-effort-without-selected as compatible, so the route read
+   * `verified` against an effort the record never named. Retention keeps pin,
+   * dispatch, and `why` on ONE effective effort.
+   *
+   * THE ADOPTION GUARD — the engine-side mirror of the selector's
+   * `retainedRouteFields` (same decided rule, documented there): the resolved
+   * config's provider/model ride only when they name the SAME route the
+   * grant/liveness/preflight checks authorized (trim-exact, `sameRoute`), and
+   * its effort only when the dispatch carried none. `resolveCallConfig`
+   * validates the config it is given — it does not re-route it — so a
+   * resolved config naming a different route, or rewriting an effort a lock,
+   * pool entry, or pin already named, is out of the upstream contract;
+   * adopting such a value would let a divergent echo outrank the owner's own
+   * named effort, so the checked dispatch's fields stand there. A conformant
+   * adapter echoing the config back composes the IDENTICAL object (the same
+   * reference is returned) — behavior byte-identical, existing green.
+   *
+   * @returns the (possibly unchanged) dispatch plus the materialized effort
+   * name for the honest `why` clause, when the adapter supplied one.
+   */
+  private retainPreflightRoute(
+    dispatch: AgentOptionsLike & { readonly provider: string; readonly model: string },
+    resolved: LlmCallConfig | undefined,
+  ): {
+    readonly dispatch: AgentOptionsLike & { readonly provider: string; readonly model: string }
+    readonly materializedEffort: string | undefined
+  } {
+    const resolvedPin = resolved === undefined ? undefined : toRoutePin(resolved)
+    if (resolvedPin === undefined || !sameRoute(resolvedPin, dispatch)) {
+      return { dispatch, materializedEffort: undefined }
+    }
+    const carried = resolved?.reasoningEffort
+    const effort = typeof carried === 'string' && carried.trim().length > 0 ? carried : undefined
+    const named = dispatch.reasoningEffort
+    const hadEffort = typeof named === 'string' && named.trim().length > 0
+    const materializedEffort = effort !== undefined && !hadEffort ? effort : undefined
+    if (materializedEffort === undefined && resolvedPin.provider === dispatch.provider && resolvedPin.model === dispatch.model) {
+      return { dispatch, materializedEffort: undefined }
+    }
+    return {
+      dispatch: {
+        ...dispatch,
+        provider: resolvedPin.provider,
+        model: resolvedPin.model,
+        ...(materializedEffort === undefined ? {} : { reasoningEffort: materializedEffort }),
+      },
+      materializedEffort,
+    }
+  }
+
+  /**
+   * F2 (PR #2 Codex review): the routing section as of THIS decision. With a
+   * volatile routing source wired, every call re-resolves the CURRENT values
+   * — a config patch lands without a remount, and the next dispatch must
+   * follow it, exactly like the legacy surfaces follow theirs. A patch that
+   * made the section INVALID must not crash mid-commit: throwing during a
+   * commit is worse than refusing the route with an honest record (the
+   * commit's persisted state must survive the owner's broken patch), so the
+   * read degrades to {@link REFUSED_ROUTING} and the refusal reason rides the
+   * decision's `why` — dispatch roles inherit the deployment default, the
+   * planner install is refused with a recorded degradation. Mount-time
+   * validation is unchanged: an invalid INITIAL config still fails the mount
+   * fast, exactly as before.
+   */
+  private routingConfig(): { readonly routing: ResolvedRouting; readonly refused?: string } {
+    if (this.routingSource === undefined) return { routing: this.config.routing }
+    try {
+      return { routing: this.routingSource() }
+    } catch (error: unknown) {
+      return {
+        routing: REFUSED_ROUTING,
+        refused: `the live routing section no longer resolves (${errorMessage(error)})`,
+      }
+    }
+  }
+
+  private async resolveRoleRoute(root: AgentRef, role: Role, prior: Snapshot): Promise<RoleRouteResolution> {
+    // F2: one live read per decision — the section as of THIS dispatch. An
+    // invalid live section refuses the route outright: the dispatch inherits
+    // the deployment default with the refusal recorded, rather than
+    // dispatching on config the code cannot validate (and rather than
+    // throwing inside the commit that carries the dispatch). The pinless
+    // record also clears any existing role pin — a pin whose config context
+    // can no longer be validated is not kept alive silently.
+    const live = this.routingConfig()
+    if (live.refused !== undefined) {
+      return {
+        kind: 'dispatch',
+        agentOptions: undefined,
+        routing: {
+          role,
+          why: [`routing: ${live.refused} — refusing to route this dispatch; inheriting the deployment default until the config is valid again`],
+        },
+      }
+    }
+    const routing = live.routing
+    const roleRouting = routing.roles[role]
+    const policy = this.readPolicy(root)
+    const catalog = this.routingPorts.catalog
+
+    if (role === 'planner') {
+      // The planner IS the root agent (plan "Roles and routing"); it is routed
+      // by installModelSelection in M6, never dispatched. Reaching this path
+      // with 'planner' is a wiring fact to record, not a dispatch to reroute.
+      return {
+        kind: 'dispatch',
+        agentOptions: undefined,
+        routing: {
+          role,
+          why: ['planner routing is installed on the root agent (M6), not dispatched — this dispatch path never reroutes it'],
+        },
+      }
+    }
+
+    // Absent catalog port: the routing core cannot select or preflight. Per the
+    // packet this resolves to 0.2.0/inherit behavior — an auto role inherits
+    // (recording `unreachable-inherit` exactly when the POLICY read is what is
+    // missing), and a locked role still gets its grant check (pure) plus its
+    // 0.2.0 dispatch, with the skipped preflight named rather than claimed.
+    let core: RoleRouteResolution
+    if (catalog === undefined) {
+      if (roleRouting.mode === 'locked') {
+        const grant = resolvePluginGrant(
+          { provider: roleRouting.provider, model: roleRouting.model, source: this.lockGrantSource(role, roleRouting) },
+          policy,
+        )
+        if (grant.kind === 'conflict') return { kind: 'escalate', reason: grant.reason }
+        const note = this.legacyLockNote(role, roleRouting)
+        core = {
+          kind: 'dispatch',
+          agentOptions: this.lockedAgentOptions(role, roleRouting),
+          routing: {
+            role,
+            pin: this.lockPin(roleRouting),
+            why: [
+              ...grant.why,
+              ...(note === undefined ? [] : [note]),
+              'catalog: no catalog port wired — provider liveness not checked and dispatch preflight not run (0.2.0 dispatch parity)',
+            ],
+            authorizationSource: 'plugin-config',
+          },
+        }
+      } else if (roleRouting.mode === 'inherit') {
+        core = {
+          kind: 'dispatch',
+          agentOptions: undefined,
+          routing: {
+            role,
+            why: ['role routing mode is inherit — GAH does not reroute this role; the deployment default applies'],
+          },
+        }
+      } else {
+        core = {
+          kind: 'dispatch',
+          agentOptions: undefined,
+          routing: {
+            role,
+            why: [
+              'routing: no catalog port wired — the routing core cannot select from live facts; inheriting the deployment default (0.2.0 dispatch parity)',
+            ],
+            ...(policy.kind === 'unreachable' ? { authorizationSource: 'unreachable-inherit' as const } : {}),
+          },
+        }
+      }
+    } else if (roleRouting.mode === 'auto') {
+      // Auto roles with a live pin reuse it (stability over reselection). A pin
+      // whose provider left the catalog, whose preflight now rejects, or whose
+      // authority no longer covers it re-selects with `repinFrom` recorded.
+      const pin = prior.routingPins?.[role]
+      if (pin !== undefined) {
+        const pinRoute: RoutePin = { provider: pin.provider, model: pin.model }
+        // F20 (PR #2 Codex round 9): recover the pool entry BEFORE the checks,
+        // because when a pool grant is what authorizes this pin (the auditor
+        // pool-equality branch `pinStillAuthorized` re-runs below) the COMPLETE
+        // entry is what the dispatch carries — so the preflight leg and the
+        // reuse dispatch below are both built from this one recovered object:
+        // preflight exactly what you dispatch (the F15 discipline). The first
+        // dispatch of a pool-picked route carries the entry whole (`agentOptions:
+        // entry` in the pool walk — maxTokens and every call-config field), but
+        // this reuse path used to rebuild agentOptions from the pin's three
+        // fields alone, silently dropping the entry's tuning after the first
+        // dispatch. An entry whose extra fields fail preflight kills the pin
+        // (dead below ⇒ re-selection with `repinFrom`), never a silent fall
+        // back to the bare reconstruction; an entry that no longer matches
+        // leaves the pin standing (or falling) on session-policy membership
+        // alone, exactly as before.
+        const poolMatch = this.auditorPoolMatchFor(role, pin)
+        const snapshot = await catalog.snapshot()
+        let dead: string | undefined
+        // F29: the retained preflight result of a SUCCESSFUL reuse check, if
+        // the checks below leave the pin standing (composed into the dispatch
+        // and the re-recorded pin at the returns below).
+        let reuseResolved: LlmCallConfig | undefined
+        // F14 (PR #2 Codex round 6): an `unavailable` snapshot (a catalog read
+        // failure — infrastructure) is NOT evidence the pinned provider is
+        // gone; `providerIsLive` honestly answers false on it (nothing is
+        // provably live), so the old check killed a HEALTHY pin on one hiccup
+        // and re-selected over it. Liveness is asserted only on a SUCCESSFUL
+        // read; otherwise preflight decides (it talks to `resolveCallConfig`
+        // directly, independent of the failed listing) and the outage is
+        // recorded on the reuse below.
+        if (snapshot.catalogStatus === 'live' && !providerIsLive(snapshot, pin.provider)) {
+          dead = `pinned provider "${pin.provider}" is no longer live in the catalog (llm/adapters-updated refreshed it)`
+        } else {
+          // F29 (PR #2 Codex round 16): RETAIN the successful preflight result —
+          // the reuse dispatch and the re-recorded pin below are composed
+          // from it, so an adapter that materializes its default
+          // `reasoningEffort` only in the resolved config can no longer
+          // dispatch an effort the pin never records. Adoption guard in
+          // `retainPreflightRoute`; an echo composes the identical dispatch.
+          let resolved: LlmCallConfig | undefined
+          try {
+            // F20: the preflight carries EXACTLY what the dispatch will — the
+            // complete recovered pool entry when a pool grant authorizes the
+            // pin (maxTokens and every call-config field ride, route identity
+            // normalized to the trimmed pin the liveness leg checked), the
+            // pin's own three fields otherwise.
+            resolved = await catalog.preflight(poolMatch?.dispatch ?? {
+              provider: pin.provider,
+              model: pin.model,
+              ...(pin.reasoningEffort === undefined ? {} : { reasoningEffort: pin.reasoningEffort }),
+            })
+          } catch (error) {
+            dead = `pinned route ${pin.provider}/${pin.model} failed dispatch preflight${poolMatch === undefined ? '' : ' on the complete pool entry that authorizes it'} (${errorMessage(error)})`
+          }
+          reuseResolved = resolved
+        }
+        if (dead === undefined) {
+          dead = this.pinStillAuthorized(role, pinRoute, policy)
+        }
+        if (dead === undefined) {
+          // F9 (PR #2 Codex round 4): the reuse label's pool inference is
+          // auditor-only, mirroring pinStillAuthorized. Persist/recover
+          // honesty, DECIDED and documented here: the fold-validated
+          // `RoutingPin` shape deliberately carries NO `authorizationSource`
+          // (it is a route, not a grant — the source lives on the DECISION
+          // that wrote the pin, a domain-owned shape outside this fix), so a
+          // recorded source is not recoverable at this call site; and reading
+          // one back from the last dispatch's RouteRecord could resurrect a
+          // STALE authority (e.g. a pre-F9 pool relabel) that contradicts the
+          // check that just re-authorized the pin. The label therefore states
+          // the authority THIS reuse actually stood on in pinStillAuthorized:
+          // a plugin-config pool grant for an auditor (route-equality — kept
+          // as-is per the finding), session-policy membership for everything
+          // else — which is what a non-auditor pin must now pass to be here at
+          // all. If the pin shape ever persists a source, prefer it over this
+          // inference whenever the two disagree.
+          //
+          // F20 (PR #2 Codex round 9): that same inference now decides WHAT is
+          // dispatched, not just how it is labeled. A pool grant authorizes
+          // the COMPLETE entry, so the pool-authorized reuse dispatches the
+          // recovered entry whole (`poolMatch.dispatch` — maxTokens and every
+          // call-config field, the pin's own effort riding only where the
+          // entry names none), and the preflight above proved exactly those
+          // fields. The recorded pin carries the effort actually dispatched —
+          // the entry's when it names one, the pin's own otherwise. A pin
+          // with NO matching entry never takes this branch: it kept (or lost)
+          // its authority on session-policy membership alone and keeps the
+          // existing provider/model/effort reconstruction below unchanged.
+          // F14: the reuse record states liveness only when the read could
+          // assert it; an unavailable catalog is named as the outage it is —
+          // never dressed up as "provider live" (nothing was proven) and
+          // never as "provider gone" (nothing failed but the read).
+          const livenessNote = snapshot.catalogStatus === 'live'
+            ? 'provider live'
+            : `provider liveness NOT assertable — catalog unavailable (${snapshot.diagnostic ?? 'no diagnostic recorded'}): a catalog read failure (infrastructure), not evidence the provider is gone`
+          if (poolMatch !== undefined) {
+            const pinEffortRides = poolMatch.entry.reasoningEffort === undefined && pin.reasoningEffort !== undefined
+            // F29: the reuse dispatch and the RE-RECORDED pin are composed from
+            // the retained preflight result — pin, dispatch, and `why` name
+            // ONE effective effort (the materialized clause rides `why` when
+            // the adapter supplied a default the entry and pin never named).
+            const retained = this.retainPreflightRoute(poolMatch.dispatch, reuseResolved)
+            return {
+              kind: 'dispatch',
+              agentOptions: retained.dispatch,
+              routing: {
+                role,
+                pin: {
+                  provider: retained.dispatch.provider,
+                  model: retained.dispatch.model,
+                  ...(retained.dispatch.reasoningEffort === undefined ? {} : { reasoningEffort: retained.dispatch.reasoningEffort }),
+                },
+                why: [
+                  `pin: reusing the role pin — ${livenessNote}, preflight accepted on the COMPLETE pool entry, authority intact (a plugin-config pool grant — the matching pool entry recovered at reuse: maxTokens ${poolMatch.entry.maxTokens === undefined ? 'unset' : String(poolMatch.entry.maxTokens)}${pinEffortRides ? ', the pin\'s own reasoningEffort riding where the entry names none' : ''}; never a provider/model/effort reconstruction)`,
+                  ...(retained.materializedEffort === undefined ? [] : [`preflight: resolveCallConfig materialized the adapter's default reasoningEffort "${retained.materializedEffort}" — the dispatch and the recorded pin carry it`]),
+                ],
+                authorizationSource: 'plugin-config',
+              },
+            }
+          }
+          // F29, the bare-pin reuse: same retention — the dispatch and the
+          // re-recorded pin compose from the retained preflight result.
+          const retained = this.retainPreflightRoute({
+            provider: pin.provider,
+            model: pin.model,
+            ...(pin.reasoningEffort === undefined ? {} : { reasoningEffort: pin.reasoningEffort }),
+          }, reuseResolved)
+          return {
+            kind: 'dispatch',
+            agentOptions: retained.dispatch,
+            routing: {
+              role,
+              pin: {
+                provider: retained.dispatch.provider,
+                model: retained.dispatch.model,
+                ...(retained.dispatch.reasoningEffort === undefined ? {} : { reasoningEffort: retained.dispatch.reasoningEffort }),
+              },
+              why: [
+                `pin: reusing the role pin — ${livenessNote}, preflight accepted, authority intact (authorized by the session policy when selected)`,
+                ...(retained.materializedEffort === undefined ? [] : [`preflight: resolveCallConfig materialized the adapter's default reasoningEffort "${retained.materializedEffort}" — the dispatch and the recorded pin carry it`]),
+              ],
+              authorizationSource: 'session-policy',
+            },
+          }
+        }
+        const reselected = await this.selectForRole(role, routing.preference, roleRouting, prior, policy, catalog)
+        core = this.decorateRepinned(
+          this.resolutionOfDecision(role, roleRouting, reselected, undefined),
+          {
+            provider: pin.provider,
+            model: pin.model,
+            ...(pin.reasoningEffort === undefined ? {} : { reasoningEffort: pin.reasoningEffort }),
+          },
+          dead,
+        )
+      } else {
+        core = this.resolutionOfDecision(role, roleRouting, await this.selectForRole(role, routing.preference, roleRouting, prior, policy, catalog), undefined)
+      }
+    } else {
+      core = this.resolutionOfDecision(role, roleRouting, await this.selectForRole(role, routing.preference, roleRouting, prior, policy, catalog), undefined)
+      // F16 (PR #2 Codex round 7): a locked dispatch is COMPOSED here
+      // (lock route + riding legacy tuning — `lockedAgentOptions`), and the
+      // composed object — not just the bare lock the selector validated — is
+      // what must pass preflight before the subagent start receives it. See
+      // {@link preflightComposedLockedDispatch} for the seam decision.
+      if (roleRouting.mode === 'locked' && core.kind === 'dispatch' && core.agentOptions !== undefined) {
+        core = await this.preflightComposedLockedDispatch(role, roleRouting, core, catalog)
+      }
+    }
+
+    if (core.kind === 'escalate') return core
+    // A selected route is final: the pool never widens the auto set and never
+    // overrides a role lock. An explicit `inherit` role mode is the owner's
+    // opt-OUT of routing for this role — the pool fallback must not fire either.
+    if (core.agentOptions !== undefined || roleRouting.mode === 'inherit') return core
+    // The core terminated to inheritance. The 0.2.0 pool fallback stays
+    // CONSULTABLE here as plugin-config grants under the one rule ([R2-P1-1]):
+    // on a no-policy deployment this is exactly 0.2.0 dispatch behavior; on a
+    // policy-bearing one a pool entry outside the policy escalates instead of
+    // silently bypassing the native allowlist. F10: for AUDITORS only — a
+    // non-auditor role keeps the inheritance result and never dispatches from
+    // the auditor candidate pool.
+    return this.carryRoutelessLegacy(role, roleRouting, await this.poolFallback(role, prior, policy, core))
+  }
+
+  /**
+   * The 0.2.0 pool fallback over an inherit resolution, grant-checked.
+   *
+   * F7 (PR #2 Codex round 3): a pool pick now runs the SAME dispatch checks as
+   * every other explicit selection BEFORE it can be handed a dispatch —
+   * provider liveness against the catalog snapshot and
+   * `preflight`/`resolveCallConfig`. Before this, the fallback checked only
+   * the grant rule, so a pool entry that was policy-authorized but DEAD (a
+   * provider absent from the live catalog, or a route resolveCallConfig
+   * rejects) was dispatched anyway: auto mode could hand a dispatch to a
+   * route no live adapter can serve. A pool route failing these checks is
+   * skipped HONESTLY — the `why` names the failure, the walk falls to the
+   * NEXT pool entry outside the builder family, and the inheritance result
+   * is retained when none qualifies. The grant rule stays FIRST (policy
+   * membership / conflict escalation per the plan's one rule), and the
+   * 0.2.0-verbatim `off`-mode path is untouched: off mode dispatches legacy
+   * verbatim by design, so these checks apply to the auto-mode pool fallback
+   * only. With no catalog port wired the checks cannot run; the pick
+   * dispatches with the skips NAMED, exactly as a locked route does in the
+   * same state (0.2.0 dispatch parity) — never a silent claim.
+   *
+   * F10 (PR #2 Codex round 4): the fallback is AUDITOR-only. The pool is a
+   * set of candidate AUDITOR routes, and this fallback used to be reachable
+   * for every role: a legacy provider-only executor config
+   * (`{ provider: 'alpha' }` — no model, so no lock, so auto mode) plus an
+   * absent policy made the core inherit, then the fallback read the
+   * executor's own family and dispatched the EXECUTOR on the first
+   * out-of-family pool entry — silently replacing the requested executor
+   * provider with an auditor model (the E8-disclosed residual, now a review
+   * finding). For every non-auditor role the fallback does not fire: the walk
+   * never runs and the inheritance result stands, with the withheld pick
+   * named honestly in `why`. The E11 checked walk (grant → liveness →
+   * preflight) is unchanged for auditors.
+   *
+   * F12 (PR #2 Codex round 5): the builder family is sourced through
+   * `executorFamilySourceOf(prior)` — dispatch pin, then the live routing
+   * lock, then the legacy `executor.agentOptions` surface (the F5 order,
+   * with the legacy tail kept at 0.2.0 family granularity: a provider-only
+   * legacy executor still names its family) — not the legacy surface alone.
+   * Before, a lock-only or pin-only executor route made
+   * `familyOf(legacy-absent)` read `undefined`, so `selectCrossFamily` saw
+   * `unknown-family` and a valid out-of-family pool entry was never consulted;
+   * the executor's DECLARED family now reaches the choice and the walk. The
+   * genuinely unrouted executor (no pin, no lock, no legacy provider) keeps
+   * the honest `unknown-family` inheritance path, and the checked walk itself
+   * is unchanged.
+   */
+  /**
+   * The executor's CURRENT family source for the pool fallback (F12): the F5
+   * order — dispatch pin, live routing lock, legacy surface — read at FAMILY
+   * granularity. `executorPinOf` walks pin → lock → a FULL legacy route; the
+   * legacy tail here keeps the 0.2.0 granularity `familyOf` always had: a
+   * provider-only legacy executor (`{ provider: 'alpha' }`, no model ⇒ no pin
+   * leg) still names its family (the F10(b)/(c) fixtures). Only an executor
+   * with no pin, no lock, and no legacy provider yields `undefined` — the
+   * honest `unknown-family` case.
+   *
+   * The PIN leg is skipped when THIS decision just refused the executor's own
+   * pin (`repinFrom` on the inherit resolution the fallback decorates — the
+   * executor role reaching here always arrives via that refusal): a refused
+   * pin names no family the fallback can consult, and letting the dead pin
+   * shadow the legacy surface would silently change which pool entries count
+   * as out-of-family exactly when the executor's route is least settled.
+   */
+  private executorFamilySourceOf(
+    prior: Snapshot,
+    refusedExecutorPin: RoutingPin | undefined,
+  ): AgentOptionsLike | undefined {
+    const pinned = refusedExecutorPin === undefined ? this.executorPinOf(prior) : undefined
+    if (pinned !== undefined) return pinned
+    const executorRouting = this.routingConfig().routing.roles.executor
+    if (executorRouting.mode === 'locked') {
+      return { provider: executorRouting.provider, model: executorRouting.model }
+    }
+    return this.config.executor.agentOptions
+  }
+
+  private async poolFallback(
+    role: Role,
+    prior: Snapshot,
+    policy: SessionPolicyState,
+    inherit: Extract<RoleRouteResolution, { readonly kind: 'dispatch' }>,
+  ): Promise<RoleRouteResolution> {
+    // The consultability gate is unchanged and pure: `selectCrossFamily`
+    // decides whether the pool is in play at all (enabled, the risk floor,
+    // an observable builder family) and supplies the outcome word the
+    // record cites. Its pick — the FIRST pool entry outside the builder
+    // family — is where the checked walk below STARTS; the walk may continue
+    // past it when the dispatch checks reject it. F12: the builder family is
+    // the executor's CURRENT route (pin → live lock → legacy surface), so a
+    // lock-only or pin-only executor route is a real family input here — with
+    // the executor's own just-refused pin (repinFrom) never counting as one.
+    const familySource = this.executorFamilySourceOf(
+      prior,
+      role === 'executor' ? inherit.routing?.repinFrom : undefined,
+    )
+    const choice = selectCrossFamily({
+      risk: prior.triage.risk,
+      configured: undefined,
+      executor: familySource,
+      // F21: the pool the choice consults is the same normalized pool the
+      // walk below iterates — one seam, so the pick the choice names and the
+      // entry the walk dispatches cannot disagree about effort.
+      policy: { ...this.config.crossFamily, pool: this.normalizedPool() },
+    })
+    if (toRoutePin(choice.agentOptions) === undefined) return inherit
+    // F10: auditor-only. A non-auditor role (the executor) never dispatches
+    // from the auditor candidate pool — no grant walk, no liveness or
+    // preflight, no pick. The note fires exactly when a pick existed and was
+    // withheld, so the record explains the divergence from 0.2.0 dispatch
+    // parity instead of silently dropping it; with no pick in play the plain
+    // inheritance result is already the honest record.
+    if (!AUDITOR_ROLE_SET.includes(role)) {
+      const withheld = toRoutePin(choice.agentOptions)
+      if (withheld === undefined || inherit.routing === undefined) return inherit
+      return {
+        ...inherit,
+        routing: {
+          ...inherit.routing,
+          why: [
+            ...inherit.routing.why,
+            `cross-family: the 0.2.0 pool fallback is auditor-only — the pool is a candidate AUDITOR route set, never an authorization for "${role}"; the ${withheld.provider}/${withheld.model} pick was not dispatched and the inheritance result stands`,
+          ],
+        },
+      }
+    }
+    const catalog = this.routingPorts.catalog
+    const builder = familyOf(familySource)
+    // F7: walk the pool in order over the entries the 0.2.0 rule considers —
+    // a well-formed route whose family differs from the builder's — so the
+    // first entry `selectCrossFamily` names is checked first and a dead one
+    // is stepped past, not dispatched.
+    const skipped: string[] = []
+    // F17: the outage note for the CURRENT walk, set by the iteration that
+    // read an `unavailable` snapshot (the catalog is cached per commit, so
+    // every iteration shares one read) and recorded on whichever resolution
+    // the walk returns — never a silent skip of the liveness leg.
+    let outage: string | undefined
+    for (const entry of this.normalizedPool()) {
+      const candidate = toRoutePin(entry)
+      if (candidate === undefined) continue
+      const family = familyOf(entry)
+      if (family === undefined || family === builder) continue
+      // The grant rule FIRST, per the plan's one rule ([R2-P1-1]): a pool
+      // entry a present policy excludes is an owner-vs-owner conflict that
+      // ESCALATES — never skipped past, never silently bypassed.
+      const verdict = resolvePluginGrant({ provider: candidate.provider, model: candidate.model, source: 'legacy-pool' }, policy)
+      if (verdict.kind === 'conflict') return { kind: 'escalate', reason: verdict.reason }
+      const effort = entry.reasoningEffort
+      const pin = { provider: candidate.provider, model: candidate.model, ...(effort === undefined ? {} : { reasoningEffort: effort }) }
+      // F24 (PR #2 Codex round 12): ONE normalized dispatch object per pool
+      // candidate — route identity (provider/model) from the trimmed pin the
+      // grant and liveness legs checked, every non-route call-config field
+      // from the entry itself (F15's full-field discipline; the effort is
+      // already the normalized value — F21's `normalizedPool` seam supplies
+      // these entries). Grant, liveness, and preflight all validate the
+      // NORMALIZED route, but the dispatch below used to hand the subagent
+      // start the RAW entry: a pool entry `{ provider: ' alpha ', model:
+      // ' model ' }` passed every check as `alpha/model` while the child start
+      // received the untrimmed strings — dispatch failure or route-evidence
+      // mismatch. The SAME object is now both preflighted and dispatched
+      // (preflight exactly what you dispatch, now including normalization),
+      // and it rides the no-catalog-port path too — there is no preflight leg
+      // there to disagree, but the dispatched route still must be the one the
+      // grant check authorized. For a clean entry the composition is
+      // field-identical to the entry (0.2.0 behavior unchanged). Site audit
+      // for the same leak: the F20 reuse recovery (`auditorPoolMatchFor`'s
+      // pre-composed dispatch) already builds its object with
+      // `provider`/`model` overridden from the trimmed `toRoutePin` route, so
+      // it needed NO change — this walk's two `agentOptions: entry` sites were
+      // the only raw-entry dispatch paths. Blank-after-trim route fields never
+      // reach here: `toRoutePin` returns `undefined` and the walk's
+      // well-formedness gate skips the entry, unchanged.
+      const dispatch: AgentOptionsLike & { readonly provider: string; readonly model: string } = {
+        ...entry,
+        provider: candidate.provider,
+        model: candidate.model,
+      }
+      const grantNote = `cross-family: the routing core terminated to inheritance; the 0.2.0 pool fallback supplied ${candidate.provider}/${candidate.model} as a plugin-config grant (${choice.outcome})`
+      if (catalog === undefined) {
+        return {
+          kind: 'dispatch',
+          agentOptions: dispatch,
+          routing: {
+            role,
+            pin,
+            why: [
+              ...(inherit.routing?.why ?? []),
+              ...verdict.why,
+              'catalog: no catalog port wired — provider liveness not checked and dispatch preflight not run (0.2.0 dispatch parity)',
+              grantNote,
+            ],
+            authorizationSource: 'plugin-config',
+          },
+        }
+      }
+      const snapshot = await catalog.snapshot()
+      // F17 (PR #2 Codex round 7): the liveness skip is asserted only on a
+      // SUCCESSFUL read — the same outage-vs-disappearance split F14 made for
+      // locks and pins. An `unavailable` snapshot (a `listProviders` throw)
+      // carries an EMPTY provider list, so the old unconditional
+      // `providerIsLive` skip read "the catalog could not be read" as "every
+      // pool provider is gone" and one hiccup ended the walk with plain
+      // inheritance, never attempting the preflight that was still available
+      // (`resolveCallConfig` runs independently of the failed listing). Under
+      // an outage the liveness leg is SKIPPED, preflight decides, and the
+      // outage is recorded below in the wording F14 established: a catalog
+      // read failure (infrastructure), not evidence the provider is gone.
+      // A live read that lacks the provider keeps the unchanged skip.
+      if (snapshot.catalogStatus === 'unavailable') {
+        outage =
+          `cross-family: provider liveness NOT assertable for the pool walk — catalog unavailable ` +
+          `(${snapshot.diagnostic ?? 'no diagnostic recorded'}): a catalog read failure (infrastructure), ` +
+          'not evidence the provider is gone; the liveness leg is skipped and preflight decides'
+      }
+      if (snapshot.catalogStatus === 'live' && !providerIsLive(snapshot, candidate.provider)) {
+        skipped.push(`cross-family: pool route ${candidate.provider}/${candidate.model} skipped — its provider is not live in the catalog snapshot`)
+        continue
+      }
+      // F15 (PR #2 Codex round 6): preflight EVERY call-config field the
+      // dispatch carries. The dispatch hands the COMPLETE pool entry to the
+      // subagent start as agentOptions, but this walk used to forward only
+      // provider/model/reasoningEffort — a pool entry with an invalid
+      // `maxTokens` (or any other call-config field) passed the walk and
+      // failed at subagent start. The port's `preflight` signature already
+      // accepts the full `LlmCallConfig` (maxTokens included), so the entry is
+      // routed through `resolveCallConfig` WHOLE (route identity normalized
+      // to the trimmed pin the grant/liveness legs checked): walk acceptance
+      // now implies dispatch validity. Grant-first ordering and the honest
+      // skip records are unchanged. F24: the object preflighted here is the
+      // SAME `dispatch` object the resolution below carries — never a
+      // parallel reconstruction that could drift (in fields or in
+      // normalization) from what the subagent start receives.
+      // F29 (PR #2 Codex round 16): the successful preflight result is
+      // RETAINED and the dispatch + recorded pin are composed from it — an
+      // adapter that materializes its default `reasoningEffort` only in the
+      // resolved config can no longer dispatch an effort the pin never
+      // records. Adoption guard in `retainPreflightRoute`; an echo composes
+      // the identical dispatch object — byte-identical, existing green.
+      let resolved: LlmCallConfig | undefined
+      try {
+        resolved = await catalog.preflight(dispatch)
+      } catch (error) {
+        skipped.push(`cross-family: pool route ${candidate.provider}/${candidate.model} skipped — dispatch preflight rejected it (${errorMessage(error)})`)
+        continue
+      }
+      const retained = this.retainPreflightRoute(dispatch, resolved)
+      return {
+        kind: 'dispatch',
+        agentOptions: retained.dispatch,
+        routing: {
+          role,
+          pin: {
+            provider: retained.dispatch.provider,
+            model: retained.dispatch.model,
+            ...(retained.dispatch.reasoningEffort === undefined ? {} : { reasoningEffort: retained.dispatch.reasoningEffort }),
+          },
+          why: [
+            ...(inherit.routing?.why ?? []),
+            ...verdict.why,
+            ...(outage !== undefined ? [outage] : []),
+            ...(skipped.length > 0 ? [skipped.join('; ')] : []),
+            grantNote,
+            ...(retained.materializedEffort === undefined ? [] : [`preflight: resolveCallConfig materialized the adapter's default reasoningEffort "${retained.materializedEffort}" — the dispatch and the recorded pin carry it`]),
+          ],
+          authorizationSource: 'plugin-config',
+        },
+      }
+    }
+    // No pool entry survived the dispatch checks: the inheritance result is
+    // retained, with every skip named — never a silent reversion to it.
+    if (inherit.routing === undefined) return inherit
+    return {
+      ...inherit,
+      routing: {
+        ...inherit.routing,
+        why: [
+          ...inherit.routing.why,
+          ...skipped,
+          // F17: when the walk ran under an outage, the retained-inheritance
+          // record names it too — the skips above are preflight verdicts, and
+          // no liveness leg was (or could be) run.
+          ...(outage !== undefined ? [outage] : []),
+          'cross-family: every pool entry outside the builder family failed the dispatch checks (provider liveness, preflight) — the inheritance result stands',
+        ],
+      },
+    }
+  }
+
+  /**
+   * P2-1 (execution-audit r1): carry ROUTELESS legacy agentOptions onto an
+   * INHERIT dispatch of the auto arm.
+   *
+   * A legal 0.2.0 config like `executor.agentOptions: {maxTokens: 8192}` (any
+   * legacy object naming no provider+model pair) maps to no lock — correctly —
+   * but when the auto arm then terminates to inheritance, mode `off` dispatches
+   * the object verbatim while auto dropped it entirely: the owner's tuning
+   * silently vanished exactly where the owner most likely still runs it. The
+   * remedy is the auditor's: the object is TUNING, not a route claim, so it
+   * rides the inherit dispatch VERBATIM and the decision's `why` says so. The
+   * route legs stay absent — no pin, no `selected`, the RouteRecord keeps
+   * saying inheritance — because GAH still selected nothing.
+   *
+   * THE DECIDED BOUNDARY (packet E8 decide point), documented and tested:
+   * routeless legacy is NOT carried onto explicitly SELECTED routes (an auto
+   * policy selection, a pin reuse, or a pool pick). Rationale: (1) the
+   * repo's own E2 resolve contract (`lockedAgentOptions`) rides legacy tuning
+   * exactly when the dispatch follows a legacy-named route, and a selection is
+   * by construction not one; (2) merging unvalidated legacy fields (effort,
+   * maxTokens) onto a preflight-validated selection would dispatch values the
+   * preflight never saw, weakening the "efforts validated at dispatch"
+   * invariant; (3) a selection cites the session policy as its authority, and
+   * the legacy config object is not a party to that grant. The asymmetry with
+   * mode `off` is visible, not hidden: no-policy deployments cannot select
+   * (inheritOnly), so the carry fires exactly there, and every selected
+   * dispatch names its own authority instead.
+   *
+   * Equally deliberate: an explicit `mode: 'inherit'` role does NOT carry —
+   * that is a v3-surface opt-out ("the deployment default applies"), a shape
+   * no 0.2.0 config can produce, and honoring it literally is the honest read.
+   */
+  private carryRoutelessLegacy(
+    role: Role,
+    roleRouting: RoleRouting,
+    resolution: RoleRouteResolution,
+  ): RoleRouteResolution {
+    if (resolution.kind !== 'dispatch') return resolution
+    if (roleRouting.mode !== 'auto') return resolution
+    if (resolution.agentOptions !== undefined) return resolution
+    const legacy = this.legacyOptionsFor(role)
+    if (legacy === undefined || toRoutePin(legacy) !== undefined) return resolution
+    if (resolution.routing === undefined) return resolution
+    const fields = Object.keys(legacy).join(', ')
+    return {
+      ...resolution,
+      agentOptions: legacy,
+      routing: {
+        ...resolution.routing,
+        why: [
+          ...resolution.routing.why,
+          `legacy ${this.legacySurfaceOf(role)}: routeless agentOptions ({${fields}}) carried onto the inherit dispatch — tuning only, not a route claim; the route legs stay absent and this record keeps saying inheritance`,
+        ],
+      },
+    }
+  }
+
+  /** `selectRoute` with the engine's resolved inputs (risk, preference, live executor pin). */
+  private async selectForRole(
+    role: Role,
+    preference: RoutePreference,
+    roleRouting: RoleRouting,
+    prior: Snapshot,
+    policy: SessionPolicyState,
+    catalog: RouteCatalog,
+  ): Promise<SelectionDecision> {
+    const executorPin = AUDITOR_ROLE_SET.includes(role) ? this.executorPinOf(prior) : undefined
+    return await selectRoute({
+      role,
+      risk: prior.triage.risk,
+      // F2: the preference as read at THIS decision's start, passed down so a
+      // patch landing mid-decision cannot split one decision across two
+      // configs (one live read per decision, not one per sub-step).
+      preference,
+      roleRouting,
+      policy,
+      catalog,
+      // Axes are recomputed against the executor's CURRENT pin at every
+      // dispatch ([R2-P2-2b] — pins stabilize routes, not judgments).
+      ...(executorPin === undefined ? {} : { executorPin }),
+      independenceFloor: this.config.crossFamily.minRisk,
+    })
+  }
+
+  /** Which config surface named a locked route, for the grant's `source` field. */
+  private lockGrantSource(role: Role, roleRouting: RoleRouting): GrantSource {
+    if (roleRouting.mode !== 'locked') throw new Error('unreachable: lockGrantSource on a non-locked routing')
+    const legacy = toRoutePin(this.legacyOptionsFor(role))
+    if (
+      legacy !== undefined
+      && legacy.provider === roleRouting.provider
+      && legacy.model === roleRouting.model
+    ) return 'legacy-role'
+    return 'routing-lock'
+  }
+
+  /**
+   * The persisted pin for a locked role. F28 (PR #2 Codex round 15): on the
+   * SELECTED path the pin is composed from `decision.route` instead (see
+   * `resolutionOfDecision`) — `selectLocked` returns the adapter-declared
+   * `defaultEffort` there when the lock omits an effort, and a pin that
+   * drops what the selector selected makes the evidence dishonest. This
+   * lock-fields-only builder remains for the no-catalog 0.2.0 parity path,
+   * where no selector ran and no adapter default is knowable.
+   */
+  private lockPin(roleRouting: RoleRouting & { readonly mode: 'locked' }): RoutingPin {
+    return {
+      provider: roleRouting.provider,
+      model: roleRouting.model,
+      ...(roleRouting.reasoningEffort === undefined ? {} : { reasoningEffort: roleRouting.reasoningEffort }),
+    }
+  }
+
+  /** Map a core selection decision onto the engine's dispatch/escalate resolution. */
+  private resolutionOfDecision(
+    role: Role,
+    roleRouting: RoleRouting,
+    decision: SelectionDecision,
+    repinFrom: RoutingPin | undefined,
+  ): RoleRouteResolution {
+    if (decision.kind === 'escalate-owner') return { kind: 'escalate', reason: decision.reason }
+    if (decision.kind === 'blocked') return { kind: 'escalate', reason: decision.reason }
+    if (decision.kind === 'inherit') {
+      return {
+        kind: 'dispatch',
+        agentOptions: undefined,
+        routing: {
+          role,
+          why: [...decision.why],
+          ...(decision.authorizationSource === undefined ? {} : { authorizationSource: decision.authorizationSource }),
+          ...(repinFrom === undefined ? {} : { repinFrom }),
+        },
+      }
+    }
+    const why = [...decision.why]
+    const note = this.legacyLockNote(role, roleRouting)
+    if (note !== undefined) why.push(note)
+    // F28 (PR #2 Codex round 15): the pin — and, for a locked role, the
+    // dispatch agentOptions — are composed from `decision.route`, ONE
+    // definition for both. For a locked selection the route carries the
+    // lock-named effort OR the adapter-declared `defaultEffort` the selector
+    // preflighted (its `why` claims it was selected); the engine used to
+    // rebuild both from `roleRouting`, discarding that default — the child's
+    // adapter applied it at request time while dispatch and pin omitted it,
+    // so the route could read `verified` without recording the effort that
+    // actually ran. Auto selections already composed from the route; the
+    // locked path now does too, so dispatch, pin, preflight and evidence can
+    // never disagree on the effort. The F11 doctrine is preserved in
+    // `lockedAgentOptions` (a stale legacy effort the lock omits stays
+    // excluded; legacy non-route tuning still rides on the equal-route
+    // branch), and a lock that names an effort is unchanged — the route
+    // carries the lock's own value.
+    const routePin: RoutingPin = {
+      provider: decision.route.provider,
+      model: decision.route.model,
+      ...(decision.route.reasoningEffort === undefined ? {} : { reasoningEffort: decision.route.reasoningEffort }),
+    }
+    return {
+      kind: 'dispatch',
+      agentOptions:
+        roleRouting.mode === 'locked'
+          ? this.lockedAgentOptions(role, roleRouting, decision.route)
+          : routePin,
+      routing: {
+        role,
+        pin: routePin,
+        why,
+        authorizationSource: decision.authorizationSource,
+        ...(decision.fallbackFrom === undefined ? {} : { fallbackFrom: decision.fallbackFrom }),
+        ...(decision.candidatesConsidered === undefined ? {} : { candidates: [...decision.candidatesConsidered] }),
+        ...(repinFrom === undefined ? {} : { repinFrom }),
+      },
+    }
+  }
+
+  /** Attach the repin provenance to a re-selection the dead pin forced. */
+  private decorateRepinned(decision: RoleRouteResolution, deadPin: RoutingPin, reason: string): RoleRouteResolution {
+    if (decision.kind !== 'dispatch' || decision.routing === undefined) return decision
+    return {
+      ...decision,
+      routing: {
+        ...decision.routing,
+        repinFrom: deadPin,
+        why: [`pin: re-selecting — ${reason}`, ...decision.routing.why],
+      },
+    }
+  }
+
+  /**
+   * The owner-escalation exit ([R2-P1-1] conflicts, dead locked routes, exhausted
+   * candidates): commit the EXISTING `set-owner-decision` op with the
+   * machine-readable `routing-escalation:` reason, then surface a typed error —
+   * state is committed first and survives, exactly like the plan-gate refusal
+   * and the revoked-executor path. No new op types, no new verdict words.
+   */
+  private async routingEscalation(root: AgentRef, prior: Snapshot, reason: string): Promise<never> {
+    await this.commit(prior, 'set-owner-decision', {
+      ...prior,
+      revision: prior.revision + 1,
+      phase: 'needs-owner-decision',
+      diagnostic: `routing-escalation: ${reason}`,
+    })
+    throw new AutopilotError(
+      `routing escalation: ${reason} — the run is needs-owner-decision; owner-resolve to arbitrate`,
+      'AP_ROUTING_ESCALATION',
+    )
+  }
+
+  // ── Planner model-selection install (M6; engine-local by plan "Roles and routing") ──
+
+  /**
+   * Resolve the PLANNER role's routing decision (M6). Same rule core and same
+   * vocabulary as {@link resolveRoleRoute}, but the outcome is an INSTALL, not
+   * a dispatch: `route` ⇒ install on the root agent's scoped ctx for the
+   * planning phases; `inherit` ⇒ nothing at all (the shipped default); every
+   * refusal (grant conflict, dead/blocked lock, exhausted auto candidates) is
+   * a RECORDED DEGRADATION to inheritance — the planner opt-in is an
+   * augmentation of the owner's own session, so unlike a dispatch role it
+   * never escalates the run and never blocks run start (packet E6:
+   * degradation is recorded, never silent, never fatal).
+   */
+  private async resolvePlannerRoute(
+    root: AgentRef | undefined,
+    next: Snapshot,
+  ): Promise<PlannerRouteDecision> {
+    // F2: the same per-decision live read as dispatch roles — a volatile
+    // patch to the routing section reaches the planner decision without a
+    // remount. An invalid live section refuses the install with a recorded
+    // degradation (never fatal, per the planner opt-in contract): the run
+    // plans on the deployment default until the config is valid again.
+    const live = this.routingConfig()
+    if (live.refused !== undefined) {
+      return {
+        kind: 'degraded',
+        why: [`routing: ${live.refused} — the planner install is refused; the run plans on the deployment default until the config is valid again`],
+      }
+    }
+    const routing = live.routing
+    const roleRouting = routing.roles.planner
+    // The shipped default: the planner inherits — GAH does not reroute the
+    // user's session model. Nothing is recorded beyond the config itself.
+    if (roleRouting.mode === 'inherit') return { kind: 'inherit' }
+    // Mode `off` with a default-`auto` planner keeps 0.2.0 parity, exactly as
+    // dispatch roles do (`routingActive`); a LOCKED planner is still a
+    // plugin-config grant and still applies in every mode.
+    if (!routingActive(routing, 'planner')) return { kind: 'inherit' }
+    // No live root agent ⇒ the policy cannot be read for its session; the
+    // unreachable state is the honest input, and the missing-ctx degradation
+    // below records the rest.
+    const policy: SessionPolicyState = root === undefined ? { kind: 'unreachable' } : this.readPolicy(root)
+    const catalog = this.routingPorts.catalog
+    const degrade = (reason: string, why: readonly string[], route?: { readonly provider: string; readonly model: string; readonly reasoningEffort?: string }):
+      { readonly kind: 'degraded'; readonly route?: { readonly provider: string; readonly model: string; readonly reasoningEffort?: string }; readonly why: readonly string[] } => ({
+      kind: 'degraded',
+      ...(route === undefined ? {} : { route }),
+      why: [...why, `planner: ${reason} — the planner decision degrades to inheritance; recorded, never fatal`],
+    })
+
+    if (roleRouting.mode === 'locked') {
+      const lock = {
+        provider: roleRouting.provider,
+        model: roleRouting.model,
+        ...(roleRouting.reasoningEffort === undefined ? {} : { reasoningEffort: roleRouting.reasoningEffort }),
+      }
+      // A lock is a plugin-config grant under the one rule ([R2-P1-1]). A
+      // grant CONFLICT means the session policy forbids this route: for a
+      // dispatch role that escalates the owner, but installing it here would
+      // route the user's own session against the deployment's allowlist —
+      // degrading to inheritance is the policy-RESPECTING outcome, recorded.
+      const grant = resolvePluginGrant({ provider: lock.provider, model: lock.model, source: 'routing-lock' }, policy)
+      if (grant.kind === 'conflict') return degrade('the locked planner route is a plugin-config grant outside the session model-selection policy — not installed', grant.why, lock)
+      // No catalog port: the grant stands and the install proceeds without
+      // liveness/preflight verification — the same 0.2.0 parity a locked
+      // dispatch role gets, with the skipped checks NAMED, not claimed.
+      if (catalog === undefined) {
+        return {
+          kind: 'route',
+          route: lock,
+          why: [
+            ...grant.why,
+            'catalog: no catalog port wired — provider liveness not checked and install preflight not run (0.2.0 parity)',
+          ],
+        }
+      }
+      // Full core resolution for the lock: liveness, exact facts, effort,
+      // preflight — `selectRoute` re-runs the same grant check internally.
+      const decision = await selectRoute({
+        role: 'planner',
+        risk: next.triage.risk,
+        preference: routing.preference,
+        roleRouting,
+        policy,
+        catalog,
+      })
+      if (decision.kind === 'route') return { kind: 'route', route: decision.route, why: decision.why }
+      if (decision.kind === 'inherit') return { kind: 'inherit' }
+      if (decision.kind === 'escalate-owner') return degrade(decision.reason, [decision.reason], lock)
+      return degrade(decision.reason, decision.why, lock)
+    }
+
+    // Auto planner: selection authority is the session policy ONLY ("auto
+    // with session policy"). Without a catalog port there are no live facts
+    // to select from — inheritance, the same no-catalog parity as dispatch
+    // roles (and an inherit decision records nothing).
+    if (catalog === undefined) return { kind: 'inherit' }
+    const decision = await selectRoute({
+      role: 'planner',
+      risk: next.triage.risk,
+      preference: routing.preference,
+      roleRouting,
+      policy,
+      catalog,
+    })
+    if (decision.kind === 'route') return { kind: 'route', route: decision.route, why: decision.why }
+    if (decision.kind === 'inherit') return { kind: 'inherit' }
+    if (decision.kind === 'escalate-owner') return degrade(decision.reason, [decision.reason])
+    return degrade(decision.reason, decision.why)
+  }
+
+  /**
+   * Arm one run's planner install (called at the commit that finds the run in
+   * a planning phase with no live install state). Records — and returns, for
+   * the event's detail — exactly what happened; `undefined` means an inherit
+   * decision, which records NOTHING.
+   */
+  private async armPlannerSelection(runId: RunId, next: Snapshot): Promise<PlannerRoutingRecord | undefined> {
+    const decision = await this.resolvePlannerRoute(this.agents.get(runId), next)
+    return await this.armPlannerDecision(runId, decision)
+  }
+
+  /**
+   * The arm itself, over an ALREADY-RESOLVED decision (F4: the refresh path
+   * re-resolves first, then arms the decision it compared — one resolution
+   * per arm, never two, so a volatile patch landing between comparison and
+   * arm cannot split one refresh across two decisions). Every state write
+   * carries the decision key the arm came from: that key is what the next
+   * planning-phase commit's change detection compares against.
+   */
+  private async armPlannerDecision(runId: RunId, decision: PlannerRouteDecision): Promise<PlannerRoutingRecord | undefined> {
+    const root = this.agents.get(runId)
+    const decisionKey = plannerDecisionKeyOf(decision)
+    // F25 (PR #2 Codex round 13): the arm may land here AFTER dispose()
+    // swept — the caller awaited planner route resolution (catalog/policy
+    // awaits that do not observe the abort), and the engine was torn down
+    // under it. Past the abort, arming is REFUSED at every state write below:
+    // no installer call, no map entry — a model selection installed now would
+    // survive plugin unload/reload and outlive the engine that owns it. The
+    // refusal is still RECORDED for installable decisions (the least-surprising
+    // existing shape: `unsupported`, why naming the disposal) so the deciding
+    // commit can stamp it durably; an inherit decision records nothing,
+    // exactly as a live-arm inherit does. Each guarded stretch is synchronous,
+    // so once past its guard no abort can interleave before the write.
+    if (decision.kind === 'inherit') {
+      if (this.lifecycle.signal.aborted) return undefined
+      this.plannerInstalls.set(runId, { kind: 'inherit' })
+      return undefined
+    }
+    const record = (status: 'routed' | 'unsupported', why: readonly string[]): PlannerRoutingRecord => ({
+      status,
+      ...(decision.kind === 'degraded' && decision.route === undefined ? {} : { route: decision.route }),
+      why,
+    })
+    if (this.lifecycle.signal.aborted) {
+      return record('unsupported', [
+        ...decision.why,
+        'planner: the engine was disposed while the route was resolving — arming refused so no model selection outlives the engine (degraded to inheritance)',
+      ])
+    }
+    // A decision that already refused to name an installable route degrades
+    // whatever the port situation — the refusal reasons are the record.
+    if (decision.kind === 'degraded') {
+      const degraded = record('unsupported', decision.why)
+      this.plannerInstalls.set(runId, { kind: 'armed', record: degraded, decision: decisionKey })
+      return degraded
+    }
+    const installer = this.routingPorts.modelSelectionInstaller
+    const agentCtx = root?.ctx
+    if (installer === undefined || agentCtx === undefined) {
+      const missing = installer === undefined
+        ? 'no modelSelectionInstaller port is wired (the host installModelSelection export was not reachable at mount)'
+        : 'the root agent exposes no scoped ctx for the install'
+      const unsupported = record('unsupported', [...decision.why, `planner: ${missing} — degraded to inheritance`])
+      this.plannerInstalls.set(runId, { kind: 'armed', record: unsupported, decision: decisionKey })
+      return unsupported
+    }
+    let dispose: (() => void) | undefined
+    try {
+      dispose = installer(agentCtx, decision.route)
+    } catch (error: unknown) {
+      const unsupported = record('unsupported', [...decision.why, `planner: the installer threw (${errorMessage(error)}) — degraded to inheritance`])
+      this.plannerInstalls.set(runId, { kind: 'armed', record: unsupported, decision: decisionKey })
+      return unsupported
+    }
+    if (dispose === undefined) {
+      const unsupported = record('unsupported', [...decision.why, 'planner: the installer declined (returned no disposer) — degraded to inheritance'])
+      this.plannerInstalls.set(runId, { kind: 'armed', record: unsupported, decision: decisionKey })
+      return unsupported
+    }
+    const routed = record('routed', [
+      ...decision.why,
+      'planner: model selection installed on the root agent\u2019s scoped ctx for the planning phases — the durable switch notice is the host\u2019s own; GAH adds nothing to the session',
+    ])
+    this.plannerInstalls.set(runId, { kind: 'armed', record: routed, dispose, decision: decisionKey })
+    return routed
+  }
+
+  /**
+   * F4 (PR #2 Codex review, round 2): re-evaluate an EXISTING planner install
+   * against CURRENT facts at every planning-phase commit. Since F2 made the
+   * routing values live, a volatile patch to `routing.roles.planner` (or
+   * `routing.mode`) mid-planning must reach the install within the planning
+   * window, not at its end — so the decision is re-resolved here, and only a
+   * CHANGED decision (different kind, or different full route identity)
+   * churns the install: the old one is disposed and the new decision armed
+   * atomically, with the refresh recorded (from→to) on the returning record.
+   * An UNCHANGED decision is a strict no-op — no dispose, no install, no
+   * record — so steady-state planning commits keep the arm-once economics the
+   * chokepoint always had (installer call count stable).
+   *
+   * Refresh-to-inherit returns the durable `status: 'inherit'` transition
+   * record instead of `undefined`: the disposal of a live install INSIDE the
+   * planning window is exactly the event the absent-field convention cannot
+   * express, and the packet requires it recorded.
+   *
+   * The reload stamp (P2-3) is deliberately PRESERVED across the internal
+   * dispose: the run never left planning, so the one-shot reload record is
+   * still owed — it rides whichever record this commit stamps (the refresh
+   * record when a refresh happened, else the armed state's record).
+   */
+  private async refreshPlannerInstall(runId: RunId, next: Snapshot): Promise<PlannerRoutingRecord | undefined> {
+    const state = this.plannerInstalls.get(runId)
+    if (state === undefined) return undefined
+    const previousDecision: PlannerDecisionKey = state.kind === 'inherit' ? { kind: 'inherit' } : state.decision
+    const decision = await this.resolvePlannerRoute(this.agents.get(runId), next)
+    if (samePlannerDecision(previousDecision, plannerDecisionKeyOf(decision))) return undefined
+    // F25: the re-resolution awaited catalog/policy facts, and the engine may
+    // have been disposed under it — the old install was already taken by
+    // dispose()'s sweep (disposePlanner is idempotent, so the one below is a
+    // no-op then). On a disposed engine there is nothing left to churn: no
+    // dispose/re-arm dance, no state entry, no record — the arm guard in
+    // {@link armPlannerDecision} refuses whatever a later path would try.
+    if (this.lifecycle.signal.aborted) return undefined
+    const from = state.kind === 'inherit'
+      ? 'inherit'
+      : `${state.record.status} ${plannerRouteLabel(state.record.route)}`
+    const owedReload = this.plannerReloadStamps.has(runId)
+    this.disposePlanner(runId)
+    if (owedReload) this.plannerReloadStamps.add(runId)
+    const note = (to: string): string =>
+      `planner: install refreshed mid-planning (${from} → ${to}) — the live routing decision changed, so the previous install was disposed and this one armed from CURRENT policy/catalog/routing facts at this commit; planning turns between the config change and this commit ran on the previous install`
+    if (decision.kind === 'inherit') {
+      this.plannerInstalls.set(runId, { kind: 'inherit' })
+      return { status: 'inherit', why: [note('inherit')] }
+    }
+    const armed = await this.armPlannerDecision(runId, decision)
+    // A non-inherit decision always arms to a record (routed or unsupported);
+    // the transition note is appended so from→to rides the durable commit,
+    // AND the armed state keeps the noted record — the live status surface and
+    // the durable detail name the same event, exactly as the arm path does.
+    const to = armed === undefined ? 'inherit' : `${armed.status} ${plannerRouteLabel(armed.route)}`
+    const noted = armed === undefined
+      ? { status: 'inherit' as const, why: [note(to)] }
+      : { ...armed, why: [...armed.why, note(to)] }
+    const armedState = this.plannerInstalls.get(runId)
+    if (armed !== undefined && armedState?.kind === 'armed' && armedState.record === armed) {
+      this.plannerInstalls.set(runId, { ...armedState, record: noted })
+    }
+    return noted
+  }
+
+  /**
+   * Dispose one run's planner install — exactly once, idempotently: the state
+   * entry is deleted FIRST, so a re-entrant or repeated call is a no-op, and a
+   * throwing disposer is swallowed (a teardown failure must never surface as
+   * a run error).
+   */
+  private disposePlanner(runId: RunId): void {
+    const state = this.plannerInstalls.get(runId)
+    this.plannerInstalls.delete(runId)
+    // The planning window closed: no later commit owes a reload re-arm record
+    // for it (P2-3) — dropping the pending stamp here keeps the one-shot honest.
+    this.plannerReloadStamps.delete(runId)
+    if (state === undefined || state.kind !== 'armed' || state.dispose === undefined) return
+    try {
+      state.dispose()
+    } catch {
+      // Never fatal — the run's transition is already committed.
+    }
+  }
+
+  /**
+   * The cross-family record for an actively-routed auditor dispatch: derived
+   * from the two-axis identity the core computed (or computed here for a locked
+   * route, which the core does not re-derive), with the honest ceiling kept.
+   */
+  private crossFamilyOfResolution(resolution: RoleRouteResolution, role: Role, prior: Snapshot): {
+    readonly outcome: CrossFamilyOutcome
+    readonly diagnostic?: string
+  } {
+    if (resolution.kind !== 'dispatch' || resolution.routing === undefined) return { outcome: 'unknown-family' }
+    const pin = resolution.routing.pin
+    if (pin === undefined) {
+      const required = RISK_ORDER.indexOf(prior.triage.risk) >= RISK_ORDER.indexOf(this.config.crossFamily.minRisk)
+      if (!required) return { outcome: 'not-required' }
+      return {
+        outcome: 'unknown-family',
+        diagnostic: 'the auditor dispatch inherits the deployment default (no explicit route), so its family is not observable here; cross-family can be claimed neither way',
+      }
+    }
+    const executorPin = this.executorPinOf(prior)
+    const required = AUDITOR_ROLE_SET.includes(role)
+      && RISK_ORDER.indexOf(prior.triage.risk) >= RISK_ORDER.indexOf(this.config.crossFamily.minRisk)
+    const record = independenceOf(pin, executorPin, required)
+    if (record.outcome === 'achieved') {
+      return {
+        outcome: record.outcome,
+        diagnostic: `independence: modelAxis ${record.modelAxis}, providerAxis ${record.providerAxis} (trim-exact id comparison only — no alias or lineage detection, no weight-independence claim)`,
+      }
+    }
+    if (record.outcome === 'not-required') return { outcome: record.outcome }
+    const label = record.outcome === 'same-family'
+      ? 'auditor and executor are not distinct on both axes — a blind spot shared by that family passes both gates unchallenged'
+      : 'the executor route is not observable (inheritance) — axes are unknown, order was unmodified'
+    return {
+      outcome: record.outcome,
+      diagnostic: `independence: modelAxis ${record.modelAxis}, providerAxis ${record.providerAxis} — ${label}`,
     }
   }
 
@@ -2037,7 +4526,7 @@ export class AutopilotEngine {
   }
 
   /** Apply one verdict to the state machine (shared by audit and selfCheck). */
-  private async applyVerdict(root: AgentRef, live: Snapshot, outcome: {
+  private async applyVerdict(root: AgentRef, liveIn: Snapshot, outcome: {
     role: AuditRole
     verdict: Verdict
     note: string
@@ -2045,7 +4534,14 @@ export class AutopilotEngine {
     route: RouteRecord
     external?: ExternalReview
     captured: { runRevision: number; planRevision: number; executionRevision: number }
+    /** The dispatch's routing decision; its pin rides THIS commit (M3b). */
+    routing?: RoutingDecisionDetail
   }): Promise<AuditOutcome> {
+    // The routing pin derives onto exactly the commit that records this
+    // dispatch's verdict, with the SAME shared rule the fold re-derives — every
+    // `{...live}` below inherits it, and `routingDetail` stamps the event.
+    const live = withRoutingDecision(liveIn, outcome.routing)
+    const routingDetail = outcome.routing === undefined ? undefined : { routing: outcome.routing }
     const record: AuditRecord = {
       ...(outcome.external === undefined ? {} : { external: outcome.external }),
       role: outcome.role,
@@ -2085,7 +4581,7 @@ export class AutopilotEngine {
           audits,
           consecutiveReplans: rounds,
           diagnostic: `bounded escalation: ${rounds} consecutive needs-replan rounds (max ${MAX_REPLAN_ROUNDS}); owner decision required`,
-        })
+        }, routingDetail)
         return result
       }
       const prior = this.current(root.id) ?? live
@@ -2101,7 +4597,7 @@ export class AutopilotEngine {
         consecutiveReplans: rounds,
         executor: keepOrSetExecutorState(live.executor, 'revoked'),
         executionPacket: undefined,
-      })
+      }, routingDetail)
       return result
     }
 
@@ -2139,7 +4635,7 @@ export class AutopilotEngine {
               phase: 'planning',
               audits,
               diagnostic: `plan gate refused despite a pass verdict: ${usageProblems.join('; ')}`,
-            })
+            }, routingDetail)
             throw new AutopilotError(
               `plan gate refused: usage evidence must be declared before the plan gate can pass: ${usageProblems.join('; ')}`,
               'AP_USAGE_UNDECLARED',
@@ -2160,7 +4656,7 @@ export class AutopilotEngine {
             ...(live.planGatePassedAt === undefined
               ? { planGatePassedAt: new Date().toISOString() }
               : {}),
-          })
+          }, routingDetail)
         } else if (outcome.role === 'execution') {
           await this.commit(live, op, {
             ...live,
@@ -2170,14 +4666,14 @@ export class AutopilotEngine {
             audits,
             consecutiveReplans: 0,
             executor: keepOrSetExecutorState(live.executor, 'completed'),
-          })
+          }, routingDetail)
         } else {
           // rules: record-only on pass; completion reads it via latestVerdicts.
           await this.commit(live, op, {
             ...live,
             revision: live.revision + 1,
             audits,
-          })
+          }, routingDetail)
         }
         return result
       }
@@ -2189,7 +4685,7 @@ export class AutopilotEngine {
           executionGate: 'needs-fix',
           audits,
           executionPacket: undefined,
-        })
+        }, routingDetail)
         return result
       }
       case 'blocked': {
@@ -2201,7 +4697,7 @@ export class AutopilotEngine {
           executionGate: outcome.role === 'plan' ? live.executionGate : 'blocked',
           audits,
           diagnostic: outcome.note,
-        })
+        }, routingDetail)
         return result
       }
       case 'needs-owner-decision': {
@@ -2213,7 +4709,7 @@ export class AutopilotEngine {
           executionGate: outcome.role === 'plan' ? live.executionGate : 'needs-owner-decision',
           audits,
           diagnostic: outcome.note,
-        })
+        }, routingDetail)
         return result
       }
       default: {
@@ -2258,6 +4754,10 @@ export class AutopilotEngine {
         : { executor: { generation: snapshot.executor.generation, state: snapshot.executor.state } }),
       enforcement: snapshot.enforcement,
       closeoutSubmitted: snapshot.closeout !== undefined,
+      ...((): { plannerRouting?: PlannerRoutingRecord } => {
+        const planner = this.plannerInstalls.get(snapshot.runId)
+        return planner?.kind === 'armed' ? { plannerRouting: planner.record } : {}
+      })(),
       ...(snapshot.diagnostic === undefined ? {} : { diagnostic: snapshot.diagnostic }),
     }
   }

@@ -4,7 +4,7 @@ import { mkdtempSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { AutopilotEngine } from '../src/engine.js'
-import type { AgentRef, EnvironmentProbes, ResolvedConfig, SubagentsRef, SubagentRunRef } from '../src/engine.js'
+import type { AgentOptionsLike, AgentRef, EnvironmentProbes, ResolvedConfig, RoutingPorts, SubagentsRef, SubagentRunRef } from '../src/engine.js'
 import { resolveConfig } from '../src/index.js'
 import { RunStore } from '../src/store/file.js'
 import type { Snapshot, Triage, UsageEntry } from '../src/domain/types.js'
@@ -49,12 +49,16 @@ export interface FakeAgent extends AgentRef {
   readonly session: AgentRef['session'] & { append(type: string, data: unknown): void }
 }
 
-export function fakeAgent(id: string, parentSession?: string, cwd?: string): FakeAgent {
+export function fakeAgent(id: string, parentSession?: string, cwd?: string, ctx?: unknown): FakeAgent {
   const events: Array<{ type: string; data: unknown }> = []
   return {
     id,
     appended: events,
     options: { provider: 'fake', model: 'fake-model' },
+    // M6 ([R2-P3-1]): the scoped ctx is PRESENT only on real host agents —
+    // a test stubs it deliberately (the planner install requires it), and
+    // every other fixture keeps the absent-means-absent shape.
+    ...(ctx === undefined ? {} : { ctx }),
     session: {
       header: {
         ...(parentSession === undefined ? {} : { parentSession }),
@@ -75,28 +79,82 @@ export class FakeAgents {
 }
 
 /** Scripted one-shot verdicts, FIFO. */
+export interface StubVerdictScript {
+  verdict: string
+  note: string
+  /**
+   * Override the child's logged `request/header` route (M4 observed leg).
+   * Absent ⇒ the stub logs a header AGREEING with the dispatch — what a
+   * healthy host does. `null` ⇒ no header event at all (observed unreadable).
+   * An object ⇒ a scripted divergence (model axis, provider axis, effort).
+   */
+  requestHeader?: { provider?: string; model?: string; reasoningEffort?: string } | null
+}
+
 export function stubSubagents(script: {
-  verdicts?: Array<{ verdict: string; note: string } | { stopReason: string }>
+  verdicts?: Array<StubVerdictScript | { stopReason: string }>
   onFollowup?: (childId: string, text: string) => void
   onStartContinuable?: (childId: string) => void
   failContinuable?: boolean
   followupFails?: number
-} = {}): SubagentsRef & { followups: Array<{ childId: string; text: string }>; started: string[] } {
+} = {}): SubagentsRef & {
+  followups: Array<{ childId: string; text: string }>
+  started: string[]
+  /** The agentOptions each one-shot auditor dispatch received (undefined = inherit). */
+  auditOptions: Array<AgentOptionsLike | undefined>
+  /** The agentOptions each continuable executor dispatch received (undefined = inherit). */
+  continuableOptions: Array<AgentOptionsLike | undefined>
+} {
   const verdicts = [...(script.verdicts ?? [])]
   const followups: Array<{ childId: string; text: string }> = []
   const started: string[] = []
+  const auditOptions: Array<AgentOptionsLike | undefined> = []
+  const continuableOptions: Array<AgentOptionsLike | undefined> = []
   let auditCounter = 0
   let followupFailsLeft = script.followupFails ?? 0
   return {
     followups,
     started,
-    async start(_provider, _request) {
+    auditOptions,
+    continuableOptions,
+    async start(_provider, request) {
+      auditOptions.push(request.agentOptions)
       const next = verdicts.shift()
       auditCounter += 1
       const id = `auditor-${auditCounter}`
+      // The child the real host would create (`resolveChildAgentOptions`:
+      // the parent's route unless the request overrides it): creation options
+      // echo the dispatch, and the session logs a `request/header` for the
+      // request the child actually sent — AGREEING with the dispatch unless a
+      // test scripts a divergence via `requestHeader`.
+      const override = next !== undefined && !('stopReason' in next) ? next.requestHeader : undefined
+      const childOptions = {
+        provider: request.agentOptions?.provider ?? 'stub-llm',
+        model: request.agentOptions?.model ?? 'stub-model',
+      }
+      const effort = override !== null && override !== undefined && override.reasoningEffort !== undefined
+        ? override.reasoningEffort
+        : request.agentOptions?.reasoningEffort
+      const events: Array<{ type: string; data: unknown }> = override === null ? [] : [{
+        type: 'request/header',
+        data: {
+          header: {
+            config: {
+              provider: override?.provider ?? childOptions.provider,
+              model: override?.model ?? childOptions.model,
+              ...(effort === undefined ? {} : { reasoningEffort: effort }),
+            },
+          },
+          reason: 'initial',
+        },
+      }]
       const run: SubagentRunRef = {
         id,
-        localAgent: { id, session: { header: {}, snapshotEvents: () => [], append() {} }, options: { provider: 'stub-llm', model: 'stub-model' } },
+        localAgent: {
+          id,
+          session: { header: {}, snapshotEvents: () => events.slice(), append() {} },
+          options: childOptions,
+        },
         result: Promise.resolve(
           next === undefined
             ? { stopReason: 'error', diagnostic: 'script exhausted' }
@@ -111,6 +169,7 @@ export function stubSubagents(script: {
     async startContinuable(spec) {
       if (script.failContinuable === true) throw new Error('continuable startup failed (scripted)')
       started.push(spec.childId)
+      continuableOptions.push(spec.request.agentOptions)
       script.onStartContinuable?.(spec.childId)
       return {}
     },
@@ -146,11 +205,15 @@ export function makeHarness(options: {
   sandboxAvailable?: () => boolean
   /** Remaining enforcement bearers; each defaults to the LEAST capable answer. */
   environment?: EnvironmentProbes
+  /** Routing ports (M3b): a stub catalog/policy pair; absent ⇒ 0.2.0/inherit parity. */
+  routing?: RoutingPorts
+  /** M6: a deliberate scoped-ctx stub on the fake root agent (the planner install leg). */
+  rootCtx?: unknown
   cwd?: string
 } = {}): Harness {
   const storeDir = mkdtempSync(join(tmpdir(), 'dsh-autopilot-test-'))
   const agents = new FakeAgents()
-  const root = fakeAgent('root-1', undefined, options.cwd)
+  const root = fakeAgent('root-1', undefined, options.cwd, options.rootCtx)
   agents.add(root)
   const subagents = options.subagents ?? stubSubagents()
   const config: ResolvedConfig = resolveConfig(options.config)
@@ -161,6 +224,7 @@ export function makeHarness(options: {
     config,
     options.sandboxAvailable ?? (() => true),
     options.environment ?? {},
+    options.routing ?? {},
   )
   return { engine, agents, subagents, root, storeDir }
 }

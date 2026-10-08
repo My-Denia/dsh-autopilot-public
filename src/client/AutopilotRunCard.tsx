@@ -22,6 +22,7 @@ import type { CSSProperties } from 'react'
 import type {
   AutopilotAuditRow, AutopilotRunChatData, Observed,
 } from './definition.js'
+import { routeStatusView } from './definition.js'
 import { fetchLiveRun, overlayLive, pollDelayMs, pollKey, shouldPoll } from './live.js'
 import type { LiveFetch, LiveRun } from './live.js'
 
@@ -243,14 +244,20 @@ function Field({ label, at }: { label: string; at: Observed<unknown> | undefined
 /** One audit dispatch row: role, verdict, and the auditor that produced it. */
 function AuditRow({ row }: { row: AutopilotAuditRow }): JSX.Element {
   const verdict = row.failed ? 'errored' : row.settled ? (row.verdict ?? 'no verdict') : 'in flight'
-  const route = row.route as { routeModel?: unknown; routeStatus?: unknown } | undefined
+  const route = row.route
+  // Route status is PROVENANCE, not a verdict: the suffix states what the
+  // record could and could not observe (`routeStatusView` is pure and tested);
+  // on mismatch/unverifiable the hover title carries the record's own
+  // diagnostic, which is where the differing axes are named. The suffix never
+  // alters the verdict badge above it.
+  const status = routeStatusView(route)
   return (
     <li style={{ marginBottom: 2 }}>
       <span style={badge(toneOf(row.settled && !row.failed ? row.verdict : undefined))}>{verdict}</span>
       <span> {row.kind}</span>
       <span style={muted}> · role {row.role ?? 'unstated'}</span>
       {typeof route?.routeModel === 'string'
-        ? <span style={muted}> · {route.routeModel}{route.routeStatus === 'unverified' ? ' (unverified route)' : ''}</span>
+        ? <span style={muted} title={status.title}> · {route.routeModel}{status.suffix}</span>
         : null}
     </li>
   )

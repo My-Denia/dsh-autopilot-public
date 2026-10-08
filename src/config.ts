@@ -18,10 +18,12 @@
  * value with `storeKind:'auto'` and no issues — exactly the silent default this
  * module claims to have eliminated. `strict` is not reachable from the public
  * builder API, so the known-key surface is declared once in
- * {@link CONFIG_KEY_SPEC} and enforced by a transform composed alongside the
- * shape. A claim a checker cannot observe being false is the one thing this
- * repository's doctrine forbids, so the check exists rather than the wording
- * being softened.
+ * {@link CONFIG_KEY_SPEC} and enforced as a pre-resolution refusal in the
+ * `~standard` façade below (formerly a transform composed alongside the
+ * shape; see {@link Config} for why the composition changed when routing
+ * gained volatile fields). A claim a checker cannot observe being false is
+ * the one thing this repository's doctrine forbids, so the check exists
+ * rather than the wording being softened.
  *
  * WHY the Standard-Schema protocol makes a second physical copy of
  * Schemastery harmless here: the host touches only `['~standard'].validate`,
@@ -97,12 +99,108 @@ const AgentOptions = Schema.object({
   provider: Schema.string().description('LLM provider id.'),
   model: Schema.string().description('Model id.'),
   maxTokens: Schema.natural().description('Per-child output cap.'),
+  /**
+   * Reasoning effort ([R2-P3-1]). Declared here so a legacy route may name
+   * one; it is validated against exact model capability by the dispatch
+   * preflight (`resolveCallConfig`) and NEVER invented. `AgentOptionsLike`
+   * in `./engine.ts` is widened by packet E3 — the config layer declares the
+   * wider input shape first (`AgentOptionsInput` in `./index.ts`).
+   */
+  reasoningEffort: Schema.string().description('Reasoning effort; validated at dispatch preflight, never invented.'),
 })
 
 /** Per-role auditor routing (the cross-family review matrix's landing point). */
 const AuditorRoute = Schema.object({
   provider: Schema.string().description('Subagent transport provider for this role.'),
   agentOptions: AgentOptions,
+})
+
+/**
+ * One explicit route lock: the new `routing` section's grant shape.
+ *
+ * WHY A TRANSFORM REFINEMENT AND NOT TWO `.required()` FIELDS: schemastery's
+ * object resolver runs on the cloned `{}` default too, so required children
+ * would make an ABSENT lock invalid — the optional-ness lives at the field
+ * level, and the pairing rule is enforced on whatever object IS present:
+ * a lock is either absent/blank or a FULL route (provider and model
+ * together; a lone `reasoningEffort` names tuning for a route that was never
+ * named, which is exactly the silently-inert config this module refuses to
+ * ship). Blank strings count as absent (trim-exact, the identity axis rule
+ * from `./routing/identity.ts`), so `{ provider: ' ' }` alone is a no-op
+ * lock, not a refusal. Resolve-time (`resolveConfig`) makes the same rule
+ * unrepresentable for hand-built config objects: `mode: 'locked'` without a
+ * lock route throws there, because the schema cannot see `mode` from inside
+ * `lock` (a role-level transform would wrap the whole role object and
+ * schemastery forbids volatile fields under a transform — see {@link Config}).
+ */
+const RouteLock = Schema.transform(
+  Schema.object({
+    provider: Schema.string().description('Locked provider route key.'),
+    model: Schema.string().description('Locked model id.'),
+    reasoningEffort: Schema.string().description('Optional reasoning effort; validated at dispatch preflight, never invented.'),
+  }),
+  (value: { provider?: string | null; model?: string | null; reasoningEffort?: string | null }, options?: unknown) => {
+    const present = (field: string | null | undefined): boolean => field !== undefined && field !== null && field.trim().length > 0
+    const claimsRoute = present(value.provider) || present(value.model) || present(value.reasoningEffort)
+    if (!claimsRoute) return value
+    const missing: string[] = []
+    if (!present(value.provider)) missing.push('provider')
+    if (!present(value.model)) missing.push('model')
+    if (missing.length > 0) {
+      throw new Schema.ValidationError(
+        `routing lock requires provider and model together (missing: ${missing.join(', ')})`,
+        (options ?? {}) as never,
+      )
+    }
+    return value
+  },
+)
+
+/**
+ * Per-role routing. `planner` defaults to `'inherit'` (plan "Roles and
+ * routing": the planner IS the root agent, and GAH does not reroute the
+ * user's session model unless opted in); every other role defaults to
+ * `'auto'`.
+ *
+ * WHY A FACTORY AND NOT ONE SHARED SCHEMA: only the `mode` default differs,
+ * and schemastery defaults live in node metadata — one shared instance would
+ * give every role the last-applied default.
+ */
+const RoleRoutingShape = (defaultMode: 'auto' | 'inherit') => Schema.object({
+  mode: Schema.union([
+    Schema.const('auto').description('Select from the authorized set by the ordered rule table.'),
+    Schema.const('inherit').description('Never reroute this role; the deployment default applies.'),
+    Schema.const('locked').description('Always dispatch the locked route (a plugin-config grant).'),
+  ]).default(defaultMode).volatile(),
+  lock: RouteLock.volatile(),
+  minContext: Schema.natural().volatile().description(
+    'Role floor in tokens for this role\'s EXPLICIT selections (unknown context windows stay eligible, ranked last). '
+    + 'Applies in auto mode only; defaults are declared in src/routing/select.ts.',
+  ),
+})
+
+/**
+ * Role-true model routing (plan v3 "Config"). Every leaf is `.volatile()`:
+ * machine-readable, patch-writable config — no shipped Settings GUI is
+ * claimed for it (the visible control surface is the run card).
+ */
+const RoutingShape = Schema.object({
+  mode: Schema.union([
+    Schema.const('auto').description('Route by the ordered rule table over the session-authorized set.'),
+    Schema.const('off').description('Reproduce 0.2.0 dispatch semantics (legacy config surfaces only).'),
+  ]).default('auto').volatile(),
+  preference: Schema.union([
+    Schema.const('balanced').description('Efforts preferred, then context window descending.'),
+    Schema.const('economy').description('Smallest sufficient context window first.'),
+    Schema.const('quality').description('Reasoning efforts first, then context window descending.'),
+  ]).default('balanced').volatile(),
+  roles: Schema.object({
+    executor: RoleRoutingShape('auto'),
+    planner: RoleRoutingShape('inherit'),
+    planAuditor: RoleRoutingShape('auto'),
+    executionAuditor: RoleRoutingShape('auto'),
+    rulesAuditor: RoleRoutingShape('auto'),
+  }),
 })
 
 /**
@@ -147,6 +245,9 @@ const ConfigShape = Schema.object({
     pool: Schema.array(AgentOptions).default([])
       .description('Candidate auditor routes to draw an out-of-family reviewer from.'),
   }).description('Cross-family review: a blind spot shared by one provider passes both gates unchallenged, so at risk the reviewer should not be from the builder family. A strategy, not a gate — the outcome is recorded per audit rather than enforced.'),
+  routing: RoutingShape.description(
+    'Role-true model routing over the live catalog. Every GAH-config-sourced explicit route (a lock, legacy role config, a legacy pool pick) is a plugin-config grant under one rule in every mode; a grant outside an existing session model-selection policy escalates to the owner instead of dispatching. In auto mode the routing core subsumes the legacy pool fallback: pool entries stay consultable as grants, never widen the session-authorized set, and never override a role lock.',
+  ),
   gate: Schema.object({
     sandboxCoupling: Schema.boolean().default(true).description('Clamp standard runs read-only until the plan gate passes.'),
     toolDeny: Schema.boolean().default(true).description('Deny write/edit/str_replace_editor pre-plan-gate and while usage is undeclared.'),
@@ -172,8 +273,20 @@ interface KeySpec {
 }
 
 /** The route shape both `auditors.*` and `executor` reuse. */
-const AGENT_OPTIONS_KEYS: KeySpec = { provider: null, model: null, maxTokens: null }
+const AGENT_OPTIONS_KEYS: KeySpec = { provider: null, model: null, maxTokens: null, reasoningEffort: null }
 const AUDITOR_ROUTE_KEYS: KeySpec = { provider: null, agentOptions: AGENT_OPTIONS_KEYS }
+/** The lock shape inside `routing.roles.<role>` (mirrors {@link RouteLock}). */
+const ROUTE_LOCK_KEYS: KeySpec = { provider: null, model: null, reasoningEffort: null }
+/** One `routing.roles.<role>` entry. */
+const ROLE_ROUTING_KEYS: KeySpec = { mode: null, lock: ROUTE_LOCK_KEYS, minContext: null }
+/** The five routable roles, exactly as the shape declares them. */
+const ROUTING_ROLES_KEYS: KeySpec = {
+  executor: ROLE_ROUTING_KEYS,
+  planner: ROLE_ROUTING_KEYS,
+  planAuditor: ROLE_ROUTING_KEYS,
+  executionAuditor: ROLE_ROUTING_KEYS,
+  rulesAuditor: ROLE_ROUTING_KEYS,
+}
 
 /**
  * Every key a profile may write, mirroring {@link ConfigShape} exactly.
@@ -189,6 +302,7 @@ const CONFIG_KEY_SPEC: KeySpec = {
   auditors: { plan: AUDITOR_ROUTE_KEYS, execution: AUDITOR_ROUTE_KEYS, rules: AUDITOR_ROUTE_KEYS },
   executor: { agentOptions: AGENT_OPTIONS_KEYS, persona: null, toolAllowList: null },
   crossFamily: { enabled: null, minRisk: null, pool: null },
+  routing: { mode: null, preference: null, roles: ROUTING_ROLES_KEYS },
   gate: {
     sandboxCoupling: null,
     toolDeny: null,
@@ -218,35 +332,69 @@ function unknownKeys(value: unknown, spec: KeySpec, prefix: string): string[] {
   return found
 }
 
-/**
- * The unknown-key half of the contract. Composed with {@link ConfigShape}
- * through `Schema.intersect`, which resolves each member in STRICT mode and
- * therefore hands this transform the RAW profile fragment — the only place a
- * key the shape does not declare is still visible.
- */
-const UnknownKeyGuard = Schema.transform(Schema.any(), (value: unknown, options?: unknown) => {
+/** The refusal half, as standard-schema issues; `undefined` when nothing is unknown. */
+function unknownKeyIssues(value: unknown): { issues: Array<{ message: string; path?: readonly PropertyKey[] }> } | undefined {
   const unknown = unknownKeys(value, CONFIG_KEY_SPEC, '')
-  if (unknown.length > 0) {
-    throw new Schema.ValidationError(
-      `unknown dsh-autopilot config key(s): ${unknown.join(', ')}`,
-      (options ?? {}) as never,
-    )
-  }
-  return {}
-})
+  if (unknown.length === 0) return undefined
+  return { issues: [{ message: `unknown dsh-autopilot config key(s): ${unknown.join(', ')}` }] }
+}
 
 /**
- * Declared plugin configuration: the shape plus the unknown-key refusal.
+ * Declared plugin configuration: the volatile-marked shape plus the
+ * unknown-key refusal, composed as a Standard-Schema façade over
+ * {@link ConfigShape}.
  *
- * Both halves are load-bearing and both are covered by a negative fixture in
- * `test/config.test.ts` — a type error, an enum violation, an unknown top-level
- * key and an unknown nested key each produce an issue naming what was wrong.
+ * WHY A FAÇADE AND NOT `Schema.intersect([ConfigShape, UnknownKeyGuard])`
+ * (the composition this module shipped before routing). Schemastery 3.18's
+ * volatility is STRUCTURAL: `Schema.resolve` runs `validateVolatileSchema`,
+ * which refuses a volatile field anywhere under a union/intersect/transform
+ * member ("volatile fields require a fixed object path without an enclosing
+ * volatile field" — intersect members resolve in strict mode and count as
+ * blocked paths, measured 2026-10-07 against @deepseek-ai/schemastery 3.18.4).
+ * The plan's routing leaves are declared `.volatile()`, so the ROOT of this
+ * schema must itself be the object schema — the fixed path volatility
+ * requires — and the unknown-key guard moved to a pre-resolution step in
+ * `['~standard'].validate`.
  *
- * The annotation is explicit (and the cast with it) because the inferred
- * intersect type reaches into a transitive `cosmokit` path TypeScript cannot
- * name from here; stating the contract — a validator whose accepted input and
- * produced value are both `ConfigInput` — is more useful to a reader than the
- * structural type anyway.
+ * That is the only surface the host touches (cordis resolves plugin config
+ * exclusively through `runtime.Config['~standard'].validate`, measured in
+ * `vendor/cordis/src/fiber.ts`) and the one every fixture in
+ * `test/config.test.ts` drives; the callable form is preserved for parity
+ * with the schema instance it replaces. The guard still sees the RAW profile
+ * fragment — exactly what the intersect's strict-mode transform used to
+ * receive — so its refusal semantics are unchanged: unknown keys are named
+ * with their dotted path and the profile is refused BEFORE any default is
+ * applied or any volatile reference is built.
+ *
+ * VOLATILE OUTPUT, STATED PLAINLY. Resolving this schema hands back, for
+ * every `.volatile()` leaf, a stable reference object (cosmokit `Volatile`,
+ * read via `.get()`) instead of a plain value — that is the mechanism the
+ * plan's "backend + patch-writable" marking rides on, and it is why
+ * `resolveConfig` in `./index.ts` unwraps references structurally: the
+ * loader path and the plain-object path must keep producing the SAME
+ * `ResolvedConfig`, which `test/config.test.ts` asserts by deep equality.
+ *
+ * The annotation is explicit (and the cast with it) for the same reason as
+ * before: the façade is not a class instance of `Schema`, and stating the
+ * contract — a validator whose accepted input and produced value are both
+ * `ConfigInput` — is more useful to a reader than the structural type anyway.
  */
-export const Config: Schema<ConfigInput, ConfigInput> =
-  Schema.intersect([ConfigShape, UnknownKeyGuard]) as unknown as Schema<ConfigInput, ConfigInput>
+function validateConfig(raw: unknown): { value?: ConfigInput; issues?: readonly { message: string }[] } {
+  const blocked = unknownKeyIssues(raw)
+  if (blocked !== undefined) return blocked
+  return ConfigShape['~standard'].validate(raw) as { value?: ConfigInput; issues?: readonly { message: string }[] }
+}
+
+export const Config: Schema<ConfigInput, ConfigInput> = ((raw: unknown, options?: unknown) => {
+  const blocked = unknownKeyIssues(raw)
+  if (blocked !== undefined) {
+    throw new Schema.ValidationError(blocked.issues[0]!.message, (options ?? {}) as never)
+  }
+  return ConfigShape(raw as never, options as never)
+}) as unknown as Schema<ConfigInput, ConfigInput>
+
+;(Config as unknown as Record<string, unknown>)['~standard'] = {
+  version: 1,
+  vendor: 'dsh-autopilot',
+  validate: (value: unknown) => validateConfig(value),
+}

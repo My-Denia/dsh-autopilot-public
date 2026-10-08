@@ -40,7 +40,7 @@ import { describe, expect, it } from 'vitest'
 import {
   AUTOPILOT_RUN_ID, AUTOPILOT_RUN_KIND, applyCall, applyResult, createAutopilotRunDefinition,
   emptyState, isAppendSurfaceEventMirror, readCall, readDispatch, readDispatchStart, readResult,
-  safeJsonObject,
+  routeStatusView, safeJsonObject,
 } from '../src/client/definition.js'
 import type {
   AutopilotRunChatData, AutopilotRunDefinition, AutopilotRunState, CardEvent, CardMatch,
@@ -1040,5 +1040,89 @@ describe('B17 — the poll key falls back to the session id, soundly', () => {
     expect(after.data.runId).toBe(SESSION)
     // …and it needs no fallback once it has one.
     expect(pollKey(after.data)).toBe(SESSION)
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
+// M4 — route-status rendering (plan v3). The card component itself can never
+// be mounted here (react is host-provided), so the RENDERING DECISION is the
+// pure `routeStatusView` — the same pattern the poll hook uses — and the DATA
+// it renders is proven by a fold passthrough below. Together these are the
+// `card-routes-rendered` boundary state; the statuses themselves are produced
+// by test/engine-route.test.ts on the `card-empty-catalog` configuration.
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('routeStatusView — the four states the card renders beside a route model', () => {
+  it('verified renders PLAIN: the record claims nothing to correct', () => {
+    expect(routeStatusView({ routeModel: 'm-c', routeStatus: 'verified' })).toEqual({ suffix: '' })
+  })
+
+  it('unverified keeps the 0.2.0 suffix verbatim', () => {
+    expect(routeStatusView({ routeStatus: 'unverified' })).toEqual({ suffix: ' (unverified route)' })
+  })
+
+  it('mismatch says so, and the hover title carries the diagnostic that names the axes', () => {
+    const view = routeStatusView({
+      routeStatus: 'mismatch',
+      routeDiagnostic: "route mismatch — the dispatch did not run the recorded route: model: selected m-c vs observed m-imposter",
+    })
+    expect(view.suffix).toBe(' (route mismatch)')
+    expect(view.title).toContain('model')
+    expect(view.title).toContain('m-imposter')
+  })
+
+  it('unverifiable says so, with the failed read as the title', () => {
+    const view = routeStatusView({
+      routeStatus: 'unverifiable',
+      routeDiagnostic: 'route unverifiable: observed route not readable: no well-formed request/header event in the child session',
+    })
+    expect(view.suffix).toBe(' (route unverifiable)')
+    expect(view.title).toContain('request/header')
+  })
+
+  it('an unrecognised or absent status stays PLAIN rather than guessing a mood', () => {
+    expect(routeStatusView(undefined)).toEqual({ suffix: '' })
+    expect(routeStatusView({ routeStatus: 'diverged' })).toEqual({ suffix: '' })
+    expect(routeStatusView('a string')).toEqual({ suffix: '' })
+  })
+
+  it('a status without a diagnostic renders its suffix with no invented title', () => {
+    expect(routeStatusView({ routeStatus: 'mismatch' })).toEqual({ suffix: ' (route mismatch)' })
+  })
+})
+
+describe('the fold passes the M4 route record through to the card verbatim', () => {
+  it('a settled audit row carries observed, routeStatus, and the diagnostic untouched', () => {
+    const route = {
+      provider: 'spawn',
+      routeProvider: 'beta',
+      routeModel: 'm-c',
+      routeStatus: 'mismatch',
+      routeDiagnostic: 'route mismatch — the dispatch did not run the recorded route: model: selected m-c vs observed m-imposter',
+      selected: { provider: 'beta', model: 'm-c' },
+      observed: { provider: 'beta', model: 'm-imposter' },
+      why: ['selected from the authorized set'],
+    }
+    const call: CardEvent = {
+      type: 'tool/call', seq: 10, time: 0, surfaceOp: 'append',
+      data: { name: 'autopilot_audit', callId: 'call-m4', arguments: JSON.stringify({ role: 'plan', prompt: 'x' }) },
+    }
+    const result: CardEvent = {
+      type: 'tool/result', seq: 11, time: 0, surfaceOp: 'append',
+      data: {
+        message: {
+          source: { kind: 'tool', callId: 'call-m4' },
+          content: [{ content: [{ type: 'text', text: JSON.stringify({ verdict: 'pass', note: 'ok', auditorId: 'a-1', route }) }] }],
+        },
+      },
+    }
+    let state = applyCall(emptyState(), { event: call, role: 'start', location: null })
+    state = applyResult(state, { event: result, role: 'update', location: null })
+    const row = state.data.audits.at(-1)
+    expect(row?.settled).toBe(true)
+    expect(row?.route).toEqual(route)
+    // And the rendering decision reads exactly what the fold preserved.
+    expect(routeStatusView(row?.route).suffix).toBe(' (route mismatch)')
+    expect(String(routeStatusView(row?.route).title)).toContain('m-imposter')
   })
 })
