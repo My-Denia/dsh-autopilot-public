@@ -1170,3 +1170,166 @@ describe('F7 (PR #2 round 3): pool fallback liveness and preflight', () => {
     expect(routing?.why?.some(entry => entry.includes('no catalog port wired — provider liveness not checked and dispatch preflight not run'))).toBe(true)
   })
 })
+
+// ── F9/F10 (PR #2 Codex round 4): the pool is an AUDITOR grant — never an executor authorization ──
+
+describe('F9/F10 (PR #2 round 4): auditor-only pool grants and pool fallback', () => {
+  /** The executor pin a PRESENT_ABC run settles on (balanced, context-descending): equal to the pool entry below. */
+  const EXECUTOR_PIN = { provider: 'beta', model: 'm-c', reasoningEffort: 'high' }
+
+  /** A policy cell the test can flip in place (same closure discipline as the F1 block). */
+  function flippable(initial: SessionPolicyState): {
+    readonly ports: RoutingPorts
+    readonly flip: (next: SessionPolicyState) => void
+  } {
+    const cell: { policy: SessionPolicyState } = { policy: initial }
+    const catalog = new RouteCatalog(new StubLlm(MODELS))
+    return { ports: { catalog, policyReader: () => cell.policy }, flip: next => { cell.policy = next } }
+  }
+
+  /** The last routing detail for one (op, role) pair in the durable stream. */
+  function lastRoutingOf(h: Harness, op: string, role: string): RoutingDecisionDetail | undefined {
+    const details = routingDetails(h).filter(detail => detail.op === op && detail.role === role)
+    return details[details.length - 1]
+  }
+
+  /**
+   * (a) F9: an EXECUTOR pin that equals a pool entry is not pool-authorized.
+   * The pool-equality check used to be role-agnostic, so the pin survived a
+   * policy flip to absent as a phantom plugin-config grant. Now the pin is
+   * refused on the F1 machinery (conservative re-selection ⇒ inheritance with
+   * repinFrom), and the F10 guard keeps the pool from re-dispatching the
+   * executor afterwards: the second start carries only the owner's routeless
+   * legacy tuning, never a route.
+   */
+  it('(a) an executor pin equal to a pool entry + policy flips absent ⇒ NOT pool-authorized: conservative re-selection (inheritance) with repinFrom, no pool dispatch', async () => {
+    const wiring = flippable(PRESENT_ABC)
+    const h = makeHarness({
+      routing: wiring.ports,
+      config: {
+        executor: { agentOptions: { provider: 'alpha' } },
+        crossFamily: { enabled: true, minRisk: 'medium', pool: [{ provider: 'beta', model: 'm-c' }] },
+      },
+      subagents: stubSubagents({ verdicts: [
+        { verdict: 'pass', note: 'plan ok' },
+        { verdict: 'pass', note: 'plan ok again' },
+      ] }),
+    })
+    const signal = new AbortController().signal
+    await h.engine.init(h.root, makeTriage(STANDARD_DELEGATED), [undeclaredSeed('m1')])
+    await h.engine.declareUsage(h.root, makeUsageEntry({ id: 'm1' }))
+    await h.engine.submitPlan(h.root, 'plan')
+    await h.engine.audit(h.root, { role: 'plan', prompt: 'packet' })
+
+    // First dispatch: the executor SELECTS beta/m-c from the present policy and pins it.
+    await h.engine.startExecutor(h.root, { prompt: 'implement', signal })
+    expect(h.subagents.continuableOptions[0]).toEqual(EXECUTOR_PIN)
+    expect(h.engine.peek(h.root.id)?.routingPins?.executor).toEqual(EXECUTOR_PIN)
+
+    // Replan revokes the executor (a second start becomes legal), then the policy goes absent.
+    await h.engine.replan(h.root, 'round two')
+    wiring.flip(ABSENT)
+    await h.engine.submitPlan(h.root, 'plan v2')
+    await h.engine.audit(h.root, { role: 'plan', prompt: 'packet' })
+
+    const second = await h.engine.startExecutor(h.root, { prompt: 'implement again', signal })
+    expect(second.executor?.state).toBe('running')
+    // NO route reached the dispatch: the pool entry equal to the dead pin was
+    // neither reused as a grant nor re-dispatched from the fallback. Only the
+    // owner's routeless legacy tuning rides (the P2-1 carry — tuning, not a route).
+    expect(h.subagents.continuableOptions[1]).toEqual({ provider: 'alpha' })
+    expect(second.executor?.route.selected).toBeUndefined()
+
+    const last = lastRoutingOf(h, 'start-executor', 'executor')
+    expect(last?.pin).toBeUndefined()
+    expect(last?.repinFrom).toEqual(EXECUTOR_PIN)
+    expect(last?.authorizationSource).toBeUndefined()
+    // The honest conservative refusal, naming the policy state — the F1 machinery, not a pool grant.
+    expect(last?.why?.some(entry =>
+      entry.includes('cannot re-establish its session-policy authorization') && entry.includes('absent'))).toBe(true)
+    expect(last?.why?.some(entry => entry.includes('pin: re-selecting'))).toBe(true)
+    // No plugin-config pool claim anywhere on the executor's record, and the
+    // F10 boundary is named: the pick existed and was withheld.
+    expect(last?.why?.some(entry => entry.includes('a plugin-config pool grant'))).toBe(false)
+    expect(last?.why?.some(entry => entry.includes('pool fallback is auditor-only'))).toBe(true)
+    // The pin is cleared in the snapshot — the fold re-derives it from the pinless record.
+    expect(h.engine.peek(h.root.id)?.routingPins?.executor).toBeUndefined()
+  })
+
+  /**
+   * (b) F10, end to end at medium risk: a provider-only legacy executor
+   * (`{ provider: 'alpha' }` — no model ⇒ no lock ⇒ auto) under an absent
+   * policy inherits. Before the guard, the fallback read the executor's own
+   * family and dispatched the executor on the first out-of-family pool entry,
+   * silently replacing the requested provider with an auditor model. Now no
+   * agentOptions the POOL could supply reaches the dispatch — the only
+   * agentOptions on the start is the owner's own routeless tuning carry
+   * (the P2-1 decided behavior, deliberately intact), the why names the
+   * inheritance and the withheld pick, and nothing is pinned.
+   */
+  it('(b) provider-only legacy executor + absent policy ⇒ executor inherits, the pool is never consulted for it, why names the inheritance', async () => {
+    const f = fixture(MODELS, ABSENT)
+    const h = makeHarness({
+      routing: f.portsFor(),
+      config: {
+        executor: { agentOptions: { provider: 'alpha' } },
+        crossFamily: { enabled: true, minRisk: 'medium', pool: [{ provider: 'beta', model: 'm-c' }] },
+      },
+      subagents: stubSubagents({ verdicts: [{ verdict: 'pass', note: 'plan ok' }] }),
+    })
+    const signal = new AbortController().signal
+    await h.engine.init(h.root, makeTriage(STANDARD_DELEGATED), [undeclaredSeed('m1')])
+    await h.engine.declareUsage(h.root, makeUsageEntry({ id: 'm1' }))
+    await h.engine.submitPlan(h.root, 'plan')
+    await h.engine.audit(h.root, { role: 'plan', prompt: 'packet' })
+
+    // The AUDITOR leg still dispatches from the pool (auditor semantics unchanged).
+    expect(h.subagents.auditOptions[0]).toEqual({ provider: 'beta', model: 'm-c' })
+
+    const started = await h.engine.startExecutor(h.root, { prompt: 'implement', signal })
+    expect(started.executor?.state).toBe('running')
+    // The EXECUTOR leg: the requested provider rides as routeless tuning; the
+    // auditor model never replaces it.
+    expect(h.subagents.continuableOptions[0]).toEqual({ provider: 'alpha' })
+    expect(started.executor?.route.selected).toBeUndefined()
+
+    const routing = routingOf(h, 'start-executor', 'executor')
+    expect(routing?.pin).toBeUndefined()
+    expect(routing?.repinFrom).toBeUndefined()
+    expect(routing?.authorizationSource).toBeUndefined()
+    // The why names the inheritance (the native default), the withheld pick,
+    // and the carry — never a pool grant.
+    expect(routing?.why?.some(entry => entry.includes('auto mode performs inheritance only'))).toBe(true)
+    expect(routing?.why?.some(entry => entry.includes('pool fallback is auditor-only'))).toBe(true)
+    expect(routing?.why?.some(entry => entry.includes('carried onto the inherit dispatch'))).toBe(true)
+    expect(routing?.why?.some(entry => entry.includes('pool fallback supplied'))).toBe(false)
+    expect(h.engine.peek(h.root.id)?.routingPins?.executor).toBeUndefined()
+  })
+
+  /**
+   * (c) F10 counterweight: a provider-only legacy AUDITOR keeps the full E11
+   * checked walk (grant → liveness → preflight) over the pool — the guard
+   * changes nothing for the roles the pool exists for.
+   */
+  it('(c) a provider-only legacy auditor + pool ⇒ the checked walk still dispatches the pick, grant/liveness/preflight unchanged', async () => {
+    const f = fixture(MODELS, ABSENT)
+    const h = makeHarness({
+      routing: f.portsFor(),
+      config: {
+        executor: { agentOptions: { provider: 'alpha' } },
+        auditors: { plan: { agentOptions: { provider: 'alpha' } } },
+        crossFamily: { enabled: true, minRisk: 'medium', pool: [{ provider: 'beta', model: 'm-c' }] },
+      },
+      subagents: stubSubagents({ verdicts: [{ verdict: 'pass', note: 'ok' }] }),
+    })
+    await toExecuting(h)
+    expect(h.subagents.auditOptions[0]).toEqual({ provider: 'beta', model: 'm-c' })
+    const routing = routingOf(h, 'audit', 'plan-auditor')
+    expect(routing?.pin).toEqual({ provider: 'beta', model: 'm-c' })
+    expect(routing?.authorizationSource).toBe('plugin-config')
+    expect(routing?.why?.some(entry => entry.includes('the 0.2.0 pool fallback supplied beta/m-c as a plugin-config grant'))).toBe(true)
+    // The checked walk actually ran: the pick was preflighted like any explicit selection.
+    expect(f.llm.preflights.some(config => config.provider === 'beta' && config.model === 'm-c')).toBe(true)
+    expect(h.engine.peek(h.root.id)?.routingPins?.['plan-auditor']).toEqual({ provider: 'beta', model: 'm-c' })
+  })
+})

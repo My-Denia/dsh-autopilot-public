@@ -2879,9 +2879,24 @@ export class AutopilotEngine {
    * POOL pin is untouched: a plugin-config grant already escalates under an
    * absent policy per the plan's one rule, so it is reused on the grant, not
    * silently inherited.
+   *
+   * F9 (PR #2 Codex round 4): the pool-grant reclassification is AUDITOR-only.
+   * `crossFamily.pool` is defined as candidate AUDITOR routes — a
+   * plugin-config grant for a reviewer the executor should not share a family
+   * with — never an EXECUTOR authorization. The check below used to be
+   * role-agnostic, so an executor pin that happened to equal a pool entry was
+   * treated as pool-authorized and kept dispatching explicitly after the
+   * session policy went absent/unreachable (the P3-3 provenance blur with a
+   * concrete failure path). For a non-auditor role the pool branch does not
+   * fire at all: the pin stands or falls on its own authority — session-policy
+   * membership when the policy is present, the F1 conservative refusal
+   * otherwise. Auditor pool semantics are unchanged.
    */
   private pinStillAuthorized(role: Role, pin: RoutePin, policy: SessionPolicyState): string | undefined {
-    const poolHit = this.config.crossFamily.pool.some(entry => {
+    // F9: pool equality reclassifies a pin as a plugin-config grant for
+    // AUDITORS only — for every other role the pool is not an authority and
+    // the pin must survive on session-policy membership alone.
+    const poolHit = AUDITOR_ROLE_SET.includes(role) && this.config.crossFamily.pool.some(entry => {
       const candidate = toRoutePin(entry)
       return candidate !== undefined && sameRoute(candidate, pin)
     })
@@ -3040,7 +3055,23 @@ export class AutopilotEngine {
           dead = this.pinStillAuthorized(role, pinRoute, policy)
         }
         if (dead === undefined) {
-          const poolHit = this.config.crossFamily.pool.some(entry => {
+          // F9 (PR #2 Codex round 4): the reuse label's pool inference is
+          // auditor-only, mirroring pinStillAuthorized. Persist/recover
+          // honesty, DECIDED and documented here: the fold-validated
+          // `RoutingPin` shape deliberately carries NO `authorizationSource`
+          // (it is a route, not a grant — the source lives on the DECISION
+          // that wrote the pin, a domain-owned shape outside this fix), so a
+          // recorded source is not recoverable at this call site; and reading
+          // one back from the last dispatch's RouteRecord could resurrect a
+          // STALE authority (e.g. a pre-F9 pool relabel) that contradicts the
+          // check that just re-authorized the pin. The label therefore states
+          // the authority THIS reuse actually stood on in pinStillAuthorized:
+          // a plugin-config pool grant for an auditor (route-equality — kept
+          // as-is per the finding), session-policy membership for everything
+          // else — which is what a non-auditor pin must now pass to be here at
+          // all. If the pin shape ever persists a source, prefer it over this
+          // inference whenever the two disagree.
+          const poolHit = AUDITOR_ROLE_SET.includes(role) && this.config.crossFamily.pool.some(entry => {
             const candidate = toRoutePin(entry)
             return candidate !== undefined && sameRoute(candidate, pinRoute)
           })
@@ -3087,7 +3118,9 @@ export class AutopilotEngine {
     // CONSULTABLE here as plugin-config grants under the one rule ([R2-P1-1]):
     // on a no-policy deployment this is exactly 0.2.0 dispatch behavior; on a
     // policy-bearing one a pool entry outside the policy escalates instead of
-    // silently bypassing the native allowlist.
+    // silently bypassing the native allowlist. F10: for AUDITORS only — a
+    // non-auditor role keeps the inheritance result and never dispatches from
+    // the auditor candidate pool.
     return this.carryRoutelessLegacy(role, roleRouting, await this.poolFallback(role, prior, policy, core))
   }
 
@@ -3111,6 +3144,19 @@ export class AutopilotEngine {
    * only. With no catalog port wired the checks cannot run; the pick
    * dispatches with the skips NAMED, exactly as a locked route does in the
    * same state (0.2.0 dispatch parity) — never a silent claim.
+   *
+   * F10 (PR #2 Codex round 4): the fallback is AUDITOR-only. The pool is a
+   * set of candidate AUDITOR routes, and this fallback used to be reachable
+   * for every role: a legacy provider-only executor config
+   * (`{ provider: 'alpha' }` — no model, so no lock, so auto mode) plus an
+   * absent policy made the core inherit, then the fallback read the
+   * executor's own family and dispatched the EXECUTOR on the first
+   * out-of-family pool entry — silently replacing the requested executor
+   * provider with an auditor model (the E8-disclosed residual, now a review
+   * finding). For every non-auditor role the fallback does not fire: the walk
+   * never runs and the inheritance result stands, with the withheld pick
+   * named honestly in `why`. The E11 checked walk (grant → liveness →
+   * preflight) is unchanged for auditors.
    */
   private async poolFallback(
     role: Role,
@@ -3131,6 +3177,26 @@ export class AutopilotEngine {
       policy: this.config.crossFamily,
     })
     if (toRoutePin(choice.agentOptions) === undefined) return inherit
+    // F10: auditor-only. A non-auditor role (the executor) never dispatches
+    // from the auditor candidate pool — no grant walk, no liveness or
+    // preflight, no pick. The note fires exactly when a pick existed and was
+    // withheld, so the record explains the divergence from 0.2.0 dispatch
+    // parity instead of silently dropping it; with no pick in play the plain
+    // inheritance result is already the honest record.
+    if (!AUDITOR_ROLE_SET.includes(role)) {
+      const withheld = toRoutePin(choice.agentOptions)
+      if (withheld === undefined || inherit.routing === undefined) return inherit
+      return {
+        ...inherit,
+        routing: {
+          ...inherit.routing,
+          why: [
+            ...inherit.routing.why,
+            `cross-family: the 0.2.0 pool fallback is auditor-only — the pool is a candidate AUDITOR route set, never an authorization for "${role}"; the ${withheld.provider}/${withheld.model} pick was not dispatched and the inheritance result stands`,
+          ],
+        },
+      }
+    }
     const catalog = this.routingPorts.catalog
     const builder = familyOf(this.config.executor.agentOptions)
     // F7: walk the pool in order over the entries the 0.2.0 rule considers —
