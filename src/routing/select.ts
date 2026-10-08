@@ -48,7 +48,7 @@
 import { errorMessage } from '../domain/types.js'
 import type { Risk } from '../domain/types.js'
 import { catalogRank, providerIsLive } from './catalog.js'
-import type { CatalogSnapshot, LlmResolvedModelInfo, RouteCatalog } from './catalog.js'
+import type { CatalogSnapshot, LlmCallConfig, LlmResolvedModelInfo, RouteCatalog } from './catalog.js'
 import { independenceOf, sameRoute, toRoutePin } from './identity.js'
 import type { IndependenceRecord, RoutePin, RouteRef } from './identity.js'
 import { authorizedAutoRoutes, resolvePluginGrant } from './authorize.js'
@@ -191,6 +191,70 @@ function effortFor(candidate: Working, lockEffort?: string): string | undefined 
   return lockEffort ?? candidate.facts?.reasoning?.defaultEffort
 }
 
+/** F29: the composed route fields, plus whether the effort came only from the retained preflight result. */
+interface RetainedRouteFields {
+  readonly provider: string
+  readonly model: string
+  readonly reasoningEffort?: string
+  /** True iff the resolved config carried an effort the walk never sent — the F29 defect class. */
+  readonly effortMaterialized: boolean
+}
+
+/**
+ * F29 (PR #2 Codex round 16): compose the selected route's fields from the
+ * RETAINED successful preflight result instead of discarding it.
+ *
+ * The candidate walk and the locked path used to `await resolveCallConfig`
+ * and throw the returned config away, rebuilding the route from
+ * `effortFor(chosen)` — the facts `resolveModelInfo` disclosed. An adapter
+ * that materializes its default `reasoningEffort` ONLY in the resolved
+ * config (nothing in the model facts names it) then dispatched that effort
+ * while the pin and `why` recorded none, and `routeStatusOf` reads
+ * observed-effort-without-selected-effort as compatible — the route could
+ * read `verified` against an effort the record never named. The fix is
+ * retention: the selected route's provider/model/reasoningEffort are
+ * composed FROM the resolved config when it carries them, falling back to
+ * the chosen candidate's fields otherwise.
+ *
+ * THE ADOPTION GUARD, decided and documented: the resolved config's
+ * provider/model are adopted only when they name the SAME route the
+ * eligibility/grant/preflight walk authorized (trim-exact, `sameRoute`),
+ * and its effort only when the selector sent NONE. `resolveCallConfig`
+ * validates the config it is given — it does not re-route it — so a
+ * resolved config naming a different route, or rewriting an effort the
+ * lock named or the facts declared, is out of the upstream contract;
+ * adopting such a value would let a divergent echo outrank the owner's lock
+ * or the catalog's own declared default, so the checked candidate's fields
+ * stand there. For a contract-conformant adapter the composition is
+ * field-identical to the previous behavior (the echo case), which keeps
+ * every existing assertion byte-identical when the adapter returns nothing
+ * extra.
+ *
+ * @param candidate the route the checks authorized (already the trimmed pin).
+ * @param unsent the effort the selector itself had to send, if any (`effortFor`).
+ * @param resolved the retained successful `resolveCallConfig` result, if the walk kept one.
+ */
+function retainedRouteFields(candidate: RoutePin, unsent: string | undefined, resolved: LlmCallConfig | undefined): RetainedRouteFields {
+  const resolvedPin = resolved === undefined ? undefined : toRoutePin(resolved)
+  if (resolvedPin === undefined || !sameRoute(resolvedPin, candidate)) {
+    return {
+      provider: candidate.provider,
+      model: candidate.model,
+      ...(unsent !== undefined ? { reasoningEffort: unsent } : {}),
+      effortMaterialized: false,
+    }
+  }
+  const carried = resolved?.reasoningEffort
+  const effort = typeof carried === 'string' && carried.trim().length > 0 ? carried : undefined
+  const effective = effort ?? unsent
+  return {
+    provider: resolvedPin.provider,
+    model: resolvedPin.model,
+    ...(effective !== undefined ? { reasoningEffort: effective } : {}),
+    effortMaterialized: effort !== undefined && unsent === undefined,
+  }
+}
+
 function candidateRecord(candidate: Working, disposition: CandidateConsidered['disposition'], note?: string): CandidateConsidered {
   const window = contextWindowOf(candidate)
   return {
@@ -287,9 +351,26 @@ async function selectLocked(input: RouteSelectionInput): Promise<SelectionDecisi
     why.push(`facts: ${routeLabel(pin)} resolution failed (${factsError}) — effort defaults omitted, never invented`)
   }
   const config = { provider: pin.provider, model: pin.model, ...(effort !== undefined ? { reasoningEffort: effort } : {}) }
+  // F29 (PR #2 Codex round 16): RETAIN the successful preflight result and
+  // compose the selected route from it — an adapter that materializes its
+  // default `reasoningEffort` only in the resolved config dispatches that
+  // effort while a route rebuilt from `effortFor` alone records none. The
+  // adoption guard (see `retainedRouteFields`): the resolved fields ride only
+  // when they name the lock's own authorized route, and the effort only when
+  // neither the lock nor the facts named one — a lock-named effort is owner
+  // authority and never rewritten by an adapter echo. An adapter that echoes
+  // the preflighted config back (nothing extra) composes the identical route:
+  // byte-identical behavior, existing green.
+  let resolved: LlmCallConfig | undefined
   try {
-    await input.catalog.preflight(config)
-    if (effort !== undefined) {
+    resolved = await input.catalog.preflight(config)
+    const retained = retainedRouteFields(pin, effort, resolved)
+    if (retained.effortMaterialized) {
+      why.push(
+        `effort: "${retained.reasoningEffort}" materialized by the adapter at preflight — ` +
+          `resolveCallConfig's resolved config carried a default neither the lock nor the route's facts named`,
+      )
+    } else if (effort !== undefined) {
       why.push(
         input.roleRouting.reasoningEffort !== undefined
           ? `effort: "${effort}" named by the role lock (overrides the adapter default)`
@@ -301,7 +382,11 @@ async function selectLocked(input: RouteSelectionInput): Promise<SelectionDecisi
     why.push(`preflight: resolveCallConfig accepted ${routeLabel(pin)}`)
     return {
       kind: 'route',
-      route: { provider: pin.provider, model: pin.model, ...(effort !== undefined ? { reasoningEffort: effort } : {}) },
+      route: {
+        provider: retained.provider,
+        model: retained.model,
+        ...(retained.reasoningEffort !== undefined ? { reasoningEffort: retained.reasoningEffort } : {}),
+      },
       why,
       candidatesConsidered: [candidateRecord(working, 'selected')],
       authorizationSource: 'plugin-config',
@@ -551,8 +636,17 @@ async function selectAutoRanked(
 
   // Steps 5 + 6 — per-candidate effort, then the preflight walk down the
   // ranked list; the first candidate resolveCallConfig accepts is chosen.
+  // F29 (PR #2 Codex round 16): the successful preflight result is RETAINED
+  // (`resolved`) so the selected route below can be composed FROM it — an
+  // adapter that materializes its default `reasoningEffort` only in the
+  // resolved config dispatches that effort while a route rebuilt from
+  // `effortFor(chosen)` alone records none, and the route then verifies
+  // against an effort the pin never named. Adoption guard in
+  // `retainedRouteFields`; an adapter that echoes the preflighted config
+  // back (nothing extra) composes the identical route — byte-identical.
   const fallbackFrom: FallbackRecord[] = []
   let chosen: Working | undefined
+  let resolved: LlmCallConfig | undefined
   for (const candidate of ordered) {
     const effort = effortFor(candidate)
     const config = {
@@ -561,7 +655,7 @@ async function selectAutoRanked(
       ...(effort !== undefined ? { reasoningEffort: effort } : {}),
     }
     try {
-      await input.catalog.preflight(config)
+      resolved = await input.catalog.preflight(config)
       chosen = candidate
       break
     } catch (error) {
@@ -604,12 +698,19 @@ async function selectAutoRanked(
     considered.push(candidateRecord(candidate, 'excluded-below-floor', `contextWindow ${contextWindowOf(candidate)} < floor ${floor}`))
   }
 
-  const effort = effortFor(chosen)
-  why.push(
-    effort !== undefined
-      ? `effort: "${effort}" is the route's adapter-declared defaultEffort`
-      : 'effort: none declared and none named — omitted, never invented',
-  )
+  const retained = retainedRouteFields(chosen.pin, effortFor(chosen), resolved)
+  if (retained.effortMaterialized) {
+    why.push(
+      `effort: "${retained.reasoningEffort}" materialized by the adapter at preflight — ` +
+        `resolveCallConfig's resolved config carried a default the route's facts never declared`,
+    )
+  } else {
+    why.push(
+      retained.reasoningEffort !== undefined
+        ? `effort: "${retained.reasoningEffort}" is the route's adapter-declared defaultEffort`
+        : 'effort: none declared and none named — omitted, never invented',
+    )
+  }
   why.push(
     fallbackFrom.length > 0
       ? `preflight: ${fallbackFrom.map((record) => `${record.provider}/${record.model} rejected (${record.reason})`).join('; ')} — fell back to ${routeLabel(chosen.pin)}`
@@ -618,9 +719,9 @@ async function selectAutoRanked(
   return {
     kind: 'route',
     route: {
-      provider: chosen.pin.provider,
-      model: chosen.pin.model,
-      ...(effort !== undefined ? { reasoningEffort: effort } : {}),
+      provider: retained.provider,
+      model: retained.model,
+      ...(retained.reasoningEffort !== undefined ? { reasoningEffort: retained.reasoningEffort } : {}),
       ...(chosen.independence !== undefined ? { independence: chosen.independence } : {}),
     },
     why: [...why, ...(outage !== undefined ? [outage.note] : [])],

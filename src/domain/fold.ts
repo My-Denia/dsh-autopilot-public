@@ -230,6 +230,38 @@ function evidenceKindStamp(detail: unknown): 'absent' | 'invalid' | 'v1' {
  * only hand-edited or foreign streams; the 0.2.0 fixture replay stays green
  * (asserted alongside, and by the legacy suite).
  *
+ * F30 (PR #2 Codex round 16), ADDITIVE STRICTNESS — CANONICAL (TRIMMED)
+ * ROUTE FIELDS: every route-identity string in a routing detail — the pin's
+ * and `repinFrom`'s provider/model/reasoningEffort, and the provider/model
+ * of each `candidates` entry and `fallbackFrom` record, where those fields
+ * form pin state — must EQUAL ITS TRIMMED FORM (non-empty after trim, effort
+ * absent or non-empty). Replay used to persist these verbatim, so a padded
+ * pin (`' alpha '`/`' model '`/`' high '`) folded clean while every consumer
+ * compares trimmed: on reuse, policy membership and catalog liveness matched
+ * `alpha/model` but the preflight and the dispatched agentOptions received
+ * the RAW pin — authorized as one route, dispatched as another. The engine
+ * cannot write the rejected shape: every pin, candidate, and fallback field
+ * it stamps passes through `toRoutePin` (or the trimmed compositions at the
+ * engine's own seams), so only hand-edited or foreign streams are refused.
+ * Replay-compat is the F22 argument verbatim: `detail.routing` is new in this
+ * branch, no 0.2.0 event carries it, and no stream this branch's engine
+ * writes can fail the rule — the 0.2.0 fixtures take the no-routing arm.
+ *
+ * F31 (PR #2 Codex round 16), ADDITIVE STRICTNESS — THE CANDIDATES SET'S
+ * `selected` IS BOUND TO THE PIN: when a detail carries BOTH `candidates`
+ * and a pin, EXACTLY ONE entry may carry disposition `selected`, and its
+ * provider/model must be the pinned route (the effort comparison is vacuous
+ * today: the candidate vocabulary carries no effort field — an effort key on
+ * a candidate is an unknown-key rejection above — and must extend to it if
+ * the vocabulary ever grows one). Dispositions used to be vocabulary-checked
+ * only, so a foreign event could mark candidate B `selected` while the pin
+ * said A, or mark zero/several selected — a considered set that contradicts
+ * the decision it rides. The engine always emits exactly one selected entry
+ * matching the pin when the set is present (the selector marks the chosen
+ * candidate; the walk's dedupe keeps one entry per route), so no stream this
+ * branch writes can fail the rule; pinless details keep the current rules
+ * (no pin to bind). Same replay-compat argument as F22/F30.
+ *
  * Returns the VALIDATED detail, or `undefined` when no routing decision is
  * present (the 0.2.0 shape — every historical fixture takes this arm).
  */
@@ -262,11 +294,26 @@ function routingDecisionOf(op: Operation, detail: unknown): RoutingDecisionDetai
       const raw = pin[field]
       if (typeof raw !== 'string' || raw.trim().length === 0) {
         out.push(`${where}.${label}.${field} must be a non-empty string`)
+      } else if (raw !== raw.trim()) {
+        // F30 (PR #2 Codex round 16): a padded pin authorizes one route
+        // (membership/liveness compare trimmed) and dispatches another (the
+        // raw fields ride preflight/agentOptions) — noncanonical pin state.
+        out.push(
+          `${where}.${label}.${field} must equal its trimmed form, got ${JSON.stringify(raw)} — ` +
+            'padded route fields are not canonical pin state (authorization compares trimmed; the pin must be the route it dispatches)',
+        )
       }
     }
     const effort = pin.reasoningEffort
     if (effort !== undefined && (typeof effort !== 'string' || effort.trim().length === 0)) {
       out.push(`${where}.${label}.reasoningEffort must be a non-empty string when present`)
+    } else if (typeof effort === 'string' && effort !== effort.trim()) {
+      // F30: same canonicality rule on the effort axis — a padded effort is
+      // dispatched raw while the fold's pin comparisons run exact.
+      out.push(
+        `${where}.${label}.reasoningEffort must equal its trimmed form, got ${JSON.stringify(effort)} — ` +
+          'padded route fields are not canonical pin state (authorization compares trimmed; the pin must be the route it dispatches)',
+      )
     }
     return out
   }
@@ -324,6 +371,14 @@ function routingDecisionOf(op: Operation, detail: unknown): RoutingDecisionDetai
           const raw = item[field]
           if (typeof raw !== 'string' || raw.trim().length === 0) {
             problems.push(`${where}.fallbackFrom entry .${field} must be a non-empty string`)
+          } else if (field !== 'reason' && raw !== raw.trim()) {
+            // F30 (PR #2 Codex round 16): fallbackFrom route fields are pin-
+            // state-adjacent route identity; padded values are noncanonical.
+            // (`reason` is prose, not a route field — exempt.)
+            problems.push(
+              `${where}.fallbackFrom entry .${field} must equal its trimmed form, got ${JSON.stringify(raw)} — ` +
+                'padded route fields are not canonical routing state',
+            )
           }
         }
       }
@@ -351,6 +406,14 @@ function routingDecisionOf(op: Operation, detail: unknown): RoutingDecisionDetai
           const raw = item[field]
           if (typeof raw !== 'string' || raw.trim().length === 0) {
             problems.push(`${where}.candidates entry .${field} must be a non-empty string`)
+          } else if (raw !== raw.trim()) {
+            // F30 (PR #2 Codex round 16): candidate route fields form the
+            // considered set the pin binds to (F31 below) — padded values are
+            // noncanonical routing state, same rule as the pin's own fields.
+            problems.push(
+              `${where}.candidates entry .${field} must equal its trimmed form, got ${JSON.stringify(raw)} — ` +
+                'padded route fields are not canonical routing state',
+            )
           }
         }
         const disposition = item.disposition
@@ -395,6 +458,45 @@ function routingDecisionOf(op: Operation, detail: unknown): RoutingDecisionDetai
                 `${where}.candidates entry .independence.outcome must be one of ${ROUTING_INDEPENDENCE_OUTCOMES.join('|')}, got ${JSON.stringify(outcome)}`,
               )
             }
+          }
+        }
+      }
+      // F31 (PR #2 Codex round 16), ADDITIVE STRICTNESS: bind the candidates
+      // set's `selected` entry to the pin when the detail carries BOTH. The
+      // engine always stamps exactly one selected entry matching the pin (the
+      // selector marks the chosen candidate; the walk dedupes routes), so a
+      // set marking another route selected, or zero/several, is a foreign or
+      // hand-edited stream contradicting the decision it rides. The
+      // comparison is trim-tolerant on purpose (canonicality is F30's own
+      // rejection above; this rule is about WHICH candidate is selected), and
+      // pinless details keep the current rules — there is no pin to bind.
+      // Effort: the candidate vocabulary carries no effort field (an effort
+      // key is an unknown-key rejection above), so provider/model is the
+      // whole binding today; if the vocabulary ever grows an effort field,
+      // the comparison must extend to it when named on both sides.
+      if (record.pin !== undefined && record.pin !== null && typeof record.pin === 'object') {
+        const pinFields = record.pin as { provider?: unknown; model?: unknown }
+        const pinProvider = typeof pinFields.provider === 'string' ? pinFields.provider.trim() : undefined
+        const pinModel = typeof pinFields.model === 'string' ? pinFields.model.trim() : undefined
+        const pinLabel = pinProvider !== undefined && pinModel !== undefined ? `${pinProvider}/${pinModel}` : JSON.stringify(record.pin)
+        const selectedEntries = candidates.filter(
+          (entry) => entry !== null && typeof entry === 'object' && !Array.isArray(entry)
+            && (entry as Record<string, unknown>).disposition === 'selected',
+        )
+        if (selectedEntries.length !== 1) {
+          problems.push(
+            `${where}: the decision pins ${pinLabel} but its candidates set marks ${String(selectedEntries.length)} entr${selectedEntries.length === 1 ? 'y' : 'ies'} selected — ` +
+              'exactly ONE selected entry is required, and it must be the pinned route',
+          )
+        } else {
+          const entry = selectedEntries[0] as { provider?: unknown; model?: unknown }
+          const entryProvider = typeof entry.provider === 'string' ? entry.provider.trim() : undefined
+          const entryModel = typeof entry.model === 'string' ? entry.model.trim() : undefined
+          if (entryProvider !== pinProvider || entryModel !== pinModel) {
+            problems.push(
+              `${where}: the candidates set marks ${String(entryProvider)}/${String(entryModel)} selected but the decision pins ${pinLabel} — ` +
+                'the selected candidate must be the pinned route (the engine stamps exactly one selected entry, matching the pin)',
+            )
           }
         }
       }

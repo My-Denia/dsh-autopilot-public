@@ -62,6 +62,7 @@ import type { Role, RoleRouting, RoutePreference, SelectedRoute, SelectionDecisi
 import { resolvePluginGrant } from './routing/authorize.js'
 import type { GrantSource, SessionPolicyState } from './routing/authorize.js'
 import { RouteCatalog, providerIsLive } from './routing/catalog.js'
+import type { LlmCallConfig } from './routing/catalog.js'
 import { independenceOf, sameRoute, toRoutePin } from './routing/identity.js'
 import type { RoutePin } from './routing/identity.js'
 
@@ -2974,8 +2975,18 @@ export class AutopilotEngine {
   ): Promise<RoleRouteResolution> {
     const composed = resolution.agentOptions
     if (composed === undefined) return resolution
+    // F29 (PR #2 Codex round 16): RETAIN the successful preflight result and
+    // compose the dispatch's ROUTE fields (and the recorded pin's) from it —
+    // an adapter that materializes its default `reasoningEffort` only in the
+    // resolved config dispatched that effort while pin and `why` recorded
+    // none. The locked dispatch always carries provider/model
+    // (`lockedAgentOptions` writes them from the route or the lock), so the
+    // cast is safe; the adoption guard (`retainPreflightRoute`) never lets a
+    // divergent echo rewrite what the lock named, and an echo composes the
+    // identical object — byte-identical behavior, existing green.
+    let resolved: LlmCallConfig | undefined
     try {
-      await catalog.preflight({
+      resolved = await catalog.preflight({
         ...composed,
         // Route identity normalized to the lock's fields — the same values
         // `lockedAgentOptions` just wrote, pinned so the object satisfies the
@@ -2995,16 +3006,43 @@ export class AutopilotEngine {
           'a lock has no fallback candidate — dispatch blocked BEFORE start',
       }
     }
-    if (resolution.routing === undefined) return resolution
+    const retained = this.retainPreflightRoute(
+      composed as AgentOptionsLike & { readonly provider: string; readonly model: string },
+      resolved,
+    )
+    if (resolution.routing === undefined) {
+      return retained.dispatch === composed ? resolution : { ...resolution, agentOptions: retained.dispatch }
+    }
     // F28: name the carried default when it rode — appended inside the
     // parenthetical so the F16 wording (and its assertions) stands unchanged
     // when the lock named its own effort or the adapter declares none.
     const defaultEffortRode = roleRouting.reasoningEffort === undefined && composed.reasoningEffort !== undefined
-    const effortNote = defaultEffortRode ? ', the adapter-declared default effort carried from the selected route' : ''
+    // F29: name the MATERIALIZED default too — the adapter supplied at this
+    // preflight an effort neither the lock, the facts, nor the selected route
+    // named; the dispatch and the pin now carry it, so the record must too.
+    const effortNote = retained.materializedEffort !== undefined
+      ? `, the adapter materialized its default reasoningEffort "${retained.materializedEffort}" at preflight — the dispatch and the recorded pin carry it`
+      : defaultEffortRode
+        ? ', the adapter-declared default effort carried from the selected route'
+        : ''
     const note = this.legacyTuningRides(role, roleRouting)
       ? `preflight: resolveCallConfig accepted the composed dispatch (lock route + legacy non-route tuning${effortNote}) — the exact object the subagent start receives`
       : `preflight: resolveCallConfig accepted the composed dispatch (the lock's own fields — no legacy tuning rides${effortNote})`
-    return { ...resolution, routing: { ...resolution.routing, why: [...resolution.routing.why, note] } }
+    return {
+      ...resolution,
+      agentOptions: retained.dispatch,
+      routing: {
+        ...resolution.routing,
+        ...(resolution.routing.pin === undefined ? {} : {
+          pin: {
+            provider: retained.dispatch.provider,
+            model: retained.dispatch.model,
+            ...(retained.dispatch.reasoningEffort === undefined ? {} : { reasoningEffort: retained.dispatch.reasoningEffort }),
+          },
+        }),
+        why: [...resolution.routing.why, note],
+      },
+    }
   }
 
   /**
@@ -3178,6 +3216,65 @@ export class AutopilotEngine {
   }
 
   /**
+   * F29 (PR #2 Codex round 16): compose a dispatch's ROUTE fields from a
+   * RETAINED successful preflight (`resolveCallConfig`) result, at the three
+   * engine seams whose preflight input is a full dispatch object — the pin
+   * reuse, the composed locked dispatch, and the pool walk. Before this, each
+   * site awaited `catalog.preflight(...)` and DISCARDED the resolved config,
+   * so an adapter that materializes its default `reasoningEffort` only there
+   * (nothing in `resolveModelInfo`'s facts names it) dispatched that effort
+   * while the persisted pin and `why` recorded none — and `routeStatusOf`
+   * treats observed-effort-without-selected as compatible, so the route read
+   * `verified` against an effort the record never named. Retention keeps pin,
+   * dispatch, and `why` on ONE effective effort.
+   *
+   * THE ADOPTION GUARD — the engine-side mirror of the selector's
+   * `retainedRouteFields` (same decided rule, documented there): the resolved
+   * config's provider/model ride only when they name the SAME route the
+   * grant/liveness/preflight checks authorized (trim-exact, `sameRoute`), and
+   * its effort only when the dispatch carried none. `resolveCallConfig`
+   * validates the config it is given — it does not re-route it — so a
+   * resolved config naming a different route, or rewriting an effort a lock,
+   * pool entry, or pin already named, is out of the upstream contract;
+   * adopting such a value would let a divergent echo outrank the owner's own
+   * named effort, so the checked dispatch's fields stand there. A conformant
+   * adapter echoing the config back composes the IDENTICAL object (the same
+   * reference is returned) — behavior byte-identical, existing green.
+   *
+   * @returns the (possibly unchanged) dispatch plus the materialized effort
+   * name for the honest `why` clause, when the adapter supplied one.
+   */
+  private retainPreflightRoute(
+    dispatch: AgentOptionsLike & { readonly provider: string; readonly model: string },
+    resolved: LlmCallConfig | undefined,
+  ): {
+    readonly dispatch: AgentOptionsLike & { readonly provider: string; readonly model: string }
+    readonly materializedEffort: string | undefined
+  } {
+    const resolvedPin = resolved === undefined ? undefined : toRoutePin(resolved)
+    if (resolvedPin === undefined || !sameRoute(resolvedPin, dispatch)) {
+      return { dispatch, materializedEffort: undefined }
+    }
+    const carried = resolved?.reasoningEffort
+    const effort = typeof carried === 'string' && carried.trim().length > 0 ? carried : undefined
+    const named = dispatch.reasoningEffort
+    const hadEffort = typeof named === 'string' && named.trim().length > 0
+    const materializedEffort = effort !== undefined && !hadEffort ? effort : undefined
+    if (materializedEffort === undefined && resolvedPin.provider === dispatch.provider && resolvedPin.model === dispatch.model) {
+      return { dispatch, materializedEffort: undefined }
+    }
+    return {
+      dispatch: {
+        ...dispatch,
+        provider: resolvedPin.provider,
+        model: resolvedPin.model,
+        ...(materializedEffort === undefined ? {} : { reasoningEffort: materializedEffort }),
+      },
+      materializedEffort,
+    }
+  }
+
+  /**
    * F2 (PR #2 Codex review): the routing section as of THIS decision. With a
    * volatile routing source wired, every call re-resolves the CURRENT values
    * — a config patch lands without a remount, and the next dispatch must
@@ -3316,6 +3413,10 @@ export class AutopilotEngine {
         const poolMatch = this.auditorPoolMatchFor(role, pin)
         const snapshot = await catalog.snapshot()
         let dead: string | undefined
+        // F29: the retained preflight result of a SUCCESSFUL reuse check, if
+        // the checks below leave the pin standing (composed into the dispatch
+        // and the re-recorded pin at the returns below).
+        let reuseResolved: LlmCallConfig | undefined
         // F14 (PR #2 Codex round 6): an `unavailable` snapshot (a catalog read
         // failure — infrastructure) is NOT evidence the pinned provider is
         // gone; `providerIsLive` honestly answers false on it (nothing is
@@ -3327,13 +3428,20 @@ export class AutopilotEngine {
         if (snapshot.catalogStatus === 'live' && !providerIsLive(snapshot, pin.provider)) {
           dead = `pinned provider "${pin.provider}" is no longer live in the catalog (llm/adapters-updated refreshed it)`
         } else {
+          // F29 (PR #2 Codex round 16): RETAIN the successful preflight result —
+          // the reuse dispatch and the re-recorded pin below are composed
+          // from it, so an adapter that materializes its default
+          // `reasoningEffort` only in the resolved config can no longer
+          // dispatch an effort the pin never records. Adoption guard in
+          // `retainPreflightRoute`; an echo composes the identical dispatch.
+          let resolved: LlmCallConfig | undefined
           try {
             // F20: the preflight carries EXACTLY what the dispatch will — the
             // complete recovered pool entry when a pool grant authorizes the
             // pin (maxTokens and every call-config field ride, route identity
             // normalized to the trimmed pin the liveness leg checked), the
             // pin's own three fields otherwise.
-            await catalog.preflight(poolMatch?.dispatch ?? {
+            resolved = await catalog.preflight(poolMatch?.dispatch ?? {
               provider: pin.provider,
               model: pin.model,
               ...(pin.reasoningEffort === undefined ? {} : { reasoningEffort: pin.reasoningEffort }),
@@ -3341,6 +3449,7 @@ export class AutopilotEngine {
           } catch (error) {
             dead = `pinned route ${pin.provider}/${pin.model} failed dispatch preflight${poolMatch === undefined ? '' : ' on the complete pool entry that authorizes it'} (${errorMessage(error)})`
           }
+          reuseResolved = resolved
         }
         if (dead === undefined) {
           dead = this.pinStillAuthorized(role, pinRoute, policy)
@@ -3383,35 +3492,49 @@ export class AutopilotEngine {
             : `provider liveness NOT assertable — catalog unavailable (${snapshot.diagnostic ?? 'no diagnostic recorded'}): a catalog read failure (infrastructure), not evidence the provider is gone`
           if (poolMatch !== undefined) {
             const pinEffortRides = poolMatch.entry.reasoningEffort === undefined && pin.reasoningEffort !== undefined
+            // F29: the reuse dispatch and the RE-RECORDED pin are composed from
+            // the retained preflight result — pin, dispatch, and `why` name
+            // ONE effective effort (the materialized clause rides `why` when
+            // the adapter supplied a default the entry and pin never named).
+            const retained = this.retainPreflightRoute(poolMatch.dispatch, reuseResolved)
             return {
               kind: 'dispatch',
-              agentOptions: poolMatch.dispatch,
+              agentOptions: retained.dispatch,
               routing: {
                 role,
                 pin: {
-                  provider: poolMatch.route.provider,
-                  model: poolMatch.route.model,
-                  ...(poolMatch.dispatch.reasoningEffort === undefined ? {} : { reasoningEffort: poolMatch.dispatch.reasoningEffort }),
+                  provider: retained.dispatch.provider,
+                  model: retained.dispatch.model,
+                  ...(retained.dispatch.reasoningEffort === undefined ? {} : { reasoningEffort: retained.dispatch.reasoningEffort }),
                 },
                 why: [
                   `pin: reusing the role pin — ${livenessNote}, preflight accepted on the COMPLETE pool entry, authority intact (a plugin-config pool grant — the matching pool entry recovered at reuse: maxTokens ${poolMatch.entry.maxTokens === undefined ? 'unset' : String(poolMatch.entry.maxTokens)}${pinEffortRides ? ', the pin\'s own reasoningEffort riding where the entry names none' : ''}; never a provider/model/effort reconstruction)`,
+                  ...(retained.materializedEffort === undefined ? [] : [`preflight: resolveCallConfig materialized the adapter's default reasoningEffort "${retained.materializedEffort}" — the dispatch and the recorded pin carry it`]),
                 ],
                 authorizationSource: 'plugin-config',
               },
             }
           }
+          // F29, the bare-pin reuse: same retention — the dispatch and the
+          // re-recorded pin compose from the retained preflight result.
+          const retained = this.retainPreflightRoute({
+            provider: pin.provider,
+            model: pin.model,
+            ...(pin.reasoningEffort === undefined ? {} : { reasoningEffort: pin.reasoningEffort }),
+          }, reuseResolved)
           return {
             kind: 'dispatch',
-            agentOptions: {
-              provider: pin.provider,
-              model: pin.model,
-              ...(pin.reasoningEffort === undefined ? {} : { reasoningEffort: pin.reasoningEffort }),
-            },
+            agentOptions: retained.dispatch,
             routing: {
               role,
-              pin,
+              pin: {
+                provider: retained.dispatch.provider,
+                model: retained.dispatch.model,
+                ...(retained.dispatch.reasoningEffort === undefined ? {} : { reasoningEffort: retained.dispatch.reasoningEffort }),
+              },
               why: [
                 `pin: reusing the role pin — ${livenessNote}, preflight accepted, authority intact (authorized by the session policy when selected)`,
+                ...(retained.materializedEffort === undefined ? [] : [`preflight: resolveCallConfig materialized the adapter's default reasoningEffort "${retained.materializedEffort}" — the dispatch and the recorded pin carry it`]),
               ],
               authorizationSource: 'session-policy',
             },
@@ -3690,24 +3813,37 @@ export class AutopilotEngine {
       // SAME `dispatch` object the resolution below carries — never a
       // parallel reconstruction that could drift (in fields or in
       // normalization) from what the subagent start receives.
+      // F29 (PR #2 Codex round 16): the successful preflight result is
+      // RETAINED and the dispatch + recorded pin are composed from it — an
+      // adapter that materializes its default `reasoningEffort` only in the
+      // resolved config can no longer dispatch an effort the pin never
+      // records. Adoption guard in `retainPreflightRoute`; an echo composes
+      // the identical dispatch object — byte-identical, existing green.
+      let resolved: LlmCallConfig | undefined
       try {
-        await catalog.preflight(dispatch)
+        resolved = await catalog.preflight(dispatch)
       } catch (error) {
         skipped.push(`cross-family: pool route ${candidate.provider}/${candidate.model} skipped — dispatch preflight rejected it (${errorMessage(error)})`)
         continue
       }
+      const retained = this.retainPreflightRoute(dispatch, resolved)
       return {
         kind: 'dispatch',
-        agentOptions: dispatch,
+        agentOptions: retained.dispatch,
         routing: {
           role,
-          pin,
+          pin: {
+            provider: retained.dispatch.provider,
+            model: retained.dispatch.model,
+            ...(retained.dispatch.reasoningEffort === undefined ? {} : { reasoningEffort: retained.dispatch.reasoningEffort }),
+          },
           why: [
             ...(inherit.routing?.why ?? []),
             ...verdict.why,
             ...(outage !== undefined ? [outage] : []),
             ...(skipped.length > 0 ? [skipped.join('; ')] : []),
             grantNote,
+            ...(retained.materializedEffort === undefined ? [] : [`preflight: resolveCallConfig materialized the adapter's default reasoningEffort "${retained.materializedEffort}" — the dispatch and the recorded pin carry it`]),
           ],
           authorizationSource: 'plugin-config',
         },

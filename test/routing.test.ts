@@ -40,6 +40,8 @@ interface StubOptions {
   readonly failListingFor?: readonly string[]
   /** When true, `listProviders` throws (the whole catalog is unavailable). */
   readonly failProviders?: boolean
+  /** F29 fixtures: model id → an effort `resolveCallConfig` MATERIALIZES when the config carries none. */
+  readonly materializeEffortFor?: Readonly<Record<string, string>>
 }
 
 function stubLlm(models: readonly StubModel[], options: StubOptions = {}): LlmRuntimeSubset & {
@@ -82,6 +84,10 @@ function stubLlm(models: readonly StubModel[], options: StubOptions = {}): LlmRu
       if (options.rejectPreflightFor?.includes(config.model)) {
         throw new Error(`resolveCallConfig rejected ${config.provider}/${config.model}: scripted rejection`)
       }
+      // F29 fixtures: an adapter that materializes its default effort ONLY in
+      // the resolved config — the facts never name it.
+      const materialized = config.reasoningEffort === undefined ? options.materializeEffortFor?.[config.model] : undefined
+      if (materialized !== undefined) return { ...config, reasoningEffort: materialized }
       return { ...config }
     },
   }
@@ -1063,5 +1069,115 @@ describe('select: F23 (PR #2 round 11) — a catalog outage is not "all provider
         'authorization: no session model-selection policy recorded (the native default) — auto mode performs inheritance only; settings are never consulted as authority',
       ],
     })
+  })
+})
+
+// ── F29 (PR #2 Codex round 16): the preflight result is RETAINED ──
+//
+// The candidate walk and the locked path awaited `resolveCallConfig` and
+// DISCARDED the returned config, rebuilding the route from `effortFor` alone.
+// An adapter that materializes its default `reasoningEffort` only in the
+// resolved config then dispatched that effort while the selected route (and
+// the pin/evidence built from it) recorded none. The successful preflight
+// result is now retained and the selected route's provider/model/
+// reasoningEffort are composed FROM it — under the documented adoption guard:
+// the resolved route rides only when it names the checked route (trim-exact),
+// and the resolved effort only when the selector sent none (a lock-named or
+// declared effort is owner/catalog authority an echo cannot rewrite). An
+// adapter that returns nothing extra composes the identical route.
+
+describe('select: F29 (PR #2 round 16) — a materialized default effort reaches the selected route', () => {
+  const models: readonly StubModel[] = [
+    { provider: 'alpha', id: 'm-a', contextWindow: 200000 }, // facts declare NO efforts and NO default
+    { provider: 'alpha', id: 'm-b', contextWindow: 131072 },
+  ]
+  const policy = presentPolicy(['alpha', 'm-a'], ['alpha', 'm-b'])
+
+  it('auto walk: resolveCallConfig materializes a default the candidate lacked ⇒ route carries it, why names its source', async () => {
+    const stubbed = stubLlm(models, { materializeEffortFor: { 'm-a': 'high' } })
+    const decision = await selectRoute(
+      selection({ role: 'executor', policy, catalog: new RouteCatalog(stubbed), executorPin: undefined }),
+    )
+    const route = expectRoute(decision)
+    expect(route.route.provider).toBe('alpha')
+    expect(route.route.model).toBe('m-a')
+    expect(route.route.reasoningEffort).toBe('high')
+    expectWhy(decision, /effort: "high" materialized by the adapter at preflight/)
+    // The walk really sent NO effort (the adapter supplied it, not the facts).
+    expect(stubbed.calls.preflight[0]).toEqual({ provider: 'alpha', model: 'm-a' })
+  })
+
+  it('auto walk: an adapter that echoes the config back composes the identical route — nothing extra ⇒ byte-identical', async () => {
+    const decision = await selectRoute(
+      selection({ role: 'executor', policy, catalog: catalogOf(models), executorPin: undefined }),
+    )
+    const route = expectRoute(decision)
+    expect(route.route.model).toBe('m-a')
+    expect('reasoningEffort' in route.route).toBe(false) // never invented
+    expectWhy(decision, /effort: none declared and none named — omitted, never invented/)
+  })
+
+  it('auto walk: a resolved config naming a DIFFERENT route is not adopted — the checked candidate stands', async () => {
+    // Out of the upstream contract (resolveCallConfig does not re-route), but
+    // the guard must keep the authorized route regardless of what an echo says.
+    const stubbed = stubLlm(models)
+    const divergent: LlmRuntimeSubset = {
+      ...stubbed,
+      resolveCallConfig: async (config: LlmCallConfig) => ({ ...config, provider: 'gamma', model: 'm-imposter', reasoningEffort: 'high' }),
+    }
+    const decision = await selectRoute(
+      selection({ role: 'executor', policy, catalog: new RouteCatalog(divergent), executorPin: undefined }),
+    )
+    const route = expectRoute(decision)
+    expect(route.route.provider).toBe('alpha')
+    expect(route.route.model).toBe('m-a')
+    expect('reasoningEffort' in route.route).toBe(false)
+    expectWhy(decision, /effort: none declared and none named/)
+  })
+
+  it('locked path: the lock names no effort, the facts declare none, the adapter materializes one ⇒ route + why carry it', async () => {
+    const decision = await selectRoute(
+      selection({
+        roleRouting: { mode: 'locked', provider: 'alpha', model: 'm-lock' },
+        policy: ABSENT_POLICY,
+        catalog: catalogOf([{ provider: 'alpha', id: 'm-lock', contextWindow: 131072 }], { materializeEffortFor: { 'm-lock': 'medium' } }),
+      }),
+    )
+    const route = expectRoute(decision)
+    expect(route.route.provider).toBe('alpha')
+    expect(route.route.model).toBe('m-lock')
+    expect(route.route.reasoningEffort).toBe('medium')
+    expectWhy(decision, /effort: "medium" materialized by the adapter at preflight/)
+    // The selected candidate set still records the lock's own route.
+    expect(route.candidatesConsidered).toEqual([
+      { provider: 'alpha', model: 'm-lock', contextWindow: 131072, hasReasoningEfforts: false, disposition: 'selected' },
+    ])
+  })
+
+  it('locked path: a lock-NAMED effort is never rewritten by the resolved config (owner authority stands)', async () => {
+    const decision = await selectRoute(
+      selection({
+        roleRouting: { mode: 'locked', provider: 'alpha', model: 'm-lock', reasoningEffort: 'low' },
+        policy: ABSENT_POLICY,
+        catalog: catalogOf([{ provider: 'alpha', id: 'm-lock', contextWindow: 131072 }]),
+      }),
+    )
+    const route = expectRoute(decision)
+    expect(route.route.reasoningEffort).toBe('low')
+    expectWhy(decision, /effort: "low" named by the role lock/)
+  })
+
+  it('locked path: echo with a lock-named effort ⇒ byte-identical (the preflight validated exactly what is recorded)', async () => {
+    const stubbed = stubLlm([{ provider: 'alpha', id: 'm-lock', contextWindow: 131072 }])
+    const decision = await selectRoute(
+      selection({
+        roleRouting: { mode: 'locked', provider: 'alpha', model: 'm-lock', reasoningEffort: 'low' },
+        policy: ABSENT_POLICY,
+        catalog: new RouteCatalog(stubbed),
+      }),
+    )
+    const route = expectRoute(decision)
+    expect(route.route).toEqual({ provider: 'alpha', model: 'm-lock', reasoningEffort: 'low' })
+    expect(stubbed.calls.preflight).toEqual([{ provider: 'alpha', model: 'm-lock', reasoningEffort: 'low' }])
   })
 })

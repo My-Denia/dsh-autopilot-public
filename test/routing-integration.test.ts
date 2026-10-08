@@ -48,6 +48,10 @@ class StubLlm implements LlmRuntimeSubset {
   public failProviders = false
   /** F15 fixtures: "provider/model" routes where `resolveCallConfig` rejects a config that carries `maxTokens`. */
   public readonly maxTokensRejects = new Set<string>()
+  /** F29 fixtures: model id → an effort `resolveCallConfig` MATERIALIZES when the config carries none (the facts declare nothing). */
+  public readonly materializeEfforts = new Map<string, string>()
+  /** F29 fixtures: when true, materialization fires only on configs carrying other call-config fields — isolating the engine's composed-locked preflight site (the only one that sees riding tuning). */
+  public materializeOnlyWithExtraFields = false
 
   constructor(private readonly models: readonly StubModel[]) {
     this.live = new Set(models.map(model => model.provider))
@@ -95,6 +99,12 @@ class StubLlm implements LlmRuntimeSubset {
     if (rejection !== undefined) throw new Error(rejection)
     if (config.maxTokens !== undefined && this.maxTokensRejects.has(`${config.provider}/${config.model}`)) {
       throw new Error(`resolveCallConfig: maxTokens ${config.maxTokens} is invalid on ${config.provider}/${config.model}`)
+    }
+    // F29 fixtures: an adapter that materializes its default effort ONLY in
+    // the resolved config — nothing in the model facts names it.
+    const materialized = config.reasoningEffort === undefined ? this.materializeEfforts.get(config.model) : undefined
+    if (materialized !== undefined && (!this.materializeOnlyWithExtraFields || config.maxTokens !== undefined)) {
+      return { ...config, reasoningEffort: materialized }
     }
     return { ...config }
   }
@@ -833,9 +843,16 @@ describe('routing integration: candidatesConsidered persisted (P2-2)', () => {
     expect(() => foldRun(corrupt(candidates => {
       (candidates as unknown[])[0] = 'beta/m-c'
     }))).toThrowError(/candidates entries must be objects/)
+    // F31 (PR #2 Codex round 16), strictly-stronger update of a
+    // defect-encoding assertion (E23 precedent): this mutation empties the
+    // candidates set of a PINNED decision, and the old `.not.toThrow()`
+    // encoded the defect itself — zero selected entries with a pin present
+    // folded clean, so a foreign event could strip the selected marker while
+    // the pin stood. The fold now binds the set's single `selected` entry to
+    // the pin, so the empty set is rejected with the named reason.
     expect(() => foldRun(corrupt(candidates => {
       (candidates as unknown[]).length = 0
-    }))).not.toThrow()
+    }))).toThrowError(/marks 0 entries selected — exactly ONE selected entry is required/)
   })
 
   it('historical fixtures: the same stream with every candidates key stripped (the pre-P2-2 shape) replays unchanged', async () => {
@@ -2694,5 +2711,164 @@ describe('F28 (PR #2 round 15): a locked dispatch without a lock-named effort ca
     const record = h.engine.peek(h.root.id)?.audits[0]?.route
     expect(record?.routeStatus).toBe('mismatch')
     expect(record?.routeDiagnostic).toContain('reasoningEffort: selected high vs observed medium')
+  })
+})
+
+// ── F29 (PR #2 Codex round 16): the retained preflight result reaches dispatch, pin, and why ──
+//
+// Every engine seam that awaited `resolveCallConfig` discarded the resolved
+// config: the auto walk's route (rebuilt from `effortFor`), the locked
+// dispatch, the pin reuse, and the pool walk. An adapter that materializes its
+// default `reasoningEffort` only in the resolved config then dispatched that
+// effort while pin and `why` recorded none — and routeStatusOf treats
+// observed-effort-without-selected as compatible, so the route read `verified`
+// against an effort the record never named. The successful preflight result
+// is now retained at each seam and the dispatch + pin are composed from it
+// (adoption guard documented on `retainPreflightRoute`), so pin, dispatch,
+// and `why` name ONE effective effort — and the observed leg makes the effort
+// axis three-leg verifiable instead of F18-unverifiable.
+
+describe('F29 (PR #2 round 16): a materialized default effort reaches dispatch, pin, and why', () => {
+  // Neither model declares efforts or a default in the FACTS — effort can
+  // only ever arrive as a materialized resolved-config value.
+  const F29_MODELS: readonly StubModel[] = [
+    { provider: 'alpha', id: 'm-a', contextWindow: 200000 },
+    { provider: 'beta', id: 'm-c', contextWindow: 131072 },
+  ]
+  const F29_POLICY: SessionPolicyState = {
+    kind: 'present',
+    routes: [{ provider: 'alpha', model: 'm-a' }, { provider: 'beta', model: 'm-c' }],
+  }
+
+  /** The last routing detail for a role in the durable stream. */
+  function lastDetail(h: Harness, role: string): RoutingDecisionDetail | undefined {
+    const details = routingDetails(h).filter(detail => detail.role === role)
+    return details[details.length - 1]
+  }
+
+  it('(a) auto selection: the plan audit\'s dispatch, pin, persisted pin, and why carry the materialized effort — and the observed leg makes it three-leg VERIFIED', async () => {
+    const f = fixture(F29_MODELS, F29_POLICY)
+    f.llm.materializeEfforts.set('m-a', 'high')
+    const h = makeHarness({
+      routing: f.portsFor(),
+      subagents: stubSubagents({ verdicts: [{ verdict: 'pass', note: 'ok', requestHeader: { provider: 'alpha', model: 'm-a', reasoningEffort: 'high' } }] }),
+    })
+    await toExecuting(h)
+    // The dispatch carries the materialized effort...
+    expect(h.subagents.auditOptions[0]).toEqual({ provider: 'alpha', model: 'm-a', reasoningEffort: 'high' })
+    // ...and the walk provably sent NO effort — the adapter supplied it.
+    const sentToSelected = f.llm.preflights.filter(config => config.model === 'm-a')
+    expect(sentToSelected.length).toBeGreaterThan(0)
+    expect(sentToSelected.every(config => config.reasoningEffort === undefined)).toBe(true)
+    const routing = routingOf(h, 'audit', 'plan-auditor')
+    expect(routing?.pin).toEqual({ provider: 'alpha', model: 'm-a', reasoningEffort: 'high' })
+    expect(h.engine.peek(h.root.id)?.routingPins?.['plan-auditor']).toEqual({ provider: 'alpha', model: 'm-a', reasoningEffort: 'high' })
+    expect(routing?.why?.some(entry => entry.includes('effort: "high" materialized by the adapter at preflight'))).toBe(true)
+    // Three-leg agreement WITH the effort recorded: the selected leg carries
+    // it, so the observed header establishes the axis — verified, not the F18
+    // unverifiable case (which needs a selected effort the observed omits).
+    const record = h.engine.peek(h.root.id)?.audits[0]?.route
+    expect(record?.selected).toEqual({ provider: 'alpha', model: 'm-a', reasoningEffort: 'high' })
+    expect(record?.observed).toEqual({ provider: 'alpha', model: 'm-a', reasoningEffort: 'high' })
+    expect(record?.routeStatus).toBe('verified')
+    // The composed stream still folds: the pin the fold re-derives is the
+    // same one the dispatch ran (engine stamp shapes stay canonical).
+    expect(() => foldRun(eventsOf(h))).not.toThrow()
+  })
+
+  it('(b) the composed LOCKED dispatch: an adapter that materializes only on the composed object (the sole preflight that sees riding tuning) puts the effort on dispatch, pin, and the composed-preflight note', async () => {
+    const f = fixture(F29_MODELS, ABSENT)
+    f.llm.materializeEfforts.set('m-a', 'medium')
+    f.llm.materializeOnlyWithExtraFields = true
+    const h = makeHarness({
+      routing: f.portsFor(),
+      config: {
+        auditors: { plan: { agentOptions: { provider: 'alpha', model: 'm-a', maxTokens: 4096 } } },
+        routing: { roles: { planAuditor: { lock: { provider: 'alpha', model: 'm-a' } } } },
+      },
+      subagents: stubSubagents({ verdicts: [{ verdict: 'pass', note: 'ok', requestHeader: { provider: 'alpha', model: 'm-a', reasoningEffort: 'medium' } }] }),
+    })
+    await h.engine.init(h.root, makeTriage(STANDARD), [undeclaredSeed('m1')])
+    await h.engine.declareUsage(h.root, makeUsageEntry({ id: 'm1' }))
+    await h.engine.submitPlan(h.root, 'plan')
+    await h.engine.audit(h.root, { role: 'plan', prompt: 'packet' })
+    // The selector's bare preflight saw no effort and none was claimed there;
+    // the ENGINE's composed preflight (the one that sees the riding tuning)
+    // materialized 'medium' — dispatch, pin, and note all carry it now.
+    expect(h.subagents.auditOptions[0]).toEqual({ provider: 'alpha', model: 'm-a', maxTokens: 4096, reasoningEffort: 'medium' })
+    const routing = routingOf(h, 'audit', 'plan-auditor')
+    expect(routing?.pin).toEqual({ provider: 'alpha', model: 'm-a', reasoningEffort: 'medium' })
+    expect(h.engine.peek(h.root.id)?.routingPins?.['plan-auditor']).toEqual({ provider: 'alpha', model: 'm-a', reasoningEffort: 'medium' })
+    expect(routing?.why?.some(entry =>
+      entry.includes('accepted the composed dispatch')
+      && entry.includes('the adapter materialized its default reasoningEffort "medium" at preflight — the dispatch and the recorded pin carry it'))).toBe(true)
+    const record = h.engine.peek(h.root.id)?.audits[0]?.route
+    expect(record?.routeStatus).toBe('verified')
+    expect(() => foldRun(eventsOf(h))).not.toThrow()
+  })
+
+  it('(c) the pool walk: a materialized default on the pool pick rides the dispatch and the recorded pin', async () => {
+    const f = fixture(F29_MODELS, ABSENT)
+    f.llm.materializeEfforts.set('m-c', 'low')
+    const h = makeHarness({
+      routing: f.portsFor(),
+      config: {
+        executor: { agentOptions: { provider: 'alpha', model: 'm-a' } },
+        crossFamily: { enabled: true, minRisk: 'medium', pool: [{ provider: 'beta', model: 'm-c' }] },
+      },
+      subagents: stubSubagents({ verdicts: [{ verdict: 'pass', note: 'ok' }] }),
+    })
+    await toExecuting(h)
+    expect(h.subagents.auditOptions[0]).toEqual({ provider: 'beta', model: 'm-c', reasoningEffort: 'low' })
+    const routing = routingOf(h, 'audit', 'plan-auditor')
+    expect(routing?.pin).toEqual({ provider: 'beta', model: 'm-c', reasoningEffort: 'low' })
+    expect(h.engine.peek(h.root.id)?.routingPins?.['plan-auditor']).toEqual({ provider: 'beta', model: 'm-c', reasoningEffort: 'low' })
+    expect(routing?.why?.some(entry =>
+      entry.includes("resolveCallConfig materialized the adapter's default reasoningEffort \"low\" — the dispatch and the recorded pin carry it"))).toBe(true)
+    expect(() => foldRun(eventsOf(h))).not.toThrow()
+  })
+
+  it('(d) the pin REUSE: the retained reuse preflight materializes an effort the settled pin lacked — dispatch, re-recorded pin, and persisted pin all gain it', async () => {
+    const f = fixture(F29_MODELS, F29_POLICY)
+    const h = makeHarness({
+      routing: f.portsFor(),
+      // The executor's legacy route names the alpha family, so the auditors'
+      // independence reordering settles them on beta/m-c (both-axis-distinct)
+      // — effort-less: neither facts nor policy named one.
+      config: { executor: { agentOptions: { provider: 'alpha', model: 'm-a' } } },
+      subagents: stubSubagents({ verdicts: [
+        { verdict: 'pass', note: 'plan ok' },
+        { verdict: 'pass', note: 'exec ok' },
+        { verdict: 'pass', note: 'exec ok again' },
+      ] }),
+    })
+    await toClosing(h)
+    expect(h.engine.peek(h.root.id)?.routingPins?.['execution-auditor']).toEqual({ provider: 'beta', model: 'm-c' })
+    // The adapter learns a default between dispatches (a config reload on the
+    // host side): the reuse preflight now materializes one.
+    f.llm.materializeEfforts.set('m-c', 'low')
+    await h.engine.audit(h.root, { role: 'execution', prompt: 'again' })
+    expect(h.subagents.auditOptions[2]).toEqual({ provider: 'beta', model: 'm-c', reasoningEffort: 'low' })
+    const last = lastDetail(h, 'execution-auditor')
+    expect(last?.pin).toEqual({ provider: 'beta', model: 'm-c', reasoningEffort: 'low' })
+    expect(last?.why?.some(entry =>
+      entry.includes("resolveCallConfig materialized the adapter's default reasoningEffort \"low\" — the dispatch and the recorded pin carry it"))).toBe(true)
+    expect(h.engine.peek(h.root.id)?.routingPins?.['execution-auditor']).toEqual({ provider: 'beta', model: 'm-c', reasoningEffort: 'low' })
+    expect(() => foldRun(eventsOf(h))).not.toThrow()
+  })
+
+  it('(e) echo restated: with no materialization anywhere, the same runs carry NO effort — byte-identical behavior (existing green)', async () => {
+    const f = fixture(F29_MODELS, F29_POLICY)
+    const h = makeHarness({
+      routing: f.portsFor(),
+      subagents: stubSubagents({ verdicts: [{ verdict: 'pass', note: 'ok', requestHeader: { provider: 'alpha', model: 'm-a' } }] }),
+    })
+    await toExecuting(h)
+    expect(h.subagents.auditOptions[0]).toEqual({ provider: 'alpha', model: 'm-a' })
+    const routing = routingOf(h, 'audit', 'plan-auditor')
+    expect(routing?.pin).toEqual({ provider: 'alpha', model: 'm-a' })
+    expect(routing?.why?.some(entry => entry.includes('effort: none declared and none named — omitted, never invented'))).toBe(true)
+    const record = h.engine.peek(h.root.id)?.audits[0]?.route
+    expect(record?.routeStatus).toBe('verified')
   })
 })

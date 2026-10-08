@@ -2338,3 +2338,156 @@ describe('F26: a routing detail binds the appended record it stamps', () => {
     expect(recordOnly.routingPins).toBeUndefined()
   })
 })
+
+// ── F30 (PR #2 Codex round 16): a routing detail's route fields must be CANONICAL (trimmed) ──
+//
+// Replay persisted pin provider/model/effort verbatim, so a padded pin
+// (' alpha '/' m-c ') folded clean while every consumer compares trimmed:
+// on reuse, policy membership and catalog liveness matched alpha/m-c but the
+// preflight and the dispatched agentOptions received the RAW pin — authorized
+// as one route, dispatched as another. The same canonicality rule covers the
+// route-identity fields of `repinFrom`, `candidates` entries, and
+// `fallbackFrom` records (pin state and the route references that surround
+// it). Additive strictness with the F22 replay-compat argument: detail.routing
+// is new in this branch and the engine stamps only trimmed fields, so no
+// 0.2.0 fixture and no engine-written stream can be rejected.
+
+describe('F30: padded (noncanonical) route fields in a routing detail are rejected', () => {
+  const PIN = { provider: 'beta', model: 'm-c', reasoningEffort: 'high' } as const
+  const TRIAGE = makeTriage({ size: 'standard', risk: 'medium', executionMode: 'inline', auditMode: 'independent' })
+
+  function auditWithRouting(prior: Snapshot, routing: unknown, pins: Snapshot['routingPins']): RunEvent {
+    return event('audit', makeSnapshot({
+      revision: prior.revision + 1,
+      phase: 'planning',
+      audits: prior.audits,
+      routingPins: pins,
+    }, TRIAGE), prior.revision + 1, { routing })
+  }
+
+  /** A well-formed detail carrying `over` merged over the canonical shape. */
+  function detail(over: Record<string, unknown> = {}): Record<string, unknown> {
+    return { role: 'plan-auditor', pin: PIN, why: ['policy allows beta'], authorizationSource: 'session-policy', ...over }
+  }
+
+  it('rejects a padded pin provider, model, and effort — each named with its field', () => {
+    const prior = makeSnapshot({ phase: 'plan-reviewing' }, TRIAGE)
+    expect(() => applyEvent(prior, auditWithRouting(prior, detail({ pin: { provider: ' beta ', model: 'm-c', reasoningEffort: 'high' } }), { 'plan-auditor': { provider: ' beta ', model: 'm-c', reasoningEffort: 'high' } })))
+      .toThrowError(/pin\.provider must equal its trimmed form, got " beta "/)
+    expect(() => applyEvent(prior, auditWithRouting(prior, detail({ pin: { provider: 'beta', model: ' m-c ', reasoningEffort: 'high' } }), { 'plan-auditor': { provider: 'beta', model: ' m-c ', reasoningEffort: 'high' } })))
+      .toThrowError(/pin\.model must equal its trimmed form, got " m-c "/)
+    expect(() => applyEvent(prior, auditWithRouting(prior, detail({ pin: { provider: 'beta', model: 'm-c', reasoningEffort: ' high ' } }), { 'plan-auditor': { provider: 'beta', model: 'm-c', reasoningEffort: ' high ' } })))
+      .toThrowError(/pin\.reasoningEffort must equal its trimmed form, got " high "/)
+  })
+
+  it('rejects a padded repinFrom (the same canonical pin shape, both route fields)', () => {
+    const prior = makeSnapshot({ phase: 'plan-reviewing' }, TRIAGE)
+    expect(() => applyEvent(prior, auditWithRouting(prior, detail({ repinFrom: { provider: ' alpha ', model: 'm-a' } }), { 'plan-auditor': PIN })))
+      .toThrowError(/repinFrom\.provider must equal its trimmed form, got " alpha "/)
+    expect(() => applyEvent(prior, auditWithRouting(prior, detail({ repinFrom: { provider: 'alpha', model: ' m-a ' } }), { 'plan-auditor': PIN })))
+      .toThrowError(/repinFrom\.model must equal its trimmed form, got " m-a "/)
+  })
+
+  it('rejects padded candidates and fallbackFrom route fields (the route references around the pin)', () => {
+    const prior = makeSnapshot({ phase: 'plan-reviewing' }, TRIAGE)
+    expect(() => applyEvent(prior, auditWithRouting(prior, detail({
+      candidates: [{ provider: ' beta ', model: 'm-c', hasReasoningEfforts: false, disposition: 'selected' }],
+    }), { 'plan-auditor': PIN })))
+      .toThrowError(/candidates entry \.provider must equal its trimmed form, got " beta "/)
+    expect(() => applyEvent(prior, auditWithRouting(prior, detail({
+      fallbackFrom: [{ provider: 'alpha', model: ' m-a ', reason: 'rejected' }],
+    }), { 'plan-auditor': PIN })))
+      .toThrowError(/fallbackFrom entry \.model must equal its trimmed form, got " m-a "/)
+  })
+
+  it('CANONICAL pins, repins, candidates, and fallback records still fold (the engine\'s own stamp shapes)', () => {
+    const prior = makeSnapshot({ phase: 'plan-reviewing' }, TRIAGE)
+    const next = applyEvent(prior, auditWithRouting(prior, detail({
+      repinFrom: { provider: 'alpha', model: 'm-a' },
+      candidates: [
+        { provider: 'alpha', model: 'm-a', hasReasoningEfforts: true, disposition: 'preflight-rejected' },
+        { provider: 'beta', model: 'm-c', hasReasoningEfforts: true, disposition: 'selected' },
+      ],
+      fallbackFrom: [{ provider: 'alpha', model: 'm-a', reason: 'resolveCallConfig rejected alpha/m-a' }],
+    }), { 'plan-auditor': PIN }))
+    expect(next.routingPins).toEqual({ 'plan-auditor': PIN })
+  })
+})
+
+// ── F31 (PR #2 Codex round 16): the candidates set's `selected` is bound to the pin ──
+//
+// Dispositions were vocabulary-checked only, so a foreign event could mark
+// candidate B `selected` while the pin said A, or mark zero/several selected —
+// a considered set contradicting the decision it rides. When a detail carries
+// BOTH `candidates` and a pin, the fold now requires EXACTLY ONE selected
+// entry matching the pinned route. Pinless details keep the current rules
+// (no pin to bind). The engine always emits the bound shape, so only
+// hand-edited or foreign streams are refused (F22 replay-compat argument).
+
+describe('F31: exactly one selected candidate, and it is the pinned route', () => {
+  const PIN = { provider: 'beta', model: 'm-c', reasoningEffort: 'high' } as const
+  const TRIAGE = makeTriage({ size: 'standard', risk: 'medium', executionMode: 'inline', auditMode: 'independent' })
+
+  function auditWithRouting(prior: Snapshot, routing: unknown, pins: Snapshot['routingPins']): RunEvent {
+    return event('audit', makeSnapshot({
+      revision: prior.revision + 1,
+      phase: 'planning',
+      audits: prior.audits,
+      routingPins: pins,
+    }, TRIAGE), prior.revision + 1, { routing })
+  }
+
+  function detail(candidates: readonly unknown[], pin: unknown = PIN): Record<string, unknown> {
+    return { role: 'plan-auditor', pin, why: ['policy allows beta'], authorizationSource: 'session-policy', candidates }
+  }
+
+  function candidate(provider: string, model: string, disposition: string): Record<string, unknown> {
+    return { provider, model, hasReasoningEfforts: false, disposition }
+  }
+
+  it('rejects a selected candidate that is NOT the pinned route', () => {
+    const prior = makeSnapshot({ phase: 'plan-reviewing' }, TRIAGE)
+    expect(() => applyEvent(prior, auditWithRouting(prior, detail([
+      candidate('alpha', 'm-a', 'selected'),
+      candidate('beta', 'm-c', 'eligible'),
+    ]), { 'plan-auditor': PIN })))
+      .toThrowError(/marks alpha\/m-a selected but the decision pins beta\/m-c — the selected candidate must be the pinned route/)
+  })
+
+  it('rejects ZERO selected entries on a pinned decision', () => {
+    const prior = makeSnapshot({ phase: 'plan-reviewing' }, TRIAGE)
+    expect(() => applyEvent(prior, auditWithRouting(prior, detail([
+      candidate('alpha', 'm-a', 'eligible'),
+      candidate('beta', 'm-c', 'eligible'),
+    ]), { 'plan-auditor': PIN })))
+      .toThrowError(/pins beta\/m-c but its candidates set marks 0 entries selected — exactly ONE selected entry is required/)
+  })
+
+  it('rejects TWO selected entries (exactly one, never a set)', () => {
+    const prior = makeSnapshot({ phase: 'plan-reviewing' }, TRIAGE)
+    expect(() => applyEvent(prior, auditWithRouting(prior, detail([
+      candidate('alpha', 'm-a', 'selected'),
+      candidate('beta', 'm-c', 'selected'),
+    ]), { 'plan-auditor': PIN })))
+      .toThrowError(/marks 2 entries selected — exactly ONE selected entry is required/)
+  })
+
+  it('accepts the engine\'s real shape: exactly one selected, matching the pin', () => {
+    const prior = makeSnapshot({ phase: 'plan-reviewing' }, TRIAGE)
+    const next = applyEvent(prior, auditWithRouting(prior, detail([
+      candidate('alpha', 'm-a', 'preflight-rejected'),
+      candidate('beta', 'm-c', 'selected'),
+    ]), { 'plan-auditor': PIN }))
+    expect(next.routingPins).toEqual({ 'plan-auditor': PIN })
+  })
+
+  it('a PINLESS detail with candidates keeps the current rules — a selected entry with no pin to bind folds', () => {
+    const prior = makeSnapshot({ phase: 'plan-reviewing' }, TRIAGE)
+    const next = applyEvent(prior, auditWithRouting(prior, {
+      role: 'plan-auditor',
+      why: ['nothing authorized — inheriting'],
+      candidates: [candidate('alpha', 'm-a', 'selected')],
+    }, undefined))
+    expect(next.routingPins).toBeUndefined()
+  })
+})
