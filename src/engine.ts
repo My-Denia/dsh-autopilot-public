@@ -964,6 +964,9 @@ export interface StatusView {
    * in a planning phase with a NON-inherit planner decision (routed or
    * unsupported). An inherit decision (the shipped default) and every
    * disposed state project NOTHING — the absent field is the honest record.
+   * (The record vocabulary's `inherit` status is a DURABLE-only shape — the
+   * mid-planning refresh-into-inherit record of F4 — and never projects
+   * here.)
    */
   readonly plannerRouting?: PlannerRoutingRecord
   readonly diagnostic?: string
@@ -1086,23 +1089,78 @@ const PLANNER_REARM_NOTE =
  *    installed (no installer port, no root ctx, a grant/preflight refusal,
  *    or a declining/throwing installer). The run CONTINUES WITH INHERITANCE —
  *    degradation is recorded, never silent, never fatal.
+ *  - `inherit` — ONLY the durable record of a mid-planning REFRESH INTO
+ *    inherit (F4): the previous install existed and was disposed because the
+ *    live routing decision changed to inherit. This status never appears on
+ *    the LIVE status surface (an inherit install projects nothing there) —
+ *    it exists so the disposal is recorded, exactly as a dispose on leaving
+ *    planning needs no record but a dispose INSIDE planning does.
  *
- * There is deliberately NO `inherit` status: an inherit decision (the shipped
- * default) records NOTHING beyond the normal routing detail — the absent
- * field IS that record.
+ * Steady-state `inherit` decisions (the shipped default) still record NOTHING
+ * beyond the normal routing detail — the absent field IS that record; only a
+ * transition AWAY from a live install carries the `inherit` status.
  */
 export interface PlannerRoutingRecord {
-  readonly status: 'routed' | 'unsupported'
+  readonly status: 'routed' | 'unsupported' | 'inherit'
   /** The route the decision named; present whenever one was resolved. */
   readonly route?: { readonly provider: string; readonly model: string; readonly reasoningEffort?: string }
   /** The rule trace, same vocabulary as the routing details' `why`. */
   readonly why: readonly string[]
 }
 
+/** A planner route as the install decision names it (provider/model/effort). */
+interface PlannerRoute {
+  readonly provider: string
+  readonly model: string
+  readonly reasoningEffort?: string
+}
+
+/** The resolved planner decision, reduced to what change detection needs (F4). */
+interface PlannerDecisionKey {
+  readonly kind: 'inherit' | 'route' | 'degraded'
+  readonly route?: PlannerRoute
+}
+
+/** Trim-exact equality of a planner route's full identity, effort included. */
+function samePlannerRoute(a: PlannerRoute | undefined, b: PlannerRoute | undefined): boolean {
+  if (a === undefined || b === undefined) return a === b
+  return a.provider === b.provider && a.model === b.model && a.reasoningEffort === b.reasoningEffort
+}
+
+/**
+ * Whether a planning-phase re-resolution is the SAME decision the current
+ * install was armed from (F4): kind and full route identity equal, `why`
+ * prose deliberately ignored — a changed refusal REASON under the same kind
+ * and route is not a re-arm event, so unchanged config can never churn the
+ * install (no extra install/dispose, no extra record).
+ */
+function samePlannerDecision(a: PlannerDecisionKey, b: PlannerDecisionKey): boolean {
+  if (a.kind !== b.kind) return false
+  return samePlannerRoute(a.route, b.route)
+}
+
+/** One planner route's compact identity, for from→to refresh notes (F4). */
+function plannerRouteLabel(route: PlannerRoute | undefined): string {
+  if (route === undefined) return '(no route named)'
+  return `${route.provider}/${route.model}${route.reasoningEffort === undefined ? '' : ` @ ${route.reasoningEffort}`}`
+}
+
 /** What one run's live planner install state is (engine-internal). */
 type PlannerInstallState =
-  | { readonly kind: 'armed'; readonly record: PlannerRoutingRecord; readonly dispose?: () => void }
+  | { readonly kind: 'armed'; readonly record: PlannerRoutingRecord; readonly dispose?: () => void; readonly decision: PlannerDecisionKey }
   | { readonly kind: 'inherit' }
+
+/** The resolved planner decision in full: the arm instruction plus its rule trace. */
+type PlannerRouteDecision =
+  | { readonly kind: 'inherit' }
+  | { readonly kind: 'route'; readonly route: PlannerRoute; readonly why: readonly string[] }
+  | { readonly kind: 'degraded'; readonly route?: PlannerRoute; readonly why: readonly string[] }
+
+/** The decision reduced to its change-detection key (F4). */
+function plannerDecisionKeyOf(decision: PlannerRouteDecision): PlannerDecisionKey {
+  if (decision.kind === 'inherit') return { kind: 'inherit' }
+  return { kind: decision.kind, ...(decision.route === undefined ? {} : { route: decision.route }) }
+}
 
 /**
  * Routing ports (M3b): the live facts the routing core needs that the
@@ -2478,6 +2536,12 @@ export class AutopilotEngine {
     // or store failure unwinds a fresh install rather than orphaning it);
     // DISPOSE runs only AFTER the transition persisted — a rejected transition
     // must not leave planning without its model selection.
+    //
+    // F4 (PR #2 Codex review, round 2): an EXISTING install is re-evaluated
+    // here too — the decision is re-resolved from CURRENT facts at every
+    // planning-phase commit, and only a CHANGED decision churns the install
+    // (dispose + re-arm, recorded from→to). Unchanged decisions keep the
+    // arm-once economics: no extra install/dispose, no extra record.
     const wasPlanning = prior !== undefined && PLANNING_PHASES.includes(prior.phase)
     const isPlanning = PLANNING_PHASES.includes(scoped.phase)
     let stampedDetail = detail
@@ -2493,13 +2557,22 @@ export class AutopilotEngine {
         // reload re-arm (P2-3) carries the one-shot reload note here too.
         stampedDetail = withPlannerDetail(detail, this.notePlannerReload(scoped.runId, record))
       }
-    } else if (isPlanning && this.plannerReloadStamps.has(scoped.runId)) {
-      // P2-3: the install was re-armed at ENGINE LOAD of this planning-phase
-      // run — before this commit — so this commit owes the durable re-arm
-      // record once (the armed state itself stamps nothing on later commits).
-      const state = this.plannerInstalls.get(scoped.runId)
-      if (state?.kind === 'armed') {
-        stampedDetail = withPlannerDetail(detail, this.notePlannerReload(scoped.runId, state.record))
+    } else if (isPlanning) {
+      const refreshed = await this.refreshPlannerInstall(scoped.runId, scoped)
+      if (refreshed !== undefined) {
+        // A changed decision re-armed the install: the new record (from→to in
+        // its `why`) is this commit's durable plannerRouting, and a failed
+        // commit unwinds the re-arm exactly as it unwinds a fresh one.
+        armedHere = true
+        stampedDetail = withPlannerDetail(detail, this.notePlannerReload(scoped.runId, refreshed))
+      } else if (this.plannerReloadStamps.has(scoped.runId)) {
+        // P2-3: the install was re-armed at ENGINE LOAD of this planning-phase
+        // run — before this commit — so this commit owes the durable re-arm
+        // record once (the armed state itself stamps nothing on later commits).
+        const state = this.plannerInstalls.get(scoped.runId)
+        if (state?.kind === 'armed') {
+          stampedDetail = withPlannerDetail(detail, this.notePlannerReload(scoped.runId, state.record))
+        }
       }
     }
     const candidate: RunEvent = {
@@ -2670,14 +2743,27 @@ export class AutopilotEngine {
    * `escalate-owner`/`blocked` ⇒ the owner-escalation exit, with the reason.
    */
   /**
-   * The executor's CURRENT route for auditor-independence axes: the dispatch
-   * pin when one exists, else the CONFIGURED explicit executor route (the
-   * 0.2.0 family source — an executor that has not dispatched yet still has a
+   * The executor's CURRENT route for auditor-independence axes, in fallback
+   * order: the dispatch pin when one exists; else the CURRENT live routing
+   * lock for the executor (`routing.roles.executor` under `mode: 'locked'` —
+   * F5, PR #2 Codex review round 2: a lock is a DECLARED family even before
+   * the executor's first dispatch, so a medium+ plan audit dispatched before
+   * the executor still gets real axes instead of `unknown` on every
+   * candidate); else the legacy `executor.agentOptions` surface (the 0.2.0
+   * family source — an executor that has not dispatched yet still has a
    * declared family). Recomputed at every dispatch; never a stored judgment.
+   * The routing leg is the per-decision LIVE read (F2): a volatile lock patch
+   * reaches the next audit's axes without a remount, and an invalid live
+   * section reads as the all-inherit `REFUSED_ROUTING` shape, so no lock is
+   * claimed from config the code cannot validate.
    */
   private executorPinOf(prior: Snapshot): RoutePin | undefined {
     const pinned = prior.routingPins?.executor
     if (pinned !== undefined) return toRoutePin(pinned)
+    const executorRouting = this.routingConfig().routing.roles.executor
+    if (executorRouting.mode === 'locked') {
+      return { provider: executorRouting.provider, model: executorRouting.model }
+    }
     return toRoutePin(this.config.executor.agentOptions)
   }
 
@@ -3153,11 +3239,7 @@ export class AutopilotEngine {
   private async resolvePlannerRoute(
     root: AgentRef | undefined,
     next: Snapshot,
-  ): Promise<
-    | { readonly kind: 'inherit' }
-    | { readonly kind: 'route'; readonly route: { readonly provider: string; readonly model: string; readonly reasoningEffort?: string }; readonly why: readonly string[] }
-    | { readonly kind: 'degraded'; readonly route?: { readonly provider: string; readonly model: string; readonly reasoningEffort?: string }; readonly why: readonly string[] }
-  > {
+  ): Promise<PlannerRouteDecision> {
     // F2: the same per-decision live read as dispatch roles — a volatile
     // patch to the routing section reaches the planner decision without a
     // remount. An invalid live section refuses the install with a recorded
@@ -3259,8 +3341,21 @@ export class AutopilotEngine {
    * decision, which records NOTHING.
    */
   private async armPlannerSelection(runId: RunId, next: Snapshot): Promise<PlannerRoutingRecord | undefined> {
+    const decision = await this.resolvePlannerRoute(this.agents.get(runId), next)
+    return await this.armPlannerDecision(runId, decision)
+  }
+
+  /**
+   * The arm itself, over an ALREADY-RESOLVED decision (F4: the refresh path
+   * re-resolves first, then arms the decision it compared — one resolution
+   * per arm, never two, so a volatile patch landing between comparison and
+   * arm cannot split one refresh across two decisions). Every state write
+   * carries the decision key the arm came from: that key is what the next
+   * planning-phase commit's change detection compares against.
+   */
+  private async armPlannerDecision(runId: RunId, decision: PlannerRouteDecision): Promise<PlannerRoutingRecord | undefined> {
     const root = this.agents.get(runId)
-    const decision = await this.resolvePlannerRoute(root, next)
+    const decisionKey = plannerDecisionKeyOf(decision)
     if (decision.kind === 'inherit') {
       this.plannerInstalls.set(runId, { kind: 'inherit' })
       return undefined
@@ -3274,7 +3369,7 @@ export class AutopilotEngine {
     // whatever the port situation — the refusal reasons are the record.
     if (decision.kind === 'degraded') {
       const degraded = record('unsupported', decision.why)
-      this.plannerInstalls.set(runId, { kind: 'armed', record: degraded })
+      this.plannerInstalls.set(runId, { kind: 'armed', record: degraded, decision: decisionKey })
       return degraded
     }
     const installer = this.routingPorts.modelSelectionInstaller
@@ -3284,7 +3379,7 @@ export class AutopilotEngine {
         ? 'no modelSelectionInstaller port is wired (the host installModelSelection export was not reachable at mount)'
         : 'the root agent exposes no scoped ctx for the install'
       const unsupported = record('unsupported', [...decision.why, `planner: ${missing} — degraded to inheritance`])
-      this.plannerInstalls.set(runId, { kind: 'armed', record: unsupported })
+      this.plannerInstalls.set(runId, { kind: 'armed', record: unsupported, decision: decisionKey })
       return unsupported
     }
     let dispose: (() => void) | undefined
@@ -3292,20 +3387,77 @@ export class AutopilotEngine {
       dispose = installer(agentCtx, decision.route)
     } catch (error: unknown) {
       const unsupported = record('unsupported', [...decision.why, `planner: the installer threw (${errorMessage(error)}) — degraded to inheritance`])
-      this.plannerInstalls.set(runId, { kind: 'armed', record: unsupported })
+      this.plannerInstalls.set(runId, { kind: 'armed', record: unsupported, decision: decisionKey })
       return unsupported
     }
     if (dispose === undefined) {
       const unsupported = record('unsupported', [...decision.why, 'planner: the installer declined (returned no disposer) — degraded to inheritance'])
-      this.plannerInstalls.set(runId, { kind: 'armed', record: unsupported })
+      this.plannerInstalls.set(runId, { kind: 'armed', record: unsupported, decision: decisionKey })
       return unsupported
     }
     const routed = record('routed', [
       ...decision.why,
       'planner: model selection installed on the root agent\u2019s scoped ctx for the planning phases — the durable switch notice is the host\u2019s own; GAH adds nothing to the session',
     ])
-    this.plannerInstalls.set(runId, { kind: 'armed', record: routed, dispose })
+    this.plannerInstalls.set(runId, { kind: 'armed', record: routed, dispose, decision: decisionKey })
     return routed
+  }
+
+  /**
+   * F4 (PR #2 Codex review, round 2): re-evaluate an EXISTING planner install
+   * against CURRENT facts at every planning-phase commit. Since F2 made the
+   * routing values live, a volatile patch to `routing.roles.planner` (or
+   * `routing.mode`) mid-planning must reach the install within the planning
+   * window, not at its end — so the decision is re-resolved here, and only a
+   * CHANGED decision (different kind, or different full route identity)
+   * churns the install: the old one is disposed and the new decision armed
+   * atomically, with the refresh recorded (from→to) on the returning record.
+   * An UNCHANGED decision is a strict no-op — no dispose, no install, no
+   * record — so steady-state planning commits keep the arm-once economics the
+   * chokepoint always had (installer call count stable).
+   *
+   * Refresh-to-inherit returns the durable `status: 'inherit'` transition
+   * record instead of `undefined`: the disposal of a live install INSIDE the
+   * planning window is exactly the event the absent-field convention cannot
+   * express, and the packet requires it recorded.
+   *
+   * The reload stamp (P2-3) is deliberately PRESERVED across the internal
+   * dispose: the run never left planning, so the one-shot reload record is
+   * still owed — it rides whichever record this commit stamps (the refresh
+   * record when a refresh happened, else the armed state's record).
+   */
+  private async refreshPlannerInstall(runId: RunId, next: Snapshot): Promise<PlannerRoutingRecord | undefined> {
+    const state = this.plannerInstalls.get(runId)
+    if (state === undefined) return undefined
+    const previousDecision: PlannerDecisionKey = state.kind === 'inherit' ? { kind: 'inherit' } : state.decision
+    const decision = await this.resolvePlannerRoute(this.agents.get(runId), next)
+    if (samePlannerDecision(previousDecision, plannerDecisionKeyOf(decision))) return undefined
+    const from = state.kind === 'inherit'
+      ? 'inherit'
+      : `${state.record.status} ${plannerRouteLabel(state.record.route)}`
+    const owedReload = this.plannerReloadStamps.has(runId)
+    this.disposePlanner(runId)
+    if (owedReload) this.plannerReloadStamps.add(runId)
+    const note = (to: string): string =>
+      `planner: install refreshed mid-planning (${from} → ${to}) — the live routing decision changed, so the previous install was disposed and this one armed from CURRENT policy/catalog/routing facts at this commit; planning turns between the config change and this commit ran on the previous install`
+    if (decision.kind === 'inherit') {
+      this.plannerInstalls.set(runId, { kind: 'inherit' })
+      return { status: 'inherit', why: [note('inherit')] }
+    }
+    const armed = await this.armPlannerDecision(runId, decision)
+    // A non-inherit decision always arms to a record (routed or unsupported);
+    // the transition note is appended so from→to rides the durable commit,
+    // AND the armed state keeps the noted record — the live status surface and
+    // the durable detail name the same event, exactly as the arm path does.
+    const to = armed === undefined ? 'inherit' : `${armed.status} ${plannerRouteLabel(armed.route)}`
+    const noted = armed === undefined
+      ? { status: 'inherit' as const, why: [note(to)] }
+      : { ...armed, why: [...armed.why, note(to)] }
+    const armedState = this.plannerInstalls.get(runId)
+    if (armed !== undefined && armedState?.kind === 'armed' && armedState.record === armed) {
+      this.plannerInstalls.set(runId, { ...armedState, record: noted })
+    }
+    return noted
   }
 
   /**

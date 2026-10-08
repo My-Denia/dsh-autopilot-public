@@ -609,3 +609,196 @@ describe('F3 (PR #2 review): a slow installer import cannot lose the planner rou
     expect(slowImport.disposes()).toBe(1)
   })
 })
+
+// ── F4 (PR #2 Codex review, round 2): the planner install follows live routing patches mid-planning ──
+//
+// The defect: the commit chokepoint armed the planner install ONCE per
+// planning window (`!plannerInstalls.has(runId)`), so after E9's F2 made the
+// routing values live, a volatile patch to `routing.roles.planner` (or
+// `routing.mode`) mid-planning left the stale install active — or an inherited
+// planner unrouted — until the run left planning. The fix re-resolves the
+// decision from CURRENT facts at every planning-phase commit and, when it
+// CHANGED (decision kind, or full route identity), disposes the old install
+// and re-arms, with the from→to transition recorded on that commit's
+// `plannerRouting` detail. An UNCHANGED decision churns nothing: no dispose,
+// no install, no record — the arm-once economics of a steady planning window.
+
+describe('F4 (PR #2 review, round 2): the planner install follows live routing patches mid-planning', () => {
+  const PATCHED_LOCK = {
+    routing: {
+      roles: {
+        planner: {
+          mode: 'locked' as const,
+          lock: { provider: 'other-p', model: 'other-m' },
+        },
+      },
+    },
+  }
+  const PATCHED_ROUTE = { provider: 'other-p', model: 'other-m' }
+
+  /** A stateful installer whose failures are toggled per call (re-arm fixtures). */
+  function toggleInstaller(): {
+    readonly port: NonNullable<RoutingPorts['modelSelectionInstaller']>
+    readonly calls: InstallCall[]
+    readonly failNext: { value: boolean }
+    readonly disposes: () => number
+  } {
+    const calls: InstallCall[] = []
+    let disposes = 0
+    const failNext = { value: false }
+    const port: NonNullable<RoutingPorts['modelSelectionInstaller']> = (agentCtx, route) => {
+      calls.push({ agentCtx, route: { ...route } })
+      if (failNext.value) throw new Error('install slot busy')
+      return () => {
+        disposes += 1
+      }
+    }
+    return { port, calls, failNext, disposes: () => disposes }
+  }
+
+  /** A planner-volatile harness: the routing section is a mutable live source. */
+  function volatilePlanner(port?: NonNullable<RoutingPorts['modelSelectionInstaller']>): {
+    readonly engine: AutopilotEngine
+    readonly root: ReturnType<typeof fakeAgent>
+    readonly storeDir: string
+    readonly installer: ReturnType<typeof stubInstaller>
+    readonly patch: (config: Parameters<typeof resolveConfig>[0]) => void
+  } {
+    const installer = stubInstaller()
+    const storeDir = mkdtempSync(join(tmpdir(), 'dsh-autopilot-f4-'))
+    const agents = new FakeAgents()
+    const root = fakeAgent('root-1', undefined, undefined, ROOT_CTX)
+    agents.add(root)
+    let routing = resolveConfig(LOCKED_PLANNER).routing
+    const engine = new AutopilotEngine(
+      agents, stubSubagents(), new RunStore(storeDir), resolveConfig(LOCKED_PLANNER), () => true, {},
+      { modelSelectionInstaller: port ?? installer.port },
+      () => routing,
+    )
+    return {
+      engine, root, storeDir, installer,
+      patch: config => {
+        routing = resolveConfig(config).routing
+      },
+    }
+  }
+
+  /** Events whose plannerRouting record names the mid-planning refresh. */
+  function refreshEvents(h: { readonly storeDir: string; readonly root: { readonly id: string } }): RunEvent[] {
+    return eventsOf(h).filter(event => {
+      const detail = event.detail as { plannerRouting?: { why?: readonly string[] } } | undefined
+      return detail?.plannerRouting?.why?.some(entry => entry.includes('install refreshed mid-planning')) ?? false
+    })
+  }
+
+  it('a lock patched mid-planning is followed at the next planning commit: old disposed, new installed, from→to recorded', async () => {
+    const h = volatilePlanner()
+    await h.engine.init(h.root, makeTriage())
+    expect(h.installer.calls).toHaveLength(1)
+    h.patch(PATCHED_LOCK)
+    await h.engine.submitPlan(h.root, 'plan v2')
+    // The install follows the new route: exactly one dispose, one new install.
+    expect(h.installer.calls).toHaveLength(2)
+    expect(h.installer.calls[1]?.route).toEqual(PATCHED_ROUTE)
+    expect(h.installer.disposes()).toBe(1)
+    expect(h.engine.status(h.root)?.plannerRouting).toEqual({
+      status: 'routed',
+      route: PATCHED_ROUTE,
+      why: expect.any(Array),
+    })
+    // The deciding commit carries the from→to refresh record, durably.
+    const stamped = refreshEvents(h)
+    expect(stamped).toHaveLength(1)
+    expect(stamped[0]?.op).toBe('submit-plan')
+    const note = (stamped[0]?.detail as { plannerRouting?: { why?: readonly string[] } } | undefined)?.plannerRouting?.why?.join('\n') ?? ''
+    expect(note).toContain('install refreshed mid-planning')
+    expect(note).toContain('routed planner-p/planner-m @ high') // the from
+    expect(note).toContain('routed other-p/other-m') // the to
+    // And the run completes normally on the refreshed install.
+    await h.engine.selfCheck(h.root, { role: 'plan', verdict: 'pass', note: 'ok' })
+    expect(h.engine.peek(h.root.id)?.phase).toBe('executing')
+    expect(h.installer.disposes()).toBe(2)
+  })
+
+  it('a patch to inherit mid-planning disposes the install and records the transition; nothing projects live', async () => {
+    const h = volatilePlanner()
+    await h.engine.init(h.root, makeTriage())
+    expect(h.installer.calls).toHaveLength(1)
+    h.patch({ routing: { roles: { planner: { mode: 'inherit' } } } })
+    await h.engine.submitPlan(h.root, 'plan v2')
+    // Inherit arms nothing: the old install is disposed and NOT replaced.
+    expect(h.installer.calls).toHaveLength(1)
+    expect(h.installer.disposes()).toBe(1)
+    expect(h.engine.status(h.root)?.plannerRouting).toBeUndefined()
+    // The disposal is still recorded durably — the `inherit` transition record.
+    const stamped = refreshEvents(h)
+    expect(stamped).toHaveLength(1)
+    const record = (stamped[0]?.detail as { plannerRouting?: { status?: string; why?: readonly string[] } } | undefined)?.plannerRouting
+    expect(record?.status).toBe('inherit')
+    expect(record?.why?.join('\n')).toContain('routed planner-p/planner-m @ high')
+    expect(record?.why?.join('\n')).toContain('→ inherit')
+    // The run continues: the gate passes and no second dispose fires.
+    await h.engine.selfCheck(h.root, { role: 'plan', verdict: 'pass', note: 'ok' })
+    expect(h.engine.peek(h.root.id)?.phase).toBe('executing')
+    expect(h.installer.disposes()).toBe(1)
+  })
+
+  it('unchanged config churns nothing: no re-install, no dispose, no refresh record (installer call count stable)', async () => {
+    const h = volatilePlanner()
+    await h.engine.init(h.root, makeTriage())
+    await h.engine.submitPlan(h.root, 'plan v1')
+    await h.engine.selfCheck(h.root, { role: 'plan', verdict: 'needs-replan', note: 'weak verification' })
+    await h.engine.submitPlan(h.root, 'plan v2')
+    expect(h.installer.calls).toHaveLength(1)
+    expect(h.installer.disposes()).toBe(0)
+    expect(refreshEvents(h)).toHaveLength(0)
+    // Re-resolving the SAME config (a no-op patch) is still no churn.
+    h.patch(LOCKED_PLANNER)
+    await h.engine.submitPlan(h.root, 'plan v3')
+    expect(h.installer.calls).toHaveLength(1)
+    expect(h.installer.disposes()).toBe(0)
+    expect(refreshEvents(h)).toHaveLength(0)
+  })
+
+  it('an effort-only lock patch is still a changed decision: the install is refreshed', async () => {
+    const h = volatilePlanner()
+    await h.engine.init(h.root, makeTriage())
+    h.patch({
+      routing: {
+        roles: {
+          planner: { mode: 'locked', lock: { provider: 'planner-p', model: 'planner-m', reasoningEffort: 'low' } },
+        },
+      },
+    })
+    await h.engine.submitPlan(h.root, 'plan v2')
+    expect(h.installer.calls).toHaveLength(2)
+    expect(h.installer.calls[1]?.route).toEqual({ provider: 'planner-p', model: 'planner-m', reasoningEffort: 'low' })
+    expect(h.installer.disposes()).toBe(1)
+    const note = (refreshEvents(h)[0]?.detail as { plannerRouting?: { why?: readonly string[] } } | undefined)?.plannerRouting?.why?.join('\n') ?? ''
+    expect(note).toContain('routed planner-p/planner-m @ high')
+    expect(note).toContain('routed planner-p/planner-m @ low')
+  })
+
+  it('a re-arm whose install FAILS degrades to recorded unsupported — the run never throws', async () => {
+    const installer = toggleInstaller()
+    const h = volatilePlanner(installer.port)
+    await h.engine.init(h.root, makeTriage())
+    expect(installer.calls).toHaveLength(1)
+    h.patch(PATCHED_LOCK)
+    installer.failNext.value = true
+    await h.engine.submitPlan(h.root, 'plan v2') // must not throw
+    // The old install was disposed; the failed re-arm degrades honestly.
+    expect(installer.calls).toHaveLength(2)
+    expect(installer.disposes()).toBe(1)
+    const status = h.engine.status(h.root)?.plannerRouting
+    expect(status?.status).toBe('unsupported')
+    expect(status?.route).toEqual(PATCHED_ROUTE)
+    expect(status?.why?.join('\n')).toContain('install slot busy')
+    expect(status?.why?.join('\n')).toContain('install refreshed mid-planning')
+    // The degradation is durable on the commit, and the run continues.
+    expect(refreshEvents(h)).toHaveLength(1)
+    await h.engine.selfCheck(h.root, { role: 'plan', verdict: 'pass', note: 'ok' })
+    expect(h.engine.peek(h.root.id)?.phase).toBe('executing')
+    expect(installer.disposes()).toBe(1) // the failed arm left no disposer to fire
+  })
+})

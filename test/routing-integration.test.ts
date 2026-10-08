@@ -969,3 +969,89 @@ describe('F3 (PR #2 review): createRoutingWiring settles the installer import be
     wiring.dispose()
   })
 })
+
+// ── F5 (PR #2 Codex review, round 2): the executor routing lock feeds the independence axes ──
+//
+// The defect: `executorPinOf` fell back from the dispatch pin straight to the
+// legacy `executor.agentOptions` surface and never consulted the NEW
+// `routing.roles.executor` lock — so a medium+ plan audit dispatched BEFORE
+// the executor gave the selector no executor route, every candidate's
+// independence was unknown, and the auditor could land on the locked
+// executor's own family even when a both-axis-distinct candidate existed.
+// The fix puts the CURRENT live routing lock between the pin and the legacy
+// surface, per decision (F2's live read, never a cached judgment).
+
+describe('F5 (PR #2 review, round 2): routing.roles.executor is visible to auditor independence before the executor dispatches', () => {
+  // beta/m-big wins on preference alone (efforts + the largest window) AND is
+  // the locked executor route; alpha/m-small is the both-axis-distinct candidate.
+  const F5_MODELS: readonly StubModel[] = [
+    { provider: 'beta', id: 'm-big', contextWindow: 400000, efforts: ['high'], defaultEffort: 'high' },
+    { provider: 'alpha', id: 'm-small', contextWindow: 131072, efforts: ['high'], defaultEffort: 'high' },
+  ]
+  const F5_POLICY: SessionPolicyState = {
+    kind: 'present',
+    routes: [{ provider: 'beta', model: 'm-big' }, { provider: 'alpha', model: 'm-small' }],
+  }
+
+  function f5Harness(
+    lock: { provider: string; model: string },
+    models: readonly StubModel[] = F5_MODELS,
+    policy: SessionPolicyState = F5_POLICY,
+  ): Harness {
+    const f = fixture(models, policy)
+    return makeHarness({
+      config: { routing: { roles: { executor: { lock } } } },
+      routing: f.portsFor(),
+      subagents: stubSubagents({ verdicts: [{ verdict: 'pass', note: 'ok' }] }),
+    })
+  }
+
+  it('(a) a locked executor with no legacy config and no pin yet gives the pre-executor plan audit REAL axes: the both-axis-distinct candidate is selected and `achieved` recorded', async () => {
+    const h = f5Harness({ provider: 'beta', model: 'm-big' })
+    await toExecuting(h)
+    // Preference alone would take beta/m-big — the locked executor's own
+    // family; the independence reorder against the LIVE lock takes the
+    // both-axis-distinct alpha/m-small instead.
+    expect(h.subagents.auditOptions[0]).toEqual({ provider: 'alpha', model: 'm-small', reasoningEffort: 'high' })
+    const record = h.engine.peek(h.root.id)?.audits[0]?.route
+    expect(record?.crossFamily).toBe('achieved')
+    expect(record?.routeDiagnostic).toContain('modelAxis distinct, providerAxis distinct')
+    const routing = routingOf(h, 'audit', 'plan-auditor')
+    expect(routing?.why?.some(entry => entry.includes("both-axis-distinct candidates from the executor's live pin first"))).toBe(true)
+    // No executor dispatch happened yet: the axes came from the LOCK, not a pin.
+    expect(h.engine.peek(h.root.id)?.routingPins?.executor).toBeUndefined()
+  })
+
+  it('(b) provider-axis distinctness is the differentiator: the same-provider preference winner loses to the provider-distinct candidate', async () => {
+    // Executor locked to beta/m-big; beta/m-alt shares the PROVIDER (modelAxis
+    // distinct only) and is the preference winner; alpha/m-x is both-axis distinct.
+    const models: readonly StubModel[] = [
+      { provider: 'beta', id: 'm-alt', contextWindow: 400000, efforts: ['high'], defaultEffort: 'high' },
+      { provider: 'alpha', id: 'm-x', contextWindow: 131072, efforts: ['high'], defaultEffort: 'high' },
+    ]
+    const policy: SessionPolicyState = {
+      kind: 'present',
+      routes: [{ provider: 'beta', model: 'm-alt' }, { provider: 'alpha', model: 'm-x' }],
+    }
+    const h = f5Harness({ provider: 'beta', model: 'm-big' }, models, policy)
+    await toExecuting(h)
+    expect(h.subagents.auditOptions[0]).toEqual({ provider: 'alpha', model: 'm-x', reasoningEffort: 'high' })
+    expect(h.engine.peek(h.root.id)?.audits[0]?.route?.crossFamily).toBe('achieved')
+    expect(h.engine.peek(h.root.id)?.audits[0]?.route?.routeDiagnostic).toContain('providerAxis distinct')
+  })
+
+  it('(c) no lock ⇒ the legacy fallback is unchanged: executor.agentOptions still names the family for the axes', async () => {
+    // No routing lock (and resolveConfig maps this legacy explicit route onto
+    // the executor role itself): the legacy surface remains the family source
+    // an auditor's axes are computed against — 0.2.0 behavior preserved.
+    const f = fixture(F5_MODELS, F5_POLICY)
+    const h = makeHarness({
+      config: { executor: { agentOptions: { provider: 'beta', model: 'm-big' } } },
+      routing: f.portsFor(),
+      subagents: stubSubagents({ verdicts: [{ verdict: 'pass', note: 'ok' }] }),
+    })
+    await toExecuting(h)
+    expect(h.subagents.auditOptions[0]).toEqual({ provider: 'alpha', model: 'm-small', reasoningEffort: 'high' })
+    expect(h.engine.peek(h.root.id)?.audits[0]?.route?.crossFamily).toBe('achieved')
+  })
+})
