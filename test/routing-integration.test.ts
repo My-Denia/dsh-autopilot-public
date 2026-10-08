@@ -44,6 +44,10 @@ class StubLlm implements LlmRuntimeSubset {
   public readonly preflights: LlmCallConfig[] = []
   /** Routes `resolveCallConfig` REJECTS (F7 fixtures): "provider/model" → reason. */
   public readonly preflightRejects = new Map<string, string>()
+  /** F14 fixtures: when true, `listProviders` throws — the whole-catalog READ fails (infrastructure), distinct from adapter loss. */
+  public failProviders = false
+  /** F15 fixtures: "provider/model" routes where `resolveCallConfig` rejects a config that carries `maxTokens`. */
+  public readonly maxTokensRejects = new Set<string>()
 
   constructor(private readonly models: readonly StubModel[]) {
     this.live = new Set(models.map(model => model.provider))
@@ -55,6 +59,7 @@ class StubLlm implements LlmRuntimeSubset {
   }
 
   listProviders() {
+    if (this.failProviders) throw new Error('listProviders: scripted outage')
     return [...this.live].map(id => ({ id, name: id }))
   }
 
@@ -88,6 +93,9 @@ class StubLlm implements LlmRuntimeSubset {
     this.preflights.push(config)
     const rejection = this.preflightRejects.get(`${config.provider}/${config.model}`)
     if (rejection !== undefined) throw new Error(rejection)
+    if (config.maxTokens !== undefined && this.maxTokensRejects.has(`${config.provider}/${config.model}`)) {
+      throw new Error(`resolveCallConfig: maxTokens ${config.maxTokens} is invalid on ${config.provider}/${config.model}`)
+    }
     return { ...config }
   }
 }
@@ -1545,5 +1553,194 @@ describe('F12 (PR #2 round 5): the pool fallback builder family is sourced from 
     expect(routing?.why?.some(entry => entry.includes('pool fallback supplied'))).toBe(false)
     expect(h.engine.peek(h.root.id)?.audits[0]?.route?.crossFamily).toBe('unknown-family')
     expect(h.engine.peek(h.root.id)?.routingPins?.['plan-auditor']).toBeUndefined()
+  })
+})
+
+// ── F14 (PR #2 round 6): a catalog outage is infrastructure, not provider disappearance ──
+//
+// `RouteCatalog.snapshot()` degrades a failed `listProviders` to
+// `catalogStatus: 'unavailable'` with an EMPTY provider list — a shape a bare
+// `providerIsLive` check cannot distinguish from a vanished provider. The
+// locked-route branch and the auto pin-reuse liveness check used exactly that
+// bare check, so ONE transient read failure escalated every locked dispatch
+// as needs-owner-decision and re-selected healthy pins over. Now liveness is
+// asserted only on a SUCCESSFUL read (`catalogStatus: 'live'`); an
+// unavailable read is recorded as the outage it is, and preflight — which
+// calls `resolveCallConfig` independently of the failed listing — decides.
+// The gone-provider escalation on a live read is unchanged ((iv-c) above
+// keeps proving it end to end).
+
+describe('F14 (PR #2 round 6): a catalog outage is infrastructure, not provider disappearance', () => {
+  /** A closing run over a live execution-auditor pin, with a third dispatch still scripted. */
+  async function pinnedRun(): Promise<{ readonly h: Harness; readonly f: Fixture }> {
+    const f = fixture(MODELS, PRESENT_ABC)
+    const h = makeHarness({
+      routing: f.portsFor(),
+      subagents: stubSubagents({ verdicts: [
+        { verdict: 'pass', note: 'plan ok' },
+        { verdict: 'pass', note: 'exec ok' },
+        { verdict: 'pass', note: 'exec ok again' },
+      ] }),
+    })
+    await toClosing(h)
+    expect(h.engine.peek(h.root.id)?.routingPins?.['execution-auditor']).toEqual({ provider: 'beta', model: 'm-c', reasoningEffort: 'high' })
+    return { h, f }
+  }
+
+  /** The last routing detail for one role in the durable stream. */
+  function lastDetail(h: Harness, role: string): RoutingDecisionDetail | undefined {
+    const details = routingDetails(h).filter(detail => detail.role === role)
+    return details[details.length - 1]
+  }
+
+  it('(a) locked role + catalog read failure ⇒ NOT escalated: the lock dispatches through preflight, why names the outage', async () => {
+    const f = fixture(MODELS, PRESENT_ABC)
+    const h = makeHarness({
+      routing: f.portsFor(),
+      config: { routing: { roles: { executionAuditor: { mode: 'locked', lock: { provider: 'alpha', model: 'm-a' } } } } },
+      subagents: stubSubagents({ verdicts: [
+        { verdict: 'pass', note: 'plan ok' },
+        { verdict: 'pass', note: 'exec ok' },
+        { verdict: 'pass', note: 'exec ok again' },
+      ] }),
+    })
+    await toClosing(h)
+    expect(h.subagents.auditOptions[1]).toEqual({ provider: 'alpha', model: 'm-a' })
+
+    f.llm.failProviders = true
+    f.catalog.invalidate()
+
+    // The outage is infrastructure, not evidence the provider is gone: the
+    // locked dispatch PROCEEDS instead of escalating needs-owner-decision.
+    await h.engine.audit(h.root, { role: 'execution', prompt: 'again' })
+    expect(h.subagents.auditOptions[2]).toEqual({ provider: 'alpha', model: 'm-a' })
+    const last = lastDetail(h, 'execution-auditor')
+    expect(last?.pin).toEqual({ provider: 'alpha', model: 'm-a' })
+    expect(last?.repinFrom).toBeUndefined()
+    expect(last?.why?.some(entry =>
+      entry.includes('catalog: snapshot unavailable') && entry.includes('not evidence the provider is gone'))).toBe(true)
+    expect(h.engine.peek(h.root.id)?.phase).not.toBe('needs-owner-decision')
+    // Preflight was the actual gate: resolveCallConfig ran for the locked route.
+    expect(f.llm.preflights.some(config => config.provider === 'alpha' && config.model === 'm-a')).toBe(true)
+  })
+
+  it('(b) locked role + outage + preflight failure ⇒ still escalates with the existing reason shape', async () => {
+    const f = fixture(MODELS, PRESENT_ABC)
+    const h = makeHarness({
+      routing: f.portsFor(),
+      config: { routing: { roles: { executionAuditor: { mode: 'locked', lock: { provider: 'alpha', model: 'm-a' } } } } },
+      subagents: stubSubagents({ verdicts: [
+        { verdict: 'pass', note: 'plan ok' },
+        { verdict: 'pass', note: 'exec ok' },
+        { verdict: 'pass', note: 'never reached' },
+      ] }),
+    })
+    await toClosing(h)
+
+    f.llm.preflightRejects.set('alpha/m-a', 'resolveCallConfig: scripted rejection under outage')
+    f.llm.failProviders = true
+    f.catalog.invalidate()
+
+    // The outage does not WEAKEN the gate either: preflight failure on a lock
+    // still blocks dispatch and escalates, exactly as on a healthy catalog.
+    await expect(h.engine.audit(h.root, { role: 'execution', prompt: 'again' }))
+      .rejects.toThrowError(/failed preflight/)
+    const snapshot = h.engine.peek(h.root.id)
+    expect(snapshot?.phase).toBe('needs-owner-decision')
+    expect(snapshot?.diagnostic?.startsWith('routing-escalation:')).toBe(true)
+    expect(h.subagents.auditOptions.length).toBe(2)
+  })
+
+  it('(c) auto pin reuse + catalog read failure ⇒ the pin is NOT killed by liveness; preflight decides; the outage is recorded', async () => {
+    const { h, f } = await pinnedRun()
+    const preflightsBefore = f.llm.preflights.length
+
+    f.llm.failProviders = true
+    f.catalog.invalidate()
+
+    await h.engine.audit(h.root, { role: 'execution', prompt: 'again' })
+    // The healthy pin survived the outage: same route dispatched, no repin,
+    // the session-policy authority intact.
+    expect(h.subagents.auditOptions[2]).toEqual({ provider: 'beta', model: 'm-c', reasoningEffort: 'high' })
+    const last = lastDetail(h, 'execution-auditor')
+    expect(last?.pin).toEqual({ provider: 'beta', model: 'm-c', reasoningEffort: 'high' })
+    expect(last?.repinFrom).toBeUndefined()
+    expect(last?.authorizationSource).toBe('session-policy')
+    // The reuse record names the outage instead of claiming a liveness proof
+    // it could not run — and instead of killing the pin over one it could not read.
+    expect(last?.why?.some(entry =>
+      entry.includes('pin: reusing the role pin')
+      && entry.includes('provider liveness NOT assertable')
+      && entry.includes('not evidence the provider is gone'))).toBe(true)
+    // Preflight decided AFTER the outage began: resolveCallConfig ran for the pin.
+    const afterOutage = f.llm.preflights.slice(preflightsBefore)
+    expect(afterOutage.some(config => config.provider === 'beta' && config.model === 'm-c')).toBe(true)
+  })
+})
+
+// ── F15 (PR #2 round 6): the pool walk preflights the FULL call config ──
+//
+// The pool fallback dispatches the COMPLETE pool entry as agentOptions, but
+// its preflight used to forward only provider/model/reasoningEffort — an
+// invalid `maxTokens` on a pool entry passed the walk and failed at subagent
+// start. The walk now routes the whole entry through `resolveCallConfig`
+// (the port's `preflight` signature already carries `maxTokens` — no port
+// change), so walk acceptance implies dispatch validity. Grant-first
+// ordering and the honest skip records are unchanged.
+
+describe('F15 (PR #2 round 6): the pool walk preflights every dispatched call-config field', () => {
+  /** Auto-mode harness over models with a gamma provider, executor named to the alpha family. */
+  function poolHarness(pool: readonly AgentOptionsLike[], llm: StubLlm): Harness {
+    const catalog = new RouteCatalog(llm)
+    const h = makeHarness({
+      routing: { catalog, policyReader: () => ABSENT },
+      config: {
+        executor: { agentOptions: { provider: 'alpha', model: 'm-a' } },
+        crossFamily: { enabled: true, minRisk: 'medium', pool: [...pool] },
+      },
+      subagents: stubSubagents({ verdicts: [{ verdict: 'pass', note: 'ok' }] }),
+    })
+    return h
+  }
+
+  it('(a) a pool entry whose maxTokens the preflight rejects is SKIPPED with the reason; the next entry dispatches', async () => {
+    const llm = new StubLlm([...MODELS, { provider: 'gamma', id: 'm-d', contextWindow: 131072 }])
+    llm.maxTokensRejects.add('beta/m-c')
+    const h = poolHarness(
+      [
+        { provider: 'beta', model: 'm-c', maxTokens: 64 },
+        { provider: 'gamma', model: 'm-d', maxTokens: 512 },
+      ],
+      llm,
+    )
+    await toExecuting(h)
+    // The invalid first entry was stepped past — NOT dispatched to fail at start.
+    expect(h.subagents.auditOptions[0]).toEqual({ provider: 'gamma', model: 'm-d', maxTokens: 512 })
+    const routing = routingOf(h, 'audit', 'plan-auditor')
+    expect(routing?.pin).toEqual({ provider: 'gamma', model: 'm-d' })
+    expect(routing?.authorizationSource).toBe('plugin-config')
+    expect(routing?.why?.some(entry =>
+      entry.includes('pool route beta/m-c skipped')
+      && entry.includes('dispatch preflight rejected it')
+      && entry.includes('maxTokens 64 is invalid'))).toBe(true)
+    // The walk actually SAW the field: the beta/m-c preflight carried maxTokens.
+    expect(llm.preflights.some(config =>
+      config.provider === 'beta' && config.model === 'm-c' && config.maxTokens === 64)).toBe(true)
+  })
+
+  it('(b) a valid maxTokens entry dispatches WHOLE — preflight proven to have received the complete fields', async () => {
+    const llm = new StubLlm([...MODELS, { provider: 'gamma', id: 'm-d', contextWindow: 131072 }])
+    const h = poolHarness([{ provider: 'gamma', model: 'm-d', maxTokens: 512, reasoningEffort: 'high' }], llm)
+    await toExecuting(h)
+    // The dispatch carries the complete entry verbatim, as 0.2.0 did.
+    expect(h.subagents.auditOptions[0]).toEqual({ provider: 'gamma', model: 'm-d', maxTokens: 512, reasoningEffort: 'high' })
+    const routing = routingOf(h, 'audit', 'plan-auditor')
+    expect(routing?.pin).toEqual({ provider: 'gamma', model: 'm-d', reasoningEffort: 'high' })
+    expect(routing?.why?.some(entry => entry.includes('skipped'))).toBe(false)
+    // And the preflight received EXACTLY those complete fields before it —
+    // walk acceptance and dispatch validity are now the same check.
+    expect(llm.preflights.some(config =>
+      config.provider === 'gamma' && config.model === 'm-d'
+      && config.maxTokens === 512 && config.reasoningEffort === 'high')).toBe(true)
   })
 })

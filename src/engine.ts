@@ -3052,7 +3052,15 @@ export class AutopilotEngine {
         const pinRoute: RoutePin = { provider: pin.provider, model: pin.model }
         const snapshot = await catalog.snapshot()
         let dead: string | undefined
-        if (!providerIsLive(snapshot, pin.provider)) {
+        // F14 (PR #2 Codex round 6): an `unavailable` snapshot (a catalog read
+        // failure — infrastructure) is NOT evidence the pinned provider is
+        // gone; `providerIsLive` honestly answers false on it (nothing is
+        // provably live), so the old check killed a HEALTHY pin on one hiccup
+        // and re-selected over it. Liveness is asserted only on a SUCCESSFUL
+        // read; otherwise preflight decides (it talks to `resolveCallConfig`
+        // directly, independent of the failed listing) and the outage is
+        // recorded on the reuse below.
+        if (snapshot.catalogStatus === 'live' && !providerIsLive(snapshot, pin.provider)) {
           dead = `pinned provider "${pin.provider}" is no longer live in the catalog (llm/adapters-updated refreshed it)`
         } else {
           try {
@@ -3089,6 +3097,13 @@ export class AutopilotEngine {
             const candidate = toRoutePin(entry)
             return candidate !== undefined && sameRoute(candidate, pinRoute)
           })
+          // F14: the reuse record states liveness only when the read could
+          // assert it; an unavailable catalog is named as the outage it is —
+          // never dressed up as "provider live" (nothing was proven) and
+          // never as "provider gone" (nothing failed but the read).
+          const livenessNote = snapshot.catalogStatus === 'live'
+            ? 'provider live'
+            : `provider liveness NOT assertable — catalog unavailable (${snapshot.diagnostic ?? 'no diagnostic recorded'}): a catalog read failure (infrastructure), not evidence the provider is gone`
           return {
             kind: 'dispatch',
             agentOptions: {
@@ -3100,7 +3115,7 @@ export class AutopilotEngine {
               role,
               pin,
               why: [
-                `pin: reusing the role pin — provider live, preflight accepted, authority intact (${poolHit ? 'a plugin-config pool grant' : 'authorized by the session policy when selected'})`,
+                `pin: reusing the role pin — ${livenessNote}, preflight accepted, authority intact (${poolHit ? 'a plugin-config pool grant' : 'authorized by the session policy when selected'})`,
               ],
               authorizationSource: poolHit ? 'plugin-config' : 'session-policy',
             },
@@ -3303,11 +3318,22 @@ export class AutopilotEngine {
         skipped.push(`cross-family: pool route ${candidate.provider}/${candidate.model} skipped — its provider is not live in the catalog snapshot`)
         continue
       }
+      // F15 (PR #2 Codex round 6): preflight EVERY call-config field the
+      // dispatch carries. The dispatch hands the COMPLETE pool entry to the
+      // subagent start as agentOptions, but this walk used to forward only
+      // provider/model/reasoningEffort — a pool entry with an invalid
+      // `maxTokens` (or any other call-config field) passed the walk and
+      // failed at subagent start. The port's `preflight` signature already
+      // accepts the full `LlmCallConfig` (maxTokens included), so the entry is
+      // routed through `resolveCallConfig` WHOLE (route identity normalized
+      // to the trimmed pin the grant/liveness legs checked): walk acceptance
+      // now implies dispatch validity. Grant-first ordering and the honest
+      // skip records are unchanged.
       try {
         await catalog.preflight({
+          ...entry,
           provider: candidate.provider,
           model: candidate.model,
-          ...(effort === undefined ? {} : { reasoningEffort: effort }),
         })
       } catch (error) {
         skipped.push(`cross-family: pool route ${candidate.provider}/${candidate.model} skipped — dispatch preflight rejected it (${errorMessage(error)})`)

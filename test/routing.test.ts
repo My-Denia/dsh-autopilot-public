@@ -637,6 +637,66 @@ describe('select: fixture (f) — a locked route outside the policy escalates to
   })
 })
 
+describe('select: F14 (PR #2 round 6) — a catalog outage is not "provider gone" on a locked route', () => {
+  it('catalogStatus unavailable ⇒ NOT escalated: the lock proceeds to preflight (the actual gate), why names the outage', async () => {
+    const stubbed = stubLlm([{ provider: 'alpha', id: 'm-lock', contextWindow: 131072 }], { failProviders: true })
+    const decision = await selectRoute(
+      selection({
+        roleRouting: { mode: 'locked', provider: 'alpha', model: 'm-lock' },
+        policy: ABSENT_POLICY,
+        catalog: new RouteCatalog(stubbed),
+      }),
+    )
+    const route = expectRoute(decision)
+    expect(route.route.provider).toBe('alpha')
+    expect(route.route.model).toBe('m-lock')
+    expect(route.authorizationSource).toBe('plugin-config')
+    // The outage is recorded honestly — degradation is never silent, and the
+    // record never claims the provider was proven live either.
+    expectWhy(decision, /^catalog: snapshot unavailable/, /not evidence the provider is gone/)
+    // Dispatch proceeded TO PREFLIGHT: resolveCallConfig was actually called
+    // (the catalog READ failed, not the route's ability to serve).
+    expect(stubbed.calls.preflight).toHaveLength(1)
+    expect(stubbed.calls.preflight[0]?.provider).toBe('alpha')
+  })
+
+  it('unavailable + preflight failure ⇒ blocked with the existing reason shape (plus the outage named)', async () => {
+    const decision = await selectRoute(
+      selection({
+        roleRouting: { mode: 'locked', provider: 'alpha', model: 'm-a' },
+        policy: ABSENT_POLICY,
+        catalog: catalogOf(
+          [{ provider: 'alpha', id: 'm-a', contextWindow: 131072 }],
+          { failProviders: true, rejectPreflightFor: ['m-a'] },
+        ),
+      }),
+    )
+    expect(decision.kind).toBe('blocked')
+    if (decision.kind === 'blocked') {
+      // The existing escalation shape, byte-for-byte in its clauses: a lock
+      // has no fallback candidate, so the failure still blocks dispatch.
+      expect(decision.reason).toContain('failed preflight')
+      expect(decision.reason).toContain('a lock has no fallback candidate')
+      expectWhy(decision, /preflight: resolveCallConfig rejected alpha\/m-a/, /^catalog: snapshot unavailable/)
+    }
+  })
+
+  it('a LIVE read that lacks the provider still escalates — the outage carve-out does not weaken the gone case', async () => {
+    const decision = await selectRoute(
+      selection({
+        roleRouting: { mode: 'locked', provider: 'gamma', model: 'm-lock' },
+        policy: ABSENT_POLICY,
+        catalog: catalogOf([{ provider: 'alpha', id: 'm-a' }]),
+      }),
+    )
+    expect(decision.kind).toBe('escalate-owner')
+    if (decision.kind === 'escalate-owner') {
+      expect(decision.reason).toContain('no live provider in the catalog')
+      expect(decision.reason).toContain('needs-owner-decision')
+    }
+  })
+})
+
 describe('select: fixture (g) — no policy ⇒ inheritance only', () => {
   it('absent policy: auto mode inherits, multi-model catalog notwithstanding; settings never consulted', async () => {
     const decision = await selectRoute(

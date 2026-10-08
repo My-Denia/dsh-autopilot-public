@@ -234,7 +234,18 @@ async function selectLocked(input: RouteSelectionInput): Promise<SelectionDecisi
     return { kind: 'escalate-owner', reason: verdict.reason }
   }
   const snapshot = await input.catalog.snapshot()
-  if (!providerIsLive(snapshot, grant.provider)) {
+  // F14 (PR #2 Codex round 6): branch on the read's own status BEFORE reading
+  // liveness off it. An `unavailable` snapshot (a `listProviders` throw — a
+  // transient infrastructure failure) carries an EMPTY provider list, so the
+  // old `!providerIsLive` check conflated "the catalog could not be read"
+  // with "the locked provider is gone" and one hiccup escalated every locked
+  // dispatch as needs-owner-decision. Only a SUCCESSFUL read (`live`) that
+  // lacks the provider is evidence of disappearance and escalates as before;
+  // an unavailable read degrades honestly below (the outage is named in `why`)
+  // and the lock proceeds to preflight — `resolveCallConfig` is the actual
+  // gate for an explicit owner selection, and a preflight failure still
+  // blocks with the existing reason shape.
+  if (snapshot.catalogStatus === 'live' && !providerIsLive(snapshot, grant.provider)) {
     // Plan "Route records and stability": a locked route whose provider is
     // gone blocks dispatch and escalates needs-owner-decision. The lock is an
     // owner grant; only the owner can re-decide it.
@@ -245,6 +256,12 @@ async function selectLocked(input: RouteSelectionInput): Promise<SelectionDecisi
         'dispatch blocked, run escalates needs-owner-decision',
     }
   }
+  const catalogOutage =
+    snapshot.catalogStatus === 'unavailable'
+      ? `catalog: snapshot unavailable (${snapshot.diagnostic ?? 'no diagnostic recorded'}) — ` +
+        'catalog read failed (infrastructure), not evidence the provider is gone; ' +
+        'proceeding to preflight, the actual gate for an explicit owner selection'
+      : undefined
   let facts: LlmResolvedModelInfo | undefined
   let factsError: string | undefined
   try {
@@ -262,6 +279,7 @@ async function selectLocked(input: RouteSelectionInput): Promise<SelectionDecisi
   }
   const effort = effortFor(working, input.roleRouting.reasoningEffort)
   const why = [...verdict.why, 'role-floor: not applied — a locked route is an explicit owner selection; no preference ranking applies']
+  if (catalogOutage !== undefined) why.push(catalogOutage)
   if (factsError !== undefined) {
     why.push(`facts: ${routeLabel(pin)} resolution failed (${factsError}) — effort defaults omitted, never invented`)
   }
