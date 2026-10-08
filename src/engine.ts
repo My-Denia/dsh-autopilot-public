@@ -1540,14 +1540,16 @@ export class AutopilotEngine {
           executor: this.config.executor.agentOptions,
           // F21: the pool leg of the policy reads the normalized pool (the one
           // seam), so a POOL pick's blank effort never reaches the pin built
-          // below; the legacy `configured` surface stays verbatim (0.2.0
-          // dispatch parity for mode 'off').
+          // below; the legacy `configured` surface feeds the CHOICE verbatim
+          // (0.2.0 selection parity for mode 'off') — the picked route is
+          // normalized at dispatch below (F27).
           policy: { ...this.config.crossFamily, pool: this.normalizedPool() },
         })
         agentOptions = choice.agentOptions
         familyChoice = choice
-        const pick = toRoutePin(choice.agentOptions)
-        if (pick !== undefined) {
+        const pickSource = choice.agentOptions
+        const pick = toRoutePin(pickSource)
+        if (pick !== undefined && pickSource !== undefined) {
           // An explicit pick is a plugin-config grant ([R2-P1-1]) — checked in
           // EVERY mode. A routeless pick (inheritance, tuning-only options)
           // names no route and checks nothing: 0.2.0 parity.
@@ -1558,10 +1560,34 @@ export class AutopilotEngine {
           if (verdict.kind === 'conflict') {
             return await this.routingEscalation(root, prior, verdict.reason)
           }
-          const effort = choice.agentOptions?.reasoningEffort
+          // F27 (PR #2 Codex round 14): dispatch the route the grant above
+          // authorized — the F24 one-object discipline, at the off-mode seam.
+          // The grant check and the pin/evidence below all name the TRIMMED
+          // route (`toRoutePin`), but 0.2.0 dispatched `choice.agentOptions`
+          // verbatim, so a whitespace-padded entry (pool or configured) was
+          // granted and recorded as `alpha/model` while the child start
+          // received `" alpha "/" model "` — a start failure or a
+          // creation-route mismatch against `detail.routing.pin`. The dispatch
+          // now carries route identity from the trimmed pick and the effort
+          // under the F21 normalization (trimmed when non-blank, ABSENT when
+          // blank — the fold rejects a blank-effort pin, and the pin below is
+          // built from the SAME value, so dispatch, grant, and evidence can
+          // never disagree), with every other call-config field riding the
+          // entry verbatim. Documented deviation from the 0.2.0-verbatim
+          // path: 0.2.0 dispatched raw; we dispatch what the grant authorized.
+          // For a clean entry the composition is field-identical to the entry
+          // (0.2.0 behavior unchanged).
+          const effort = pickSource.reasoningEffort?.trim()
+          const carriesEffort = effort !== undefined && effort.length > 0
+          if (carriesEffort) {
+            agentOptions = { ...pickSource, provider: pick.provider, model: pick.model, reasoningEffort: effort }
+          } else {
+            const { reasoningEffort: _blank, ...rest } = pickSource
+            agentOptions = { ...rest, provider: pick.provider, model: pick.model }
+          }
           routingDetail = {
             role: roleKey,
-            pin: { provider: pick.provider, model: pick.model, ...(effort === undefined ? {} : { reasoningEffort: effort }) },
+            pin: { provider: pick.provider, model: pick.model, ...(carriesEffort ? { reasoningEffort: effort } : {}) },
             why: [
               ...verdict.why,
               `cross-family: routed by the 0.2.0 pool fallback (${choice.outcome})${choice.diagnostic === undefined ? '' : ` — ${choice.diagnostic}`}`,

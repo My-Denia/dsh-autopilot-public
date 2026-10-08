@@ -431,6 +431,89 @@ describe('routing integration: mode off', () => {
     const routing = routingOf(h, 'audit', 'plan-auditor')
     expect(routing?.authorizationSource).toBe('plugin-config')
   })
+
+  // F27 (PR #2 Codex round 14): the off-mode pick dispatches the NORMALIZED
+  // route the grant authorized. The grant check and the pin/evidence layers
+  // name the trimmed route (`toRoutePin`); before F27 the dispatch handed the
+  // subagent start the raw pick, so a padded entry was granted/recorded as
+  // `beta/m-c` while the child started as `" beta "/" m-c "` — a start
+  // failure or a creation-evidence mismatch against `detail.routing.pin`.
+  // Clean entries stay byte-identical to 0.2.0 (vii-a/vii-c above, existing
+  // green).
+  function offF27Harness(options: {
+    readonly pool?: AgentOptionsLike
+    readonly planAuditor?: AgentOptionsLike
+  }): Harness {
+    const f = fixture(MODELS, PRESENT_ABC)
+    return makeHarness({
+      routing: { catalog: f.catalog, policyReader: () => PRESENT_ABC },
+      config: {
+        routing: { mode: 'off' },
+        executor: { agentOptions: { provider: 'alpha', model: 'm-a' } },
+        ...(options.planAuditor === undefined ? {} : { auditors: { plan: { agentOptions: options.planAuditor } } }),
+        crossFamily: {
+          enabled: true,
+          minRisk: 'medium',
+          ...(options.pool === undefined ? {} : { pool: [options.pool] }),
+        },
+      },
+      subagents: stubSubagents({ verdicts: [{ verdict: 'pass', note: 'ok' }] }),
+    })
+  }
+
+  it('(vii-d) F27: a padded POOL entry dispatches the trimmed route (other fields verbatim) and pin/evidence agree', async () => {
+    const h = offF27Harness({ pool: { provider: ' beta ', model: ' m-c ', maxTokens: 4096, reasoningEffort: ' high ' } })
+    await toExecuting(h)
+    // Route identity dispatched TRIMMED — the route the grant checked — with
+    // the entry's other call-config fields verbatim and the effort under the
+    // F21 normalization (trimmed when non-blank).
+    expect(h.subagents.auditOptions[0]).toEqual({ provider: 'beta', model: 'm-c', maxTokens: 4096, reasoningEffort: 'high' })
+    const routing = routingOf(h, 'audit', 'plan-auditor')
+    expect(routing?.pin).toEqual({ provider: 'beta', model: 'm-c', reasoningEffort: 'high' })
+    expect(routing?.authorizationSource).toBe('plugin-config')
+    // Pin/evidence agreement: creation (`Agent.options`) and observed
+    // (`request/header`) echo the dispatched route, so the record is
+    // `verified` — never a mismatch against `detail.routing.pin`.
+    const record = h.engine.peek(h.root.id)?.audits[0]?.route
+    expect(record?.routeProvider).toBe('beta')
+    expect(record?.routeModel).toBe('m-c')
+    expect(record?.selected).toEqual({ provider: 'beta', model: 'm-c', reasoningEffort: 'high' })
+    expect(record?.observed).toEqual({ provider: 'beta', model: 'm-c', reasoningEffort: 'high' })
+    expect(record?.routeStatus).toBe('verified')
+    expect(record?.crossFamily).toBe('achieved')
+  })
+
+  it('(vii-e) F27: a padded CONFIGURED pick (the verbatim legacy surface) dispatches the same normalized route', async () => {
+    // The configured surface never passes through `normalizedPool` (F21's
+    // seam) — it feeds `selectCrossFamily` verbatim, so the padded effort and
+    // route reach the pick raw; the dispatch and pin still agree on the
+    // normalized route.
+    const h = offF27Harness({ planAuditor: { provider: ' beta ', model: ' m-c ', maxTokens: 2048, reasoningEffort: ' high ' } })
+    await toExecuting(h)
+    expect(h.subagents.auditOptions[0]).toEqual({ provider: 'beta', model: 'm-c', maxTokens: 2048, reasoningEffort: 'high' })
+    const routing = routingOf(h, 'audit', 'plan-auditor')
+    expect(routing?.pin).toEqual({ provider: 'beta', model: 'm-c', reasoningEffort: 'high' })
+    const record = h.engine.peek(h.root.id)?.audits[0]?.route
+    expect(record?.routeStatus).toBe('verified')
+    expect(record?.selected).toEqual(routing?.pin)
+  })
+
+  it('(vii-f) F27: a blank effort on the pick dispatches and pins NO effort (absence, not blank) — the fold-legal pin', async () => {
+    // A whitespace-only effort names no effort at all (the F21 rule applied
+    // at the off-mode seam): the dispatch carries no `reasoningEffort` key
+    // and the pin omits it — the fold rejects a blank-effort pin, and before
+    // F27 the verbatim configured pick copied `'  '` into both.
+    const h = offF27Harness({ planAuditor: { provider: ' beta ', model: ' m-c ', reasoningEffort: '  ' } })
+    await toExecuting(h)
+    const dispatched = h.subagents.auditOptions[0]
+    expect(dispatched).toEqual({ provider: 'beta', model: 'm-c' })
+    expect('reasoningEffort' in (dispatched ?? {})).toBe(false)
+    const routing = routingOf(h, 'audit', 'plan-auditor')
+    expect(routing?.pin).toEqual({ provider: 'beta', model: 'm-c' })
+    expect(routing?.pin?.reasoningEffort).toBeUndefined()
+    const record = h.engine.peek(h.root.id)?.audits[0]?.route
+    expect(record?.routeStatus).toBe('verified')
+  })
 })
 
 // ── (viii) resume carries no route fields ──
