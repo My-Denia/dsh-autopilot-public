@@ -673,6 +673,27 @@ function routingActive(routing: ResolvedRouting, role: Role): boolean {
   return routing.roles[role].mode !== 'auto'
 }
 
+/**
+ * F2 (PR #2 Codex review): the conservative routing an INVALID live section
+ * degrades to — mode `off` with every role `inherit`, i.e. "route nothing
+ * explicitly". Only its ACTIVITY is ever consumed (the dispatch gates and the
+ * planner re-arm check); every decision path that would act on it returns the
+ * recorded refusal instead, so this shape can never select, lock, or pin
+ * anything. It exists so the gates have a total function to read even when
+ * the real section cannot be resolved at all.
+ */
+const REFUSED_ROUTING: ResolvedRouting = {
+  mode: 'off',
+  preference: 'balanced',
+  roles: {
+    executor: { mode: 'inherit' },
+    planner: { mode: 'inherit' },
+    'plan-auditor': { mode: 'inherit' },
+    'execution-auditor': { mode: 'inherit' },
+    'rules-auditor': { mode: 'inherit' },
+  },
+}
+
 /** What one dispatch runs on, after routing decided (or recorded parity). */
 export interface DispatchRouting {
   /** The agentOptions the child dispatches with; `undefined` = inherit the deployment default. */
@@ -1174,6 +1195,18 @@ export class AutopilotEngine {
     private readonly environment: EnvironmentProbes = {},
     /** Routing ports (M3b). Absent ⇒ 0.2.0/inherit dispatch behavior, recorded honestly. */
     private readonly routingPorts: RoutingPorts = {},
+    /**
+     * F2 (PR #2 Codex review): re-resolves the routing section from the raw
+     * config at each routing decision. Wired by `apply()` exactly when the
+     * routing leaves arrived as volatile references (the Cordis loader
+     * path), where a config PATCH updates the refs in place WITHOUT
+     * remounting the plugin — a mount-time snapshot would freeze
+     * mode/lock/preference at their mount values while the legacy surfaces
+     * follow their patches through the remount. Absent (every plain-object
+     * caller, and the whole pre-F2 test suite) ⇒ `config.routing` IS the
+     * live routing, byte-identical to the previous behavior.
+     */
+    private readonly routingSource: (() => ResolvedRouting) | undefined = undefined,
   ) {}
 
   /**
@@ -1312,7 +1345,12 @@ export class AutopilotEngine {
       let agentOptions: AgentOptionsLike | undefined
       let routingDetail: RoutingDecisionDetail | undefined
       let familyChoice: CrossFamilyChoice
-      if (routingActive(this.config.routing, roleKey)) {
+      // F2: the gate reads the CURRENT routing (a volatile patch lands
+      // without remount); an invalid live section reads as the conservative
+      // all-inherit shape, which routes every role INTO resolveRoleRoute so
+      // the refusal is recorded on the dispatch instead of silently taking
+      // the 0.2.0 pool path under a config the code cannot validate.
+      if (routingActive(this.routingConfig().routing, roleKey)) {
         const resolution = await this.resolveRoleRoute(root, roleKey, prior)
         if (resolution.kind === 'escalate') {
           return await this.routingEscalation(root, prior, resolution.reason)
@@ -1601,7 +1639,8 @@ export class AutopilotEngine {
       // still covers every config-sourced explicit route in every mode.
       let agentOptions: AgentOptionsLike | undefined
       let routingDetail: RoutingDecisionDetail | undefined
-      if (routingActive(this.config.routing, 'executor')) {
+      // F2: same live gate read as the audit path above.
+      if (routingActive(this.routingConfig().routing, 'executor')) {
         const resolution = await this.resolveRoleRoute(root, 'executor', prior)
         if (resolution.kind === 'escalate') {
           return await this.routingEscalation(root, prior, resolution.reason)
@@ -2278,7 +2317,11 @@ export class AutopilotEngine {
    * deployments are untouched by the reload path.
    */
   private plannerRoutingActive(): boolean {
-    return this.config.routing.roles.planner.mode !== 'inherit' && routingActive(this.config.routing, 'planner')
+    // F2: the CURRENT routing decides — an invalid live section reads as the
+    // conservative all-inherit shape ⇒ inactive, so no re-arm is scheduled on
+    // config the code cannot validate.
+    const routing = this.routingConfig().routing
+    return routing.roles.planner.mode !== 'inherit' && routingActive(routing, 'planner')
   }
 
   /**
@@ -2643,6 +2686,18 @@ export class AutopilotEngine {
    * plugin-config pin re-runs the one grant rule, and a session-policy pin
    * must still be a member of the (write-once, but re-read) policy set. A pin
    * that fails either check re-selects — recorded as a repin, not a crash.
+   *
+   * F1 (PR #2 Codex review): a NON-pool pin whose policy is `absent` or
+   * `unreachable` is refused too. Before, that case fell through to
+   * `undefined` (authorized) and the auto reuse branch dispatched the pin
+   * labeled `session-policy` although current authorization could not be
+   * established — the pin's authority evaporated with the policy read. The
+   * refusal names the policy state and lets the existing re-selection
+   * machinery apply unchanged (absent/unreachable ⇒ the selector terminates
+   * to inheritance, the pin is cleared, `repinFrom` records the dead pin). A
+   * POOL pin is untouched: a plugin-config grant already escalates under an
+   * absent policy per the plan's one rule, so it is reused on the grant, not
+   * silently inherited.
    */
   private pinStillAuthorized(role: Role, pin: RoutePin, policy: SessionPolicyState): string | undefined {
     const poolHit = this.config.crossFamily.pool.some(entry => {
@@ -2653,18 +2708,63 @@ export class AutopilotEngine {
       const verdict = resolvePluginGrant({ provider: pin.provider, model: pin.model, source: 'legacy-pool' }, policy)
       return verdict.kind === 'conflict' ? verdict.reason : undefined
     }
-    if (policy.kind === 'present') {
-      const member = policy.routes.some(route => {
-        const candidate = toRoutePin(route)
-        return candidate !== undefined && sameRoute(candidate, pin)
-      })
-      if (!member) return `pinned route ${pin.provider}/${pin.model} is no longer in the session model-selection policy set`
+    if (policy.kind !== 'present') {
+      return `pinned route ${pin.provider}/${pin.model} cannot re-establish its session-policy authorization — the session policy is ${policy.kind}; refusing the pin conservatively`
     }
+    const member = policy.routes.some(route => {
+      const candidate = toRoutePin(route)
+      return candidate !== undefined && sameRoute(candidate, pin)
+    })
+    if (!member) return `pinned route ${pin.provider}/${pin.model} is no longer in the session model-selection policy set`
     return undefined
   }
 
+  /**
+   * F2 (PR #2 Codex review): the routing section as of THIS decision. With a
+   * volatile routing source wired, every call re-resolves the CURRENT values
+   * — a config patch lands without a remount, and the next dispatch must
+   * follow it, exactly like the legacy surfaces follow theirs. A patch that
+   * made the section INVALID must not crash mid-commit: throwing during a
+   * commit is worse than refusing the route with an honest record (the
+   * commit's persisted state must survive the owner's broken patch), so the
+   * read degrades to {@link REFUSED_ROUTING} and the refusal reason rides the
+   * decision's `why` — dispatch roles inherit the deployment default, the
+   * planner install is refused with a recorded degradation. Mount-time
+   * validation is unchanged: an invalid INITIAL config still fails the mount
+   * fast, exactly as before.
+   */
+  private routingConfig(): { readonly routing: ResolvedRouting; readonly refused?: string } {
+    if (this.routingSource === undefined) return { routing: this.config.routing }
+    try {
+      return { routing: this.routingSource() }
+    } catch (error: unknown) {
+      return {
+        routing: REFUSED_ROUTING,
+        refused: `the live routing section no longer resolves (${errorMessage(error)})`,
+      }
+    }
+  }
+
   private async resolveRoleRoute(root: AgentRef, role: Role, prior: Snapshot): Promise<RoleRouteResolution> {
-    const routing = this.config.routing
+    // F2: one live read per decision — the section as of THIS dispatch. An
+    // invalid live section refuses the route outright: the dispatch inherits
+    // the deployment default with the refusal recorded, rather than
+    // dispatching on config the code cannot validate (and rather than
+    // throwing inside the commit that carries the dispatch). The pinless
+    // record also clears any existing role pin — a pin whose config context
+    // can no longer be validated is not kept alive silently.
+    const live = this.routingConfig()
+    if (live.refused !== undefined) {
+      return {
+        kind: 'dispatch',
+        agentOptions: undefined,
+        routing: {
+          role,
+          why: [`routing: ${live.refused} — refusing to route this dispatch; inheriting the deployment default until the config is valid again`],
+        },
+      }
+    }
+    const routing = live.routing
     const roleRouting = routing.roles[role]
     const policy = this.readPolicy(root)
     const catalog = this.routingPorts.catalog
@@ -2780,7 +2880,7 @@ export class AutopilotEngine {
             },
           }
         }
-        const reselected = await this.selectForRole(role, roleRouting, prior, policy, catalog)
+        const reselected = await this.selectForRole(role, routing.preference, roleRouting, prior, policy, catalog)
         core = this.decorateRepinned(
           this.resolutionOfDecision(role, roleRouting, reselected, undefined),
           {
@@ -2791,10 +2891,10 @@ export class AutopilotEngine {
           dead,
         )
       } else {
-        core = this.resolutionOfDecision(role, roleRouting, await this.selectForRole(role, roleRouting, prior, policy, catalog), undefined)
+        core = this.resolutionOfDecision(role, roleRouting, await this.selectForRole(role, routing.preference, roleRouting, prior, policy, catalog), undefined)
       }
     } else {
-      core = this.resolutionOfDecision(role, roleRouting, await this.selectForRole(role, roleRouting, prior, policy, catalog), undefined)
+      core = this.resolutionOfDecision(role, roleRouting, await this.selectForRole(role, routing.preference, roleRouting, prior, policy, catalog), undefined)
     }
 
     if (core.kind === 'escalate') return core
@@ -2907,6 +3007,7 @@ export class AutopilotEngine {
   /** `selectRoute` with the engine's resolved inputs (risk, preference, live executor pin). */
   private async selectForRole(
     role: Role,
+    preference: RoutePreference,
     roleRouting: RoleRouting,
     prior: Snapshot,
     policy: SessionPolicyState,
@@ -2916,7 +3017,10 @@ export class AutopilotEngine {
     return await selectRoute({
       role,
       risk: prior.triage.risk,
-      preference: this.config.routing.preference,
+      // F2: the preference as read at THIS decision's start, passed down so a
+      // patch landing mid-decision cannot split one decision across two
+      // configs (one live read per decision, not one per sub-step).
+      preference,
       roleRouting,
       policy,
       catalog,
@@ -3054,7 +3158,19 @@ export class AutopilotEngine {
     | { readonly kind: 'route'; readonly route: { readonly provider: string; readonly model: string; readonly reasoningEffort?: string }; readonly why: readonly string[] }
     | { readonly kind: 'degraded'; readonly route?: { readonly provider: string; readonly model: string; readonly reasoningEffort?: string }; readonly why: readonly string[] }
   > {
-    const routing = this.config.routing
+    // F2: the same per-decision live read as dispatch roles — a volatile
+    // patch to the routing section reaches the planner decision without a
+    // remount. An invalid live section refuses the install with a recorded
+    // degradation (never fatal, per the planner opt-in contract): the run
+    // plans on the deployment default until the config is valid again.
+    const live = this.routingConfig()
+    if (live.refused !== undefined) {
+      return {
+        kind: 'degraded',
+        why: [`routing: ${live.refused} — the planner install is refused; the run plans on the deployment default until the config is valid again`],
+      }
+    }
+    const routing = live.routing
     const roleRouting = routing.roles.planner
     // The shipped default: the planner inherits — GAH does not reroute the
     // user's session model. Nothing is recorded beyond the config itself.

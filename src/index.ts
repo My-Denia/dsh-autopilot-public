@@ -331,6 +331,53 @@ function readSetting<T>(value: T | VolatileRef): T {
   return isVolatileRef(value) ? (value.get() as T) : value
 }
 
+/**
+ * F2 (PR #2 Codex review): whether ANY leaf under the `routing` section
+ * arrived as a volatile reference. Bounded depth (the section is three
+ * levels deep: section → role → leaf) and cycle-safe by construction — a
+ * volatile reference is returned on sight and never descended into.
+ */
+function containsVolatileRef(value: unknown, depth = 0): boolean {
+  if (value === null || typeof value !== 'object' || depth > 4) return false
+  if (isVolatileRef(value)) return true
+  if (Array.isArray(value)) return value.some(item => containsVolatileRef(item, depth + 1))
+  return Object.values(value as Record<string, unknown>).some(item => containsVolatileRef(item, depth + 1))
+}
+
+/**
+ * F2 (PR #2 Codex review): the per-decision routing re-read for the engine.
+ *
+ * THE DEFECT THIS CLOSES: `resolveConfig` is evaluated ONCE at mount, and on
+ * the Cordis loader path the routing leaves arrive as volatile REFERENCES —
+ * precisely so a config PATCH can update them in place WITHOUT remounting the
+ * plugin fiber. Unwrapping them into `ResolvedConfig.routing` at mount froze
+ * mode/lock/preference at their mount values: a patched `routing.mode` or a
+ * patched lock had no effect until a remount, while the legacy
+ * `executor.agentOptions` surface stayed live through its own remount path.
+ *
+ * THE SHAPE, AND WHY NOT A FIELD ON `ResolvedRouting`: the raw `ConfigInput`
+ * is kept and re-resolved by {@link resolveRouting} at each routing decision
+ * (the packet's second suggested shape). Carrying the refs INSIDE
+ * `ResolvedRouting` would put a live closure into a value the suite asserts
+ * by deep equality against the plain path (`test/config.test.ts`), so the
+ * accessor travels beside the resolved config instead — `apply()` hands it
+ * to the engine as its optional `routingSource`, and the resolved config
+ * stays pure data on BOTH paths.
+ *
+ * The PLAIN path is untouched by construction: no volatile references ⇒
+ * `undefined` ⇒ the engine keeps reading its mount-time `config.routing`,
+ * byte-identical to the pre-F2 behavior. On the loader path the closure
+ * re-runs the SAME resolution (defaults, legacy mapping, fail-closed
+ * validation), so a patch that makes the section invalid surfaces at the
+ * next decision — where the engine degrades honestly instead of throwing
+ * mid-commit (see the engine's `routingConfig`); the mount-time
+ * fail-fast on an invalid INITIAL config is unchanged.
+ */
+export function volatileRoutingAccess(input?: ConfigInput): (() => ResolvedRouting) | undefined {
+  if (!containsVolatileRef(input?.routing)) return undefined
+  return () => resolveRouting(input)
+}
+
 /** The five per-role config keys, in schema declaration order. */
 const ROLE_CONFIG_KEYS = ['executor', 'planner', 'planAuditor', 'executionAuditor', 'rulesAuditor'] as const
 
@@ -876,6 +923,17 @@ const MIRROR_MODEL_SELECTION_PROJECTION = {
 /** What {@link createRoutingWiring} built, for the engine and the lifecycle. */
 export interface RoutingWiring {
   readonly ports: RoutingPorts
+  /**
+   * F3 (PR #2 Codex review): settles when the late-bound planner installer
+   * import has resolved OR irrecoverably failed — never rejects. `apply()`
+   * AWAITS this before constructing the engine, so the engine is never
+   * exposed before the installer port is known: a run entering planning at
+   * cold mount can no longer record `plannerRouting: 'unsupported'` because
+   * the dynamic import had not settled yet (the fire-and-forget race).
+   * Direct constructor callers (tests) that never await it keep the previous
+   * semantics — the port simply appears when the import lands.
+   */
+  readonly installerReady: Promise<void>
   /** Releases the mirror projection registration and the adapters-updated subscription. */
   dispose: () => void
 }
@@ -906,6 +964,11 @@ type HostModelSelectionInstall = (
  *   export, late-bound by DYNAMIC import (see the wiring below); absence of
  *   the export leaves the port `undefined` and the engine records the
  *   degradation only when a non-inherit planner decision makes it matter.
+ *   F3 (PR #2 Codex review): the import is AWAITED during mount through the
+ *   returned `installerReady` promise, so a run entering planning at cold
+ *   mount finds the port already resolved (or honestly `undefined`) — the
+ *   fire-and-forget race that could permanently record `unsupported` for a
+ *   healthy host is closed at the only place ordering is enforceable.
  */
 export function createRoutingWiring(rawCtx: unknown, onWarn: (message: string) => void = () => {}): RoutingWiring {
   const llm = probeLlmRuntime(rawCtx)
@@ -956,14 +1019,6 @@ export function createRoutingWiring(rawCtx: unknown, onWarn: (message: string) =
       return { kind: 'unreachable' }
     }
   }
-  // M6 planner install port (engine-local role routing): the host's
-  // `installModelSelection`, late-bound by DYNAMIC import — never a static
-  // import, because this plugin must keep mounting on hosts whose package
-  // graph resolves differently from its own declared dependencies (the
-  // plugin runs INSIDE the host process, so the host's own copy answers).
-  // Absence of the export, or an unresolvable module, leaves the port
-  // `undefined` — the engine then records `plannerRouting: 'unsupported'`
-  // and continues with inheritance; the mount NEVER fails over this.
   const ports: {
     catalog?: RouteCatalog
     policyReader?: (root: AgentRef) => SessionPolicyState
@@ -972,40 +1027,58 @@ export function createRoutingWiring(rawCtx: unknown, onWarn: (message: string) =
     ...(catalog === undefined ? {} : { catalog }),
     policyReader,
   }
-  void import('@deepseek-ai/dsh-agent')
-    .then((module) => {
-      const install = (module as { installModelSelection?: unknown }).installModelSelection as HostModelSelectionInstall | undefined
-      if (typeof install !== 'function') return
-      ports.modelSelectionInstaller = (agentCtx, route) => {
-        // The host contract wants a MUTABLE selection ref the caller owns:
-        // `current` is the planner route for every step that enters prompt
-        // assembly while the install is live. The returned disposer is wrapped
-        // so clearing the selection rides the engine's dispose too.
-        const selection: {
-          current: { provider: string; model: string; reasoningEffort?: string } | undefined
-          assembled: unknown
-        } = {
-          current: {
-            provider: route.provider,
-            model: route.model,
-            ...(route.reasoningEffort === undefined ? {} : { reasoningEffort: route.reasoningEffort }),
-          },
-          assembled: undefined,
-        }
-        const hostDispose = install(agentCtx, selection)
-        return () => {
-          selection.current = undefined
-          hostDispose()
-        }
+  // M6 planner install port (engine-local role routing): the host's
+  // `installModelSelection`, late-bound by DYNAMIC import — never a static
+  // import, because this plugin must keep mounting on hosts whose package
+  // graph resolves differently from its own declared dependencies (the
+  // plugin runs INSIDE the host process, so the host's own copy answers).
+  // Absence of the export, or an unresolvable module, leaves the port
+  // `undefined` — the engine then records `plannerRouting: 'unsupported'`
+  // and continues with inheritance; the mount NEVER fails over this.
+  //
+  // F3 (PR #2 Codex review): the promise is RETURNED as `installerReady` and
+  // `apply()` awaits it BEFORE constructing the engine. It used to be
+  // fire-and-forget (`void import(...)`), and a run entering planning before
+  // it settled recorded `plannerRouting: 'unsupported'` — never retried
+  // within the planning phase — on a perfectly healthy host; awaiting the
+  // port at mount is the decided fix (the alternative, re-arming planner
+  // selections when the installer arrives, would have to un-write the
+  // already-recorded `unsupported` state, which is exactly the kind of
+  // record-rewriting this repository refuses).
+  const installerReady: Promise<void> = import('@deepseek-ai/dsh-agent').then((module) => {
+    const install = (module as { installModelSelection?: unknown }).installModelSelection as HostModelSelectionInstall | undefined
+    if (typeof install !== 'function') return
+    ports.modelSelectionInstaller = (agentCtx, route) => {
+      // The host contract wants a MUTABLE selection ref the caller owns:
+      // `current` is the planner route for every step that enters prompt
+      // assembly while the install is live. The returned disposer is wrapped
+      // so clearing the selection rides the engine's dispose too.
+      const selection: {
+        current: { provider: string; model: string; reasoningEffort?: string } | undefined
+        assembled: unknown
+      } = {
+        current: {
+          provider: route.provider,
+          model: route.model,
+          ...(route.reasoningEffort === undefined ? {} : { reasoningEffort: route.reasoningEffort }),
+        },
+        assembled: undefined,
       }
-    }, () => {
-      // Not resolvable from this plugin's location on this deployment — the
-      // normal shape for a host profile without the agent package above it.
-      // The degradation is recorded by the engine ('unsupported') exactly
-      // when a non-inherit planner decision makes it matter, not here.
-    })
+      const hostDispose = install(agentCtx, selection)
+      return () => {
+        selection.current = undefined
+        hostDispose()
+      }
+    }
+  }, () => {
+    // Not resolvable from this plugin's location on this deployment — the
+    // normal shape for a host profile without the agent package above it.
+    // The degradation is recorded by the engine ('unsupported') exactly
+    // when a non-inherit planner decision makes it matter, not here.
+  })
   return {
     ports,
+    installerReady,
     dispose: () => {
       for (const dispose of disposers.splice(0).reverse()) {
         try {
@@ -1385,6 +1458,16 @@ export async function apply(rawCtx: unknown, config?: ConfigInput): Promise<() =
     // what this mount can actually see. Disposers (adapters-updated
     // subscription, mirror projection registration) ride the plugin lifecycle.
     const routing = createRoutingWiring(rawCtx, message => warn(rawCtx, message))
+    // F3 (PR #2 Codex review): the planner installer port is a DYNAMIC
+    // import away, and the engine must never be exposed before it is known —
+    // a run entering planning at cold mount would otherwise record
+    // `plannerRouting: 'unsupported'` for a healthy host and never retry
+    // within the planning phase. `apply()` is already the async mount
+    // barrier the store relies on (the fiber awaits it before the plugin is
+    // ACTIVE), so the import settles HERE: the promise never rejects (an
+    // unresolvable module keeps the port honestly `undefined`), hence this
+    // await cannot unwind the mount.
+    await routing.installerReady
     const engine = new AutopilotEngine(
       ctx.agents as never,
       ctx.subagents as never,
@@ -1393,6 +1476,11 @@ export async function apply(rawCtx: unknown, config?: ConfigInput): Promise<() =
       () => probeSandbox(rawCtx),
       probes,
       routing.ports,
+      // F2 (PR #2 Codex review): the per-decision routing re-read — wired
+      // exactly when the routing leaves arrived as volatile references (the
+      // Cordis loader path); `undefined` on the plain path, whose
+      // `config.routing` snapshot is therefore still the live truth.
+      volatileRoutingAccess(config),
     )
 
     // ── Policy prompt section (zero tokens without a run) ──────────────────

@@ -14,12 +14,13 @@
  * the port.
  */
 
-import { readFileSync } from 'node:fs'
+import { mkdtempSync, readFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it, vi } from 'vitest'
 import type { RoutingPorts } from '../src/engine.js'
 import { AutopilotEngine } from '../src/engine.js'
-import { resolveConfig } from '../src/index.js'
+import { apply, resolveConfig } from '../src/index.js'
 import { RouteCatalog } from '../src/routing/catalog.js'
 import type { LlmRuntimeSubset } from '../src/routing/catalog.js'
 import { RunStore } from '../src/store/file.js'
@@ -476,5 +477,135 @@ describe('P2-3: the planner install is re-armed after an engine reload', () => {
     await engine2.submitPlan(root2, 'plan v2')
     expect(installer2.calls).toHaveLength(0)
     expect(rearmEvents(h)).toHaveLength(0)
+  })
+})
+
+// ── F3 (PR #2 Codex review): the installer import settles BEFORE the engine exists ──
+//
+// The defect: `createRoutingWiring`'s dynamic import of the host's
+// `installModelSelection` was fire-and-forget, and `apply()` constructed the
+// engine immediately — a run entering planning at cold mount recorded
+// `plannerRouting: 'unsupported'` ("no modelSelectionInstaller port is wired")
+// on a perfectly healthy host and never retried within the planning phase.
+// The decided fix is the mount-ordering one: `apply()` awaits the wiring's
+// `installerReady` promise before constructing the engine, so the port is
+// known (or honestly `undefined`) by the time any run can exist. The mock
+// below delays the module on purpose — the mount must be observed WAITING on
+// it, then the first planning commit must find the install LIVE.
+
+const slowImport = vi.hoisted(() => {
+  const calls: Array<{ agentCtx: unknown; route: { provider: string; model: string } }> = []
+  let disposes = 0
+  return {
+    calls,
+    disposes: () => disposes,
+    installModelSelection(
+      agentCtx: unknown,
+      selection: { current: { provider: string; model: string; reasoningEffort?: string } | undefined },
+    ): () => void {
+      calls.push({ agentCtx, route: { ...(selection.current as { provider: string; model: string }) } })
+      return () => {
+        disposes += 1
+        selection.current = undefined
+      }
+    },
+  }
+})
+
+vi.mock('@deepseek-ai/dsh-agent', () => new Promise(resolve => {
+  // The simulated slow import: the factory resolves only after the timer,
+  // exactly like a cold dynamic import landing behind other module work.
+  setTimeout(() => resolve({ installModelSelection: slowImport.installModelSelection }), 30)
+}))
+
+describe('F3 (PR #2 review): a slow installer import cannot lose the planner route at cold mount', () => {
+  /** A minimal fake host for apply(): one root agent, recorded tools, no services. */
+  function fakeHost(storeRoot: string) {
+    const toolDefs: Array<{ name?: string; execute?: (args: unknown, exec: unknown) => Promise<unknown> }> = []
+    const agentTools = {
+      register(definition: unknown) {
+        toolDefs.push(definition as never)
+        return () => {}
+      },
+      guard() { return () => {} },
+    }
+    const rootAgent = {
+      id: 'root-session-1',
+      // The scoped ctx IS the planner install target (armPlannerSelection
+      // passes the root agent's own ctx to the installer).
+      ctx: { tools: agentTools, on: () => () => {} },
+      session: { header: {}, snapshotEvents: () => [] as Array<{ type: string; data: unknown }>, append() {} },
+      followup() {},
+    }
+    const created: Array<(payload: { agent: unknown }) => void> = []
+    const disposed: Array<(payload: { agent: unknown }) => void> = []
+    const ctx = {
+      agents: {
+        get: (id: string) => (id === rootAgent.id ? rootAgent : undefined),
+        list: () => [rootAgent],
+        roots: () => [rootAgent as unknown],
+      },
+      subagents: stubSubagents(),
+      systemPrompt: { section: () => () => {} },
+      provide: () => () => {},
+      logger: { warn() {} },
+      on(event: string, listener: (payload: { agent: unknown }) => void) {
+        if (event === 'agent/created') created.push(listener)
+        if (event === 'agent/disposed') disposed.push(listener)
+        return () => {}
+      },
+    }
+    return { ctx, toolDefs, rootAgent, storeRoot }
+  }
+
+  it('apply() holds the mount open on the slow import, then the first planning run is INSTALLED (not unsupported)', async () => {
+    const storeRoot = mkdtempSync(join(tmpdir(), 'dsh-autopilot-f3-'))
+    const host = fakeHost(storeRoot)
+    const mount = apply(host.ctx, {
+      storeRoot,
+      storeKind: 'file',
+      skillInstall: 'off',
+      routing: { roles: { planner: { mode: 'locked', lock: { provider: 'planner-p', model: 'planner-m' } } } },
+    })
+
+    // While the 30ms import is in flight the mount is STILL pending — the
+    // engine (and every autopilot surface) must not exist yet. This is the
+    // window in which the fire-and-forget shape used to construct the engine.
+    let settled = false
+    void mount.then(() => { settled = true })
+    await new Promise(resolve => setTimeout(resolve, 10))
+    expect(settled).toBe(false)
+    expect(host.toolDefs.length).toBe(0)
+    expect(slowImport.calls).toHaveLength(0)
+
+    const dispose = await mount
+    expect(settled).toBe(true)
+
+    // An IMMEDIATE planning run on the freshly mounted engine: the locked
+    // planner route must be installed through the (now settled) port — the
+    // exact run that recorded 'unsupported' before the fix.
+    const init = host.toolDefs.find(definition => definition.name === 'autopilot_init')
+    expect(init?.execute).toBeDefined()
+    const execute = init?.execute
+    if (execute === undefined) throw new Error('inject: autopilot_init tool was not registered')
+    await execute(
+      {
+        objective: 'o', scope: ['src/'], nonGoals: ['docs/'], acceptanceCriteria: ['tests pass'],
+        risk: 'low', size: 'lightweight', executionMode: 'inline', auditMode: 'self-check',
+      },
+      { agent: host.rootAgent },
+    )
+    expect(slowImport.calls).toHaveLength(1)
+    expect(slowImport.calls[0]?.agentCtx).toBe(host.rootAgent.ctx)
+    expect(slowImport.calls[0]?.route).toEqual({ provider: 'planner-p', model: 'planner-m' })
+
+    // And the durable init event says ROUTED, not unsupported.
+    const stream = readFileSync(join(storeRoot, 'runs', host.rootAgent.id, 'events.jsonl'), 'utf8')
+      .trim().split(String.fromCharCode(10)).map(line => JSON.parse(line) as RunEvent)
+    const plannerRouting = (stream[0]?.detail as { plannerRouting?: { status?: string } } | undefined)?.plannerRouting
+    expect(plannerRouting?.status).toBe('routed')
+
+    await dispose()
+    expect(slowImport.disposes()).toBe(1)
   })
 })

@@ -14,7 +14,7 @@
 import { describe, expect, it } from 'vitest'
 import { Config, DEFAULT_EXECUTOR_TOOLS } from '../src/config.js'
 import { SHELL_TOOLS, isEgressCommand } from '../src/gate/decide.js'
-import { resolveConfig } from '../src/index.js'
+import { resolveConfig, volatileRoutingAccess } from '../src/index.js'
 import type { ConfigInput, ResolvedRouting } from '../src/index.js'
 import { DEFAULT_ROLE_MIN_CONTEXT } from '../src/routing/select.js'
 
@@ -537,5 +537,52 @@ describe('DEFAULT_EXECUTOR_TOOLS: the platform shell pair', () => {
       'bash', 'edit', 'glob', 'grep', 'pwsh', 'read', 'read_image',
       'str_replace_editor', 'todo_write', 'write',
     ])
+  })
+})
+
+// ── F2 (PR #2 Codex review): the per-decision routing re-read seam ──
+
+describe('volatileRoutingAccess — the F2 seam between the loader refs and the engine', () => {
+  const VOLATILE_WRITE = Symbol.for('cosmokit.volatile.write')
+  type Ref = { get(): unknown } & Record<symbol, unknown>
+
+  /** Write one simulated volatile update into a loader-produced reference. */
+  function patch(ref: Ref, next: unknown): void {
+    ;(ref[VOLATILE_WRITE] as (value: unknown) => void)(next)
+  }
+
+  it('is ABSENT on the plain path (no references ⇒ the mount snapshot stays the live truth)', () => {
+    expect(volatileRoutingAccess(undefined)).toBeUndefined()
+    expect(volatileRoutingAccess({})).toBeUndefined()
+    expect(volatileRoutingAccess({ routing: { mode: 'off', preference: 'quality' } })).toBeUndefined()
+    expect(volatileRoutingAccess({ executor: { agentOptions: { provider: 'p', model: 'm' } } })).toBeUndefined()
+  })
+
+  it('is PRESENT on the loader path, and a volatile patch reaches the accessor while the mount snapshot stays frozen', () => {
+    const value = loaded({ routing: { mode: 'auto' } }).value as ConfigInput
+    const access = volatileRoutingAccess(value)
+    expect(access).toBeDefined()
+
+    // The frozen half: a config resolved ONCE at mount keeps its values even
+    // after the references move — this is the exact defect class F2 closes at
+    // the engine (a snapshot cannot follow a patch that never remounts).
+    const mountSnapshot = resolveConfig(value).routing
+    expect(mountSnapshot.mode).toBe('auto')
+
+    const refs = (value as unknown as { routing: { mode: Ref; roles: Record<string, { lock: Ref }> } }).routing
+    patch(refs.mode, 'off')
+    patch(refs.roles.executionAuditor?.lock as Ref, { provider: 'p', model: 'm' })
+
+    expect(mountSnapshot.mode).toBe('auto')
+    expect(mountSnapshot.roles.executor.mode).toBe('auto')
+    // The live half: the accessor re-resolves the CURRENT reference values.
+    expect(access?.().mode).toBe('off')
+    expect(access?.().roles['execution-auditor']).toEqual({ mode: 'locked', provider: 'p', model: 'm' })
+
+    // An invalid patch surfaces as a THROW from the accessor (the engine
+    // catches it per-decision and records the refusal; the mount-time
+    // fail-fast on an invalid INITIAL config is unchanged).
+    patch(refs.mode, 'on')
+    expect(() => access?.()).toThrow(/routing\.mode must be 'auto' or 'off'/)
   })
 })

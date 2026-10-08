@@ -10,12 +10,15 @@
  * boolean.
  */
 
-import { readFileSync } from 'node:fs'
+import { readFileSync, mkdtempSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
 import { AutopilotEngine } from '../src/engine.js'
 import type { AgentOptionsLike, RoutingPorts } from '../src/engine.js'
-import { createRoutingWiring, resolveConfig } from '../src/index.js'
+import { Config } from '../src/config.js'
+import { createRoutingWiring, resolveConfig, volatileRoutingAccess } from '../src/index.js'
+import type { ConfigInput } from '../src/index.js'
 import { RouteCatalog } from '../src/routing/catalog.js'
 import type { LlmCallConfig, LlmRuntimeSubset } from '../src/routing/catalog.js'
 import type { SessionPolicyState } from '../src/routing/authorize.js'
@@ -745,5 +748,224 @@ describe('routing integration: candidatesConsidered persisted (P2-2)', () => {
     const folded = foldRun(stripped)
     expect(folded.snapshot?.routingPins).toEqual(h.engine.peek(h.root.id)?.routingPins)
     expect(folded.snapshot?.audits[0]?.route.selected).toEqual({ provider: 'beta', model: 'm-c', reasoningEffort: 'high' })
+  })
+})
+
+// ── F1 (PR #2 Codex review): a pin cannot be reused when the policy cannot authorize it ──
+
+describe('F1 (PR #2 review): session-policy pin reuse vs. an unreadable policy', () => {
+  /** The execution-auditor pin a PRESENT_ABC run settles on (balanced preference, context-descending). */
+  const SETTLED_PIN = { provider: 'beta', model: 'm-c', reasoningEffort: 'high' }
+
+  /**
+   * A policy the test can FLIP in place. The shared `fixture()` helper spreads
+   * its state into the return value, so rebinding `f.policy` on the copy never
+   * reaches the `portsFor` closure — exactly the silent no-op these tests
+   * exist to avoid, so the flip lives behind an explicit setter over one
+   * closure-shared cell.
+   */
+  function flippableFixture(initial: SessionPolicyState): {
+    readonly ports: RoutingPorts
+    readonly setPolicy: (next: SessionPolicyState) => void
+  } {
+    const cell: { policy: SessionPolicyState } = { policy: initial }
+    const catalog = new RouteCatalog(new StubLlm(MODELS))
+    return {
+      ports: { catalog, policyReader: () => cell.policy },
+      setPolicy: next => { cell.policy = next },
+    }
+  }
+
+  /** A closing run over a live execution-auditor pin, with a third dispatch still scripted. */
+  async function pinnedRun(initial: SessionPolicyState, config?: Parameters<typeof resolveConfig>[0]): Promise<{ readonly h: Harness; readonly flip: ReturnType<typeof flippableFixture>['setPolicy'] }> {
+    const wiring = flippableFixture(initial)
+    const h = makeHarness({
+      routing: wiring.ports,
+      ...(config === undefined ? {} : { config }),
+      subagents: stubSubagents({ verdicts: [
+        { verdict: 'pass', note: 'plan ok' },
+        { verdict: 'pass', note: 'exec ok' },
+        { verdict: 'pass', note: 'exec ok again' },
+      ] }),
+    })
+    await toClosing(h)
+    expect(h.engine.peek(h.root.id)?.routingPins?.['execution-auditor']).toEqual(SETTLED_PIN)
+    return { h, flip: wiring.setPolicy }
+  }
+
+  /** The last execution-auditor routing detail in the durable stream. */
+  function lastExecDetail(h: Harness): RoutingDecisionDetail | undefined {
+    const details = routingDetails(h).filter(detail => detail.role === 'execution-auditor')
+    return details[details.length - 1]
+  }
+
+  it('(a) policy still PRESENT ⇒ the pin is reused as-is: same route, session-policy source, no repin', async () => {
+    const { h } = await pinnedRun(PRESENT_ABC)
+    await h.engine.audit(h.root, { role: 'execution', prompt: 'again' })
+    expect(h.subagents.auditOptions[2]).toEqual(SETTLED_PIN)
+    const last = lastExecDetail(h)
+    expect(last?.pin).toEqual(SETTLED_PIN)
+    expect(last?.repinFrom).toBeUndefined()
+    expect(last?.authorizationSource).toBe('session-policy')
+    expect(last?.why?.some(entry => entry.includes('pin: reusing the role pin'))).toBe(true)
+  })
+
+  it('(b) policy flips PRESENT→absent between dispatches ⇒ the pin is refused, the re-selection inherits, the pin is cleared, repinFrom named', async () => {
+    const { h, flip } = await pinnedRun(PRESENT_ABC)
+    flip(ABSENT)
+    await h.engine.audit(h.root, { role: 'execution', prompt: 'again' })
+    // NOT reused: the dispatch inherits (no agentOptions reach the start).
+    expect(h.subagents.auditOptions[2]).toBeUndefined()
+    const last = lastExecDetail(h)
+    expect(last?.pin).toBeUndefined()
+    expect(last?.repinFrom).toEqual(SETTLED_PIN)
+    // The honest conservative reason, naming the policy state.
+    expect(last?.why?.some(entry =>
+      entry.includes('cannot re-establish its session-policy authorization') && entry.includes('absent'))).toBe(true)
+    // The re-selection under an absent policy records inheritance with NO authority claim.
+    expect(last?.authorizationSource).toBeUndefined()
+    // The pin is cleared in the snapshot — the fold re-derives it from the pinless record.
+    expect(h.engine.peek(h.root.id)?.routingPins?.['execution-auditor']).toBeUndefined()
+  })
+
+  it('(c) policy flips PRESENT→unreachable ⇒ same refusal, with unreachable-inherit on the re-selection', async () => {
+    const { h, flip } = await pinnedRun(PRESENT_ABC)
+    flip({ kind: 'unreachable' })
+    await h.engine.audit(h.root, { role: 'execution', prompt: 'again' })
+    expect(h.subagents.auditOptions[2]).toBeUndefined()
+    const last = lastExecDetail(h)
+    expect(last?.pin).toBeUndefined()
+    expect(last?.repinFrom).toEqual(SETTLED_PIN)
+    expect(last?.why?.some(entry =>
+      entry.includes('cannot re-establish its session-policy authorization') && entry.includes('unreachable'))).toBe(true)
+    expect(last?.authorizationSource).toBe('unreachable-inherit')
+    expect(h.engine.peek(h.root.id)?.routingPins?.['execution-auditor']).toBeUndefined()
+  })
+
+  it('(d) a POOL pin under an absent policy keeps its plugin-config grant — dispatched, never silently inherited', async () => {
+    const { h, flip } = await pinnedRun(PRESENT_ABC, { crossFamily: { pool: [{ provider: 'beta', model: 'm-c' }] } })
+    flip(ABSENT)
+    await h.engine.audit(h.root, { role: 'execution', prompt: 'again' })
+    // The pool grant escalates under an absent policy per the plan's one rule:
+    // the pin is REUSED on the grant, not inherited away.
+    expect(h.subagents.auditOptions[2]).toEqual(SETTLED_PIN)
+    const last = lastExecDetail(h)
+    expect(last?.pin).toEqual(SETTLED_PIN)
+    expect(last?.repinFrom).toBeUndefined()
+    expect(last?.authorizationSource).toBe('plugin-config')
+    expect(last?.why?.some(entry => entry.includes('a plugin-config pool grant'))).toBe(true)
+    expect(h.engine.peek(h.root.id)?.routingPins?.['execution-auditor']).toEqual(SETTLED_PIN)
+  })
+})
+
+// ── F2 (PR #2 Codex review): volatile routing values are read at each decision ──
+
+describe('F2 (PR #2 review): a volatile routing patch reaches the NEXT dispatch without a remount', () => {
+  const VOLATILE_WRITE = Symbol.for('cosmokit.volatile.write')
+  type Ref = { get(): unknown } & Record<symbol, unknown>
+
+  /** Commit one simulated volatile update (what the loader runtime's patch path does to the ref). */
+  function patch(ref: Ref, next: unknown): void {
+    ;(ref[VOLATILE_WRITE] as (value: unknown) => void)(next)
+  }
+
+  /** The loader-path config value with volatile routing leaves, plus a live-access engine over it. */
+  function volatileHarness(raw: unknown, policy: SessionPolicyState): Harness & { readonly routingRefs: { mode: Ref; roles: Record<string, { lock: Ref }> } } {
+    const validated = Config['~standard'].validate(raw) as { value?: ConfigInput }
+    expect(validated.value).toBeDefined()
+    const value = validated.value as ConfigInput
+    // The seam the fix ships: the accessor is wired EXACTLY because the leaves are references.
+    expect(volatileRoutingAccess(value)).toBeDefined()
+    const routingRefs = (value as unknown as { routing: { mode: Ref; roles: Record<string, { lock: Ref }> } }).routing
+    const f = fixture(MODELS, policy)
+    const storeDir = mkdtempSync(join(tmpdir(), 'dsh-autopilot-f2-'))
+    const agents = new FakeAgents()
+    const root = fakeAgent('root-1')
+    agents.add(root)
+    const subagents = stubSubagents({ verdicts: [
+      { verdict: 'pass', note: 'plan ok' },
+      { verdict: 'pass', note: 'exec ok' },
+      { verdict: 'pass', note: 'exec ok again' },
+    ] })
+    const engine = new AutopilotEngine(
+      agents, subagents, new RunStore(storeDir), resolveConfig(value), () => true, {},
+      f.portsFor(), volatileRoutingAccess(value),
+    )
+    const h: Harness = { engine, agents, subagents, root, storeDir }
+    return { ...h, routingRefs }
+  }
+
+  it('a routing.mode auto→off patch makes the next dispatch the 0.2.0 flow: inherit, no routing detail', async () => {
+    const h = volatileHarness({ routing: { mode: 'auto' } }, PRESENT_ABC)
+    await toClosing(h)
+    expect(h.subagents.auditOptions[1]).toEqual({ provider: 'beta', model: 'm-c', reasoningEffort: 'high' })
+    patch(h.routingRefs.mode, 'off')
+    await h.engine.audit(h.root, { role: 'execution', prompt: 'again' })
+    // Mode off with a default-auto role: the 0.2.0 composition, inherit, and
+    // NO routing decision on the dispatch — the parity record, not a frozen 'auto'.
+    expect(h.subagents.auditOptions[2]).toBeUndefined()
+    expect(routingDetails(h).filter(detail => detail.role === 'execution-auditor')).toHaveLength(1)
+  })
+
+  it('a lock patched onto a role is followed by the next dispatch, grant-checked against the policy', async () => {
+    const h = volatileHarness({ routing: { roles: { executionAuditor: {} } } }, PRESENT_ABC)
+    await toClosing(h)
+    expect(h.subagents.auditOptions[1]).toEqual({ provider: 'beta', model: 'm-c', reasoningEffort: 'high' })
+    patch(h.routingRefs.roles.executionAuditor?.lock as Ref, { provider: 'alpha', model: 'm-a' })
+    await h.engine.audit(h.root, { role: 'execution', prompt: 'again' })
+    // The lock is INSIDE the policy ⇒ the grant stands and the dispatch follows it.
+    // A lock names no effort here, and the locked dispatch carries exactly the
+    // lock's own fields (no adapter default invented).
+    expect(h.subagents.auditOptions[2]).toEqual({ provider: 'alpha', model: 'm-a' })
+    const details = routingDetails(h).filter(detail => detail.role === 'execution-auditor')
+    const last = details[details.length - 1]
+    expect(last?.authorizationSource).toBe('plugin-config')
+    expect(last?.pin).toEqual({ provider: 'alpha', model: 'm-a' })
+    expect(h.engine.peek(h.root.id)?.routingPins?.['execution-auditor']).toEqual({ provider: 'alpha', model: 'm-a' })
+  })
+
+  it('a patch to an INVALID mode refuses the route at the next decision: inherit, recorded, no crash, stream replays', async () => {
+    const h = volatileHarness({ routing: { mode: 'auto' } }, PRESENT_ABC)
+    await toClosing(h)
+    expect(h.engine.peek(h.root.id)?.routingPins?.['execution-auditor']).toBeDefined()
+    patch(h.routingRefs.mode, 'on')
+    await h.engine.audit(h.root, { role: 'execution', prompt: 'again' })
+    // The decided degradation (F2): refuse the route — inherit the deployment
+    // default — with the validation failure recorded on the dispatch, never a
+    // throw mid-commit and never a dispatch on unvalidatable config.
+    expect(h.subagents.auditOptions[2]).toBeUndefined()
+    const details = routingDetails(h).filter(detail => detail.role === 'execution-auditor')
+    const last = details[details.length - 1]
+    expect(last?.pin).toBeUndefined()
+    expect(last?.why?.some(entry => entry.includes('no longer resolves') && entry.includes("routing.mode must be 'auto' or 'off'"))).toBe(true)
+    // The pin did not survive a dispatch whose config context cannot be validated.
+    expect(h.engine.peek(h.root.id)?.routingPins?.['execution-auditor']).toBeUndefined()
+    // The run itself is alive and the degraded record is fold-legal.
+    expect(h.engine.peek(h.root.id)?.phase).toBe('closing')
+    expect(() => foldRun(eventsOf(h))).not.toThrow()
+  })
+
+  it('the plain path keeps the snapshot semantics: no volatile leaves ⇒ no accessor at all', () => {
+    expect(volatileRoutingAccess(undefined)).toBeUndefined()
+    expect(volatileRoutingAccess({ routing: { mode: 'auto' } })).toBeUndefined()
+    expect(volatileRoutingAccess({ executor: { agentOptions: { provider: 'p', model: 'm' } } })).toBeUndefined()
+  })
+})
+
+// ── F3 (PR #2 Codex review): the planner installer port is settled before the engine exists ──
+
+describe('F3 (PR #2 review): createRoutingWiring settles the installer import before use', () => {
+  /** A bare service-less host shape (the wiring probes tolerate absence). */
+  const bareCtx: unknown = { get: () => undefined, on: () => () => {} }
+
+  it('the port is undefined while the import is in flight and wired once installerReady settles (never rejects)', async () => {
+    const wiring = createRoutingWiring(bareCtx)
+    // Synchronously after construction the dynamic import cannot have landed
+    // (its continuation is a microtask away) — this is the window apply() closes.
+    expect(wiring.ports.modelSelectionInstaller).toBeUndefined()
+    await wiring.installerReady
+    // The real host package is resolvable from this repo, so the port is wired.
+    expect(typeof wiring.ports.modelSelectionInstaller).toBe('function')
+    wiring.dispose()
   })
 })
