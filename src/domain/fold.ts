@@ -14,6 +14,7 @@ import {
   ROUTING_AUDITOR_ROLES,
   ROUTING_AUTHORIZATION_SOURCES,
   ROUTING_CANDIDATE_DISPOSITIONS,
+  ROUTING_COST_MATCHES,
   ROUTING_IDENTITY_AXES,
   ROUTING_INDEPENDENCE_OUTCOMES,
   ROUTING_ROLES,
@@ -23,6 +24,7 @@ import {
   TERMINAL_PHASES,
   evaluateCompletion,
   evidenceKindProblems,
+  handoffProblems,
   isAbsoluteShapedBearer,
   usageDeclarationProblems,
 } from './types.js'
@@ -32,8 +34,8 @@ import type { AuditRole, Operation, Phase, RouteRecord, RunEvent, RoutingDecisio
 const LEGAL_OPS: Record<Phase, readonly Operation[]> = {
   'planning': ['submit-plan', 'audit', 'self-check', 'external-audit', 'log', 'replan', 'set-blocked', 'set-owner-decision', 'owner-approve', 'consume-approval', 'consume-manifest', 'declare-usage', 'sandbox'],
   'plan-reviewing': ['audit', 'self-check', 'external-audit', 'log', 'set-blocked', 'set-owner-decision', 'owner-approve', 'consume-approval', 'consume-manifest', 'sandbox'],
-  'executing': ['start-executor', 'resume-executor', 'submit-packet', 'submit-evidence', 'log', 'replan', 'set-blocked', 'set-owner-decision', 'owner-approve', 'consume-approval', 'consume-manifest', 'declare-usage', 'reminder', 'audit', 'self-check', 'external-audit', 'sandbox'],
-  'execution-reviewing': ['audit', 'self-check', 'external-audit', 'log', 'replan', 'set-blocked', 'set-owner-decision', 'owner-approve', 'consume-approval', 'consume-manifest', 'reminder', 'sandbox'],
+  'executing': ['start-executor', 'resume-executor', 'submit-packet', 'submit-evidence', 'amend-plan', 'log', 'replan', 'set-blocked', 'set-owner-decision', 'owner-approve', 'consume-approval', 'consume-manifest', 'declare-usage', 'reminder', 'audit', 'self-check', 'external-audit', 'sandbox'],
+  'execution-reviewing': ['audit', 'self-check', 'external-audit', 'log', 'replan', 'amend-plan', 'set-blocked', 'set-owner-decision', 'owner-approve', 'consume-approval', 'consume-manifest', 'reminder', 'sandbox'],
   'replanning': ['submit-plan', 'audit', 'self-check', 'external-audit', 'log', 'set-blocked', 'set-owner-decision', 'consume-manifest', 'declare-usage', 'sandbox'],
   // 'declare-usage' is legal here on purpose (added 2026-08-24): an entry
   // reverted to 'undeclared' during execution used to reach 'closing' with no
@@ -204,6 +206,31 @@ function evidenceKindStamp(detail: unknown): 'absent' | 'invalid' | 'v1' {
 }
 
 /**
+ * Same stamp pattern for the partial-delivery contract: 'absent' = written
+ * before the handoff dimension existed (legacy reading: unproven criteria
+ * legal with no handoff requirement); 'v1' = "handoff/outcome validation v1";
+ * anything else is a corrupt stamp, not an old stream.
+ */
+function closeoutHandoffStamp(detail: unknown): 'absent' | 'invalid' | 'v1' {
+  if (detail === null || typeof detail !== 'object') return 'absent'
+  if (!('closeoutHandoff' in detail)) return 'absent'
+  return (detail as { closeoutHandoff?: unknown }).closeoutHandoff === 1 ? 'v1' : 'invalid'
+}
+
+/**
+ * The owner-resolve decision an event's detail carries, when it carries one.
+ * Pre-decision streams wrote NO detail on owner-resolve — those replay as
+ * resume-planning (the only decision that existed), which is exactly what
+ * their snapshots say.
+ */
+function ownerResolveDecisionOf(detail: unknown): 'resume-planning' | 'resume-execution' | 'block' | undefined {
+  if (detail === null || typeof detail !== 'object') return undefined
+  const decision = (detail as { decision?: unknown }).decision
+  if (decision === 'resume-planning' || decision === 'resume-execution' || decision === 'block') return decision
+  return undefined
+}
+
+/**
  * The routing decision on a dispatch commit's `detail.routing`, STRICTLY
  * validated (packet M3b): `{role, pin?, why, authorizationSource,
  * fallbackFrom?, repinFrom?, candidates?}` and nothing else. Malformed ⇒ fold
@@ -275,7 +302,7 @@ function routingDecisionOf(op: Operation, detail: unknown): RoutingDecisionDetai
     fail(`${where} must be an object, got ${typeof routing}`, 'AP_ROUTING_DETAIL')
   }
   const record = routing as Record<string, unknown>
-  const known: readonly string[] = ['role', 'pin', 'why', 'authorizationSource', 'fallbackFrom', 'repinFrom', 'candidates']
+  const known: readonly string[] = ['role', 'pin', 'why', 'authorizationSource', 'fallbackFrom', 'repinFrom', 'candidates', 'costMatch']
   for (const key of Object.keys(record)) {
     if (!known.includes(key)) problems.push(`${where} has an unknown key "${key}"`)
   }
@@ -502,6 +529,10 @@ function routingDecisionOf(op: Operation, detail: unknown): RoutingDecisionDetai
       }
     }
   }
+  const costMatch = record.costMatch
+  if (costMatch !== undefined && (typeof costMatch !== 'string' || !ROUTING_COST_MATCHES.includes(costMatch))) {
+    problems.push(`${where}.costMatch must be one of ${ROUTING_COST_MATCHES.join('|')}, got ${JSON.stringify(costMatch)}`)
+  }
   if (problems.length > 0) {
     fail(`${where} is malformed: ${problems.join('; ')}`, 'AP_ROUTING_DETAIL')
   }
@@ -514,7 +545,7 @@ function routingDecisionOf(op: Operation, detail: unknown): RoutingDecisionDetai
  * it; the mapping is the one rule both sides share, so it is stated once here
  * and must move with the role vocabularies).
  */
-const AUDIT_ROLE_OF_ROUTING_ROLE: Readonly<Record<string, AuditRole>> = {
+export const AUDIT_ROLE_OF_ROUTING_ROLE: Readonly<Record<string, AuditRole>> = {
   'plan-auditor': 'plan',
   'execution-auditor': 'execution',
   'rules-auditor': 'rules',
@@ -619,6 +650,23 @@ export function applyEvent(prior: Snapshot | undefined, event: RunEvent): Snapsh
         fail('init bearerBase must be absolute-shaped when present', 'AP_BEARER_BASE_RELATIVE')
       }
     }
+    // Carryover shape (presence-gated): whether the predecessor run really
+    // exists and completed is a FILESYSTEM question, settled once at the
+    // engine's init; the fold re-checks only the structural claim, so replay
+    // never depends on another run's directory still being present.
+    if (next.triage.carryover !== undefined) {
+      const carry = next.triage.carryover as { fromRunId?: unknown; note?: unknown; inherits?: unknown }
+      if (typeof carry.fromRunId !== 'string' || carry.fromRunId.trim().length === 0) {
+        fail('init carryover.fromRunId must be a non-empty string when present', 'AP_CARRYOVER_INVALID')
+      }
+      if (typeof carry.note !== 'string' || carry.note.trim().length === 0) {
+        fail('init carryover.note must be a non-empty string when present', 'AP_CARRYOVER_INVALID')
+      }
+      if (!Array.isArray(carry.inherits) || carry.inherits.length < 1
+        || carry.inherits.some((item: unknown) => typeof item !== 'string' || (item as string).trim().length === 0)) {
+        fail('init carryover.inherits must be a non-empty array of non-empty strings when present', 'AP_CARRYOVER_INVALID')
+      }
+    }
     return next
   }
 
@@ -696,6 +744,44 @@ export function applyEvent(prior: Snapshot | undefined, event: RunEvent): Snapsh
     if (problems.length > 0) fail(`audit record ${i}: ${problems.join('; ')}`, 'AP_EXTERNAL_INVALID')
   }
 
+  // Structured findings (governance pragmatics v1), PRESENCE-GATED like the
+  // routing detail above: the contract fires only on records that carry the
+  // field, so every pre-findings stream keeps its old reading. The rule the
+  // field buys: needs-replan is reserved for plan-shape defects (a blocking
+  // finding the PLAN layer owns); an execution- or rules-layer defect is
+  // executor-fixable and belongs in needs-fix, where it resumes the same
+  // executor instead of resetting the run.
+  for (let i = prior.audits.length; i < next.audits.length; i++) {
+    const record = next.audits[i]
+    if (record?.findings === undefined) continue
+    const findings = record.findings
+    if (!Array.isArray(findings) || findings.length === 0) {
+      fail(`audit record ${i} carries an empty findings array; absent is the legacy arm, present must grade at least one finding`, 'AP_AUDIT_FINDINGS_INVALID')
+    }
+    for (const finding of Array.isArray(findings) ? findings : []) {
+      if (typeof finding?.summary !== 'string' || finding.summary.trim().length === 0) {
+        fail(`audit record ${i} carries a finding with an empty summary`, 'AP_AUDIT_FINDINGS_INVALID')
+      }
+      if (finding?.severity !== 'blocking' && finding?.severity !== 'non-blocking') {
+        fail(`audit record ${i} carries a finding whose severity is not blocking|non-blocking ("${String(finding?.severity)}")`, 'AP_AUDIT_FINDINGS_INVALID')
+      }
+      if (finding?.layer !== 'plan' && finding?.layer !== 'execution' && finding?.layer !== 'rules') {
+        fail(`audit record ${i} carries a finding whose layer is not plan|execution|rules ("${String(finding?.layer)}")`, 'AP_AUDIT_FINDINGS_INVALID')
+      }
+    }
+    const blockingPlan = Array.isArray(findings)
+      && findings.some(finding => finding?.severity === 'blocking' && finding?.layer === 'plan')
+    if (record?.verdict === 'needs-replan' && !blockingPlan) {
+      fail(
+        `audit record ${i} returns needs-replan without a blocking plan-layer finding; an execution- or rules-layer defect is executor-fixable (needs-fix)`,
+        'AP_AUDIT_FINDINGS_INVALID',
+      )
+    }
+    if (record?.verdict === 'blocked' && !(Array.isArray(findings) && findings.some(finding => finding?.severity === 'blocking'))) {
+      fail(`audit record ${i} returns blocked without a blocking finding`, 'AP_AUDIT_FINDINGS_INVALID')
+    }
+  }
+
   // Plan revision is monotonic.
   if (next.plan.revision < prior.plan.revision) fail('plan revision decreased', 'AP_PLAN_REVISION')
 
@@ -723,6 +809,127 @@ export function applyEvent(prior: Snapshot | undefined, event: RunEvent): Snapsh
   if (event.op === 'submit-plan') {
     if (next.executionPacket !== undefined) fail('submit-plan must clear the execution packet', 'AP_STALE_EVIDENCE')
     if (next.executionGate !== 'pending') fail('submit-plan must reset executionGate to pending', 'AP_STALE_EVIDENCE')
+  }
+
+  // Amend-plan (governance pragmatics v1): a plan revision that PRESERVES
+  // execution state — the mirror image of the submit-plan rule above. Gates
+  // must not reset, the packet must survive, and the amendment arms the delta
+  // re-audit binding: further submit-evidence/submit-closeout are refused
+  // until a plan-role PASS captured at or after the amended revision lands
+  // (the same binding shape as the executionGate/audit rule below). A
+  // plan change is always re-audited; what it never does again is destroy
+  // still-valid execution evidence.
+  if (event.op === 'amend-plan') {
+    if (next.plan.revision !== prior.plan.revision + 1) {
+      fail(
+        `amend-plan must advance plan revision by exactly 1 (prior ${prior.plan.revision}, next ${next.plan.revision})`,
+        'AP_AMEND_PLAN_INVALID',
+      )
+    }
+    if (prior.planGate !== 'pass' || next.planGate !== 'pass') {
+      fail('amend-plan requires planGate pass on both sides (a failed plan is replanned, not amended)', 'AP_AMEND_PLAN_INVALID')
+    }
+    if (next.executionGate !== prior.executionGate) {
+      fail('amend-plan must not reset executionGate', 'AP_AMEND_PLAN_INVALID')
+    }
+    if (next.executionPacket !== prior.executionPacket) {
+      fail('amend-plan must preserve the execution packet', 'AP_AMEND_PLAN_INVALID')
+    }
+    if (next.planAmendedAtRevision !== next.plan.revision) {
+      fail('amend-plan must arm the delta re-audit at the new plan revision', 'AP_AMEND_PLAN_INVALID')
+    }
+  } else if (event.op === 'submit-plan' || event.op === 'replan') {
+    if (next.planAmendedAtRevision !== undefined) {
+      fail(`${event.op} must clear planAmendedAtRevision (the amendment cycle is superseded)`, 'AP_AMEND_PLAN_INVALID')
+    }
+  } else if (event.op === 'audit' || event.op === 'self-check' || event.op === 'external-audit') {
+    // A plan-role PASS appended by THIS commit, captured at or after the
+    // amended revision, disarms the binding; anything else preserves it.
+    const amended = prior.planAmendedAtRevision
+    const appended = next.audits.length > prior.audits.length
+      ? next.audits.slice(prior.audits.length)
+      : []
+    const clears = amended !== undefined
+      && appended.some(record => record?.role === 'plan' && record.verdict === 'pass' && record.planRevision >= amended)
+    const expectedPlanAmended = clears ? undefined : prior.planAmendedAtRevision
+    if (next.planAmendedAtRevision !== expectedPlanAmended) {
+      fail(
+        'planAmendedAtRevision must follow the fold derivation (armed by amend-plan, cleared only by a plan-role pass at or after the amended revision)',
+        'AP_AMEND_STATE_INVALID',
+      )
+    }
+  } else if (event.op === 'owner-resolve') {
+    const decision = ownerResolveDecisionOf(event.detail)
+    const expectedPlanAmended = decision === 'resume-execution' ? prior.planAmendedAtRevision : undefined
+    if (next.planAmendedAtRevision !== expectedPlanAmended) {
+      fail(
+        'planAmendedAtRevision must be preserved by owner-resolve(resume-execution) and cleared by resume-planning/block',
+        'AP_AMEND_STATE_INVALID',
+      )
+    }
+  } else if (event.op === 'submit-evidence' || event.op === 'submit-closeout') {
+    if (prior.planAmendedAtRevision !== undefined) {
+      fail(
+        `plan amended at revision ${prior.planAmendedAtRevision} without a delta re-audit pass; ${event.op} requires a plan-role pass at or after the amended revision`,
+        'AP_AMEND_REAUDIT_REQUIRED',
+      )
+    }
+    if (next.planAmendedAtRevision !== undefined) {
+      fail(`${event.op} cannot arm planAmendedAtRevision`, 'AP_AMEND_STATE_INVALID')
+    }
+  } else if (next.planAmendedAtRevision !== prior.planAmendedAtRevision) {
+    fail(
+      `planAmendedAtRevision mutated via op ${event.op} (derives from amend-plan and plan-role passes only)`,
+      'AP_AMEND_STATE_MUTATED',
+    )
+  }
+
+  // Owner resolution (governance pragmatics v1): resume-execution restores
+  // the paused-from phase with gates, packet, executor and the amendment
+  // binding byte-identical. The pause asked the owner a question; the answer
+  // must not destroy still-valid state. resume-planning keeps its full-reset
+  // reading, and a stream that predates pause-tracking has no pausedFrom and
+  // therefore cannot take the resume-execution arm at all.
+  if (event.op === 'owner-resolve' && ownerResolveDecisionOf(event.detail) === 'resume-execution') {
+    if (prior.pausedFrom === undefined
+      || (prior.pausedFrom !== 'executing' && prior.pausedFrom !== 'execution-reviewing')) {
+      fail(
+        'owner-resolve(resume-execution) requires pausedFrom executing|execution-reviewing; pre-pause-tracking streams keep the resume-planning-only reading',
+        'AP_OWNER_RESUME_INVALID',
+      )
+    }
+    const pausedFrom = prior.pausedFrom
+    if (next.phase !== pausedFrom) {
+      fail(`owner-resolve(resume-execution) must restore phase ${pausedFrom}, got ${next.phase}`, 'AP_OWNER_RESUME_INVALID')
+    }
+    if (next.planGate !== prior.planGate || next.executionGate !== prior.executionGate) {
+      fail('owner-resolve(resume-execution) must not touch the gates', 'AP_OWNER_RESUME_INVALID')
+    }
+    if (next.executionPacket !== prior.executionPacket) {
+      fail('owner-resolve(resume-execution) must preserve the execution packet', 'AP_OWNER_RESUME_INVALID')
+    }
+    if (JSON.stringify(next.executor) !== JSON.stringify(prior.executor)) {
+      fail('owner-resolve(resume-execution) must preserve the executor record', 'AP_OWNER_RESUME_INVALID')
+    }
+  }
+
+  // pausedFrom derivation (presence-gated: a stream that never carries the
+  // field — every pre-pause-tracking stream — keeps its old reading).
+  if (prior.pausedFrom !== undefined || next.pausedFrom !== undefined) {
+    if (next.phase === 'needs-owner-decision') {
+      if (prior.phase === 'needs-owner-decision') {
+        if (next.pausedFrom !== prior.pausedFrom) {
+          fail('pausedFrom mutated while paused', 'AP_PAUSE_STATE_INVALID')
+        }
+      } else if (next.pausedFrom !== prior.phase) {
+        fail(
+          `entering needs-owner-decision from ${prior.phase} must stamp pausedFrom=${prior.phase}`,
+          'AP_PAUSE_STATE_INVALID',
+        )
+      }
+    } else if (next.pausedFrom !== undefined) {
+      fail(`leaving needs-owner-decision must clear pausedFrom (phase ${next.phase})`, 'AP_PAUSE_STATE_INVALID')
+    }
   }
 
   // Stamped packet identity must match the live executor. Absent detail is
@@ -879,6 +1086,33 @@ export function applyEvent(prior: Snapshot | undefined, event: RunEvent): Snapsh
           `submit-closeout stamped evidenceKinds 1: ${problems.map(problem => problem.message).join('; ')}`,
           first.code,
         )
+      }
+    }
+    // Partial-delivery contract, same stamp pattern as evidenceKinds: the
+    // stream's own stamp decides the arm, never the reading build. Unstamped
+    // (legacy) closeouts keep the old reading — unproven criteria legal, no
+    // handoff required, no outcome recorded.
+    const handoffStamp = closeoutHandoffStamp(event.detail)
+    if (handoffStamp === 'invalid') {
+      const raw = (event.detail as { closeoutHandoff?: unknown }).closeoutHandoff
+      fail(
+        `submit-closeout closeoutHandoff stamp is not the integer 1: ${String(raw)}`,
+        'AP_HANDOFF_STAMP_INVALID',
+      )
+    }
+    if (handoffStamp === 'v1') {
+      const problems = handoffProblems(next.closeout ?? {
+        summary: '',
+        changedFiles: [],
+        commands: [],
+        evidence: [],
+        residualRisks: [],
+        exclusions: [],
+        workspaceCleanup: '',
+        drift: '',
+      }, next.triage.acceptanceCriteria)
+      if (problems.length > 0) {
+        fail(`submit-closeout stamped closeoutHandoff 1: ${problems.join('; ')}`, 'AP_HANDOFF_INVALID')
       }
     }
   }

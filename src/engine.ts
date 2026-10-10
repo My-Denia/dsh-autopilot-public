@@ -10,7 +10,7 @@
  */
 
 import { randomUUID } from 'node:crypto'
-import { applyEvent } from './domain/fold.js'
+import { applyEvent, AUDIT_ROLE_OF_ROUTING_ROLE } from './domain/fold.js'
 import {
   AutopilotError,
   MAX_REPLAN_ROUNDS,
@@ -26,8 +26,10 @@ import {
   validateTriage,
   validateExternalReview,
   compareDeclaredTree,
+  handoffProblems,
 } from './domain/types.js'
 import type {
+  AuditFinding,
   AuditRecord,
   AuditRole,
   CrossFamilyOutcome,
@@ -201,11 +203,45 @@ export interface AgentOptionsLike {
  * session model-selection policy — while the per-role table still resolves,
  * so locks stay visible (and enforced as plugin-config grants) in every mode.
  */
+/** One owner-authored cost override, parsed from `provider/model=input/output`. */
+export interface ResolvedCostOverride {
+  readonly provider: string
+  readonly model: string
+  readonly inputPerM: number
+  readonly outputPerM: number
+}
+
+/**
+ * The owner's routing ladder, resolved.
+ *
+ * TIER NAMES ARE FIXED (economy/standard/reserve) and every field is a fixed
+ * path, because Schemastery forbids a volatile field under a transform or a
+ * keyed dict and `containsVolatileRef` caps the depth it will follow. An
+ * owner-authored map of arbitrary tier names is therefore not expressible;
+ * fixed names are, and they are what this type carries.
+ *
+ * ABSENT IS NOT DERIVED. Every default here is a declared literal. Nothing is
+ * inferred from a model name or id: a name is not evidence about speed, cost
+ * or tier, so the ladder states nothing it was not told.
+ */
+export interface ResolvedLadder {
+  readonly tiers: Readonly<Record<'economy' | 'standard' | 'reserve', readonly string[]>>
+  readonly auditTier: 'economy' | 'standard' | 'reserve' | 'none'
+  /** Owner-declared speed order, earliest = faster. Empty means speed is UNKNOWN. */
+  readonly speedOrder: readonly string[]
+  readonly costOverrides: readonly ResolvedCostOverride[]
+}
+
 export interface ResolvedRouting {
   readonly mode: 'auto' | 'off'
   readonly preference: RoutePreference
   /** Every role is always present, resolved to its effective routing. */
   readonly roles: Readonly<Record<Role, RoleRouting>>
+  /**
+   * The owner's ladder. Present on every resolved routing (empty by default)
+   * so a consumer never has to distinguish "no ladder" from "an empty one".
+   */
+  readonly ladder: ResolvedLadder
 }
 
 /** Resolved plugin configuration. */
@@ -231,6 +267,15 @@ export interface ResolvedConfig {
   }
   /** Copy bundled SKILL.md into the skill-scan root (`auto`) or leave it (`off`). */
   readonly skillInstall: 'auto' | 'off'
+  /**
+   * Governance pragmatics knobs (all optional, all OFF by default).
+   * `maxAuditRoundsPerRole` brakes audit storms: beyond the cap, further
+   * dispatches for that role are refused (AP_AUDIT_ROUND_CAP) instead of
+   * silently escalating to the owner.
+   */
+  readonly governance?: {
+    readonly maxAuditRoundsPerRole?: number
+  }
 }
 
 /**
@@ -612,6 +657,21 @@ function withToolDiagnostic(route: RouteRecord, note: string | undefined): Route
   }
 }
 
+/** The graded-findings channel both verdict schemas share (governance pragmatics v1). */
+const FINDINGS_SCHEMA = {
+  type: 'array' as const,
+  items: {
+    type: 'object' as const,
+    additionalProperties: false,
+    required: ['severity', 'layer', 'summary'],
+    properties: {
+      severity: { type: 'string' as const, enum: ['blocking', 'non-blocking'] },
+      layer: { type: 'string' as const, enum: ['plan', 'execution', 'rules'] },
+      summary: { type: 'string' as const },
+    },
+  },
+}
+
 /** Structured verdict schema for plan auditors (no needs-fix on the plan gate). */
 export const PLAN_VERDICT_SCHEMA = {
   type: 'object' as const,
@@ -620,6 +680,7 @@ export const PLAN_VERDICT_SCHEMA = {
   properties: {
     verdict: { type: 'string' as const, enum: ['pass', 'needs-replan', 'blocked', 'needs-owner-decision'] },
     note: { type: 'string' as const },
+    findings: FINDINGS_SCHEMA,
   },
 }
 
@@ -631,6 +692,7 @@ export const EXECUTION_VERDICT_SCHEMA = {
   properties: {
     verdict: { type: 'string' as const, enum: ['pass', 'needs-fix', 'needs-replan', 'blocked', 'needs-owner-decision'] },
     note: { type: 'string' as const },
+    findings: FINDINGS_SCHEMA,
   },
 }
 
@@ -683,9 +745,50 @@ function routingActive(routing: ResolvedRouting, role: Role): boolean {
  * anything. It exists so the gates have a total function to read even when
  * the real section cannot be resolved at all.
  */
+/** The ladder of a routing that can never select: every tier empty, no axes declared. */
+const EMPTY_LADDER: ResolvedLadder = {
+  tiers: { economy: [], standard: [], reserve: [] },
+  auditTier: 'none',
+  speedOrder: [],
+  costOverrides: [],
+}
+
+/**
+ * The owner's cost overrides as the selector's `provider/model` index. An
+ * override is an owner statement about a ROUTE the deployment runs, so the
+ * key is that exact route — unlike the seed, which resolves route and then
+ * model identity. Absent when the owner declared none, so the selector input
+ * carries nothing a legacy decision ever carried.
+ */
+function costOverrideIndex(ladder: ResolvedLadder): Readonly<Record<string, { readonly inputPerM: number; readonly outputPerM: number }>> | undefined {
+  if (ladder.costOverrides.length === 0) return undefined
+  const index: Record<string, { readonly inputPerM: number; readonly outputPerM: number }> = {}
+  for (const override of ladder.costOverrides) {
+    index[override.provider + '/' + override.model] = { inputPerM: override.inputPerM, outputPerM: override.outputPerM }
+  }
+  return index
+}
+
+/**
+ * The owner-declared AXES the selector consumes. The ladder is resolved and
+ * passed to every selection; nothing here derives an axis the owner did not
+ * declare, and a field is present only when the owner wrote one.
+ */
+function routingAxisInput(ladder: ResolvedLadder): {
+  readonly costOverrides?: Readonly<Record<string, { readonly inputPerM: number; readonly outputPerM: number }>>
+  readonly speedOrder?: readonly string[]
+} {
+  const costOverrides = costOverrideIndex(ladder)
+  return {
+    ...(costOverrides === undefined ? {} : { costOverrides }),
+    ...(ladder.speedOrder.length === 0 ? {} : { speedOrder: ladder.speedOrder }),
+  }
+}
+
 const REFUSED_ROUTING: ResolvedRouting = {
   mode: 'off',
   preference: 'balanced',
+  ladder: EMPTY_LADDER,
   roles: {
     executor: { mode: 'inherit' },
     planner: { mode: 'inherit' },
@@ -1040,6 +1143,60 @@ function withPlannerDetail(detail: unknown, record: PlannerRoutingRecord): unkno
 }
 
 /** Model-facing status projection. */
+/**
+ * One required role's latest audit record, VERBATIM — the audit-packet rule's
+ * input.
+ *
+ * The rule (see skill/dsh-autopilot/references/governance-invariants.md) is
+ * that an audit packet embeds every required role's latest verdict read
+ * directly from the run state, with non-passes shown explicitly, and that the
+ * dispatcher does not summarise or characterise them. `latestVerdicts` is a
+ * verdict WORD; it cannot carry provenance, freshness or a non-pass's reason,
+ * so a dispatcher working from it is retyping a conclusion. This record keeps
+ * the fields the decision actually needs.
+ */
+export interface AuditStatusRecord {
+  readonly role: AuditRole
+  /** 0-based append-only sequence: two records are comparable without a clock. */
+  readonly seq: number
+  readonly verdict: Verdict
+  readonly note: string
+  /** The auditor child session id, or `self-check`. */
+  readonly auditorId: string
+  /** Run revision captured when the audit STARTED — a later revision makes it stale. */
+  readonly runRevision: number
+  readonly planRevision: number
+  readonly executionRevision: number
+  /** `self-check`, or the subagent transport provider that ran the auditor. */
+  readonly provider: string
+  /** Present only on an owner-countersigned external review. */
+  readonly external?: ExternalReview
+  /** Whether the current triage requires this role. */
+  readonly required: boolean
+}
+
+/** The verbatim latest audit record per role. See {@link AuditStatusRecord}. */
+export function auditStatusRecords(snapshot: Snapshot): Partial<Record<AuditRole, AuditStatusRecord>> {
+  const required = new Set(requiredRoles(snapshot.triage))
+  const out: Partial<Record<AuditRole, AuditStatusRecord>> = {}
+  for (const [role, record] of Object.entries(latestVerdicts(snapshot.audits)) as Array<[AuditRole, AuditRecord]>) {
+    out[role] = {
+      role: record.role,
+      seq: record.seq,
+      verdict: record.verdict,
+      note: record.note,
+      auditorId: record.auditorId,
+      runRevision: record.runRevision,
+      planRevision: record.planRevision,
+      executionRevision: record.executionRevision,
+      provider: record.route.provider,
+      ...(record.external === undefined ? {} : { external: record.external }),
+      required: required.has(role),
+    }
+  }
+  return out
+}
+
 export interface StatusView {
   readonly runId: RunId
   readonly revision: number
@@ -1054,6 +1211,12 @@ export interface StatusView {
   readonly auditMode: Snapshot['triage']['auditMode']
   readonly requiredRoles: readonly AuditRole[]
   readonly latestVerdicts: Partial<Record<AuditRole, Verdict>>
+  /**
+   * The latest audit record per role, verbatim. Build an audit packet from
+   * THIS, not from `latestVerdicts`: a packet must carry the record, and a
+   * non-pass must be visible as itself rather than summarised away.
+   */
+  readonly latestAuditRecords: Partial<Record<AuditRole, AuditStatusRecord>>
   readonly replanBudgetRemaining: number
   readonly auditCount: number
   readonly logCount: number
@@ -1435,6 +1598,25 @@ export class AutopilotEngine {
         )
       }
 
+      // CARRYOVER (governance pragmatics v1): the write path settles the
+      // filesystem question once, here — the predecessor must exist and have
+      // completed. The fold re-checks only the shape, so replay never depends
+      // on another run's directory surviving.
+      if (triage.carryover !== undefined) {
+        const predecessor = this.current(triage.carryover.fromRunId)
+        if (predecessor === undefined) {
+          throw new AutopilotError(
+            `carryover predecessor run not found: ${triage.carryover.fromRunId}`,
+            'AP_CARRYOVER_UNKNOWN',
+          )
+        }
+        if (predecessor.phase !== 'completed') {
+          throw new AutopilotError(
+            `carryover predecessor has not completed (phase ${predecessor.phase}); only a completed run's work may be carried forward`,
+            'AP_CARRYOVER_NOT_COMPLETED',
+          )
+        }
+      }
       const enforcement = this.applyInitEnforcement(root, triage)
       const snapshot: Snapshot = {
         runId: root.id,
@@ -1488,6 +1670,52 @@ export class AutopilotEngine {
     })
   }
 
+  /**
+   * Amend the passed plan mid-execution WITHOUT destroying execution state
+   * (governance pragmatics v1).
+   *
+   * The fold mechanically wipes evidence on submit-plan (AP_STALE_EVIDENCE),
+   * which made every mid-execution plan refinement a full replan — the
+   * model-orchestration record shows what that costs. An amendment bumps the
+   * plan revision, keeps gates/packet/executor untouched, and ARMS the delta
+   * re-audit binding: further submit-evidence/submit-closeout are refused
+   * until a plan-role pass captured at or after the amended revision lands
+   * (a delta audit, not a from-scratch one). Material changes that fail the
+   * delta audit still take the full replan path.
+   *
+   * The objective/scope/acceptance criteria cannot change here at all —
+   * triage is immutable after init (the fold enforces it), so an amendment
+   * can only re-plan HOW, never WHAT or WHETHER it counts.
+   */
+  async amendPlan(caller: AgentRef, request: { text: string; note: string }): Promise<Snapshot> {
+    const root = this.resolveRoot(caller)
+    if (request.text.trim().length === 0) {
+      throw new AutopilotError('amendment text is empty', 'AP_INVALID_ARGUMENT')
+    }
+    if (request.note.trim().length === 0) {
+      throw new AutopilotError('amendment note is empty — an amendment must say what changed and why', 'AP_INVALID_ARGUMENT')
+    }
+    return this.transact(root.id, async () => {
+      const prior = this.require(root.id)
+      if (prior.phase !== 'executing' && prior.phase !== 'execution-reviewing') {
+        throw new AutopilotError(
+          `amend-plan requires phase executing|execution-reviewing, got ${prior.phase}`,
+          'AP_WRONG_PHASE',
+        )
+      }
+      if (prior.planGate !== 'pass') {
+        throw new AutopilotError(`amend-plan requires planGate pass, got ${prior.planGate}`, 'AP_INVALID_ARGUMENT')
+      }
+      return await this.commit(prior, 'amend-plan', {
+        ...prior,
+        revision: prior.revision + 1,
+        plan: { revision: prior.plan.revision + 1, text: request.text },
+        planAmendedAtRevision: prior.plan.revision + 1,
+        diagnostic: `plan amended: ${request.note}`,
+      }, { note: request.note })
+    })
+  }
+
   /** Dispatch one independent auditor (auditMode independent only). */
   async audit(caller: AgentRef, request: { role: AuditRole; prompt: string; provider?: string }): Promise<AuditOutcome> {
     const root = this.resolveRoot(caller)
@@ -1498,6 +1726,23 @@ export class AutopilotEngine {
       }
       this.assertAuditPhase(prior, request.role)
       if (request.prompt.trim().length === 0) throw new AutopilotError('audit prompt is empty', 'AP_INVALID_ARGUMENT')
+      // AUDIT ROUND CAP (governance pragmatics v1): a mechanical brake on
+      // audit storms, OFF by default. When configured, dispatching the same
+      // role beyond the cap is refused — the run must resolve with the
+      // findings it has, escalate deliberately, or raise the cap. This is the
+      // convergence backstop that replacing the forced replan escalation
+      // left open, and unlike that mechanism it never invents an owner
+      // question; it just stops the meter.
+      const roundCap = this.config.governance?.maxAuditRoundsPerRole
+      if (roundCap !== undefined && Number.isFinite(roundCap)) {
+        const dispatched = prior.audits.filter(record => record.role === request.role).length
+        if (dispatched >= roundCap) {
+          throw new AutopilotError(
+            `audit round cap reached for role ${request.role} (${dispatched}/${roundCap}); re-audits beyond the cap are refused — resolve with the findings recorded, or raise governance.maxAuditRoundsPerRole`,
+            'AP_AUDIT_ROUND_CAP',
+          )
+        }
+      }
 
       const provider = request.provider ?? this.config.auditors[request.role]?.provider ?? this.config.auditProvider
       const roleKey = routeRoleOf(request.role)
@@ -1679,6 +1924,9 @@ export class AutopilotEngine {
           route,
           captured,
           ...(routingDetail === undefined ? {} : { routing: routingDetail }),
+          ...(Array.isArray((structured as { findings?: unknown }).findings)
+            ? { findings: (structured as { findings: AuditFinding[] }).findings }
+            : {}),
         })
       } finally {
         if (run !== undefined) await run.dispose()
@@ -2191,6 +2439,10 @@ export class AutopilotEngine {
         ...prior,
         revision: prior.revision + 1,
         phase: 'needs-owner-decision',
+        // Pause tracking (governance pragmatics v1): remember where the run
+        // was paused FROM so owner-resolve(resume-execution) can restore it
+        // without destroying still-valid state.
+        pausedFrom: prior.phase,
         diagnostic: reason,
       })
     })
@@ -2215,8 +2467,20 @@ export class AutopilotEngine {
     })
   }
 
-  /** Owner-authority: resolve a needs-owner-decision pause. */
-  async ownerResolve(caller: AgentRef, request: { decision: 'resume-planning' | 'block'; note: string }): Promise<Snapshot> {
+  /**
+   * Owner-authority: resolve a needs-owner-decision pause.
+   *
+   * Three rulings (governance pragmatics v1 adds resume-execution):
+   * - resume-execution: restore the paused-from phase with gates, packet,
+   *   executor and amendment binding byte-identical. The pause asked the
+   *   owner a question; the answer must not destroy still-valid state. Only
+   *   legal when the pause stamped pausedFrom (executing|execution-reviewing)
+   *   — a stream that predates pause tracking keeps resume-planning only.
+   * - resume-planning: the full reset (both gates pending, packet cleared) —
+   *   the original reading, kept for rulings that actually invalidate the plan.
+   * - block: terminal.
+   */
+  async ownerResolve(caller: AgentRef, request: { decision: 'resume-planning' | 'resume-execution' | 'block'; note: string }): Promise<Snapshot> {
     const root = this.resolveRoot(caller)
     return this.transact(root.id, async () => {
       const prior = this.require(root.id)
@@ -2228,8 +2492,25 @@ export class AutopilotEngine {
           ...prior,
           revision: prior.revision + 1,
           phase: 'blocked',
+          pausedFrom: undefined,
           diagnostic: `owner ruling: ${request.note}`,
-        })
+        }, { decision: 'block' })
+      }
+      if (request.decision === 'resume-execution') {
+        if (prior.pausedFrom === undefined
+          || (prior.pausedFrom !== 'executing' && prior.pausedFrom !== 'execution-reviewing')) {
+          throw new AutopilotError(
+            'resume-execution requires a pause stamped pausedFrom=executing|execution-reviewing; this stream predates pause tracking — use resume-planning',
+            'AP_OWNER_RESUME_INVALID',
+          )
+        }
+        return await this.commit(prior, 'owner-resolve', {
+          ...prior,
+          revision: prior.revision + 1,
+          phase: prior.pausedFrom,
+          pausedFrom: undefined,
+          diagnostic: `owner ruling: ${request.note}`,
+        }, { decision: 'resume-execution' })
       }
       return await this.commit(prior, 'owner-resolve', {
         ...prior,
@@ -2239,8 +2520,10 @@ export class AutopilotEngine {
         executionGate: 'pending',
         consecutiveReplans: 0,
         executionPacket: undefined,
+        pausedFrom: undefined,
+        planAmendedAtRevision: undefined,
         diagnostic: `owner ruling: ${request.note}`,
-      })
+      }, { decision: 'resume-planning' })
     })
   }
 
@@ -2295,11 +2578,28 @@ export class AutopilotEngine {
           firstKindProblem.code,
         )
       }
+      // PARTIAL DELIVERY (governance pragmatics v1): the outcome label is
+      // DERIVED here and never trusted from the caller — 'partial' iff any
+      // criterion is unproven — and an unproven criterion requires a handoff
+      // whose openItems map the gaps one-to-one. The stamp below puts this
+      // stream on the new arm; unstamped (legacy) closeouts keep the old
+      // reading on replay.
+      const derivedOutcome: 'complete' | 'partial' = closeout.evidence.some(entry => entry.status === 'unproven')
+        ? 'partial'
+        : 'complete'
+      const enriched: Closeout = { ...closeout, outcome: derivedOutcome }
+      const handoffProblemsList = handoffProblems(enriched, prior.triage.acceptanceCriteria)
+      if (handoffProblemsList.length > 0) {
+        throw new AutopilotError(
+          `closeout refused: ${handoffProblemsList.join('; ')}`,
+          'AP_HANDOFF_INVALID',
+        )
+      }
       const candidate: Snapshot = {
         ...prior,
         revision: prior.revision + 1,
         phase: 'completed',
-        closeout,
+        closeout: enriched,
       }
       // Settlement runs HERE and not in the fold: it reads the filesystem, and
       // replay of an old stream must not depend on artifacts still being on
@@ -2320,6 +2620,7 @@ export class AutopilotEngine {
         // carries no information (DESIGN.md §5).
         settledAt: new Date().toISOString(),
         requireKind: true,
+        requireHandoff: true,
       })
       if (!check.ok) {
         throw new AutopilotError(`completion refused: ${check.problems.join('; ')}`, 'AP_COMPLETION_REFUSED')
@@ -2327,7 +2628,7 @@ export class AutopilotEngine {
       // The format stamp. It says what THIS writer guaranteed, so a later
       // replay can hold this event to the current rule without holding older
       // events to a rule that did not exist when they were written.
-      return await this.commit(prior, 'submit-closeout', candidate, { evidenceKinds: 1 })
+      return await this.commit(prior, 'submit-closeout', candidate, { evidenceKinds: 1, closeoutHandoff: 1 })
     })
   }
 
@@ -3540,7 +3841,7 @@ export class AutopilotEngine {
             },
           }
         }
-        const reselected = await this.selectForRole(role, routing.preference, roleRouting, prior, policy, catalog)
+        const reselected = await this.selectForRole(role, routing.preference, roleRouting, prior, policy, catalog, routing.ladder)
         core = this.decorateRepinned(
           this.resolutionOfDecision(role, roleRouting, reselected, undefined),
           {
@@ -3551,10 +3852,10 @@ export class AutopilotEngine {
           dead,
         )
       } else {
-        core = this.resolutionOfDecision(role, roleRouting, await this.selectForRole(role, routing.preference, roleRouting, prior, policy, catalog), undefined)
+        core = this.resolutionOfDecision(role, roleRouting, await this.selectForRole(role, routing.preference, roleRouting, prior, policy, catalog, routing.ladder), undefined)
       }
     } else {
-      core = this.resolutionOfDecision(role, roleRouting, await this.selectForRole(role, routing.preference, roleRouting, prior, policy, catalog), undefined)
+      core = this.resolutionOfDecision(role, roleRouting, await this.selectForRole(role, routing.preference, roleRouting, prior, policy, catalog, routing.ladder), undefined)
       // F16 (PR #2 Codex round 7): a locked dispatch is COMPOSED here
       // (lock route + riding legacy tuning — `lockedAgentOptions`), and the
       // composed object — not just the bare lock the selector validated — is
@@ -3934,8 +4235,17 @@ export class AutopilotEngine {
     prior: Snapshot,
     policy: SessionPolicyState,
     catalog: RouteCatalog,
+    ladder: ResolvedLadder,
   ): Promise<SelectionDecision> {
     const executorPin = AUDITOR_ROLE_SET.includes(role) ? this.executorPinOf(prior) : undefined
+    // The rotation ordinal (owner coverage requirement): how many audit
+    // records this role's mapped audit role already holds in the run's OWN
+    // durable stream. Derived, never a mutable counter, so replay recomputes
+    // the same ordinal. The mapping is fold.ts's
+    // AUDIT_ROLE_OF_ROUTING_ROLE (routing role -> audit role); the engine's
+    // own `routeRoleOf` is the INVERSE and is deliberately NOT used here.
+    const auditRole = AUDIT_ROLE_OF_ROUTING_ROLE[role]
+    const rotation = auditRole === undefined ? undefined : prior.audits.filter((record) => record.role === auditRole).length
     return await selectRoute({
       role,
       risk: prior.triage.risk,
@@ -3950,6 +4260,10 @@ export class AutopilotEngine {
       // dispatch ([R2-P2-2b] — pins stabilize routes, not judgments).
       ...(executorPin === undefined ? {} : { executorPin }),
       independenceFloor: this.config.crossFamily.minRisk,
+      // The owner's ladder: cost overrides and the declared speed order reach
+      // the selector, so an owner override changes the selected route.
+      ...routingAxisInput(ladder),
+      ...(rotation === undefined ? {} : { rotation }),
     })
   }
 
@@ -4037,6 +4351,7 @@ export class AutopilotEngine {
         pin: routePin,
         why,
         authorizationSource: decision.authorizationSource,
+        ...(decision.costMatch === undefined ? {} : { costMatch: decision.costMatch }),
         ...(decision.fallbackFrom === undefined ? {} : { fallbackFrom: decision.fallbackFrom }),
         ...(decision.candidatesConsidered === undefined ? {} : { candidates: [...decision.candidatesConsidered] }),
         ...(repinFrom === undefined ? {} : { repinFrom }),
@@ -4069,6 +4384,7 @@ export class AutopilotEngine {
       ...prior,
       revision: prior.revision + 1,
       phase: 'needs-owner-decision',
+      pausedFrom: prior.phase,
       diagnostic: `routing-escalation: ${reason}`,
     })
     throw new AutopilotError(
@@ -4162,6 +4478,7 @@ export class AutopilotEngine {
         roleRouting,
         policy,
         catalog,
+        ...routingAxisInput(routing.ladder),
       })
       if (decision.kind === 'route') return { kind: 'route', route: decision.route, why: decision.why }
       if (decision.kind === 'inherit') return { kind: 'inherit' }
@@ -4181,6 +4498,7 @@ export class AutopilotEngine {
       roleRouting,
       policy,
       catalog,
+      ...routingAxisInput(routing.ladder),
     })
     if (decision.kind === 'route') return { kind: 'route', route: decision.route, why: decision.why }
     if (decision.kind === 'inherit') return { kind: 'inherit' }
@@ -4400,6 +4718,17 @@ export class AutopilotEngine {
 
   private assertAuditPhase(snapshot: Snapshot, role: AuditRole): void {
     if (role === 'plan') {
+      // DELTA RE-AUDIT (governance pragmatics v1): an armed amendment
+      // (planAmendedAtRevision) opens the plan role to the execution phases,
+      // because that is exactly when an amendment happens and exactly what
+      // must be re-audited before further evidence can land.
+      if (snapshot.planAmendedAtRevision !== undefined
+        && (snapshot.phase === 'executing' || snapshot.phase === 'execution-reviewing' || snapshot.phase === 'closing')) {
+        if (snapshot.plan.revision < 1) {
+          throw new AutopilotError('no plan submitted yet', 'AP_NO_PLAN')
+        }
+        return
+      }
       if (snapshot.phase !== 'planning' && snapshot.phase !== 'replanning') {
         throw new AutopilotError(`plan audits run from planning/replanning, not ${snapshot.phase}`, 'AP_WRONG_PHASE')
       }
@@ -4520,6 +4849,7 @@ export class AutopilotEngine {
         revision: prior.revision + 1,
         phase: 'needs-owner-decision',
         executionGate: 'needs-owner-decision',
+        pausedFrom: prior.phase,
         diagnostic: `executor drain failed: ${errorMessage(error)}`,
       })
     }
@@ -4536,7 +4866,43 @@ export class AutopilotEngine {
     captured: { runRevision: number; planRevision: number; executionRevision: number }
     /** The dispatch's routing decision; its pin rides THIS commit (M3b). */
     routing?: RoutingDecisionDetail
+    /** Graded findings from the auditor's structured return, when it graded any. */
+    findings?: readonly AuditFinding[]
   }): Promise<AuditOutcome> {
+    // FINDINGS CONTRACT, PRE-COMMIT (governance pragmatics v1). This is the
+    // divert point: a needs-replan that cannot name a blocking plan-layer
+    // finding is refused BEFORE any record lands, so the dispatcher re-issues
+    // the dispatch with the verdict the findings actually support (needs-fix
+    // for execution/rules-layer defects). No partial state, no burned round,
+    // no new gate value — the error IS the remediation instruction.
+    if (outcome.findings !== undefined) {
+      const findings = outcome.findings
+      const label = `${outcome.role} audit`
+      if (!Array.isArray(findings) || findings.length === 0) {
+        throw new AutopilotError(`${label} carried an empty findings array; omit the field instead`, 'AP_AUDIT_FINDINGS_INVALID')
+      }
+      for (const finding of findings) {
+        if (typeof finding?.summary !== 'string' || finding.summary.trim().length === 0) {
+          throw new AutopilotError(`${label} carried a finding with an empty summary`, 'AP_AUDIT_FINDINGS_INVALID')
+        }
+        if (finding?.severity !== 'blocking' && finding?.severity !== 'non-blocking') {
+          throw new AutopilotError(`${label} carried a finding whose severity is not blocking|non-blocking ("${String(finding?.severity)}")`, 'AP_AUDIT_FINDINGS_INVALID')
+        }
+        if (finding?.layer !== 'plan' && finding?.layer !== 'execution' && finding?.layer !== 'rules') {
+          throw new AutopilotError(`${label} carried a finding whose layer is not plan|execution|rules ("${String(finding?.layer)}")`, 'AP_AUDIT_FINDINGS_INVALID')
+        }
+      }
+      const blockingPlan = findings.some(finding => finding?.severity === 'blocking' && finding?.layer === 'plan')
+      if (outcome.verdict === 'needs-replan' && !blockingPlan) {
+        throw new AutopilotError(
+          `${label} returned needs-replan without a blocking plan-layer finding. An execution- or rules-layer defect is executor-fixable: re-dispatch with verdict needs-fix and carry the findings`,
+          'AP_AUDIT_FINDINGS_INVALID',
+        )
+      }
+      if (outcome.verdict === 'blocked' && !findings.some(finding => finding?.severity === 'blocking')) {
+        throw new AutopilotError(`${label} returned blocked without a blocking finding`, 'AP_AUDIT_FINDINGS_INVALID')
+      }
+    }
     // The routing pin derives onto exactly the commit that records this
     // dispatch's verdict, with the SAME shared rule the fold re-derives — every
     // `{...live}` below inherits it, and `routingDetail` stamps the event.
@@ -4553,6 +4919,7 @@ export class AutopilotEngine {
       verdict: outcome.verdict,
       note: outcome.note,
       route: outcome.route,
+      ...(outcome.findings === undefined ? {} : { findings: outcome.findings }),
     }
     const audits = [...live.audits, record]
     // The op distinguishes the three verdict PROVENANCES in the event stream
@@ -4568,22 +4935,19 @@ export class AutopilotEngine {
       route: outcome.route,
     }
 
-    // needs-replan from any role: bounded escalation (CC: 2 rounds, the 3rd escalates).
+    // needs-replan from any role (governance pragmatics v1): the replan
+    // budget is OBSERVED, never auto-escalated. Budget exhaustion used to
+    // force needs-owner-decision on the 3rd consecutive round — a mechanical
+    // trigger for a channel reserved for questions only the owner can answer
+    // (the m6-live incident: "Replan budget is 0, so execution is mechanically
+    // blocked. Owner decision is required."). Now the run stays in its
+    // replanning lane with the exhaustion visible in status, and escalating
+    // to the owner is a DELIBERATE choice via autopilot_signal owner-decision.
+    // Liveness backstops: replanBudgetRemaining in status, the discipline
+    // default in the skill layer, and governance.maxAuditRoundsPerRole.
     if (outcome.verdict === 'needs-replan') {
       const rounds = live.consecutiveReplans + 1
-      if (rounds > MAX_REPLAN_ROUNDS) {
-        await this.commit(live, op, {
-          ...live,
-          revision: live.revision + 1,
-          phase: 'needs-owner-decision',
-          planGate: outcome.role === 'plan' ? 'needs-owner-decision' : live.planGate,
-          executionGate: outcome.role === 'plan' ? live.executionGate : 'needs-owner-decision',
-          audits,
-          consecutiveReplans: rounds,
-          diagnostic: `bounded escalation: ${rounds} consecutive needs-replan rounds (max ${MAX_REPLAN_ROUNDS}); owner decision required`,
-        }, routingDetail)
-        return result
-      }
+      const exhausted = rounds > MAX_REPLAN_ROUNDS
       const prior = this.current(root.id) ?? live
       const drained = outcome.role !== 'plan' ? await this.drainExecutorIfRunning(root, prior) : undefined
       if (drained !== undefined) return result
@@ -4597,6 +4961,11 @@ export class AutopilotEngine {
         consecutiveReplans: rounds,
         executor: keepOrSetExecutorState(live.executor, 'revoked'),
         executionPacket: undefined,
+        ...(exhausted
+          ? {
+              diagnostic: `replan budget exhausted: ${rounds} consecutive needs-replan rounds (max ${MAX_REPLAN_ROUNDS}); escalation to the owner is a deliberate choice (autopilot_signal owner-decision), not automatic`,
+            }
+          : {}),
       }, routingDetail)
       return result
     }
@@ -4642,14 +5011,32 @@ export class AutopilotEngine {
             )
           }
           const enforcement = this.restoreSandbox(root, live)
+          // DELTA RE-AUDIT (governance pragmatics v1): when the plan gate is
+          // ALREADY pass, this pass is the delta re-audit an amendment
+          // demanded — it must not yank the run out of the phase it audited
+          // from (execution-reviewing/closing), and it disarms the binding by
+          // construction (the fold derives the clear from this record's
+          // planRevision).
+          const planPassTargetPhase = live.planGate === 'pass'
+            && live.phase !== 'planning' && live.phase !== 'plan-reviewing' && live.phase !== 'replanning'
+            ? live.phase
+            : 'executing'
+          // The same record disarms the amendment binding when it was
+          // captured at or after the amended revision — the writer half of
+          // the fold's derivation (the fold re-derives and would refuse a
+          // stream where the two disagree).
+          const amendedRevision = live.planAmendedAtRevision
+          const disarmAmendment = amendedRevision !== undefined
+            && outcome.captured.planRevision >= amendedRevision
           await this.commit(live, op, {
             ...live,
             revision: live.revision + 1,
-            phase: 'executing',
+            phase: planPassTargetPhase,
             planGate: 'pass',
             audits,
             consecutiveReplans: 0,
             enforcement,
+            ...(disarmAmendment ? { planAmendedAtRevision: undefined } : {}),
             // Freshness anchor for usage artifacts, stamped on the FIRST pass
             // only. The fold refuses any restamp: re-anchoring would silently
             // re-admit artifacts captured before the gate.
@@ -4708,6 +5095,7 @@ export class AutopilotEngine {
           planGate: outcome.role === 'plan' ? 'needs-owner-decision' : live.planGate,
           executionGate: outcome.role === 'plan' ? live.executionGate : 'needs-owner-decision',
           audits,
+          pausedFrom: live.phase,
           diagnostic: outcome.note,
         }, routingDetail)
         return result
@@ -4746,6 +5134,7 @@ export class AutopilotEngine {
       auditMode: snapshot.triage.auditMode,
       requiredRoles: requiredRoles(snapshot.triage),
       latestVerdicts: verdicts,
+      latestAuditRecords: auditStatusRecords(snapshot),
       replanBudgetRemaining: Math.max(0, MAX_REPLAN_ROUNDS - snapshot.consecutiveReplans),
       auditCount: snapshot.audits.length,
       logCount: snapshot.logCount,

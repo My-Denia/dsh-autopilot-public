@@ -191,6 +191,7 @@ const AUTOPILOT_TOOL_NAMES: readonly string[] = [
   'autopilot_init',
   'autopilot_status',
   'autopilot_submit_plan',
+  'autopilot_amend_plan',
   'autopilot_audit',
   'autopilot_self_check',
   'autopilot_usage',
@@ -467,7 +468,18 @@ describe('§1 tool output crosses the real lossless-JSON validator', () => {
     })
     await driveInline('autopilot_submit_plan', { text: 'inline plan' })
     await driveInline('autopilot_self_check', { role: 'plan', verdict: 'pass', note: 'checked' })
+    // Governance pragmatics v1: amend mid-execution, then land the delta
+    // re-audit before evidence — the full amendment path crosses the real
+    // boundary here with all optional arguments omitted.
+    await driveInline('autopilot_amend_plan', { text: 'inline plan (amended)', note: 'implementation detail refined' })
+    await driveInline('autopilot_self_check', { role: 'plan', verdict: 'pass', note: 'delta approved' })
     await driveInline('autopilot_submit_evidence', { report: 'inline evidence' })
+    // Governance pragmatics v1: pause and state-preserving resume at the TOOL
+    // layer (execution-audit non-blocking finding 2). The direct human turn is
+    // already open on this root for owner-approve; owner-decision itself does
+    // not require one, owner-resolve does.
+    await driveInline('autopilot_signal', { action: 'owner-decision', note: 'genuine question: extend scope?' })
+    await driveInline('autopilot_signal', { action: 'owner-resolve', ownerDecision: 'resume-execution', note: 'no; continue in scope' })
     await driveInline('autopilot_signal', { action: 'owner-approve', note: 'git push' })
     await driveInline('autopilot_self_check', { role: 'execution', verdict: 'pass', note: 'checked' })
 

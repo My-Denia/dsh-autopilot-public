@@ -2872,3 +2872,61 @@ describe('F29 (PR #2 round 16): a materialized default effort reaches dispatch, 
     expect(record?.routeStatus).toBe('verified')
   })
 })
+
+
+// ── preference 'axis' + the owner cost override, driven end to end ──
+//
+// The owner's #1 requirement: an owner override must REACH the selector and
+// change the selected route. Two routes, both seeded, are offered to the plan
+// auditor; the cheaper by seed wins, and an owner override reverses it and is
+// recorded as 'owner-override' (never as a seed kind).
+
+describe('routing integration: preference axis and the owner cost override', () => {
+  const AXIS_MODELS: readonly StubModel[] = [
+    { provider: 'google', id: 'gemini-3.1-flash-lite', contextWindow: 200000 }, // seed 0.25 / 1.5
+    { provider: 'mistral', id: 'magistral-small', contextWindow: 200000 }, // seed 0.5 / 1.5
+  ]
+  const AXIS_POLICY: SessionPolicyState = {
+    kind: 'present',
+    routes: [
+      { provider: 'google', model: 'gemini-3.1-flash-lite' },
+      { provider: 'mistral', model: 'magistral-small' },
+    ],
+  }
+
+  async function planAudit(costOverrides?: readonly string[]): Promise<{
+    readonly options: AgentOptionsLike | undefined
+    readonly routing: RoutingDecisionDetail | undefined
+  }> {
+    const f = fixture(AXIS_MODELS, AXIS_POLICY)
+    const h = makeHarness({
+      routing: f.portsFor(),
+      subagents: stubSubagents({ verdicts: [{ verdict: 'pass', note: 'ok' }] }),
+      config: {
+        routing: {
+          preference: 'axis',
+          ...(costOverrides === undefined ? {} : { ladder: { costOverrides } }),
+        },
+      },
+    })
+    await toExecuting(h)
+    return { options: h.subagents.auditOptions[0], routing: routingOf(h, 'audit', 'plan-auditor') }
+  }
+
+  it('selects the cheaper seeded route and records the seed provenance', async () => {
+    const { options, routing } = await planAudit()
+    expect(options?.provider).toBe('google')
+    expect(options?.model).toBe('gemini-3.1-flash-lite')
+    expect(routing?.pin).toEqual({ provider: 'google', model: 'gemini-3.1-flash-lite' })
+    expect(routing?.costMatch).toBe('route')
+  })
+
+  it("an owner costOverride changes the winner and is recorded as 'owner-override'", async () => {
+    const { options, routing } = await planAudit(['mistral/magistral-small=0.01/0.02'])
+    expect(options?.provider).toBe('mistral')
+    expect(options?.model).toBe('magistral-small')
+    expect(routing?.pin).toEqual({ provider: 'mistral', model: 'magistral-small' })
+    expect(routing?.costMatch).toBe('owner-override')
+    expect(routing?.why.some(entry => entry.includes('provenance owner-override'))).toBe(true)
+  })
+})

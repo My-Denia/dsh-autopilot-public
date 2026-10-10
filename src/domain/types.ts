@@ -197,6 +197,14 @@ export interface RoutingDecisionDetail {
    * that one day records the set it refused is honest, not illegal.
    */
   readonly candidates?: readonly CandidateConsidered[]
+  /**
+   * Provenance of the EFFECTIVE cost the selection ranked on, ADDITIVE and
+   * OPTIONAL: present exactly when cost was an ordering input (preference
+   * `axis`), absent on every legacy record. The fold validates the value
+   * against the five kinds, so a hand-edited stream cannot smuggle a
+   * fabricated provenance past replay.
+   */
+  readonly costMatch?: 'route' | 'model' | 'model-case-folded' | 'unknown' | 'owner-override'
 }
 
 /** The five routed roles, as the fold validates them (mirror of `Role`). */
@@ -207,6 +215,15 @@ export const ROUTING_ROLES: readonly string[] = [
 /** The auditor roles: the only roles a dispatch op other than `start-executor` may name. */
 export const ROUTING_AUDITOR_ROLES: readonly string[] = [
   'plan-auditor', 'execution-auditor', 'rules-auditor',
+]
+
+/**
+ * The cost-provenance vocabulary (mirror of `CostMatchKind`,
+ * `../routing/select.js`). `owner-override` is deliberately NOT a seed kind:
+ * an owner price must never be presented as the built-in snapshot's.
+ */
+export const ROUTING_COST_MATCHES: readonly string[] = [
+  'route', 'model', 'model-case-folded', 'unknown', 'owner-override',
 ]
 
 /** The authorization-source vocabulary (mirror of `AuthorizationSource`). */
@@ -314,6 +331,25 @@ export interface ExternalReview {
   readonly treeHash?: string
 }
 
+/**
+ * One structured audit finding (governance pragmatics v1).
+ *
+ * Auditors graded findings in practice long before this type existed (the
+ * goal-runs/ records carry P1/P2/P3 prose), but the binary verdict space
+ * forced every finding into either 'pass' (finding lost) or 'needs-replan'
+ * (a round burned). The finding carries the two axes the gates need: HOW
+ * severe, and WHICH layer owns the fix.
+ *
+ * REPLAY: 'findings' is ABSENT on every pre-findings stream, and every rule
+ * keyed to it is presence-gated (same argument as detail.routing F26): the
+ * fold fires only when the stream itself carries the field.
+ */
+export interface AuditFinding {
+  readonly severity: 'blocking' | 'non-blocking'
+  readonly layer: 'plan' | 'execution' | 'rules'
+  readonly summary: string
+}
+
 /** One audit record. Provenance is in-band: the engine itself dispatched the auditor and received the structured verdict. */
 export interface AuditRecord {
   readonly role: AuditRole
@@ -336,6 +372,16 @@ export interface AuditRecord {
    * `route.provider` alone would flatten them.
    */
   readonly external?: ExternalReview
+  /**
+   * Structured findings, when the auditor graded them. ABSENT marks a
+   * pre-findings (legacy) stream and every findings rule is inert for it.
+   * Contract (enforced at write AND on presence-gated replay):
+   * 'needs-replan' requires >=1 finding {severity:'blocking', layer:'plan'}
+   * — an execution- or rules-layer defect is executor-fixable, use needs-fix;
+   * 'blocked' requires >=1 blocking finding; 'pass' may carry non-blocking
+   * findings (suggestions ride along without burning a round).
+   */
+  readonly findings?: readonly AuditFinding[]
 }
 
 /** Executor authorization record (delegated mode only). */
@@ -458,6 +504,26 @@ export function evidenceKindProblems(
   return problems
 }
 
+/**
+ * One open item a partial delivery hands to a follow-up run. `criterion`
+ * text-matches the acceptance criterion it speaks for; the mechanical rule
+ * (stamped streams only) is a bijection: every UNPROVEN criterion has exactly
+ * one openItem, and an openItem for a proven criterion is a known-limitation
+ * record, not coverage.
+ */
+export interface HandoffItem {
+  readonly criterion: string
+  readonly state: 'implemented-unverified' | 'not-implemented' | 'known-limitation'
+  readonly note: string
+}
+
+/** Structured handoff for a stage-scoped closeout (governance pragmatics v1). */
+export interface CloseoutHandoff {
+  readonly openItems: readonly HandoffItem[]
+  /** The next authorized action, persisted so the follow-up run inherits intent, not guesswork. */
+  readonly nextAuthorizedAction?: string
+}
+
 /** Structured closeout (CC Phase 5 contract). Completion is refused without it. */
 export interface Closeout {
   readonly summary: string
@@ -469,6 +535,17 @@ export interface Closeout {
   readonly workspaceCleanup: string
   /** Prompt/workspace drift: 'none found' or exact facts to update upstream. */
   readonly drift: string
+  /**
+   * Required on stamped closeouts whenever any criterion is unproven (partial
+   * delivery); ABSENT on legacy streams. Enforced at write and under the
+   * `closeoutHandoff: 1` stamp on replay.
+   */
+  readonly handoff?: CloseoutHandoff
+  /**
+   * 'complete' when zero unproven criteria, 'partial' otherwise. Written by
+   * the engine, derived-checked by the fold whenever present.
+   */
+  readonly outcome?: 'complete' | 'partial'
 }
 
 /** One owner egress approval (v1 stand-in for the CC outbound evidence manifest). */
@@ -890,6 +967,24 @@ export interface Triage {
   /** Self-declared: the run modifies rules/skills/hooks/agent config. Adds the `rules` audit role. */
   readonly touchesOperatingLayer: boolean
   readonly baseline: Baseline
+  /**
+   * Cross-run carryover declaration: this run continues a completed
+   * predecessor's authorized work. Validated against the store at init
+   * (write path only -- the fold checks shape, never the filesystem).
+   * Immutable like the rest of triage, so a run cannot retcon its ancestry.
+   */
+  readonly carryover?: Carryover
+}
+
+/**
+ * The carryover contract a follow-up run declares at init. `inherits` names
+ * what is being carried (verified results, open items, decisions, evidence);
+ * the predecessor's closeout handoff is the durable counterpart.
+ */
+export interface Carryover {
+  readonly fromRunId: string
+  readonly note: string
+  readonly inherits: readonly string[]
 }
 
 /** The complete durable run snapshot, written on every event. */
@@ -907,7 +1002,12 @@ export interface Snapshot {
   readonly executionPacket?: string
   readonly residualRisks: readonly string[]
   readonly logCount: number
-  /** Consecutive needs-replan verdicts; MAX_REPLAN_ROUNDS+1 forces needs-owner-decision. */
+  /**
+   * Consecutive needs-replan verdicts. Beyond MAX_REPLAN_ROUNDS the run stays
+   * in its replanning lane with the exhaustion visible (governance pragmatics
+   * v1 removed the forced needs-owner-decision escalation); the owner channel
+   * is a deliberate choice, never a meter reading.
+   */
   readonly consecutiveReplans: number
   readonly closeout?: Closeout
   /**
@@ -937,6 +1037,23 @@ export interface Snapshot {
    * dispatch — those replay exactly as before.
    */
   readonly routingPins?: Partial<Record<Role, RoutingPin>>
+  /**
+   * The phase a needs-owner-decision pause took the run out of. Written by
+   * set-owner-decision and by an auditor's needs-owner-decision verdict;
+   * REQUIRED before owner-resolve(resume-execution) may restore it. ABSENT on
+   * every pre-pause-tracking stream, which therefore cannot resume-execution
+   * (they keep the resume-planning-only reading -- the legacy arm).
+   */
+  readonly pausedFrom?: Phase
+  /**
+   * Set by amend-plan to the amended plan revision; cleared by a plan-role
+   * PASS captured at or after that revision (the delta re-audit). While set,
+   * submit-evidence and submit-closeout are refused -- a plan change must be
+   * re-audited before further execution lands, but the execution state is NOT
+   * wiped (that is the whole point of amendment vs replan). Derived by the
+   * fold from ops, exactly like routingPins.
+   */
+  readonly planAmendedAtRevision?: number
   readonly diagnostic?: string
 }
 
@@ -944,6 +1061,7 @@ export interface Snapshot {
 export type Operation =
   | 'init'
   | 'submit-plan'
+  | 'amend-plan'
   | 'audit'
   | 'self-check'
   | 'external-audit'
@@ -1061,6 +1179,73 @@ export interface CompletionOptions {
    * the stream itself says, never by the build that happens to be reading it.
    */
   readonly requireKind?: boolean
+  /**
+   * Enforce the partial-delivery contract: outcome matches its derivation and
+   * every unproven criterion maps to exactly one handoff openItem.
+   *
+   * OFF BY DEFAULT for the same replay reason as `requireKind`: the fold
+   * passes `true` only for an event that stamped `closeoutHandoff: 1`, and
+   * the engine passes `true` at the write.
+   */
+  readonly requireHandoff?: boolean
+}
+
+/**
+ * The partial-delivery contract for a closeout (governance pragmatics v1),
+ * shared by the engine's write path and the fold's stamped replay arm.
+ *
+ * The rules, in the order they refuse:
+ * 1. `outcome`, when present, must match its derivation ('complete' iff zero
+ *    unproven evidence entries) — the label is written by the engine and
+ *    re-derived, never trusted.
+ * 2. Zero unproven criteria means the delivery is whole: a handoff present
+ *    anyway is refused (the field exists to carry open items, not prose).
+ * 3. >=1 unproven criterion REQUIRES a handoff, and the mapping is a
+ *    bijection: every unproven criterion has exactly one openItem. Extra
+ *    openItems are allowed only for PROVEN criteria as known-limitation
+ *    records, and every openItem's criterion must be a real acceptance
+ *    criterion (a typo must not pass silently as coverage).
+ */
+export function handoffProblems(closeout: Closeout, acceptanceCriteria: readonly string[]): string[] {
+  const problems: string[] = []
+  const unproven = closeout.evidence
+    .filter(entry => entry.status === 'unproven')
+    .map(entry => entry.criterion.trim())
+  const derived: 'complete' | 'partial' = unproven.length === 0 ? 'complete' : 'partial'
+  if (closeout.outcome !== undefined && closeout.outcome !== derived) {
+    problems.push(`closeout outcome is '${closeout.outcome}' but the derivation says '${derived}' (${unproven.length} unproven criteria)`)
+  }
+  if (unproven.length === 0) {
+    if (closeout.handoff !== undefined) {
+      problems.push('closeout carries a handoff but zero unproven criteria; use residualRisks for limitations on proven work')
+    }
+    return problems
+  }
+  if (closeout.handoff === undefined) {
+    problems.push(`partial delivery requires a handoff: ${unproven.length} unproven criteria and no openItems`)
+    return problems
+  }
+  const known = new Set(acceptanceCriteria.map(criterion => criterion.trim()))
+  for (const [index, item] of closeout.handoff.openItems.entries()) {
+    const criterion = item.criterion.trim()
+    if (criterion.length === 0) {
+      problems.push(`handoff openItem #${index}: criterion is empty`)
+    } else if (!known.has(criterion)) {
+      problems.push(`handoff openItem #${index}: criterion is not an acceptance criterion: ${criterion}`)
+    }
+    if (item.state !== 'implemented-unverified' && item.state !== 'not-implemented' && item.state !== 'known-limitation') {
+      problems.push(`handoff openItem #${index}: state is not a delivery state ("${String(item.state)}")`)
+    }
+    if (item.note.trim().length === 0) {
+      problems.push(`handoff openItem #${index}: note is empty`)
+    }
+  }
+  for (const criterion of unproven) {
+    const items = closeout.handoff.openItems.filter(item => item.criterion.trim() === criterion)
+    if (items.length === 0) problems.push(`unproven criterion has no handoff openItem: ${criterion}`)
+    if (items.length > 1) problems.push(`unproven criterion has ${items.length} handoff openItems (exactly one): ${criterion}`)
+  }
+  return problems
 }
 
 /**
@@ -1094,6 +1279,9 @@ export function evaluateCompletion(snapshot: Snapshot, options: CompletionOption
       ...evidenceKindProblems(closeout.evidence, { requireKind: options.requireKind === true })
         .map(problem => problem.message),
     )
+    if (options.requireHandoff === true) {
+      problems.push(...handoffProblems(closeout, triage.acceptanceCriteria))
+    }
     for (const criterion of triage.acceptanceCriteria) {
       const entries = closeout.evidence.filter(entry => entry.criterion === criterion)
       if (entries.length === 0) problems.push(`criterion has no evidence entry: ${criterion}`)

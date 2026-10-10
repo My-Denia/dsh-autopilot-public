@@ -143,6 +143,9 @@ export function installRootTools(
           items: { type: 'string' },
           description: 'Standard runs only: ids of the user-visible changes this run will make, seeded as "undeclared". Defaults to a single entry "m1". Each must be answered with autopilot_usage before the plan gate can pass.',
         },
+        carryoverFromRunId: { type: 'string', description: 'Declare this run as the continuation of a COMPLETED predecessor run (cross-run carryover). The predecessor must exist in the store and be completed; refused otherwise.' },
+        carryoverNote: { type: 'string', description: 'What this run carries forward from the predecessor (required with carryoverFromRunId).' },
+        carryoverInherits: { type: 'array', items: { type: 'string' }, description: 'Named items inherited from the predecessor (verified results, open items, decisions, evidence refs). Required non-empty with carryoverFromRunId.' },
       },
       output: jsonOutput(JSON_VALUE),
       async execute(args, exec) {
@@ -163,6 +166,13 @@ export function installRootTools(
             ...(args.baselineDirty === undefined ? {} : { dirty: args.baselineDirty }),
             ...(args.baselineNote === undefined ? {} : { note: args.baselineNote }),
           },
+          ...(args.carryoverFromRunId === undefined ? {} : {
+            carryover: {
+              fromRunId: args.carryoverFromRunId,
+              note: args.carryoverNote ?? '',
+              inherits: args.carryoverInherits ?? [],
+            },
+          }),
         }
         // Usage seeding is STANDARD-ONLY: lightweight runs skip mechanical
         // enforcement across the board (CC parity — the same exemption the
@@ -197,6 +207,28 @@ export function installRootTools(
           phase: snapshot.phase,
           enforcement: snapshot.enforcement,
           ...(snapshot.usage === undefined ? {} : { usage: snapshot.usage }),
+        } as never
+      },
+    }))
+
+    register(defineTool({
+      name: 'autopilot_amend_plan',
+      description: 'Amend the PASSED plan mid-execution without destroying execution state: bumps the plan revision, keeps gates/executor/evidence, and ARMS a delta re-audit — further evidence/closeout are refused until a plan-role pass at the amended revision lands. Objective/scope/acceptance criteria are immutable (triage); a material change that fails the delta audit still takes the full replan path.',
+      parameters: {
+        text: { type: 'string', required: true, description: 'The complete amended plan text.' },
+        note: { type: 'string', required: true, description: 'What changed and why — the delta the re-audit will review.' },
+      },
+      output: jsonOutput(JSON_VALUE),
+      async execute(args, exec) {
+        const agent = callingAgent(exec.agent, 'autopilot_amend_plan')
+        const snapshot = await engine.amendPlan(agent, { text: args.text, note: args.note })
+        return {
+          runId: snapshot.runId,
+          revision: snapshot.revision,
+          phase: snapshot.phase,
+          planRevision: snapshot.plan.revision,
+          planGate: snapshot.planGate,
+          planAmendedAtRevision: snapshot.planAmendedAtRevision,
         } as never
       },
     }))
@@ -483,11 +515,11 @@ export function installRootTools(
 
     register(defineTool({
       name: 'autopilot_signal',
-      description: 'Run control signals. replan: rewrite the plan (drains any executor). block / owner-decision: stop the run. owner-approve: grant ONE egress approval (owner-only; requires a direct human turn). owner-resolve: resolve a needs-owner-decision pause (owner-only; decision resume-planning or block).',
+      description: 'Run control signals. replan: rewrite the plan (drains any executor). block / owner-decision: stop the run. owner-approve: grant ONE egress approval (owner-only; requires a direct human turn). owner-resolve: resolve a needs-owner-decision pause (owner-only; decision resume-planning, resume-execution to restore the paused-from phase with gates/evidence untouched, or block).',
       parameters: {
         action: { type: 'string', required: true, enum: ['replan', 'block', 'owner-decision', 'owner-approve', 'owner-resolve'] },
         note: { type: 'string', required: true, description: 'Reason / ruling / approval target description.' },
-        ownerDecision: { type: 'string', enum: ['resume-planning', 'block'], description: 'owner-resolve only.' },
+        ownerDecision: { type: 'string', enum: ['resume-planning', 'resume-execution', 'block'], description: 'owner-resolve only. resume-execution restores the paused-from phase with gates/evidence untouched (requires a pause that stamped it); resume-planning fully resets.' },
       },
       output: jsonOutput(JSON_VALUE),
       async execute(args, exec) {
@@ -513,8 +545,8 @@ export function installRootTools(
           case 'owner-resolve': {
             requireDirectHumanTurn(agent, 'owner-resolve')
             const decision = args.ownerDecision
-            if (decision !== 'resume-planning' && decision !== 'block') {
-              throw new AutopilotError('owner-resolve requires ownerDecision resume-planning|block', 'AP_INVALID_ARGUMENT')
+            if (decision !== 'resume-planning' && decision !== 'resume-execution' && decision !== 'block') {
+              throw new AutopilotError('owner-resolve requires ownerDecision resume-planning|resume-execution|block', 'AP_INVALID_ARGUMENT')
             }
             const snapshot = await engine.ownerResolve(agent, { decision, note: args.note })
             return { runId: snapshot.runId, revision: snapshot.revision, phase: snapshot.phase } as never
@@ -567,6 +599,20 @@ export function installRootTools(
         exclusions: { type: 'array', items: { type: 'string' }, description: 'What was deliberately not changed.' },
         workspaceCleanup: { type: 'string', required: true, description: 'Self-created artifacts kept/archived/deleted/left, with reasons.' },
         drift: { type: 'string', required: true, description: '"none found" or exact upstream facts to update.' },
+        handoffOpenItems: {
+          type: 'array',
+          description: 'REQUIRED when any criterion is unproven (partial delivery): every unproven criterion must map to exactly one openItem. The outcome label (complete|partial) is derived by the engine, never taken from the caller.',
+          items: {
+            type: 'object',
+            additionalProperties: false,
+            properties: {
+              criterion: { type: 'string', required: true, description: 'The acceptance criterion this open item speaks for, verbatim.' },
+              state: { type: 'string', required: true, enum: ['implemented-unverified', 'not-implemented', 'known-limitation'] },
+              note: { type: 'string', required: true, description: 'What remains and why.' },
+            },
+          },
+        },
+        handoffNextAuthorizedAction: { type: 'string', description: 'The next authorized action, persisted with the handoff so a follow-up run inherits intent, not guesswork.' },
       },
       output: jsonOutput(JSON_VALUE),
       async execute(args, exec) {
@@ -584,6 +630,16 @@ export function installRootTools(
           exclusions: args.exclusions ?? [],
           workspaceCleanup: args.workspaceCleanup,
           drift: args.drift,
+          ...(args.handoffOpenItems === undefined
+            ? {}
+            : {
+                handoff: {
+                  openItems: args.handoffOpenItems,
+                  ...(args.handoffNextAuthorizedAction === undefined
+                    ? {}
+                    : { nextAuthorizedAction: args.handoffNextAuthorizedAction }),
+                },
+              }),
         })
         return { runId: snapshot.runId, revision: snapshot.revision, phase: snapshot.phase } as never
       },

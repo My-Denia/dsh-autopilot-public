@@ -19,10 +19,14 @@ vi.mock('../src/skill-install.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../src/skill-install.js')>()
   return {
     ...actual,
-    syncBundledSkill: () => ({
+    // The mount publishes the whole skill directory, so THIS is the symbol the
+    // fallback calls. Mocking syncBundledSkill would leave the real tree
+    // publish running against the operator's skill home.
+    syncBundledSkillTree: () => ({
       status: 'unsupported' as const,
       dest: DEST,
-      detail: `skill home does not support hard links; nothing was written to ${DEST} — copy the bundled SKILL.md there manually to install`,
+      detail: `skill home does not support hard links; nothing was written to ${DEST} — copy /pkg/skill/dsh-autopilot/SKILL.md there manually to install`,
+      files: [],
     }),
   }
 })

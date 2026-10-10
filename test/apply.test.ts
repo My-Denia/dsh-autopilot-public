@@ -856,7 +856,8 @@ describe('apply through a REAL cordis fiber', () => {
     // in the other direction. Naming them makes every change deliberate.
     const autopilotTools = toolNames.filter(tool => tool.startsWith('autopilot_')).sort()
     expect(autopilotTools).toEqual([
-      'autopilot_audit',
+      'autopilot_amend_plan',
+  'autopilot_audit',
       'autopilot_external_audit',
       'autopilot_executor',
       'autopilot_init',

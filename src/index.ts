@@ -27,7 +27,7 @@
  */
 
 import { AutopilotEngine } from './engine.js'
-import type { AgentOptionsLike, AgentRef, EnvironmentProbes, ResolvedConfig, ResolvedRouting, RoutingPorts } from './engine.js'
+import type { AgentOptionsLike, AgentRef, EnvironmentProbes, ResolvedConfig, ResolvedCostOverride, ResolvedLadder, ResolvedRouting, RoutingPorts } from './engine.js'
 import { installChildEgressGuard, installRootGate } from './gate/install.js'
 import type { GateAgentRef } from './gate/install.js'
 import { installPreExecuteGate } from './gate/preexecute.js'
@@ -105,14 +105,26 @@ export {
 export type { AutopilotWebRoute, EnforcementProjection, RunProjection, RunsBody } from './web.js'
 export { Config, DEFAULT_EXECUTOR_TOOLS, StoreKindSchema } from './config.js'
 export type { Role, RoleRouting, RoutePreference } from './routing/select.js'
+export type { ResolvedCostOverride, ResolvedLadder } from './engine.js'
 export {
+  BUNDLED_SKILL_REFERENCES,
   SKILL_HOME_ENV,
+  SKILL_REFERENCES_DIR,
   SKILL_RELATIVE,
   bundledSkillPath,
+  bundledSkillRoot,
   skillHome,
   syncBundledSkill,
+  syncBundledSkillTree,
 } from './skill-install.js'
-export type { DestKind, SkillInstallStatus, SkillSyncIo, SkillSyncResult } from './skill-install.js'
+export type {
+  DestKind,
+  SkillInstallStatus,
+  SkillSyncIo,
+  SkillSyncResult,
+  SkillTreeFileResult,
+  SkillTreeSyncResult,
+} from './skill-install.js'
 export {
   BUNDLED_SKILL_PROVIDER_NAME,
   BUNDLED_SKILL_PROVIDER_RANK,
@@ -215,6 +227,15 @@ export interface ConfigInput {
    * a differing dest is a warning.
    */
   readonly skillInstall?: 'auto' | 'off'
+  /**
+   * Governance pragmatics knobs (governance pragmatics v1), all optional:
+   * `maxAuditRoundsPerRole` refuses further same-role audit dispatches beyond
+   * the cap (AP_AUDIT_ROUND_CAP) — a brake on audit storms that never
+   * escalates to the owner on its own.
+   */
+  readonly governance?: {
+    readonly maxAuditRoundsPerRole?: number
+  }
 }
 
 /**
@@ -244,13 +265,23 @@ export interface RoleRoutingInput {
 /** The `routing` section as a profile may write it. */
 export interface RoutingInput {
   readonly mode?: 'auto' | 'off'
-  readonly preference?: 'balanced' | 'economy' | 'quality'
+  readonly preference?: 'balanced' | 'economy' | 'quality' | 'axis'
   readonly roles?: {
     readonly executor?: RoleRoutingInput
     readonly planner?: RoleRoutingInput
     readonly planAuditor?: RoleRoutingInput
     readonly executionAuditor?: RoleRoutingInput
     readonly rulesAuditor?: RoleRoutingInput
+  }
+  readonly ladder?: {
+    readonly tiers?: {
+      readonly economy?: readonly string[]
+      readonly standard?: readonly string[]
+      readonly reserve?: readonly string[]
+    }
+    readonly auditTier?: 'economy' | 'standard' | 'reserve' | 'none'
+    readonly speedOrder?: readonly string[]
+    readonly costOverrides?: readonly string[]
   }
 }
 
@@ -479,8 +510,8 @@ function resolveRouting(input?: ConfigInput): ResolvedRouting {
   const mode = readSetting(routing?.mode) ?? 'auto'
   const preference = readSetting(routing?.preference) ?? 'balanced'
   if (mode !== 'auto' && mode !== 'off') throw new Error(`routing.mode must be 'auto' or 'off' (got ${JSON.stringify(mode)})`)
-  if (preference !== 'balanced' && preference !== 'economy' && preference !== 'quality') {
-    throw new Error(`routing.preference must be 'balanced', 'economy' or 'quality' (got ${JSON.stringify(preference)})`)
+  if (preference !== 'balanced' && preference !== 'economy' && preference !== 'quality' && preference !== 'axis') {
+    throw new Error(`routing.preference must be 'balanced', 'economy', 'quality' or 'axis' (got ${JSON.stringify(preference)})`)
   }
   const roles = {} as Record<Role, RoleRouting>
   for (const key of ROLE_CONFIG_KEYS) {
@@ -515,7 +546,56 @@ function resolveRouting(input?: ConfigInput): ResolvedRouting {
     }
     roles[role] = { mode: 'auto', minContext: minContext ?? DEFAULT_ROLE_MIN_CONTEXT[role] }
   }
-  return { mode, preference, roles }
+  return { mode, preference, roles, ladder: resolveLadder(input) }
+}
+
+/** `provider/model=inputPerM/outputPerM`. Anything else is refused, never ignored. */
+const COST_OVERRIDE_PATTERN = /^([^/=]+)\/([^=]+)=([0-9]+(?:\.[0-9]+)?)\/([0-9]+(?:\.[0-9]+)?)$/
+
+/** Read an optional array-of-strings leaf, trim-exact, dropping blanks. */
+function ladderList(value: unknown): readonly string[] {
+  if (!Array.isArray(value)) return []
+  return value.filter((entry): entry is string => typeof entry === 'string').map(entry => entry.trim()).filter(entry => entry.length > 0)
+}
+
+function parseCostOverride(entry: string): ResolvedCostOverride {
+  const match = COST_OVERRIDE_PATTERN.exec(entry.trim())
+  const provider = (match?.[1] ?? '').trim()
+  const model = (match?.[2] ?? '').trim()
+  const inputPerM = Number(match?.[3])
+  const outputPerM = Number(match?.[4])
+  if (match === null || provider.length === 0 || model.length === 0
+    || !Number.isFinite(inputPerM) || !Number.isFinite(outputPerM) || inputPerM <= 0 || outputPerM <= 0) {
+    throw new Error(`routing.ladder.costOverrides entry ${JSON.stringify(entry)} is malformed — expected "provider/model=inputPerM/outputPerM" with positive prices`)
+  }
+  return { provider, model, inputPerM, outputPerM }
+}
+
+/**
+ * Resolve the owner's ladder.
+ *
+ * Owner values win; a declared default applies only where the owner is silent.
+ * Nothing here is derived from a model name or id, and a malformed cost
+ * override is REFUSED rather than dropped, because a silently ignored pricing
+ * instruction would leave the owner believing a route costs what it does not.
+ */
+function resolveLadder(input?: ConfigInput): ResolvedLadder {
+  const raw = input?.routing?.ladder
+  const tiers = readSetting(raw?.tiers)
+  const auditTier = readSetting(raw?.auditTier)
+  if (auditTier !== undefined && auditTier !== 'economy' && auditTier !== 'standard' && auditTier !== 'reserve' && auditTier !== 'none') {
+    throw new Error(`routing.ladder.auditTier must be 'economy', 'standard', 'reserve' or 'none' (got ${JSON.stringify(auditTier)})`)
+  }
+  return {
+    tiers: {
+      economy: ladderList(readSetting(tiers?.economy)),
+      standard: ladderList(readSetting(tiers?.standard)),
+      reserve: ladderList(readSetting(tiers?.reserve)),
+    },
+    auditTier: auditTier ?? 'none',
+    speedOrder: ladderList(readSetting(raw?.speedOrder)),
+    costOverrides: ladderList(readSetting(raw?.costOverrides)).map(parseCostOverride),
+  }
 }
 
 /** Resolve raw config with defaults (manual, defensive — the schema governs writes, this governs reads). */
@@ -545,6 +625,14 @@ export function resolveConfig(input?: ConfigInput): ResolvedConfig {
       restoreMode: input?.gate?.restoreMode ?? 'workspace-write',
     },
     skillInstall: input?.skillInstall ?? 'auto',
+    // Mirrors the loader path field-for-field: an unset governance section
+    // resolves to an EMPTY object on both paths (the engine reads
+    // governance?.maxAuditRoundsPerRole and treats absent as off).
+    governance: {
+      ...(input?.governance?.maxAuditRoundsPerRole === undefined
+        ? {}
+        : { maxAuditRoundsPerRole: input.governance.maxAuditRoundsPerRole }),
+    },
   }
 }
 
