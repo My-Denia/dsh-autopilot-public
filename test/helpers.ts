@@ -82,6 +82,8 @@ export class FakeAgents {
 export interface StubVerdictScript {
   verdict: string
   note: string
+  /** Graded findings forwarded verbatim into the structured return (governance pragmatics v1). */
+  findings?: import('../src/domain/types.js').AuditFinding[]
   /**
    * Override the child's logged `request/header` route (M4 observed leg).
    * Absent ⇒ the stub logs a header AGREEING with the dispatch — what a

@@ -141,6 +141,8 @@ For detailed compatibility notes and host verification traces, see [docs/compati
 | Document | Focus |
 | :--- | :--- |
 | **[DESIGN.md](./DESIGN.md)** | Core architecture, CC GAH mapping, state machine, invariants, and design roadmap. |
+| **[skill/dsh-autopilot/references/refusals.md](./skill/dsh-autopilot/references/refusals.md)** | The contract behind every engine refusal code, with its remedy. |
+| **[skill/dsh-autopilot/references/governance-invariants.md](./skill/dsh-autopilot/references/governance-invariants.md)** | The host-neutral governance rules (risk, audit invariants, evidence, closeout) this adapter consumes. |
 | **[docs/compatibility.md](./docs/compatibility.md)** | DSH version matrix, Desktop notes, 0.2.0 adapter details, and sandbox residual. |
 | **[docs/security.md](./docs/security.md)** | Approval mechanisms, egress interception, sandbox assumptions, and non-goals. |
 | **[docs/reference.md](./docs/reference.md)** | Complete tool protocol (`autopilot_*`), run state schema, and usage classes. |

@@ -184,6 +184,31 @@ const RoleRoutingShape = (defaultMode: 'auto' | 'inherit') => Schema.object({
  * machine-readable, patch-writable config — no shipped Settings GUI is
  * claimed for it (the visible control surface is the run card).
  */
+/**
+ * The owner's routing ladder.
+ *
+ * WHY FIXED TIER NAMES rather than an owner-authored record: Schemastery
+ * refuses a volatile field beneath a transform or a keyed dict, and the loader
+ * follows volatile references only so deep. economy/standard/reserve are fixed
+ * paths, so each leaf stays volatile and live-editable, which is what makes an
+ * owner edit take effect without a restart.
+ */
+const LadderShape = Schema.object({
+  tiers: Schema.object({
+    economy: Schema.array(Schema.string()).default([]).volatile().description('Routes the owner places in the economy tier, as provider/model.'),
+    standard: Schema.array(Schema.string()).default([]).volatile().description('Routes the owner places in the standard tier, as provider/model.'),
+    reserve: Schema.array(Schema.string()).default([]).volatile().description('Routes the owner reserves, as provider/model.'),
+  }),
+  auditTier: Schema.union([
+    Schema.const('economy').description('Audit roles may draw from the economy tier.'),
+    Schema.const('standard').description('Audit roles may draw from the standard tier.'),
+    Schema.const('reserve').description('Audit roles may draw from the reserve tier.'),
+    Schema.const('none').description('No tier restriction is configured (the shipped default).'),
+  ]).default('none').volatile(),
+  speedOrder: Schema.array(Schema.string()).default([]).volatile().description('Owner-declared speed order, fastest first, as provider/model. Empty means speed is unknown and is not ranked.'),
+  costOverrides: Schema.array(Schema.string()).default([]).volatile().description('Owner cost overrides, "provider/model=inputPerM/outputPerM". These beat the seeded cost. A malformed entry is refused.'),
+})
+
 const RoutingShape = Schema.object({
   mode: Schema.union([
     Schema.const('auto').description('Route by the ordered rule table over the session-authorized set.'),
@@ -193,6 +218,7 @@ const RoutingShape = Schema.object({
     Schema.const('balanced').description('Efforts preferred, then context window descending.'),
     Schema.const('economy').description('Smallest sufficient context window first.'),
     Schema.const('quality').description('Reasoning efforts first, then context window descending.'),
+    Schema.const('axis').description('Sufficiency thresholds pass/fail (never ranked), then survivors ranked on the declared axes: effective cost (outputPerM then inputPerM), then the owner-declared speed order when one is declared.'),
   ]).default('balanced').volatile(),
   roles: Schema.object({
     executor: RoleRoutingShape('auto'),
@@ -201,6 +227,7 @@ const RoutingShape = Schema.object({
     executionAuditor: RoleRoutingShape('auto'),
     rulesAuditor: RoleRoutingShape('auto'),
   }),
+  ladder: LadderShape,
 })
 
 /**
@@ -258,6 +285,11 @@ const ConfigShape = Schema.object({
   }),
   storeKind: StoreKindSchema,
   storeRoot: Schema.string().default('').description('Run store directory; empty means $DSH_HOME/storages/dsh-autopilot.'),
+  governance: Schema.object({
+    maxAuditRoundsPerRole: Schema.number().min(1).description(
+      'Brake on audit storms: refuse further same-role audit dispatches beyond this many rounds (AP_AUDIT_ROUND_CAP). Off when unset; escalation to the owner is never automatic.',
+    ),
+  }).description('Governance pragmatics knobs (all optional, all off by default).'),
   skillInstall: Schema.union([
     Schema.const('auto').description('Copy bundled SKILL.md into the skill-scan root if absent; warn on drift, never overwrite.'),
     Schema.const('off').description('Do not touch the skill-scan root.'),
@@ -302,7 +334,17 @@ const CONFIG_KEY_SPEC: KeySpec = {
   auditors: { plan: AUDITOR_ROUTE_KEYS, execution: AUDITOR_ROUTE_KEYS, rules: AUDITOR_ROUTE_KEYS },
   executor: { agentOptions: AGENT_OPTIONS_KEYS, persona: null, toolAllowList: null },
   crossFamily: { enabled: null, minRisk: null, pool: null },
-  routing: { mode: null, preference: null, roles: ROUTING_ROLES_KEYS },
+  routing: {
+    mode: null,
+    preference: null,
+    roles: ROUTING_ROLES_KEYS,
+    ladder: {
+      tiers: { economy: null, standard: null, reserve: null },
+      auditTier: null,
+      speedOrder: null,
+      costOverrides: null,
+    },
+  },
   gate: {
     sandboxCoupling: null,
     toolDeny: null,
@@ -314,6 +356,7 @@ const CONFIG_KEY_SPEC: KeySpec = {
   storeKind: null,
   storeRoot: null,
   skillInstall: null,
+  governance: { maxAuditRoundsPerRole: null },
 }
 
 /** Collect every dotted path in `value` that {@link CONFIG_KEY_SPEC} does not declare. */

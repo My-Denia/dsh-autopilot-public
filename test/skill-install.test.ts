@@ -7,9 +7,12 @@
 
 import { describe, expect, it } from 'vitest'
 import {
+  BUNDLED_SKILL_REFERENCES,
+  SKILL_REFERENCES_DIR,
   SKILL_RELATIVE,
   skillHome,
   syncBundledSkill,
+  syncBundledSkillTree,
 } from '../src/skill-install.js'
 import type { DestKind, SkillSyncIo } from '../src/skill-install.js'
 
@@ -30,6 +33,8 @@ function io(
     linkError?: string
     /** Dest appears (edited by someone else) at the moment link fails. */
     racedDestOnLink?: string
+    /** Per-DESTINATION link failure, keyed by destination path. */
+    linkErrors?: Record<string, string>
   } = {},
 ): SkillSyncIo {
   const writes = options.writes ?? []
@@ -56,6 +61,13 @@ function io(
       return kinds[path] ?? (path in store ? 'file' : 'absent')
     },
     link: (from, to) => {
+      const perDest = options.linkErrors?.[to]
+      if (perDest !== undefined) {
+        links.push([from, to])
+        const error = new Error(`${perDest}: ${to}`) as NodeJS.ErrnoException
+        error.code = perDest
+        throw error
+      }
       if (options.linkError !== undefined) {
         links.push([from, to])
         if (options.racedDestOnLink !== undefined) {
@@ -292,5 +304,128 @@ describe('syncBundledSkill', () => {
 describe('SKILL_RELATIVE', () => {
   it('is the dsh skill-scan shape: skills/<name>/SKILL.md', () => {
     expect(SKILL_RELATIVE.replaceAll('\\', '/')).toBe('skills/dsh-autopilot/SKILL.md')
+  })
+})
+
+const TREE_ROOT = '/pkg/skill/dsh-autopilot'
+const TREE_DEST = '/agents/skills/dsh-autopilot'
+const GOV_REF_REL = `${SKILL_REFERENCES_DIR}/governance-invariants.md`
+const GOV_REF_DEST = `${TREE_DEST}/${GOV_REF_REL}`
+const REFUSALS_REF_DEST = `${TREE_DEST}/${SKILL_REFERENCES_DIR}/refusals.md`
+
+/**
+ * Source tree for a fully installable skill, DERIVED from the shipped list.
+ *
+ * WHY DERIVED rather than naming the reference files here: this fixture used to
+ * spell them out, so adding a file to `BUNDLED_SKILL_REFERENCES` made the
+ * publisher plan a source the fixture had never heard of, the read threw ENOENT,
+ * and every tree test went red for a reason that had nothing to do with the
+ * installer. One list, one owner — a second hand-kept copy is the defect.
+ */
+function treeSources(): Record<string, string> {
+  const sources: Record<string, string> = { [`${TREE_ROOT}/SKILL.md`]: BUNDLED }
+  for (const name of BUNDLED_SKILL_REFERENCES) {
+    sources[`${TREE_ROOT}/${SKILL_REFERENCES_DIR}/${name}`] = `# ${name}\n`
+  }
+  return sources
+}
+
+/** A destination tree whose every file already matches the bundle. */
+function installedDest(): Record<string, string> {
+  const sources = treeSources()
+  const dest: Record<string, string> = { [DEST]: BUNDLED }
+  for (const name of BUNDLED_SKILL_REFERENCES) {
+    dest[`${TREE_DEST}/${SKILL_REFERENCES_DIR}/${name}`] = sources[`${TREE_ROOT}/${SKILL_REFERENCES_DIR}/${name}`] as string
+  }
+  return dest
+}
+
+/** One status per planned file: SKILL.md first, then every reference. */
+function perFile(status: string, ...refStatuses: string[]): readonly string[] {
+  return [status, ...(refStatuses.length > 0 ? refStatuses : BUNDLED_SKILL_REFERENCES.map(() => status))]
+}
+
+describe('syncBundledSkillTree', () => {
+  it('publishes SKILL.md AND the reference layer on a fresh install', () => {
+    const store = treeSources()
+    const result = syncBundledSkillTree({ enabled: true, root: TREE_ROOT, destRoot: TREE_DEST, io: io(store) })
+    expect(result.status).toBe('copied')
+    expect(result.dest).toBe(DEST)
+    expect(result.files.map(file => file.relative)).toEqual([
+      'SKILL.md',
+      ...BUNDLED_SKILL_REFERENCES.map(name => `${SKILL_REFERENCES_DIR}/${name}`),
+    ])
+    expect(result.files.map(file => file.status)).toEqual(perFile('copied'))
+    // The whole point: a SKILL.md whose links resolve.
+    expect(store[DEST]).toBe(BUNDLED)
+    expect(store[GOV_REF_DEST]).toBeDefined()
+    expect(store[REFUSALS_REF_DEST]).toBeDefined()
+  })
+
+  it('is unchanged when every file already matches', () => {
+    // Sources AND destinations: the publish reads each source before it looks
+    // at the destination, so a dest-only store is a different failure.
+    const store = { ...treeSources(), ...installedDest() }
+    const result = syncBundledSkillTree({ enabled: true, root: TREE_ROOT, destRoot: TREE_DEST, io: io(store) })
+    expect(result.status).toBe('unchanged')
+    expect(result.files.map(file => file.status)).toEqual(perFile('unchanged'))
+  })
+
+  it('upgrades a 0.1.x single-file install by adding only the missing references', () => {
+    // SKILL.md present and identical, references absent — the real upgrade path.
+    const store: Record<string, string> = { ...treeSources(), [DEST]: BUNDLED }
+    const result = syncBundledSkillTree({ enabled: true, root: TREE_ROOT, destRoot: TREE_DEST, io: io(store) })
+    expect(result.status).toBe('copied')
+    expect(result.files.map(file => file.status)).toEqual(perFile('unchanged', ...BUNDLED_SKILL_REFERENCES.map(() => 'copied')))
+  })
+
+  it('writes nothing, and undoes what it wrote, when a reference has drifted', () => {
+    const unlinks: string[] = []
+    const store: Record<string, string> = { ...treeSources(), [GOV_REF_DEST]: '# edited by hand\n' }
+    const result = syncBundledSkillTree({ enabled: true, root: TREE_ROOT, destRoot: TREE_DEST, io: io(store, { unlinks }) })
+    expect(result.status).toBe('drift')
+    // SKILL.md was published first, then rolled back: a half-installed skill
+    // whose adapter expects references that were refused is worse than none.
+    expect(store[DEST]).toBeUndefined()
+    expect(unlinks).toContain(DEST)
+    expect(result.detail).toContain('undid 1 of 1 file(s)')
+    // refusals.md was never reached at all.
+    expect(store[REFUSALS_REF_DEST]).toBeUndefined()
+  })
+
+  it('reports a rollback it could not complete instead of claiming a clean undo', () => {
+    const unlinks: string[] = []
+    const store: Record<string, string> = { ...treeSources(), [GOV_REF_DEST]: '# edited by hand\n' }
+    const base = io(store, { unlinks })
+    // The undo itself fails: the published SKILL.md survives. Reporting
+    // 'rolled back 1 file(s)' here would be a false claim about the disk.
+    const stubborn: SkillSyncIo = {
+      ...base,
+      unlink: (target: string) => { unlinks.push(target); throw Object.assign(new Error('EPERM: ' + target), { code: 'EPERM' }) },
+    }
+    const result = syncBundledSkillTree({ enabled: true, root: TREE_ROOT, destRoot: TREE_DEST, io: stubborn })
+    expect(result.status).toBe('drift')
+    expect(result.detail).toContain('undid 0 of 1 file(s)')
+    expect(result.detail).toContain('FAILED to remove')
+    expect(result.detail).toContain(DEST)
+    expect(store[DEST]).toBeDefined()
+  })
+
+  it('writes nothing when the filesystem cannot hard-link a reference', () => {
+    const unlinks: string[] = []
+    const store = treeSources()
+    const result = syncBundledSkillTree({
+      enabled: true, root: TREE_ROOT, destRoot: TREE_DEST,
+      io: io(store, { unlinks, linkErrors: { [GOV_REF_DEST]: 'ENOTSUP' } }),
+    })
+    expect(result.status).toBe('unsupported')
+    expect(store[DEST]).toBeUndefined()
+    expect(unlinks).toContain(DEST)
+  })
+
+  it('skips without touching IO when disabled', () => {
+    const store = treeSources()
+    const result = syncBundledSkillTree({ enabled: false, root: TREE_ROOT, destRoot: TREE_DEST, io: io(store) })
+    expect(result).toEqual({ status: 'skipped', files: [] })
   })
 })

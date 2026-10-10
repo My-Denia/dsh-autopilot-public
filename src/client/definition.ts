@@ -722,7 +722,9 @@ export function applyResult(state: AutopilotRunState, match: CardMatch): Autopil
       // carries none of them, and inferring `verdict:'pass' -> gate:'pass'` is
       // UNSOUND: `applyVerdict` records a plan pass while REFUSING the gate flip
       // when a usage entry is still `undeclared`, and a `needs-replan` past
-      // MAX_REPLAN_ROUNDS yields `needs-owner-decision`, not `needs-replan`.
+      // MAX_REPLAN_ROUNDS stays in `replanning` with an exhaustion diagnostic
+      // (governance pragmatics v1 removed the forced owner escalation) — the
+      // gate values still cannot be inferred from the verdict alone.
       data = patchAudit(data, at, {
         settled: true,
         ...optional('verdict', str(payload.verdict)),

@@ -143,7 +143,7 @@ describe('renderRootPolicy', () => {
       'plan-reviewing': 'wait for its verdict before any mutation',
       'executing': 'smallest coherent edit',
       'execution-reviewing': 'never your own reasoning or success claims',
-      'replanning': 'Bounded escalation',
+      'replanning': 'OBSERVED, never auto-escalated',
       'closing': 'EVIDENCE PER ACCEPTANCE CRITERION',
       'completed': 'no further run mutations are legal',
       'blocked': 'a new run needs a new session',

@@ -104,12 +104,22 @@ describe('inline self-check lightweight happy path', () => {
     // it; the tool schema is the stricter surface and requires `kind` on
     // every item there. This pins the layer boundary so it cannot drift
     // silently in either direction.
+    //
+    // Governance pragmatics v1: an unproven criterion is now a PARTIAL
+    // delivery, which requires a handoff mapping the open item. The layer
+    // boundary under test (kind-less unproven accepted at the engine layer)
+    // is unchanged; what changed is that the gap must be handed off, and the
+    // outcome label is derived rather than defaulted to complete.
     const h = await readyToClose()
     const snapshot = await h.engine.submitCloseout(h.root, {
       ...GOOD_CLOSEOUT,
       evidence: [{ criterion: 'tests pass', bearer: '', status: 'unproven' as const }],
+      handoff: {
+        openItems: [{ criterion: 'tests pass', state: 'not-implemented' as const, note: 'gap handed to the follow-up run' }],
+      },
     })
     expect(snapshot.phase).toBe('completed')
+    expect(snapshot.closeout?.outcome).toBe('partial')
     const events = readFileSync(join(h.storeDir, 'runs', h.root.id, 'events.jsonl'), 'utf8')
       .trim().split(String.fromCharCode(10))
       .map(line => JSON.parse(line) as { op: string; detail?: { evidenceKinds?: unknown } })
@@ -227,7 +237,11 @@ describe('independent audits (stubbed subagents)', () => {
 })
 
 describe('bounded escalation', () => {
-  it('forces needs-owner-decision on the third consecutive needs-replan', async () => {
+  it('keeps replanning past the budget instead of forcing an owner decision (governance pragmatics v1)', async () => {
+    // The forced escalation was REMOVED deliberately: budget exhaustion is
+    // not an owner-level question (the m6-live incident recorded the run it
+    // stranded). The budget stays OBSERVED — visible in status and in the
+    // diagnostic — and escalation is a deliberate autopilot_signal choice.
     const h = makeHarness()
     await h.engine.init(h.root, makeTriage())
     for (let round = 1; round <= 2; round++) {
@@ -238,8 +252,9 @@ describe('bounded escalation', () => {
     await h.engine.submitPlan(h.root, 'plan v3')
     await h.engine.selfCheck(h.root, { role: 'plan', verdict: 'needs-replan', note: 'round 3' })
     const snapshot = h.engine.peek(h.root.id)
-    expect(snapshot?.phase).toBe('needs-owner-decision')
-    expect(snapshot?.diagnostic).toMatch(/bounded escalation/)
+    expect(snapshot?.phase).toBe('replanning')
+    expect(snapshot?.diagnostic).toMatch(/replan budget exhausted/)
+    expect(snapshot?.consecutiveReplans).toBe(3)
   })
 
   it('owner-resolve resumes planning and resets the budget', async () => {

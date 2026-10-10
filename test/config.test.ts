@@ -54,6 +54,13 @@ describe('Config — the loader path', () => {
     // defect unrepresentable rather than this one instance of it.
     expect(resolveConfig(loaded({}).value)).toEqual(resolveConfig({}))
     expect(resolveConfig(loaded({}).value)?.skillInstall).toBe('auto')
+    // Governance pragmatics v1: the PRESENT-value arm. The empty-config arm
+    // above cannot see a key the loader drops or defaults differently — this
+    // one pins maxAuditRoundsPerRole through both paths (rules-audit finding).
+    const capped = resolveConfig(loaded({ governance: { maxAuditRoundsPerRole: 3 } }).value)
+    expect(capped?.governance?.maxAuditRoundsPerRole).toBe(3)
+    expect(capped).toEqual(resolveConfig({ governance: { maxAuditRoundsPerRole: 3 } }))
+    expect(resolveConfig(loaded({}).value)?.governance).toEqual({})
     // An ABSENT config (a deployment that writes no dsh-autopilot block at
     // all) validates to the same defaults — cordis hands `validate` the raw
     // undefined, and both halves of this schema must survive that.
@@ -229,6 +236,7 @@ describe('resolveConfig — the routing section', () => {
     const expected: ResolvedRouting = {
       mode: 'off',
       preference: 'quality',
+      ladder: { tiers: { economy: [], standard: [], reserve: [] }, auditTier: 'none', speedOrder: [], costOverrides: [] },
       roles: {
         executor: { mode: 'locked', provider: 'deepseek-official', model: 'deepseek-v4-pro', reasoningEffort: 'high' },
         planner: { mode: 'auto', minContext: 262144 },
@@ -280,6 +288,7 @@ describe('resolveConfig — the routing section', () => {
     expect(viaPlain).toEqual({
       mode: 'auto',
       preference: 'balanced',
+      ladder: { tiers: { economy: [], standard: [], reserve: [] }, auditTier: 'none', speedOrder: [], costOverrides: [] },
       roles: {
         executor: { mode: 'auto', minContext: 131072 },
         planner: { mode: 'inherit' },
@@ -584,5 +593,26 @@ describe('volatileRoutingAccess — the F2 seam between the loader refs and the 
     // fail-fast on an invalid INITIAL config is unchanged).
     patch(refs.mode, 'on')
     expect(() => access?.()).toThrow(/routing\.mode must be 'auto' or 'off'/)
+  })
+})
+
+
+// ── preference 'axis': the owner-declared ordering path ──
+
+describe("resolveConfig — routing.preference 'axis'", () => {
+  it("accepts 'axis' on both the loader path and the plain path, byte-identically", () => {
+    const viaLoader = resolveConfig(loaded({ routing: { preference: 'axis' } }).value)
+    const viaPlain = resolveConfig({ routing: { preference: 'axis' } })
+    expect(viaLoader.routing.preference).toBe('axis')
+    expect(viaLoader.routing).toEqual(viaPlain.routing)
+    // The three legacy members are untouched, and the shipped default stands.
+    expect(resolveConfig({}).routing.preference).toBe('balanced')
+  })
+
+  it('a value outside the enlarged enum is still refused, by name', () => {
+    const bogus = 'speed'
+    expect(['balanced', 'economy', 'quality', 'axis']).not.toContain(bogus)
+    const preference = loaded({ routing: { preference: bogus } })
+    expect(preference.issues?.some(issue => issue.message.includes('routing.preference'))).toBe(true)
   })
 })
