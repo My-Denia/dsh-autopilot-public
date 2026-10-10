@@ -168,11 +168,15 @@ What trips the matcher is TEXT, read command-shaped. On a `bash` / `pwsh` /
 `terminal_open` line an unquoted `#` comment and the inside of a multi-word
 quoted argument are dropped before matching, so `grep -rn "git push" .` and a
 commit message that mentions pushing do not trip it. An UNQUOTED mention still
-does (`cat notes/git-push.md`), and inside `run_code` source or
-`terminal_send` keystrokes ANY occurrence does, because neither is a shell
-command line. A read-only command refused that way is the over-inclusion
-recorded in DESIGN.md §6 — say so and move on; do not reshape the command to
-slip past it.
+does (`cat notes/git-push.md`). Inside `run_code` source the reading is
+CODE-AWARE (2026-10-09): tagged templates and enumerated sink-call arguments
+(exec/spawn/system...) are performances and match verbatim, while mentions in
+ordinary strings, comments and untagged templates are data and pass — a
+nested `pwsh`/`bash` dispatch is gated at its own call regardless.
+`terminal_send` keystrokes keep verbatim matching — any occurrence trips,
+because a PTY is one Enter away from executing them. A read-only command
+refused that way is the over-inclusion recorded in DESIGN.md §6 — say so and
+move on; do not reshape the command to slip past it.
 
 ## Installing this skill
 

@@ -666,10 +666,20 @@ v2 新增的诚实上限：
     heredoc 体里的 `git push`、`sudo git push` 在文本上无从区分，而能区分它们的
     "命令位置"规则对 `xargs git push`、`env X=1 git push`、
     `find . -exec git push \;` 全是 fail-OPEN 的，所以没有采用。
-  - `run_code` 的 `code` 与 `terminal_send` 的 `text` **不是命令行**：前者是
-    某种语言的源码（`"git push"` 在被交给 `shell=True` 之前是惰性字符串），
-    后者是键入一个前台进程未知的 PTY 的按键（`#` 是不是注释取决于那头是 shell、node REPL
-    还是 `cat`）。这两条通道保留逐字匹配，因此保留完整的过度包含——提及即拒。
+  - `run_code` 的 `code` 与 `terminal_send` 的 `text` **不是命令行**——但
+    2026-10-09 的准确性修复（owner P1 裁决）把两者分开处理：
+    `run_code` 源码获得**代码感知**读法——标签模板（tag 是执行器）与枚举的
+    sink 调用参数（exec/execSync/spawn/system/popen/runCommand）是"表演"，逐字
+    匹配；普通字符串、注释（`//`、`/* */`、行首/空白后的 `#`）与未打标签的
+    模板是**数据**，其内部词边界被融合（`'git push'` → `git_push`），提及不再
+    被拒。实测动机：两次合法操作被拒，皆因审计 packet **引用**了裁决原文中的
+    出站词。安全核算：(a) 程序内真正发起出站的嵌套 `pwsh`/`bash`/`run_code`
+    派发在**各自派发点**仍被同一 seam 完整门禁；(b) `child_process` 继承 stdio
+    的路径对任何文本匹配器本来就可用 `'git'+' push'` 拼接绕过——逐字匹配对
+    对抗性程序从未提供真实防护，此次只是停止对诚实使用征税。新上限：不在
+    sink 名单上却执行其字符串参数的助手被放行（与解释器名单同一枚举边界）。
+    `terminal_send` 的按键**保留逐字匹配**——PTY 距执行只差一个回车，且无
+    嵌套派发论证可用。
   四点都在 `test/gate.test.ts` 有夹具（`mentions` 与 `performed` 两个方向各带
   基数下限，外加三条 `RECORDED CEILING`）。
 - `git … push` 模式的 gap **排除了** `&` / `|` / `;`，所以这三个字符出现在 `git`

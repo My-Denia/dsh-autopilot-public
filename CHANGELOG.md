@@ -8,6 +8,17 @@ Host and packaging bounds that outlive a single release are in
 Realigns the plugin with the current goal-autopilot-harness design, where a host
 adapter stays thin and the host-neutral rules live in one reference layer.
 
+### Fixed (egress accuracy, 2026-10-09 owner P1)
+
+- `run_code` program source now gets a CODE-AWARE egress reading instead of
+  verbatim mention-refusal: tagged templates and enumerated sink-call arguments
+  (exec/execSync/execFile/spawn/system/popen/runCommand) are performances and
+  still match verbatim; mentions inside ordinary strings, comments and untagged
+  templates are data and pass. Nested pwsh/bash/run_code dispatches stay gated
+  at their own call; `terminal_send` keeps verbatim matching (one Enter from
+  execution). Measured motivation: two legitimate operations were refused
+  because audit packets QUOTED egress phrases from the owner's ruling.
+
 ### Added (governance pragmatics v1)
 
 - Graded audit findings: auditors may return `findings`
