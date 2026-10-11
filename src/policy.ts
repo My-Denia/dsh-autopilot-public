@@ -14,7 +14,22 @@ Rules that always hold:
 - Report visible progress at every phase transition ([TRIAGE]/[PLAN]/[PLAN-AUDIT]/[EXEC]/[AUDIT]/[CLOSEOUT] lines).
 - Record as you go with autopilot_log (stance: on-plan|detour|grind|escalate; escalate needs a note) — an abandoned execution log is the most pervasive historical defect.
 - Pause ONLY at owner-only boundaries: push/PR/release/publish, destructive or irreversible ops, credentials, payment, public-visible changes. Ordinary engineering steps never pause.
+- Pause ONLY at owner-only boundaries: push/PR/release/publish, destructive or irreversible ops, credentials, payment, public-visible changes. Ordinary engineering steps never pause.
 - Audit decisions are respected: needs-fix means fix it; do not argue a gate open.`
+
+/**
+ * UNATTENDED APPROVAL POLICY (P1), appended to the root doctrine when the run's
+ * config has governance.unattended on. An ask pends forever when nobody is
+ * present to answer, so a validated egress returns an immediate, visible,
+ * recoverable DENY instead. The doctrine tells the agent how to handle it:
+ * record the refusal, surface a visible pause when genuinely blocked, continue
+ * other authorized work, and never busy-retry a call that pends on an absent
+ * owner.
+ */
+const UNATTENDED = `Unattended approval policy (governance.unattended is ON):
+- A refused egress is a DENY with a recovery path, not a hang: the manifest stands, the owner later grants autopilot_signal action=owner-approve naming the egress, then the command is retried. Record it with autopilot_log (stance: escalate) so the refusal is visible.
+- When genuinely blocked on an owner-only boundary, pause visibly with autopilot_signal action=owner-decision; do not busy-retry a call that pends on an absent owner.
+- Continue every other authorized, non-egress milestone; an egress refusal never halts the whole run.`
 
 /**
  * Substituted at render time. The audit tools are NOT interchangeable:
@@ -56,7 +71,7 @@ OUTBOUND: any egress (push / PR / release / publish) needs <run>/outbound/manife
 }
 
 /** Render the policy section for the root controller. */
-export function renderRootPolicy(snapshot: Snapshot): string {
+export function renderRootPolicy(snapshot: Snapshot, unattended = false): string {
   const triage = snapshot.triage
   const roles = requiredRoles(triage)
   const latest = latestVerdicts(snapshot.audits)
@@ -65,6 +80,7 @@ export function renderRootPolicy(snapshot: Snapshot): string {
     .join(' ')
   return [
     COMMON,
+    ...(unattended ? ['', UNATTENDED] : []),
     '',
     `Run state: phase=${snapshot.phase} planGate=${snapshot.planGate} executionGate=${snapshot.executionGate} planRev=${snapshot.plan.revision} replanBudget=${Math.max(0, MAX_REPLAN_ROUNDS - snapshot.consecutiveReplans)}`,
     `Triage: size=${triage.size} risk=${triage.risk} exec=${triage.executionMode} audit=${triage.auditMode} requiredRoles=[${roles.join(', ')}] latest: ${verdictLine}`,

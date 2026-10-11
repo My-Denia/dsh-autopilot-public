@@ -177,8 +177,17 @@ export function decideEgress(
   rootSessionId: string,
   command: string,
   options: PreExecuteOptions = {},
-): { readonly decision: PreDecision; readonly manifest?: OutboundManifest } {
+): { readonly decision: PreDecision; readonly manifest?: OutboundManifest; readonly unattended?: boolean } {
   const snapshot = engine.peek(rootSessionId)
+  // UNATTENDED APPROVAL POLICY (P1). When the run's config turns
+  // governance.unattended on, a validated egress cannot ASK — an ask pends
+  // forever when nobody is present to answer (the M9 unattended-observation
+  // defect). It returns an immediate, visible, recoverable DENY instead. The
+  // manifest stands; the owner later grants `autopilot_signal owner-approve`
+  // and the call is retried (consumeApproval below already honors it). This
+  // never auto-approves; it makes the refusal explicit. Off (the default)
+  // keeps the ask arm byte-identical.
+  const unattended = engine.config.governance?.unattended === true
   // No run, or a finished run: the harness does not gate (CC fail-open parity
   // with the guard, so installing this seam cannot make a non-run stricter).
   if (snapshot === undefined || TERMINAL_PHASES.includes(snapshot.phase)) return { decision: { kind: 'allow' } }
@@ -238,6 +247,21 @@ export function decideEgress(
         kind: 'deny',
         reason: `autopilot outbound gate: manifest at ${path} does not authorize this egress: ${problems.join('; ')}`,
       },
+    }
+  }
+
+  if (unattended) {
+    // The manifest validated; unattended policy turns the would-be ask into an
+    // immediate deny. The reason names the command and target, states the
+    // manifest stands, gives the recovery path, and says other authorized work
+    // continues — so the refusal is actionable, not a silent hang.
+    return {
+      decision: {
+        kind: 'deny',
+        reason: `autopilot unattended egress DENIED to ${parsed.manifest.target}: command class(es) [${parsed.manifest.commands.join(' | ')}], for command "${command.slice(0, 300)}", manifest ${path}. The manifest stands and is NOT spent. Recovery: the owner grants approval in this session (autopilot_signal action=owner-approve with a target naming this egress), then retries the command; the pending approval is consumed automatically. Other authorized, non-egress work continues.`,
+      },
+      manifest: parsed.manifest,
+      unattended: true,
     }
   }
 
@@ -340,6 +364,23 @@ export function installPreExecuteGate(
     authorized.set(callId, entry)
   }
 
+  /**
+   * Record one egress ask/deny outcome on the run (durable + visible in
+   * autopilot_status). Best-effort: a recording failure must not change the
+   * egress decision, which is why callers `.catch(() => undefined)`.
+   */
+  const recordOutcome = (decision: {
+    outcome: 'asked' | 'denied-unattended'
+    target: string
+    commands: readonly string[]
+    command: string
+    manifestPath: string
+    recovery?: string
+  }): Promise<number | undefined> => engine.recordEgressOutcome(rootSessionId, {
+    ...decision,
+    at: new Date().toISOString(),
+  })
+
   try {
     disposers.push(host.on('tools/pre-execute', async (exec, next) => {
       const command = egressCommandOf(exec)
@@ -352,15 +393,25 @@ export function installPreExecuteGate(
         // must not become an open one.
         return { kind: 'deny', reason: `autopilot outbound gate failed closed: ${errorMessage(error)}` }
       }
-      if (resolved.decision.kind !== 'ask' || resolved.manifest === undefined) return resolved.decision
 
-      if (exec.callId !== undefined) {
+      // UNATTENDED VISIBILITY (P1): an unattended deny is recorded below (after
+      // the owner-approval check) so the run shows what was refused and how to
+      // recover, instead of a silent hang. The manifest is NOT spent and NOT
+      // remembered on the deny path (the call never reaches dispatch).
+      if (resolved.manifest === undefined) return resolved.decision
+      // Non-ask decisions (allow/deny) pass through untouched — EXCEPT the
+      // unattended-policy deny, which still honors an open owner approval below
+      // before it refuses.
+      if (resolved.decision.kind !== 'ask' && resolved.unattended !== true) return resolved.decision
+
+      if (exec.callId !== undefined && resolved.decision.kind === 'ask') {
         remember(exec.callId, { manifest: resolved.manifest, command })
       }
 
       // A direct-human-turn `owner-approve` is authority the owner already
       // granted in this session; v1's one-approval-per-egress semantics are
-      // preserved by consuming it here instead of asking again.
+      // preserved by consuming it here instead of asking again. Under
+      // unattended this is the recovery path the deny names: approve, retry.
       let consumed: number | undefined
       try {
         consumed = await engine.consumeApproval(rootSessionId, command)
@@ -368,6 +419,28 @@ export function installPreExecuteGate(
         consumed = undefined
       }
       if (consumed !== undefined) return { kind: 'allow' }
+
+      if (resolved.unattended === true) {
+        await recordOutcome({
+          outcome: 'denied-unattended',
+          target: resolved.manifest.target,
+          commands: resolved.manifest.commands,
+          command,
+          manifestPath: '(see reason)',
+          recovery: 'owner grants autopilot_signal action=owner-approve naming this egress, then retries',
+        }).catch(() => undefined)
+        return resolved.decision
+      }
+
+      // The run is now genuinely waiting on an owner answer; record it so
+      // autopilot_status answers "what approval is this run waiting on".
+      await recordOutcome({
+        outcome: 'asked',
+        target: resolved.manifest.target,
+        commands: resolved.manifest.commands,
+        command,
+        manifestPath: '(see reason)',
+      }).catch(() => undefined)
       return resolved.decision
     }))
 

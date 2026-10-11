@@ -28,6 +28,8 @@ interface Recorded {
   readonly toolNames: string[]
   guards: number
   readonly sections: string[]
+  /** Every section DEFINITION, so a test can render one instead of only counting names. */
+  readonly sectionDefs: Array<{ name: string; order?: number; text: (context: { agent?: unknown }) => string }>
   preExecuteListeners: number
   readonly provided: Record<string, unknown>
   childSetups: number
@@ -67,11 +69,12 @@ interface RecordedChild {
   agent?: unknown
 }
 
-function fakeCtx(storeRoot: string, options: { storageDomain?: unknown; seamThrows?: boolean; child?: ChildInjection; llm?: unknown } = {}) {
+function fakeCtx(storeRoot: string, options: { storageDomain?: unknown; seamThrows?: boolean; child?: ChildInjection; llm?: unknown; strictServiceAccess?: boolean } = {}) {
   const recorded: Recorded = {
     toolNames: [],
     guards: 0,
     sections: [],
+    sectionDefs: [],
     preExecuteListeners: 0,
     provided: {},
     childSetups: 0,
@@ -228,8 +231,9 @@ function fakeCtx(storeRoot: string, options: { storageDomain?: unknown; seamThro
       async drainContinuableChildren() { return {} },
     },
     systemPrompt: {
-      section(section: { name: string }) {
+      section(section: { name: string; order?: number; text: (context: { agent?: unknown }) => string }) {
         recorded.sections.push(section.name)
+        recorded.sectionDefs.push(section)
         return () => {}
       },
     },
@@ -251,8 +255,38 @@ function fakeCtx(storeRoot: string, options: { storageDomain?: unknown; seamThro
     },
   }
 
+  /**
+   * cordis reads an UNDECLARED service through a strict accessor that THROWS
+   * (`cannot get property "x" without inject`), which a plain object fake cannot
+   * reproduce: `ctx.configEditor` reads as `undefined` here and the mount looks
+   * healthy. Measured on a real headless 0.2.0 host, the M5 onboarding probe's
+   * bare property read took the whole plugin down at first render, so this mode
+   * keeps the fake honest about the host it claims to be.
+   *
+   * `get` stays callable (dsh's own `ctx.get(name)` accessor) and symbols pass
+   * through for the runner's own inspection.
+   */
+  /**
+   * cordis's own Context API is exempt: `inject`/`get`/`on`/`provide` live on
+   * the context (prototype members), and only UNDECLARED SERVICE reads go
+   * through the throwing accessor. A real host answered `ctx.configEditor` with
+   * `cannot get property "configEditor" without inject` while `ctx.inject()`
+   * worked in the same mount, which is exactly this split.
+   */
+  const contextApi = new Set(['get', 'set', 'inject', 'on', 'provide', 'effect', 'then', 'toJSON', 'inspect', 'constructor'])
+  const strictCtx = options.strictServiceAccess === true
+    ? new Proxy(ctx, {
+      get(target, prop, receiver) {
+        if (typeof prop === 'string' && !(prop in target) && !contextApi.has(prop)) {
+          throw new Error(`cannot get property "${prop}" without inject`)
+        }
+        return Reflect.get(target, prop, receiver)
+      },
+    })
+    : ctx
+
   return {
-    ctx,
+    ctx: strictCtx,
     recorded,
     rootAgent,
     storeRoot,
@@ -328,7 +362,7 @@ describe('apply', () => {
     expect(host.recorded.provided.autopilot).toBeUndefined()
 
     const dispose = await mount
-    expect(host.recorded.sections).toEqual(['autopilot:policy'])
+    expect(host.recorded.sections).toEqual(['autopilot:policy', 'autopilot:routing-onboarding'])
     expect(host.recorded.toolNames).toContain('autopilot_init')
     expect(host.recorded.toolNames).toContain('autopilot_usage')
     expect(host.recorded.guards).toBe(1)
@@ -436,10 +470,11 @@ describe('apply', () => {
     const root = mkdtempSync(join(tmpdir(), 'dsh-autopilot-apply-'))
     const host = fakeCtx(root, { llm: stubLlmRuntime() })
     const dispose = await apply(host.ctx, { storeRoot: root, storeKind: 'file', skillInstall: 'off' })
-    // Live after a successful mount: the subscription rides the lifecycle.
-    expect(host.subscriptionDisposals('llm/adapters-updated')).toEqual([0])
+    // Live after a successful mount: BOTH subscriptions ride the lifecycle
+    // (the wiring's, and the M5 onboarding report refresh's).
+    expect(host.subscriptionDisposals('llm/adapters-updated')).toEqual([0, 0])
     await dispose()
-    expect(host.subscriptionDisposals('llm/adapters-updated')).toEqual([1])
+    expect(host.subscriptionDisposals('llm/adapters-updated')).toEqual([1, 1])
   })
 
   it('F19: a remount after a failed mount accumulates no duplicate llm/adapters-updated listener', async () => {
@@ -452,12 +487,41 @@ describe('apply', () => {
       .rejects.toThrowError(/systemPrompt refused the section/)
     host.ctx.systemPrompt.section = originalSection
     const dispose = await apply(host.ctx, { storeRoot: retryRoot, storeKind: 'file', skillInstall: 'off' })
-    // Two subscriptions were made, but only the SECOND is still live — the
-    // failed mount's listener was released instead of stacking beneath it.
-    expect(host.subscriptionDisposals('llm/adapters-updated')).toEqual([1, 0])
-    expect(host.liveSubscriptions('llm/adapters-updated')).toBe(1)
+    // Three subscriptions were made (the failed mount's wiring listener,
+    // then the retry's wiring + M5 onboarding listeners), but only the
+    // retry's TWO are still live — the failed mount's listener was released
+    // instead of stacking beneath them.
+    expect(host.subscriptionDisposals('llm/adapters-updated')).toEqual([1, 0, 0])
+    expect(host.liveSubscriptions('llm/adapters-updated')).toBe(2)
     await dispose()
     expect(host.liveSubscriptions('llm/adapters-updated')).toBe(0)
+  })
+
+  // ── M7 live-host regression (2026-10-10) ────────────────────────────────
+  //
+  // Measured on a real headless 0.2.0 host: the M5 onboarding probe read
+  // `ctx.configEditor`/`ctx.settings` as BARE PROPERTIES, and cordis answers an
+  // undeclared service read by THROWING (`cannot get property "configEditor"
+  // without inject`). The throw happened at first section render, i.e. on every
+  // root turn, and the mount died with it — a fake host that returns `undefined`
+  // for unknown members could never see it. `strictServiceAccess` reproduces the
+  // accessor, and this test renders the section the way the host does.
+  it('M7: renders the onboarding section on a host whose undeclared service reads throw (cordis inject semantics)', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'dsh-autopilot-apply-'))
+    const host = fakeCtx(root, { strictServiceAccess: true, llm: stubLlmRuntime() })
+    const dispose = await apply(host.ctx, {
+      storeRoot: root,
+      storeKind: 'file',
+      skillInstall: 'off',
+      routing: { mode: 'auto', ladder: { tiers: { economy: ['p/m'], standard: [], reserve: [] } } },
+    })
+    const section = host.recorded.sectionDefs.find(s => s.name === 'autopilot:routing-onboarding')
+    expect(section).toBeDefined()
+    // A root agent renders it; a child agent does not. Neither may throw.
+    expect(() => section?.text({ agent: host.rootAgent })).not.toThrow()
+    expect(() => section?.text({ agent: host.childAgent })).not.toThrow()
+    expect(section?.text({ agent: host.childAgent })).toBe('')
+    await dispose()
   })
 
   it('positive control: a clean mount closes the store exactly once, at disposal', async () => {

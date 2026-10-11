@@ -113,6 +113,16 @@ describe('renderRootPolicy', () => {
     expect(text).toContain('Audit decisions are respected')
   })
 
+  it('unattended policy: the doctrine is present only when unattended is on', () => {
+    const on = renderRootPolicy(at('planning'), true)
+    expect(on).toContain('Unattended approval policy')
+    expect(on).toContain('governance.unattended is ON')
+    expect(on).toContain('owner-approve')
+    expect(on).toContain('do not busy-retry')
+    const off = renderRootPolicy(at('planning'))
+    expect(off).not.toContain('Unattended approval policy')
+  })
+
   it('states the live run state, the triage contract and the objective', () => {
     const snapshot = at('planning', { planGate: 'pending', executionGate: 'pending' })
     const text = renderRootPolicy(snapshot)

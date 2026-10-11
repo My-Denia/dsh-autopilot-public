@@ -2930,3 +2930,320 @@ describe('routing integration: preference axis and the owner cost override', () 
     expect(routing?.why.some(entry => entry.includes('provenance owner-override'))).toBe(true)
   })
 })
+// ── M3: work-class reachability on the StatusView (DESIGN §9-14/16) ──
+
+describe('routing integration: work-class reachability on the StatusView', () => {
+  it('is ABSENT before the run ever reads a catalog — never fabricated', async () => {
+    const f = fixture(MODELS, PRESENT_ABC)
+    const h = makeHarness({
+      routing: f.portsFor(),
+      config: { routing: { mode: 'auto', ladder: { tiers: { economy: ['alpha/m-b'], standard: ['alpha/m-a', 'beta/m-c'] } } } },
+      subagents: stubSubagents({ verdicts: [{ verdict: 'pass', note: 'ok' }] }),
+    })
+    await h.engine.init(h.root, makeTriage(STANDARD), [undeclaredSeed('m1')])
+    expect(h.engine.status(h.root)?.routingReachability).toBeUndefined()
+  })
+
+  it('appears after a routed dispatch, computed from the same snapshot the decision read', async () => {
+    const f = fixture(MODELS, PRESENT_ABC)
+    const h = makeHarness({
+      routing: f.portsFor(),
+      config: { routing: { mode: 'auto', ladder: { tiers: { economy: ['alpha/m-b'], standard: ['alpha/m-a', 'beta/m-c'] } } } },
+      subagents: stubSubagents({ verdicts: [{ verdict: 'pass', note: 'ok' }] }),
+    })
+    await toExecuting(h) // the plan-auditor dispatch is the first catalog read
+    const report = h.engine.status(h.root)?.routingReachability
+    expect(report?.kind).toBe('work-class-reachability')
+    expect(report?.outcome).toBe('reachable')
+    expect(report?.observed).toBe(3)
+    expect(report?.unreachable).toEqual([])
+    expect(report?.nonTierBoundClasses).toEqual(['mechanical'])
+  })
+
+  it('names an observed model no tier-bound class can reach', async () => {
+    const f = fixture(MODELS, PRESENT_ABC)
+    const h = makeHarness({
+      routing: f.portsFor(),
+      // alpha/m-b is placed in NO tier — reachable by no class, and the
+      // StatusView says so by name instead of reading the empty delta as fine.
+      config: { routing: { mode: 'auto', ladder: { tiers: { economy: [], standard: ['alpha/m-a'], reserve: ['beta/m-c'] } } } },
+      subagents: stubSubagents({ verdicts: [{ verdict: 'pass', note: 'ok' }] }),
+    })
+    await toExecuting(h)
+    const report = h.engine.status(h.root)?.routingReachability
+    expect(report?.outcome).toBe('unreachable-models')
+    expect(report?.unreachable).toEqual(['alpha/m-b'])
+    expect(report?.why.join('\n')).toContain('alpha/m-b')
+  })
+
+  it('records unconfigured on a shipped-default deployment (a state, not a pass)', async () => {
+    const f = fixture(MODELS, PRESENT_ABC)
+    const h = makeHarness({
+      routing: f.portsFor(),
+      config: { routing: { mode: 'auto' } },
+      subagents: stubSubagents({ verdicts: [{ verdict: 'pass', note: 'ok' }] }),
+    })
+    await toExecuting(h)
+    const report = h.engine.status(h.root)?.routingReachability
+    expect(report?.outcome).toBe('unconfigured')
+    expect(report?.kind).toBe('work-class-reachability')
+  })
+})
+// ── M4 (DESIGN §9-15): owner-opted engine-level rotation for auditor roles ──
+//
+// A healthy auditor pin yields to a FULL re-selection when
+// `routing.ladder.rotation` is on. The re-selection walks the same
+// selectForRole path as a first dispatch, and the selector's ordinal offset
+// applies WITHIN the independence class — never overriding it. Default off
+// leaves pin reuse untouched; the executor role never rotates this way.
+
+describe('routing integration: M4 engine-level rotation (routing.ladder.rotation)', () => {
+  it('rotation ON + auditor role: the healthy pin yields to a re-selection with repinFrom and reason rotation', async () => {
+    const f = fixture(MODELS, PRESENT_ABC3)
+    const h = makeHarness({
+      routing: f.portsFor(),
+      // minRisk critical ⇒ risk medium is BELOW the floor: independence is not
+      // required, so the rotation group is the full ranked survivor list (3
+      // members) and an advancing ordinal visibly moves the route. The
+      // within-independence-class confinement is selector-pinned separately.
+      config: {
+        routing: { mode: 'auto', ladder: { rotation: true } },
+        crossFamily: { minRisk: 'critical' },
+      },
+      subagents: stubSubagents({ verdicts: [
+        { verdict: 'pass', note: 'plan ok' },
+        { verdict: 'pass', note: 'exec ok' },
+        { verdict: 'pass', note: 'exec ok again' },
+      ] }),
+    })
+    await toClosing(h)
+    const firstPin = h.engine.peek(h.root.id)?.routingPins?.['execution-auditor']
+    expect(firstPin).toBeDefined()
+
+    await h.engine.audit(h.root, { role: 'execution', prompt: 'again' })
+    const details = routingDetails(h).filter(detail => detail.role === 'execution-auditor')
+    const last = details[details.length - 1]
+    // The pin was healthy — this is a ROTATION repin, not a death repin.
+    expect(last?.repinFrom).toEqual(firstPin)
+    expect(last?.why?.some(entry => entry.includes('rotation: routing.ladder.rotation is on'))).toBe(true)
+    // The rotation ordinal moved the route inside the eligible group: three
+    // authorized candidates, ordinal advanced by the run's own audit stream.
+    expect(last?.pin).toBeDefined()
+    expect(last?.pin).not.toEqual(firstPin)
+    expect(last?.why?.some(entry => entry.includes('rotation: ordinal 1 into the ranked survivor list (3 members)'))).toBe(true)
+    // The full path re-ran: preflight for the NEW route happened at this dispatch.
+    expect(f.llm.preflights.some(config => config.provider === last?.pin?.provider && config.model === last?.pin?.model)).toBe(true)
+  })
+
+  it('rotation OFF (explicit false): the healthy pin is REUSED — the shipped stability semantics are unchanged', async () => {
+    const f = fixture(MODELS, PRESENT_ABC3)
+    const h = makeHarness({
+      routing: f.portsFor(),
+      config: { routing: { mode: 'auto', ladder: { rotation: false } } },
+      subagents: stubSubagents({ verdicts: [
+        { verdict: 'pass', note: 'plan ok' },
+        { verdict: 'pass', note: 'exec ok' },
+        { verdict: 'pass', note: 'exec ok again' },
+      ] }),
+    })
+    await toClosing(h)
+    const firstPin = h.engine.peek(h.root.id)?.routingPins?.['execution-auditor']
+    expect(firstPin).toBeDefined()
+
+    await h.engine.audit(h.root, { role: 'execution', prompt: 'again' })
+    const details = routingDetails(h).filter(detail => detail.role === 'execution-auditor')
+    const last = details[details.length - 1]
+    expect(last?.pin).toEqual(firstPin)
+    expect(last?.repinFrom).toBeUndefined()
+    expect(last?.why?.some(entry => entry.includes('pin: reusing the role pin'))).toBe(true)
+    expect(last?.why?.some(entry => entry.includes('rotation: routing.ladder.rotation is on'))).toBe(false)
+  })
+
+  it('rotation ON does not move the FIRST selection: ordinal 0 names the no-op', async () => {
+    const f = fixture(MODELS, PRESENT_ABC3)
+    const h = makeHarness({
+      routing: f.portsFor(),
+      config: { routing: { mode: 'auto', ladder: { rotation: true } } },
+      subagents: stubSubagents({ verdicts: [{ verdict: 'pass', note: 'ok' }] }),
+    })
+    await toExecuting(h)
+    const planDetail = routingOf(h, 'audit', 'plan-auditor')
+    expect(planDetail?.repinFrom).toBeUndefined()
+    expect(planDetail?.pin).toBeDefined()
+    expect(planDetail?.why?.some(entry => entry.includes('rotation: ordinal 0'))).toBe(true)
+  })
+
+
+// ── M7b: the StatusView report follows the LIVE routing config ──
+//
+// DEFECT THIS PINS (measured in M7b M1): the reachabilityReports map had
+// exactly ONE writer, inside selectForRole. A healthy-pin REUSE never reaches
+// that method, so after a config edit the StatusView kept serving the value the
+// last fresh selection wrote — while the onboarding section, reading the SAME
+// shared volatileRoutingAccess closure, already reported the new ladder. The
+// predecessor run measured exactly that split. The fix refreshes the report
+// from the CURRENT routing (the resolution the dispatch decision itself reads)
+// on the status read path.
+
+describe('M7b: routingReachability follows the LIVE routing config', () => {
+  const VOLATILE_WRITE = Symbol.for('cosmokit.volatile.write')
+  type LeafRef = { get(): unknown } & Record<symbol, unknown>
+
+  /** One simulated loader commit into a volatile leaf (what a config patch does). */
+  function patch(ref: LeafRef, next: unknown): void {
+    ;(ref[VOLATILE_WRITE] as (value: unknown) => void)(next)
+  }
+
+  /**
+   * The loader-path harness: the raw config is validated through the SAME schema
+   * the loader uses, so the routing section carries real volatile references and
+   * volatileRoutingAccess is wired exactly as apply() wires it (src/index.ts:1723).
+   */
+  function volatileHarness(raw: unknown, policy: SessionPolicyState): Harness & {
+    readonly tierRefs: { readonly economy: LeafRef; readonly standard: LeafRef; readonly reserve: LeafRef }
+  } {
+    const validated = Config['~standard'].validate(raw) as { value?: ConfigInput }
+    expect(validated.value).toBeDefined()
+    const value = validated.value as ConfigInput
+    const accessor = volatileRoutingAccess(value)
+    expect(accessor).toBeDefined()
+    const tierRefs = (value as unknown as { routing: { ladder: { tiers: Record<string, LeafRef> } } })
+      .routing.ladder.tiers
+    const f = fixture(MODELS, policy)
+    const storeDir = mkdtempSync(join(tmpdir(), 'dsh-autopilot-m7b-'))
+    const agents = new FakeAgents()
+    const root = fakeAgent('root-1')
+    agents.add(root)
+    const subagents = stubSubagents({ verdicts: [
+      { verdict: 'pass', note: 'plan ok' },
+      { verdict: 'pass', note: 'exec ok' },
+      { verdict: 'pass', note: 'exec ok again' },
+    ] })
+    const engine = new AutopilotEngine(
+      agents, subagents, new RunStore(storeDir), resolveConfig(value), () => true, {},
+      f.portsFor(), accessor,
+    )
+    return {
+      engine, agents, subagents, root, storeDir,
+      tierRefs: {
+        economy: tierRefs.economy as LeafRef,
+        standard: tierRefs.standard as LeafRef,
+        reserve: tierRefs.reserve as LeafRef,
+      },
+    }
+  }
+
+  it('a volatile ladder patch is reflected by the next status read, with no intervening dispatch', async () => {
+    // Ladder A covers all three observed models (economy: alpha/m-b and
+    // beta/m-c; standard: alpha/m-a), so the reachability report is 'reachable'.
+    const h = volatileHarness(
+      { routing: { mode: 'auto', ladder: { tiers: { economy: ['alpha/m-b', 'beta/m-c'], standard: ['alpha/m-a'] } } } },
+      PRESENT_ABC,
+    )
+    // The live accessor is wired (the loader path), so the engine re-resolves per decision.
+    expect((h.engine as unknown as { routingSource?: unknown }).routingSource).toBeDefined()
+    await toExecuting(h)
+    const first = h.engine.status(h.root)?.routingReachability
+    expect(first?.kind).toBe('work-class-reachability')
+    expect(first?.outcome).toBe('reachable')
+    expect(first?.unreachable).toEqual([])
+
+    // The owner's patch lands ONLY in the volatile leaves — the shape a profile
+    // edit takes on the loader path. Ladder B keeps alpha/m-a (standard) and
+    // beta/m-c (reserve), so alpha/m-b becomes reachable by no class at all.
+    patch(h.tierRefs.economy, [])
+    patch(h.tierRefs.standard, ['alpha/m-a'])
+    patch(h.tierRefs.reserve, ['beta/m-c'])
+
+    // The awaited refresh is what `autopilot_status` performs before projecting.
+    // Called defensively so that on the PRE-FIX engine — which has no such
+    // method — this test still reaches the assertion below and fails on the
+    // STALE VALUE, not on a missing method.
+    const refresh = (h.engine as unknown as { refreshReachability?: () => Promise<void> }).refreshReachability
+    if (refresh !== undefined) await refresh.call(h.engine)
+
+    // Pre-fix this still answered the cached dispatch-#1 value ('reachable').
+    const after = h.engine.status(h.root)?.routingReachability
+    expect(after?.outcome).toBe('unreachable-models')
+    expect(after?.unreachable).toEqual(['alpha/m-b'])
+  })
+})
+
+// ── M7b M3: fail-closed with a REALISTIC configuration ──
+//
+// The condition the selector enforces (src/routing/select.ts:722-737): on a
+// CONFIGURED ladder, the dispatch's authorized ∩ live route set intersected
+// with the class's mapped tier members must not be empty; an empty result is a
+// configuration error, not a silent shelving. The engine turns the selector's
+// `blocked` into `routingEscalation` (src/engine.ts:4461, :4536-4548):
+// set-owner-decision with the reason in the diagnostic, then a thrown
+// AP_ROUTING_ESCALATION whose message carries the AP_ROUTE_* code.
+
+describe('M7b: a work class with no authorized reachable route fails closed', () => {
+  it('CASE A — the tier route is not authorized by the session policy (the live deployment shape)', async () => {
+    // Ladder: the daily routes in economy, the mid routes in standard, and a
+    // reserve tier naming a route THIS session's account does not authorize.
+    // That is exactly the live desktop state corrected in M1: the on-disk
+    // ladder's reserve tier names kimi-coding/k3 (cordis.patch.yml:138-139)
+    // while the host's allowed-model list carries no such route.
+    const f = fixture(MODELS, PRESENT_ABC)
+    const subagents = stubSubagents({ verdicts: [{ verdict: 'pass', note: 'never reached' }] })
+    const h = makeHarness({
+      routing: f.portsFor(),
+      config: {
+        routing: {
+          mode: 'auto',
+          // The OWNER'S OWN mapping: the audit class draws from the reserve
+          // tier (routing.workClasses.audit.tiers, src/config.ts:276-282).
+          // Without it the audit class defaults to ['standard'] and would
+          // still find alpha/m-a — the plan-audit note on this milestone.
+          workClasses: { audit: { tiers: ['reserve'] } },
+          ladder: { tiers: { economy: ['alpha/m-b'], standard: ['alpha/m-a'], reserve: ['gamma/m-z'] } },
+        },
+      },
+      subagents,
+    })
+    await h.engine.init(h.root, makeTriage(STANDARD), [undeclaredSeed('m1')])
+    await h.engine.declareUsage(h.root, makeUsageEntry({ id: 'm1' }))
+    await h.engine.submitPlan(h.root, 'plan')
+    await expect(h.engine.audit(h.root, { role: 'plan', prompt: 'packet' }))
+      .rejects.toThrowError(/AP_ROUTE_NO_REACHABLE_WORK_CLASS/)
+    const snapshot = h.engine.peek(h.root.id)
+    expect(snapshot?.phase).toBe('needs-owner-decision')
+    expect(snapshot?.diagnostic).toContain('routing-escalation:')
+    expect(snapshot?.diagnostic).toContain('AP_ROUTE_NO_REACHABLE_WORK_CLASS')
+    expect(snapshot?.diagnostic).toContain('reserve')
+    // The agent-visible remedy names the config path the owner must edit.
+    expect(snapshot?.diagnostic).toContain('routing.workClasses.audit.tiers')
+    // Fail-closed means NO auditor was dispatched.
+    expect(subagents.auditOptions.length).toBe(0)
+  })
+
+  it('CASE B — the mapped tier declares no members at all (the predecessor-probe shape)', async () => {
+    const f = fixture(MODELS, PRESENT_ABC)
+    const subagents = stubSubagents({ verdicts: [{ verdict: 'pass', note: 'never reached' }] })
+    const h = makeHarness({
+      routing: f.portsFor(),
+      config: {
+        routing: {
+          mode: 'auto',
+          workClasses: { extreme: { tiers: ['reserve'] } },
+          roles: { planAuditor: { workClass: 'extreme' } },
+          ladder: { tiers: { economy: ['alpha/m-b'], standard: ['alpha/m-a'], reserve: [] } },
+        },
+      },
+      subagents,
+    })
+    await h.engine.init(h.root, makeTriage(STANDARD), [undeclaredSeed('m1')])
+    await h.engine.declareUsage(h.root, makeUsageEntry({ id: 'm1' }))
+    await h.engine.submitPlan(h.root, 'plan')
+    await expect(h.engine.audit(h.root, { role: 'plan', prompt: 'packet' }))
+      .rejects.toThrowError(/AP_ROUTE_NO_REACHABLE_WORK_CLASS/)
+    const snapshot = h.engine.peek(h.root.id)
+    expect(snapshot?.phase).toBe('needs-owner-decision')
+    expect(snapshot?.diagnostic).toContain('AP_ROUTE_NO_REACHABLE_WORK_CLASS')
+    expect(snapshot?.diagnostic).toContain('reserve')
+    expect(subagents.auditOptions.length).toBe(0)
+  })
+})
+})

@@ -16,7 +16,7 @@ runtime compatibility fix.
 | `0.1.7-x`, `0.2.1-x` | **outside** the peer range; dsh refuses the install | — | — |
 | `0.1.5-rc.1` | WSL2 live CLI, 2026-09-13 (0.1.1) | **0.1.1 peer-layout:** compose/mount + skill load + `autopilot_init` | **not verified:** write lifecycle. 0.2.0's code changes were checked against the published 0.1.5 packages, not re-run on a 0.1.5 host |
 | `0.1.2-rc.1` | Original package pin / earlier real-host work | claimed by this snapshot's design notes | earlier host traces in [DESIGN.md §8](../DESIGN.md) (not re-run) |
-| Desktop (macOS / Windows) | **not run** | **not verified** | **not verified** |
+| Windows Desktop 0.2.0-rc.2 (app, real account) | **run 2026-10-10**, profile `desktop`, candidate tarball | **verified:** plugin mount; the shipped system-prompt section renders against the LIVE catalog (`m7/desktop-onboarding-section.md` in the run store); the routing config on the profile patch is what the host mounts, and the session's own run stayed visible (`enforcement.store=file`) after a restart | **partially verified:** run persistence across a host restart (needs the packaged `storeKind: file` pin repeated in the profile patch — see below); the composed-config dump is a HEADLESS artifact (the managed `desktop` profile refuses `--dump-config`), so the desktop side is backed by the on-disk patch plus the restarted session's own run state; **not verified:** full write lifecycle / closeout on Desktop, macOS |
 | Windows | out of scope | **not verified** | **not verified** |
 
 Windows is **not** a supported platform in this snapshot. Do not read the
@@ -34,8 +34,36 @@ plugin. Install from the Desktop plugin manager by package name
 dsh plugin --profile <name> add dsh-goal-autopilot@0.2.0
 ```
 
-Desktop itself was not run for this release (not verified on macOS or
-Windows). On a host outside the range dsh offers an exact-version exemption
+### Profile patch hazard: re-declaring the plugin id drops the packaged store pin
+
+The plugin ships its own bundle layer (`cordis.patch.yml`) which pins
+`storeKind: file`. A profile's patch layer **replaces** the config of the entry
+it targets rather than merging into it, so an owner who adds
+
+```yaml
+- id: autopilot
+  name: dsh-goal-autopilot
+  config:
+    routing: { … }
+```
+
+silently loses that pin: `storeKind` falls back to the schema default `auto`,
+the host picks the `storageDomain` backend, and every run this session already
+recorded in the file store becomes invisible (`autopilot_status` answers
+`{"initialized":false,"note":"no autopilot run on this session"}`).
+**Measured on Windows Desktop 0.2.0-rc.2, 2026-10-10**: two runs created after
+such a patch landed in `$DSH_HOME/storages/dsh_autopilot.json` (the domain
+table) while four earlier file-backed runs stayed under
+`$DSH_HOME/storages/dsh-autopilot/runs/` — the split-brain the packaged layer's
+own comment warns about. Repeat `storeKind: file` in any patch entry for this
+id.
+
+Windows Desktop **was** run for the 0.2.0-rc.2 candidate on 2026-10-10 with a
+real account and the live model catalog: the plugin mounted, the onboarding
+system-prompt section rendered against the live catalog, and the run store
+stayed file-backed once the packaged `storeKind: file` pin was repeated in the
+profile patch (see "Profile patch hazard" below). Not verified there: the full
+write lifecycle to closeout, and macOS. On a host outside the range dsh offers an exact-version exemption
 (`dsh plugin --profile <name> allow-version …`); that accepts an untested
 combination, it does not make one supported.
 

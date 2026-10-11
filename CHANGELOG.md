@@ -8,7 +8,39 @@ Host and packaging bounds that outlive a single release are in
 Realigns the plugin with the current goal-autopilot-harness design, where a host
 adapter stays thin and the host-neutral rules live in one reference layer.
 
-### Fixed (egress accuracy, 2026-10-09 owner P1)
+### Fixed (plan-reviewing wedge, P0; 2026-10-11 M10)
+
+- A refused plan audit no longer leaves the run wedged in `plan-reviewing`.
+  Pre-dispatch phase and both baseline revisions are captured before the
+  auditor is dispatched; when the verdict path refuses the audit
+  (`AP_AUDIT_NO_VERDICT`, `AP_AUDIT_INVALID_VERDICT`, `AP_AUDIT_FINDINGS_INVALID`)
+  and the live state still matches the captured baseline, the engine commits a
+  recovery event (op `audit`, detail `{role, stage:'rejected', error:{code,
+  message}, auditorId}`) that restores the pre-dispatch phase. No `audits[]`
+  entry is appended and no gate is touched; the refusal still rethrows. A stale
+  audit (`AP_STALE_AUDIT`) deliberately does NOT roll back. Measured on the real
+  host: a `needs-replan` carrying only an execution-layer finding used to wedge
+  the run in `plan-reviewing` (every further plan audit refused by
+  `assertAuditPhase`); post-fix the phase recovers to `planning` and the
+  re-dispatch passes. Red→green in `test/plan-audit-wedge.test.ts`; real-boot
+  evidence in `goal-runs/m10-desktop-reliability/evidence/p0-wedge-recovery.json`.
+
+### Added (unattended egress, P1; 2026-10-11 M10)
+
+- `governance.unattended` (boolean, default off; mirrored in `CONFIG_KEY_SPEC`).
+  When on, a validated egress manifest no longer asks the owner mid-run: the
+  gate DENIES the egress before spawn, naming the command and target, stating
+  the manifest still stands, giving the recovery path (owner runs
+  `autopilot_signal owner-approve`, then the agent retries — `consumeApproval`
+  honors it), and noting other authorized non-egress work continues. When off,
+  the ask path is byte-identical to before. Every egress ask/deny is recorded on
+  the run (`enforcement.egressDecisions`, outcome `asked` /
+  `denied-unattended`) so an unattended refusal is visible and recoverable
+  rather than an infinite wait. Doctrine in `src/policy.ts` and
+  `skill/dsh-autopilot/SKILL.md`. Tests in `test/preexecute.test.ts` and
+  `test/policy.test.ts`.
+
+
 
 - `run_code` program source now gets a CODE-AWARE egress reading instead of
   verbatim mention-refusal: tagged templates and enumerated sink-call arguments
@@ -18,6 +50,28 @@ adapter stays thin and the host-neutral rules live in one reference layer.
   at their own call; `terminal_send` keeps verbatim matching (one Enter from
   execution). Measured motivation: two legitimate operations were refused
   because audit packets QUOTED egress phrases from the owner's ruling.
+
+### Fixed (routing reachability refresh, M7b; 2026-10-10)
+
+- `routingReachability` is now read from the CURRENT routing section instead of
+  from the config the last FRESH selection happened to run under. The report had
+  exactly one writer, inside the selection path (`selectForRole`); a healthy-pin
+  REUSE never reached it, so after a profile edit the StatusView served the
+  pre-edit ladder while the onboarding section — reading the same
+  `volatileRoutingAccess` closure — already reported the new one. The engine now
+  refreshes the report on each routing decision and again on the status read
+  path (`autopilot_status` awaits `refreshReachability()` before projecting).
+  Measured pre-fix: the regression test in `test/routing-integration.test.ts`
+  read `reachable` where the live config said `unreachable-models`.
+- Corrected a claim the fix made false:
+  `skill/dsh-autopilot/references/model-routing.md` said the engine refreshes
+  the report "on every selection"; it now says the report is read from the
+  current routing section, refreshed by every routing decision and by the status
+  read path. The dispatch-membership claim was checked and kept: dispatch does
+  read the live config (`routingSource`).
+- DESIGN.md §9 item 12 carries the same boundary (the predecessor M7 probe's
+  "engine kept a mount-time snapshot" reading is falsified — no dispatch in that
+  window read the config at all).
 
 ### Added (governance pragmatics v1)
 
@@ -51,6 +105,82 @@ adapter stays thin and the host-neutral rules live in one reference layer.
   refusals.md documents the 13 new codes in a new section 16 with the
   bidirectional census; docs/reference.md and SKILL.md tool sequences updated;
   DESIGN.md §8.5 records the decisions and their honest limits.
+
+### Added (model routing, DESIGN §9 items 11–16; 2026-10-10)
+
+- Work-class dispatch membership: five fixed task classes (`mechanical` /
+  `simple` / `hard` / `audit` / `extreme`) with role defaults, per-role
+  override via `routing.roles.<role>.workClass`, per-class tier remapping via
+  `routing.workClasses`; a tier-bound class whose mapped tiers leave zero
+  reachable routes blocks the dispatch with
+  `AP_ROUTE_NO_REACHABLE_WORK_CLASS` (routing-escalation pause) instead of
+  silently shelving. The ladder engages only when configured or overridden —
+  otherwise the selection is recorded, not applied (0.2.0 parity).
+- First-use onboarding: the `autopilot:routing-onboarding` system-prompt
+  section (root agents only, zero tokens when fully covered / unobserved /
+  routing off) names the models no tier-bound class can reach and instructs
+  the agent to check current capability facts online or ask the owner — never
+  to infer from model names — then to assign `provider/model` ids to
+  `routing.ladder.tiers.*` (volatile leaves, no restart); hosts without a
+  config-edit surface get the exact YAML to hand to the owner.
+- Explicit preference provenance (A2): `routing.preferenceSource` is resolved
+  and selection records carry `preferenceSource`; the explicit opt-in
+  `routing.orderingAxisDefault: true` promotes the ordering-axis path (price,
+  then owner-declared speed) to the deployment default without touching
+  deployments that never wrote it.
+- Engine-level auditor rotation (A4, DESIGN §9-15, auditor roles only):
+  `routing.ladder.rotation: true` (default off) makes a healthy auditor pin
+  yield to a full re-selection at the next same-role dispatch, offset by the
+  audit-count ordinal within its independence class — rotation never overrides
+  cross-family independence, and executor engine-level rotation stays an
+  explicitly recorded known limitation.
+- Coverage upgraded to work-class reachability: `workClassReachability`
+  (`kind: 'work-class-reachability'`, five outcomes over the same non-empty
+  observation floor, `auditTier` overrides reflected, non-tier-bound classes
+  named not counted), refreshed by the engine from the same cached catalog
+  snapshot and exposed on StatusView as `routingReachability` (absent = never
+  observed).
+- Deployment hazard documented (measured on Windows Desktop 0.2.0-rc.2): a
+  profile patch entry that re-declares `id: autopilot` REPLACES the packaged
+  bundle layer's config, so the packaged `storeKind: file` pin must be repeated
+  — without it the medium silently flips to the `storageDomain` backend and a
+  session loses the file-backed run it was working on. See
+  [docs/compatibility.md](docs/compatibility.md).
+- Live-host hardening from M7 acceptance: the onboarding probe now reads the
+  host's config-edit surface through `ctx.get` instead of a bare property read
+  — cordis THROWS on an undeclared service read (`cannot get property
+  "configEditor" without inject`), which took the whole mount down at first
+  section render on a real 0.2.0 host while `apply.test.ts`'s permissive fake
+  saw nothing; `fakeCtx` gained a `strictServiceAccess` mode (undeclared
+  service reads throw, context-API members pass) and a regression test now
+  fails against the old probe.
+- The onboarding notice states the selection prerequisite (M7 finding on two
+  real hosts): a session with no `subagent/model-selection-policy` record —
+  and every session measured so far — authorizes nothing, so auto mode only
+  inherits and the ladder selects nothing at all. The notice says
+  "INHERITANCE ONLY" for `absent` (pointing at the host's own subagent model
+  selection, which applies to new sessions) and its own wording for an
+  unreachable projection, and stays silent when a policy is present.
+- Rules-audit corrections (2026-10-10, all three were shipped contracts that
+  were false of the code): `hard`'s default candidate pool is now **economy
+  only** — DESIGN §1.2's "try economy first; widen only when the working model
+  asks" plus a request channel that is a documented non-goal left the shipped
+  `economy + standard + reserve` seed silently widening a `hard` dispatch to the
+  ceiling, so the seed and the table now agree and a new census test compares
+  the routed class→tier table against `DEFAULT_WORK_CLASSES` both ways;
+  recorded boundary (a) was rewritten to the delivered producer set (the
+  mechanical `requirements: { effortIds: ['low'] }` licence plus ladder-tier
+  membership are produced at the dispatch site; modality, the extended context
+  floor and the ceiling still are not); and the onboarding notice's owner-edit
+  path now really emits the YAML block it promises, carrying the observed
+  unreachable ids with the tier left to the capability facts (asserted in
+  `test/routing-onboarding.test.ts`, and `SKILL.md` now routes readers to
+  `references/model-routing.md`).
+- Docs: DESIGN.md §1.2/§9 items 11–16 updated in place (§9-15 marked
+  partial-for-executor); model-routing.md owns the work-class table, rotation
+  leaf, onboarding behavior and the updated recorded boundaries, now including
+  the no-policy inheritance boundary; refusals.md §10 documents
+  `AP_ROUTE_NO_REACHABLE_WORK_CLASS`.
 
 ### Added
 
@@ -89,15 +219,19 @@ adapter stays thin and the host-neutral rules live in one reference layer.
   them.
 - `docs/reference.md` no longer claims to be a second copy of the skill; the
   two now have distinct, stated owners.
-- DESIGN.md §1.2 records the routing boundaries: the `requirements` threshold input
-  has no production producer and is inert in production; a role holding a live pin
-  does not re-select, so engine-level automatic rotation is not delivered; a
-  `balanced` default and an explicitly written `balanced` are indistinguishable,
-  so the axis path cannot yet be the default; and coverage is tier coverage of
-  observed models, not work-class reachability. The section's work-class table is
-  marked as a design target, and §9 adds roadmap items for the explicit
-  preference source (A2), a real work-class input (A5), safe engine-level
-  re-selection (A4), and wiring the ladder into dispatch membership.
+- DESIGN.md §1.2 originally recorded the routing boundaries as they stood then:
+  the `requirements` threshold input had no production producer; a role holding a
+  live pin did not re-select, so engine-level automatic rotation was not
+  delivered; a `balanced` default and an explicitly written `balanced` were
+  indistinguishable, so the axis path could not yet be the default; and coverage
+  was tier coverage of observed models, not work-class reachability. **The
+  work-class release below moved all four**: `requirements` now has one producer
+  (the mechanical effort licence) and the ladder's tier membership is applied at
+  the dispatch site; **auditor** rotation is delivered as an explicit owner
+  opt-in (executor rotation remains the recorded known limitation); A2 ships as
+  the explicit `routing.orderingAxisDefault` opt-in; and coverage is two metrics
+  (tier coverage plus work-class reachability). Read the "已记录的边界" section
+  of DESIGN.md, not this historical line, for the delivered set.
 
 ### Fixed
 

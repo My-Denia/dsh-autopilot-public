@@ -114,6 +114,8 @@ The plugin automatically initializes the run, requests read-only sandbox mode, c
   The engine rejects completion unless both gates have passed, required roles are satisfied, and every acceptance criterion is backed by an on-disk bearer artifact.
 - ⏱️ **Turn Reminder &amp; Usage Governance**  
   A bounded 3x nudge prevents agents from silently stopping mid-execution. Standard runs must declare observable usage states before mutations are unlocked.
+- 🧭 **Governed Model Routing**  
+  An owner-declared `routing.ladder` (economy / standard / reserve tiers) drives work-class dispatch membership, ordering-axis selection (price, then owner-declared speed — opt-in via `routing.orderingAxisDefault`), engine-level auditor rotation (`routing.ladder.rotation`), and two coverage metrics (tier coverage + work-class reachability). A work class with zero reachable routes blocks with `AP_ROUTE_NO_REACHABLE_WORK_CLASS` instead of silently shelving; a first-use onboarding prompt helps classify models the ladder cannot reach. Nothing is inferred from model names.
 
 ---
 
@@ -126,7 +128,7 @@ The plugin automatically initializes the run, requests read-only sandbox mode, c
 | **Host Support** | `dsh` 0.2.0 line, `0.1.5-rc.1`, `0.1.2-rc.1` (0.1.7 and 0.2.1 are outside the peer range). |
 | **WSL2 + 0.2.0-rc.2** | **Verified:** Plugin install, mount, skill registration, plan audit, delegated executor, and needs-fix resume measured with a local mock model. |
 | **Real-Model Full Closeout** | **Unverified:** Natural-language write → live model execution audit → full closeout not yet verified with a real model. |
-| **Desktop (macOS / Windows)** | **Unverified:** Desktop UI packaging is not run in this test environment. |
+| **Desktop (macOS / Windows)** | **Windows Desktop 0.2.0-rc.2 partially verified (2026-10-10):** plugin mount and the live-catalog routing onboarding section measured on the running app; file-backed run visible after a host restart. **Unverified:** macOS, and the full write lifecycle to closeout on Desktop. See [docs/compatibility.md](./docs/compatibility.md). |
 | **Windows Native** | **Unverified:** Windows native environment is not tested and not claimed as supported. |
 | **Browser Card Rendering** | **Unverified:** PTC card rendering and cold-resume executor re-recognition remain unverified. |
 | **Distribution Channels** | **npm is the package distribution channel.** GitHub Releases are notes-only (no attached tarballs). |
@@ -142,6 +144,7 @@ For detailed compatibility notes and host verification traces, see [docs/compati
 | :--- | :--- |
 | **[DESIGN.md](./DESIGN.md)** | Core architecture, CC GAH mapping, state machine, invariants, and design roadmap. |
 | **[skill/dsh-autopilot/references/refusals.md](./skill/dsh-autopilot/references/refusals.md)** | The contract behind every engine refusal code, with its remedy. |
+| **[skill/dsh-autopilot/references/model-routing.md](./skill/dsh-autopilot/references/model-routing.md)** | The model-routing contract: authority order, thresholds vs axes, the ladder, work classes, coverage metrics, and recorded boundaries. |
 | **[skill/dsh-autopilot/references/governance-invariants.md](./skill/dsh-autopilot/references/governance-invariants.md)** | The host-neutral governance rules (risk, audit invariants, evidence, closeout) this adapter consumes. |
 | **[docs/compatibility.md](./docs/compatibility.md)** | DSH version matrix, Desktop notes, 0.2.0 adapter details, and sandbox residual. |
 | **[docs/security.md](./docs/security.md)** | Approval mechanisms, egress interception, sandbox assumptions, and non-goals. |

@@ -192,10 +192,17 @@ owner 原话：「模型一直在变化，不应该定死，也不应该机械�
 
 #### 任务档（work_class）决定哪条轴当主导
 
-> **未接线（2026-10-09）。** 下表是 owner 需求的设计目标，不是当前实现：没有任何
-> `workClass` 输入进入选择器，也没有"零可达 work_class 报错"的生产消费者；当前
-> 覆盖面只做 `coverageReport` 的档位覆盖（`kind: 'tier-coverage'`）。见本节的
-> "已记录的边界"与 §9 第 13–16 项。
+> **已接线（2026-10-10，governance-pragmatics-v1 承接轮）。** workClass 输入已进入
+> 选择器（角色级 `routing.roles.<role>.workClass`，缺省按角色表：executor/planner
+> simple，三审计角色 audit），零可达 work_class 以 `AP_ROUTE_NO_REACHABLE_WORK_CLASS`
+> 报出（ladder 已配置、类档位非空而候选集为空 ⇒ blocked + routingEscalation，不静默
+> 搁置）；覆盖面已升级为双度量（tier-coverage 与 work-class 可达性并存，见
+> "已记录的边界"）。仍缺：run 级 triage 的 workClass 字段（派发档位只能按角色配置，
+> 不能按单个 run 声明）与升档请求通道（子代理 → 主 agent 的 `failure_kind` 上报）
+> ——后者的缺席直接决定 `hard` 档的交付形态：DESIGN 上文要求"先试 economy；没有被请求
+> 就不升档"，因此 `hard` 的交付候选池为 **economy 单档**（`routing.workClasses.hard.tiers`
+> 可覆盖），standard/reserve 不由该类自行进入；
+> ——两者登记为非目标/已知限制，不静默缺席。
 
 不是给模型定死角色——难任务照样可以派 economy 档，先试。
 
@@ -235,6 +242,14 @@ independenceFloor——`counter`、`history`、`prior`、`rotation`、`used` **�
 **修法**：轮转索引从 run 自己的 `events.jsonl` 中该 role 的既往派发数**推导**
 （不引入可变计数器，replay 得到同样选择）；顺序固定为 资格 → 审计独立性 → 地板 →
 **轮转** → 主导轴偏好（速度/价格）；轮转不得凌驾独立性，plan/execution 审计仍跨 provider。
+
+**已修复（2026-10-10）**：轮转序数从 run 自身审计记录数推导（`prior.audits` 中该角色
+条数，replay 得同一序数）；选择器在审计独立性类内按序数偏移轮转（独立性永远先于轮转，
+组内 ≤1 成员时如实记 NO-OP）。引擎级重选作为 owner 显式 opt-in
+（`routing.ladder.rotation`，默认关）交付给**审计角色**：活体 pin 在下一次同角色派发
+让位整轮重选（§9 第 15 项）。executor 的引擎级轮转**未交付**——inline 模式下 executor
+路由对选择器不可观察（unknown-family，轮转组为空，NO-OP），且稳定性权重更高；登记为
+已知限制，不是静默缺口。
 
 **边界**："有活干"≠"每轮都有活"。某 run 内没有机械活时 `glm-5.3` 那一轮不上场是正确的。
 可强制的是**可达性 + 轮转**。
@@ -286,30 +301,58 @@ harness 自己的目录就自相矛盾地否证了它：`moonshotai/kimi-k3` 与
 上文写的是 owner 需求与设计意图；以下四条是**当前实现做到哪一步**的机械事实。
 它们不是"将来会做"的承诺，而是现在就不该被读成已交付的东西；与上文冲突时以本小节为准。
 
-- **阈值输入 `requirements` 没有生产生产者，因此生产中 INERT。** 阈值侧（effort
-  许可集 / 模态 / context 地板 / owner tier / ceiling）以 `requirements` 形态表达，
-  但没有任何生产派发点构造它；不得把这条阈值阶段写成"生产中强制"。生产中真正跑到的
-  阈值只有：角色 `minContext` 地板（executor/planner 131072，审计角色 65536）与授权
-  交集（会话策略路由 ∩ 活体 provider）。effort 取自适配器自报事实；模态、ceiling、
-  owner tier 在派发点都没有生产者。
-- **持有活体 pin 的角色不重选。** 引擎在 pin 的 provider 仍活、preflight 仍接受、
-  授权仍覆盖时复用 pin（"stability over reselection"），只有 pin 死亡才带
-  `repinFrom` 重选。因此轮转只可能在**选择器**层发生，**引擎级自动轮转没有交付**。
-- **`balanced` 默认值与 owner 显式写下的 `balanced` 不可区分。** 解析器把
-  `preference` 折叠成一个普通枚举值（`readSetting(...) ?? 'balanced'`），下游拿不到
-  "这是默认"还是"这是 owner 说的"。所以**排序轴路径还不能当默认**——把它设成默认会
-  静默翻转所有没写过 `preference` 的部署；这要等 A2（显式 preference 来源）。
-- **覆盖面是"已观察模型的档位覆盖"，不是 work-class 可达性。** 覆盖率报告的 `kind`
-  固定为 `'tier-coverage'`，五种结局（`unobservable` / `unconfigured` / `incomplete` /
-  `gap` / `covered`）只在回答"观察到的模型有没有被某个已配置档位收录"；它**不回答**
-  "每个模型是否都有可达的 work_class"，因为**没有任何 `workClass` 输入**。上面的任务档
-  表是设计目标，不是已接线行为。
+- **阈值输入 `requirements` 有且仅有**一个**生产生产者（mechanical 档的 effort
+  许可），其余阈值仍无生产者。**自 work-class 接线起，引擎在生产派发点构造
+  `requirements: { effortIds: ['low'] }`（mechanical 档的入场门，DESIGN 上文
+  "持有 low 的" 那条），这是 fail-closed 的充分性阈值、不是排序轴；同一派发点也施加
+  ladder 档位成员资格（某档的候选集 = 其映射档位的并集），即 owner tier 阈值的已交付
+  形态。**其余不得写成"生产中强制"：模态、超出角色 `minContext` 默认的 context 地板、
+  ceiling 在派发点都没有生产者；mechanical 许可之外的努力档取自适配器自报事实。
+  生产中也真正跑到的还有：角色 `minContext` 地板（executor/planner 131072，审计角色
+  65536）与授权交集（会话策略路由 ∩ 活体 provider）。
+- **持有活体 pin 的角色默认不重选；审计角色可由 owner 选择引擎级轮转。** 引擎在
+  pin 的 provider 仍活、preflight 仍接受、授权仍覆盖时复用 pin
+  （"stability over reselection"），只有 pin 死亡才带 `repinFrom` 重选。
+  `routing.ladder.rotation: true`（owner 显式 opt-in，默认关，出厂语义逐字节保留）时，
+  **审计角色**在下一次同角色派发让位整轮重选，why 行点名 rotation 是原因，序数取自
+  run 自身审计记录数，轮转偏移落在审计独立性类内（永不凌驾独立性）。executor 永不
+  进入该分支（§9 第 15 项：引擎级 executor 轮转未交付，登记为已知限制）。
+- **`balanced` 默认值与 owner 显式写下的 `balanced` 仍不可区分**（显式性上限：
+  schemastery 在 `apply()` 之前已填默认值，loader 与 plain 两条配置路径必须同值；
+  写成恰好等于默认值的 `balanced` 在两条路径上都如实记为 `default`）。A2 的交付
+  形态是**显式 opt-in**：`routing.orderingAxisDefault: true` 让排序轴路径
+  （价格 → owner 声明的速度）成为该部署的默认排序，引擎把有效 preference 记为
+  `axis`、来源记为 `default`（owner 选择的是"晋升"，不是 axis 本身），选择记录带
+  `preferenceSource`；未 opt-in 的部署语义逐字节不变。
+- **覆盖面是双度量：档位覆盖 + work-class 可达性。** `coverageReport`
+  （`kind: 'tier-coverage'`）保持原义五结局；`workClassReachability`
+  （`kind: 'work-class-reachability'`）回答"每个观察到的模型有没有至少一个可达的
+  tier-bound work_class"，五结局（`unobservable` / `unconfigured` / `incomplete` /
+  `unreachable-models` / `reachable`）同样遵守非空观察地板，`auditTier` 覆盖如实
+  进入报告，非档位绑定的类（mechanical，按事实许可入场）只点名不计数。报告由引擎
+  每次选择从同一缓存目录快照刷新，经 StatusView `routingReachability` 暴露
+  （缺席 = 从未观察，绝不声称可达）。
 
-另记：`routing.ladder` 已解析（tiers / auditTier / speedOrder / costOverrides）且可由
-owner 配置，但**尚未接入派发成员资格**；目前消费其 tiers 的只有覆盖率报告。接线是
-单独一项（§9 第 16 项）。成本种子的 provenance（`seed-cost@2026-10-09`，由 harness
+另记：`routing.ladder` 已解析（tiers / auditTier / rotation / speedOrder /
+costOverrides）且已**接入派发成员资格**：tier-bound work class 的候选集即其档位成员
+（§9 第 16 项已交付）。成本种子的 provenance（`seed-cost@2026-10-09`，由 harness
 自带 provider 目录生成、按模型身份键、命中步骤带标签）由
 `skill/dsh-autopilot/references/model-routing.md` 单一 owner 记录。
+
+**前提：自主选择需要会话的 subagent model-selection policy（2026-10-10 实测）**。
+在真实 0.2.0 桌面宿主与 headless 宿主上，两个会话都没有
+`subagent/model-selection-policy` 事件，于是 auto 模式**只做继承**——引擎自己的 why 行
+逐字为 `authorization: no session model-selection policy recorded (the native default)
+— auto mode performs inheritance only; settings are never consulted as authority`，
+ladder 在该次派发上**不参与成员资格判定**（`src/routing/authorize.ts:90-98` 的
+`inheritOnly` 短路；`selectForRole` 仍会算可达性报告与轮转序数，但没有授权集合可筛）。
+策略存在时（`policy.kind === 'present'`）才有授权集合，ladder 才真正约束候选
+（`authorize.ts:109-121` → `engine.ts:3925/3936`）。宿主侧的开关是它自己的 subagent
+model selection（UI 文案 "Allow agents to choose models for Subagents"，**只对新会话
+生效**），本插件无法代设。因此"ladder 已接入派发成员资格"的诚实读法是：**接入在
+选择真正发生时生效**；无 policy 的部署上派发是继承，ladder 只影响覆盖面报告与首次
+使用引导。§9 第 12 项的引导段已如实说出这一前提（`policyState: 'absent'` /
+`'unreachable'` 各自措辞），避免引导段读起来像"路由已在派发"。
 
 ## 2. CC 机制 → dsh 原生机制映射
 
@@ -2653,7 +2696,50 @@ resume 把 findings 送到同一子代理 → packet rev 2 被接受（重复提
 + 可选 round cap 兜底，非机械保证；(c) 本 repo 是 source-ready 未安装态（§1.1），
 以上行为在已安装 0.2.0 宿主上不生效，直到下一版本发布。
 
-## 9. 路线图
+### 8.6 M10 桌面可靠性（2026-10-11）：plan-reviewing 楔死修复（P0）+ 无人值守 egress（P1）
+
+两个交付物，都落在 `governance-pragmatics-v1` 分支，r7 构建
+（`dsh-goal-autopilot-0.2.0-candidate-routing-m1-m9-r7.tgz`）。
+
+1. **plan-reviewing 楔死修复（P0）**：派发审计员之前先捕获 pre-dispatch 相位与两条
+   baseline 修订（runRevision / planRevision）。当判决路径拒收审计
+   （`AP_AUDIT_NO_VERDICT` / `AP_AUDIT_INVALID_VERDICT` /
+   `AP_AUDIT_FINDINGS_INVALID`）且 live state 仍等于捕获的 baseline 时，引擎提交一条
+   恢复事件（op `audit`，detail `{role, stage:'rejected', error:{code,message},
+   auditorId}`）把相位恢复到派发前；**不**追加 `audits[]`、**不**动任何 gate，拒收
+   照常 rethrow。`AP_STALE_AUDIT` 刻意**不**回滚（新鲜度绑定仍任其职）。真机楔死
+   实录：一个只带执行层 finding 的 `needs-replan` 落盘前被
+   `AP_AUDIT_FINDINGS_INVALID` 拒收，但相位已提交成 `plan-reviewing`，此后每次 plan
+   审计都被 `assertAuditPhase` 拒——run 卡死。修复后相位恢复到 `planning`、重派发
+   通过。红→绿见 `test/plan-audit-wedge.test.ts`（6 例）；真机独立启动证据见
+   `goal-runs/m10-desktop-reliability/evidence/p0-wedge-recovery.json`
+   （recoveryEventCount=1，phaseTrace rev4 plan-reviewing → rev5 planning → rev7
+   executing，wedgeRecovered=true）。
+2. **无人值守 egress（P1）**：`governance.unattended`（布尔，默认关；CONFIG_KEY_SPEC
+   同步镜像）。开启时，一份**已校验**的 egress manifest 不再中途询问 owner：门禁在
+   spawn 前**拒绝**该 egress，理由点名命令与目标、声明 manifest 仍然有效、给出恢复
+   路径（owner 执行 `autopilot_signal owner-approve` 后 agent 重试——`consumeApproval`
+   认账），并说明其它已授权的非 egress 工作继续。关闭时 ask 路径与旧行为逐字节一致。
+   每次 egress ask/deny 都记录到 run（`enforcement.egressDecisions`，outcome
+   `asked` / `denied-unattended`），让无人值守的拒绝**可见且可恢复**，而不是无限等待。
+   教义在 `src/policy.ts` 与 `skill/dsh-autopilot/SKILL.md`；测试在
+   `test/preexecute.test.ts`（含 unattended 开/关 + owner-approve 回归）与
+   `test/policy.test.ts`。
+
+**如实记录的边界（M10）**：(a) P0 修复只覆盖"判决路径在 live state 仍等于 baseline 时
+拒收"这一种楔死；若派发后又有别的 commit 改了相位/修订（baseline 不再相等），恢复
+不触发、由既有不变量兜底（宁留可诊断状态，不猜相位）。(b) P1 无人值守**只**把"已
+校验 manifest 的 egress ask"改成 deny；它**不**自动批准任何 Owner 审批、不改 ACL/
+沙箱/出站权限、不绕过安全边界——owner-approve 仍是人工显式动作。(c) 独立 headless
+验收的 (b)/(c) 两臂（unattended egress 真机拒绝、v4-pro 真机派发）被本机
+Store-PowerShell 缺陷卡住：`dsh-subprocess` 的 env-scrub 让子进程拿到默认 PATH，
+沙箱受限令牌下 Store 安装的真 pwsh ACL 不可见（candidateExists 跳过）→ 落到
+reparse-alias 桩 → spawn ENOENT；修复需持久改用户 PATH 或管理员权限，超出本轮授权
+范围。(d) 验收过程中发现并修正了一处探针配置错误：`allowedModels` 是宿主面
+`subagent-model-selection-settings` 插件的字段（MS4 叶③），**不是** autopilot 配置
+字段——把它挂在 autopilot 下会让 cordis 配置解析失败、插件不挂载。
+
+
 
 编号保持稳定（其他章节按号引用），已交付项保留条目并标注，不删号。
 
@@ -2769,27 +2855,76 @@ resume 把 findings 送到同一子代理 → packet rev 2 被接受（重复提
      后继 run 以 `Triage.carryover` 指名承接（前驱必须 completed）。closeout 仍
      是 run 级——"阶段"由 handoff+carryover 显式接续，而不是引入第二类终态；
      legacy closeout（无 `closeoutHandoff: 1` 戳）保留旧读法。
-11. **模型路由：任务档 + 覆盖面**（**部分交付**，2026-10-09 owner 需求，见 §1.2）：
-    已交付 `routing.ladder` 的解析（固定档位 economy/standard/reserve、`auditTier`、
-    owner 声明的 `speedOrder`、`costOverrides`，格式错误即拒绝）、按模型身份键的真实
-    价格种子（`seed-cost@2026-10-09`）与 `coverageReport`（`kind: 'tier-coverage'`，
-    拒绝在未观察/未配置/列出不全时声称覆盖）。任务档（work_class）与零可达 work_class 报错、
-    排序轴路径当默认、引擎级轮转、ladder 接入派发成员资格见第 13–16 项。原文说
-    "`routing.ladder` 声明 work_class→档位成员"与实现不符——ladder 没有该输入，已改正。
-12. **首次使用引导**（**未交付**）：扫 `ctx.llm` 目录，出现 ladder 分类不了的模型时，
-    经已有的 `systemPrompt.section()` 提示 agent——联网查各模型能力，或询问 owner，
-    再经 DSH 原生 `ctx.settings` / `ctx.configEditor.edit()` 写入（`routing` 各叶
-    已标 `.volatile()`，HMR 即时生效）。**不另造插件私有策略文件**。
+11. **模型路由：任务档 + 覆盖面**（**已交付**，2026-10-10 governance-pragmatics-v1
+    承接轮；2026-10-09 owner 需求，见 §1.2）：`routing.ladder` 解析（固定档位
+    economy/standard/reserve、`auditTier`、`rotation`、owner 声明的 `speedOrder`、
+    `costOverrides`，格式错误即拒绝）、按模型身份键的真实价格种子
+    （`seed-cost@2026-10-09`）、任务档（work_class）五档表与角色缺省映射、零可达
+    work_class 报错（`AP_ROUTE_NO_REACHABLE_WORK_CLASS`）、双度量覆盖面
+    （`coverageReport` 档位覆盖 + `workClassReachability` work-class 可达性，两者都
+    拒绝在未观察/未配置/列出不全时声称可达）。排序轴默认、引擎级轮转、ladder 成员
+    资格、首次引导分别见第 12/13/15/16 项。原文说"`routing.ladder` 声明
+    work_class→档位成员"与实现不符——ladder 没有该输入，已改正（成员资格现在由
+    work class 的 `tiers` 映射声明）。
+12. **首次使用引导**（**已交付**，2026-10-10）：`autopilot:routing-onboarding`
+    systemPrompt 段（order 61，仅 root agent）——路由开（`mode: auto`）且活体目录里
+    出现任何 tier-bound work_class 都放不下的模型时（复用引擎同一
+    `workClassReachability` 度量，单一真相），提示 agent：先在线核查各模型当前能力
+    事实或询问 owner（**禁止按名字推断**，§1.2），再写 `routing.ladder.tiers.*` 等
+    volatile 叶（无需重启）；引导文本点名不可达模型（≤5 名 + "+N more"）。全覆盖、
+    目录未观察、路由关 ⇒ **零 token**。宿主无 `ctx.configEditor` / `ctx.settings.edit`
+    时降级为"把确切 YAML 报给 owner 编辑
+    profile"路径。**未另造插件私有策略文件**。报告缓存于挂载层，挂载时与
+    `llm/adapters-updated` 刷新，渲染到时再做一次异步再校验（stale-by-one：配置修复
+    在下一次 prompt 组装时清除提示，已在代码注释声明）。config-edit 面按
+    `lookupService` 结构性探测（`ctx.get` 优先）：两个活体宿主（桌面 + headless）
+    实测**都有**该面，渲染的是"自行编辑"分支；降级分支由单测锁定，本机未实测到。
 
-13. **模型路由 A2：显式 preference 来源**（**未交付**）：让"owner 显式写了
-    `balanced`"与"默认 balanced"可区分（配置显式性上限），从而排序轴路径
-    （价格 → owner 声明的速度）可以成为默认；在此之前它不能当默认（§1.2 边界）。
-14. **模型路由 A5：真实 workClass 输入 + work-class 可达性**（**未交付**）：在派发点
-    提供 workClass，才能把任务档表接进资格判定，并把覆盖面从"档位覆盖"提升为
-    "每个模型有可达 work_class"；当前无 workClass 输入，`coverageReport` 只能报
-    `'tier-coverage'`。
-15. **模型路由 A4：安全的引擎级重选**（**未交付**）：现在持有活体 pin 的角色不重选，
-    轮转只在选择器层；在引擎层安全地重选（不破坏稳定性与审计独立性）需要自己的状态机
-    改动与审计。
-16. **模型路由：把 ladder 接入派发成员资格**（**未交付**）：`routing.ladder` 已解析但
-    只被覆盖率报告读 `tiers`；尚未成为"某次派发能从哪些模型里选"的成员判定。
+    **2026-10-10 活体验收补充（M7 实测驱动）**：引导段现在还说出"ladder 何时才真正
+    参与派发"这一前提——渲染 agent 的会话读不到 model-selection policy 时（`absent` /
+    `unreachable`，与引擎 authorize 同一个 `policyReader`），文本追加 "INHERITANCE
+    ONLY：引擎派发部署默认，ladder 什么都不选"，并按成因分别措辞（无 policy ⇒ 请 owner
+    打开宿主的 subagent model selection，**只对新会话生效**；policy 投影不可达 ⇒ 本会话
+    无法打开，只能告知 owner）。策略存在时不追加。这一条由实测逼出：ladder 配全、本引导段
+    已渲染，而每一次派发仍记 `inheritance only`（见 §1.2 另记"前提"）。
+
+    **2026-10-10 M7b 修正（引导段 vs 派发读同一份 live 配置）**：前驱 run 记录过"面板显示已更新、
+    派发仍用旧策略"的分裂（引导段 1→4→1 不可达、引擎 `routingReachability` 停在
+    `k3 → ["audit","extreme"]`）。M7b 重读源码并实测后判定：两个消费者读的是**同一个**
+    `volatileRoutingAccess(config)` 闭包（`src/index.ts:1723` 建、`:1736` 给引擎、`:1796` 给引导段），
+    每次调用都重新 `resolveRouting`，因此**派发从未被冻在挂载快照上**——前驱窗口内根本没有一次为选择
+    而重读配置的派发（那次审计复用了健康 pin，走 reuse 分支，不经过 `selectForRole`）。
+    真正的缺陷是**可观测面 stale**：`reachabilityReports` 只有 `selectForRole` 一个写入点
+    （`src/engine.ts:4362`），pin 复用不会刷新它，于是配置改动后 StatusView 仍报旧梯子。
+    修正形态：引擎新增 `refreshReachability()`，在状态读取路径（`autopilot_status`）await 之后
+    再投影，报告取自**当前** routing 段落；`skill/dsh-autopilot/references/model-routing.md` 里
+    "on every selection" 的措辞随之改正，而"ladder 参与派发成员资格"这一条经核对**保留**
+    （派发确实读 live 配置）。零可达 work_class 的 fail-closed 行为在引擎层用真实形态的梯子
+    重新验证（`AP_ROUTE_NO_REACHABLE_WORK_CLASS` → routing-escalation → `needs-owner-decision`）。
+
+13. **模型路由 A2：显式 preference 来源**（**已交付**，2026-10-10，形态为显式
+    opt-in）：`routing.preferenceSource` 把"owner 显式写了非默认值"与"默认"区分开
+    （选择记录带 `preferenceSource`）；`routing.orderingAxisDefault: true` 让排序轴
+    路径（价格 → owner 声明的速度）成为该部署默认——owner 选择的是"晋升"，不是
+    axis 本身，故来源如实记为 `default`。"写成恰好等于默认值的 `balanced`"在
+    loader 与 plain 两条路径上都仍不可区分（显式性上限，§1.2 边界保留原文含义）。
+14. **模型路由 A5：真实 workClass 输入 + work-class 可达性**（**已交付**，
+    2026-10-10）：auto 角色派发从 `routing.roles.<role>.workClass`（缺省按角色表）
+    解析任务档，tier-bound 类的候选集即其档位成员（与第 16 项同一接线）；owner 未
+    启用（ladder 空且类未改）时选择**记录而不施加**（0.2.0 parity）。零可达 ⇒
+    `AP_ROUTE_NO_REACHABLE_WORK_CLASS`（blocked + routingEscalation）。覆盖面升级为
+    `workClassReachability`（`kind: 'work-class-reachability'`，经 StatusView
+    `routingReachability` 暴露）。run 级 triage 的 workClass 字段未引入（登记为
+    非目标，见 §1.2"已接线"注）。
+15. **模型路由 A4：安全的引擎级重选**（**部分交付——仅审计角色**，2026-10-10）：
+    `routing.ladder.rotation: true`（owner 显式 opt-in，默认关）时，审计角色的活体
+    pin 在下一次同角色派发让位整轮重选（`repinFrom` 指向原 pin，why 行点名 rotation
+    为原因）；轮转序数取自 run 自身审计记录数，偏移落在审计独立性类内，**永不凌驾
+    独立性**；escalate/blocked 结果直通，不吞。executor 的引擎级轮转**未交付**：
+    inline 模式下 executor 路由对选择器不可观察（轮转组为空，NO-OP 如实记录），且
+    executor 稳定性权重更高；登记为已知限制，不是静默缺口。
+16. **模型路由：把 ladder 接入派发成员资格**（**已交付**，2026-10-10）：tier-bound
+    work class 的候选集即其 `tiers` 映射的档位成员，选择器在资格判定阶段施加
+    （engaged 判定：ladder 已配置或 owner 改过类映射；未启用时记录而不施加，
+    0.2.0 parity）；`routing.ladder.auditTier` 覆盖 audit 类档位，选择器与可达性
+    报告用同一有效映射。

@@ -17,6 +17,7 @@ import { SHELL_TOOLS, isEgressCommand } from '../src/gate/decide.js'
 import { resolveConfig, volatileRoutingAccess } from '../src/index.js'
 import type { ConfigInput, ResolvedRouting } from '../src/index.js'
 import { DEFAULT_ROLE_MIN_CONTEXT } from '../src/routing/select.js'
+import { DEFAULT_WORK_CLASSES } from '../src/routing/work-class.js'
 
 /** Run one raw profile fragment through the loader exactly as cordis would. */
 function loaded(raw: unknown): { value?: ConfigInput; issues?: readonly { message: string }[] } {
@@ -236,7 +237,9 @@ describe('resolveConfig — the routing section', () => {
     const expected: ResolvedRouting = {
       mode: 'off',
       preference: 'quality',
-      ladder: { tiers: { economy: [], standard: [], reserve: [] }, auditTier: 'none', speedOrder: [], costOverrides: [] },
+      preferenceSource: 'explicit',
+      ladder: { tiers: { economy: [], standard: [], reserve: [] }, auditTier: 'none', rotation: false, speedOrder: [], costOverrides: [] },
+      workClasses: DEFAULT_WORK_CLASSES,
       roles: {
         executor: { mode: 'locked', provider: 'deepseek-official', model: 'deepseek-v4-pro', reasoningEffort: 'high' },
         planner: { mode: 'auto', minContext: 262144 },
@@ -288,7 +291,9 @@ describe('resolveConfig — the routing section', () => {
     expect(viaPlain).toEqual({
       mode: 'auto',
       preference: 'balanced',
-      ladder: { tiers: { economy: [], standard: [], reserve: [] }, auditTier: 'none', speedOrder: [], costOverrides: [] },
+      preferenceSource: 'default',
+      ladder: { tiers: { economy: [], standard: [], reserve: [] }, auditTier: 'none', rotation: false, speedOrder: [], costOverrides: [] },
+      workClasses: DEFAULT_WORK_CLASSES,
       roles: {
         executor: { mode: 'auto', minContext: 131072 },
         planner: { mode: 'inherit' },
@@ -324,6 +329,82 @@ describe('resolveConfig — the routing section', () => {
     // User-tuned floor is honored verbatim.
     const tuned = resolveConfig({ routing: { roles: { executor: { minContext: 999999 } } } }).routing.roles.executor
     expect(tuned).toEqual({ mode: 'auto', minContext: 999999 })
+  })
+
+  it('work classes: per-role override and per-class overrides resolve on BOTH paths; malformed leaves throw with their path', () => {
+    const raw: ConfigInput = {
+      routing: {
+        roles: { executor: { workClass: 'mechanical' }, rulesAuditor: { workClass: 'extreme' } },
+        workClasses: {
+          simple: { tiers: ['standard', 'economy', 'standard'], axis: 'economy-first' },
+          audit: { tiers: ['reserve'] },
+        },
+      },
+    }
+    const viaPlain = resolveConfig(raw).routing
+    const viaLoader = resolveConfig(loaded(raw).value).routing
+    // The deep-equality doctrine: both paths answer identically.
+    expect(viaLoader).toEqual(viaPlain)
+    // The owner's per-role class wins and rides the auto variant.
+    expect(viaPlain.roles.executor).toEqual({ mode: 'auto', minContext: 131072, workClass: 'mechanical' })
+    expect(viaPlain.roles['rules-auditor']).toEqual({ mode: 'auto', minContext: 65536, workClass: 'extreme' })
+    // Roles without an override omit the key (the role default applies downstream).
+    expect('workClass' in viaPlain.roles.planner).toBe(false)
+    // Class overrides replace one class at a time; tiers dedupe, order preserved.
+    expect(viaPlain.workClasses.simple).toEqual({ name: 'simple', tiers: ['standard', 'economy'], axis: 'economy-first' })
+    expect(viaPlain.workClasses.audit).toEqual({ name: 'audit', tiers: ['reserve'], axis: 'ceiling-independence' })
+    // Untouched classes keep the owner-table default.
+    expect(viaPlain.workClasses.mechanical).toEqual({ name: 'mechanical', tiers: [], axis: 'speed' })
+    // A workClass written alongside an INHERIT role is dropped, not honored
+    // (the same doctrine as minContext: no selection, no class).
+    const dropped = resolveConfig({ routing: { roles: { planner: { workClass: 'hard' } } } }).routing.roles.planner
+    expect(dropped).toEqual({ mode: 'inherit' })
+    // Malformed leaves REFUSE with their dotted path (plain path; the schema
+    // rejects them on the loader path before resolveConfig sees them).
+    expect(() => resolveConfig({ routing: { roles: { executor: { workClass: 'fancy' as never } } } }))
+      .toThrow(/routing\.roles\.executor\.workClass must be one of mechanical \| simple \| hard \| audit \| extreme/)
+    expect(() => resolveConfig({ routing: { workClasses: { simple: { tiers: ['platinum' as never] } } } }))
+      .toThrow(/routing\.workClasses\.simple\.tiers entry must be 'economy', 'standard' or 'reserve'/)
+    expect(() => resolveConfig({ routing: { workClasses: { hard: { axis: 'magic' as never } } } }))
+      .toThrow(/routing\.workClasses\.hard\.axis must be one of speed \| speed-cost \| economy-first \| ceiling-independence \| ceiling/)
+  })
+
+  it('preference source: a non-default value is explicit on BOTH paths; written-default counts as default (the documented loader ceiling)', () => {
+    for (const preference of ['economy', 'quality', 'axis'] as const) {
+      expect(resolveConfig({ routing: { preference } }).routing.preferenceSource).toBe('explicit')
+      expect(resolveConfig(loaded({ routing: { preference } }).value).routing.preferenceSource).toBe('explicit')
+    }
+    // Absent is the default source.
+    expect(resolveConfig({}).routing.preferenceSource).toBe('default')
+    // A preference WRITTEN as exactly the shipped default is indistinguishable
+    // from an absent one on the loader path, so it counts as 'default' on BOTH
+    // paths — the same doctrine modeIsExplicit follows for role modes.
+    expect(resolveConfig({ routing: { preference: 'balanced' } }).routing.preferenceSource).toBe('default')
+    expect(resolveConfig(loaded({ routing: { preference: 'balanced' } }).value).routing.preferenceSource).toBe('default')
+  })
+
+  it('orderingAxisDefault promotes the effective preference to axis ONLY on the default source — never overriding an explicit preference', () => {
+    // Absent preference + opt-in: axis, recorded as the default source.
+    const promoted = resolveConfig({ routing: { orderingAxisDefault: true } }).routing
+    expect(promoted.preference).toBe('axis')
+    expect(promoted.preferenceSource).toBe('default')
+    // Loader path agrees byte-for-byte (the deep-equality doctrine).
+    const promotedLoader = resolveConfig(loaded({ routing: { orderingAxisDefault: true } }).value).routing
+    expect(promotedLoader.preference).toBe('axis')
+    expect(promotedLoader.preferenceSource).toBe('default')
+    // Written 'balanced' + opt-in: the loader ceiling applies — the write is
+    // indistinguishable from absent, so the promotion fires (documented).
+    expect(resolveConfig({ routing: { preference: 'balanced', orderingAxisDefault: true } }).routing.preference).toBe('axis')
+    // An explicit preference is NEVER overridden.
+    const explicit = resolveConfig({ routing: { preference: 'economy', orderingAxisDefault: true } }).routing
+    expect(explicit.preference).toBe('economy')
+    expect(explicit.preferenceSource).toBe('explicit')
+    // Default off: no promotion.
+    expect(resolveConfig({}).routing.preference).toBe('balanced')
+    expect(resolveConfig({ routing: { orderingAxisDefault: false } }).routing.preference).toBe('balanced')
+    // Fail-closed on a malformed leaf on the plain path (the schema rejects
+    // non-booleans on the loader path before resolveConfig sees them).
+    expect(() => resolveConfig({ routing: { orderingAxisDefault: 'yes' as never } })).toThrow(/orderingAxisDefault/)
   })
 
   it('THROWS on locked mode with no lock route — on BOTH paths (fail-closed, never auto-route while claiming locked)', () => {

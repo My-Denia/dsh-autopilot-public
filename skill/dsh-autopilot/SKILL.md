@@ -23,6 +23,7 @@ rules. It deliberately does not restate them.
 | --- | --- |
 | [references/governance-invariants.md](references/governance-invariants.md) | risk and audit shape, the audit invariants, evidence sufficiency, sizing, delegation, state, closeout |
 | [references/refusals.md](references/refusals.md) | every `AP_*` refusal: what it requires in advance, and the remedy |
+| [references/model-routing.md](references/model-routing.md) | the model-routing contract: authority order, sufficiency thresholds vs ranking axes, the owner's ladder, work classes, both coverage metrics, and the recorded boundaries |
 | `docs/reference.md` (in the package, not the installed skill) | the full tool protocol, phases and run state |
 
 Read `references/governance-invariants.md` before dispatching any audit. Read
@@ -177,6 +178,29 @@ nested `pwsh`/`bash` dispatch is gated at its own call regardless.
 because a PTY is one Enter away from executing them. A read-only command
 refused that way is the over-inclusion recorded in DESIGN.md §6 — say so and
 move on; do not reshape the command to slip past it.
+
+### Unattended egress (governance.unattended)
+
+When the deployment sets `governance.unattended: true`, a validated egress does
+NOT ask — an ask pends forever when nobody is present to answer. It returns an
+immediate, visible, recoverable DENY instead. Handle it this way:
+
+- The refusal names the command and target, states the manifest stands (it is
+  NOT spent), and gives the recovery path. Record it with `autopilot_log`
+  (stance: `escalate`) so the refusal is visible in the run log and
+  `autopilot_status` (`enforcement.egressDecisions`).
+- The recovery path: the owner grants `autopilot_signal action=owner-approve`
+  with a target naming this egress, then the command is retried; the pending
+  approval is consumed automatically. Do not re-author the manifest — it still
+  stands.
+- When genuinely blocked on an owner-only boundary, pause visibly with
+  `autopilot_signal action=owner-decision`. Never busy-retry a call that pends
+  on an absent owner.
+- Continue every other authorized, non-egress milestone; an egress refusal
+  never halts the whole run.
+
+This policy never auto-approves anything. It only makes the refusal explicit
+and recoverable instead of an invisible, indefinite wait.
 
 ## Installing this skill
 

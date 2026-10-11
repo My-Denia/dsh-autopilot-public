@@ -238,10 +238,17 @@ export function installRootTools(
       description: 'Read the autopilot run status: phase, gates, required audit roles with latest verdicts, replan budget, enforcement state.',
       parameters: {},
       output: jsonOutput(JSON_VALUE),
-      execute(_args, exec) {
+      async execute(_args, exec) {
         const agent = callingAgent(exec.agent, 'autopilot_status')
+        // M7b: refresh the work-class report from the LIVE routing config and a
+        // current catalog snapshot before projecting, so the status a reader
+        // sees describes the ladder in force now. The report used to be written
+        // only by a FRESH selection, so a pin reuse served a pre-edit value.
+        // The refresh never throws; a failed catalog read leaves the last
+        // observed report standing.
+        await engine.refreshReachability()
         const view = engine.status(agent)
-        return Promise.resolve((view ?? { initialized: false, note: 'no autopilot run on this session' }) as never)
+        return (view ?? { initialized: false, note: 'no autopilot run on this session' }) as never
       },
     }))
 

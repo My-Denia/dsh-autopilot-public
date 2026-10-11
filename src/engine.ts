@@ -37,6 +37,7 @@ import type {
   Risk,
   Closeout,
   EgressChannel,
+  EgressDecision,
   Enforcement,
   ExecutorRecord,
   LogEntry,
@@ -64,9 +65,13 @@ import type { Role, RoleRouting, RoutePreference, SelectedRoute, SelectionDecisi
 import { resolvePluginGrant } from './routing/authorize.js'
 import type { GrantSource, SessionPolicyState } from './routing/authorize.js'
 import { RouteCatalog, providerIsLive } from './routing/catalog.js'
+import type { CatalogSnapshot } from './routing/catalog.js'
+import { workClassReachability, type WorkClassReachabilityReport } from './routing/coverage.js'
 import type { LlmCallConfig } from './routing/catalog.js'
 import { independenceOf, sameRoute, toRoutePin } from './routing/identity.js'
 import type { RoutePin } from './routing/identity.js'
+import { DEFAULT_ROLE_WORK_CLASS, DEFAULT_WORK_CLASSES, resolveWorkClassSelection } from './routing/work-class.js'
+import type { ResolvedWorkClass, WorkClassName } from './routing/work-class.js'
 
 // ── Structural platform types (subset of dsh surfaces the engine touches) ──
 
@@ -227,6 +232,13 @@ export interface ResolvedCostOverride {
 export interface ResolvedLadder {
   readonly tiers: Readonly<Record<'economy' | 'standard' | 'reserve', readonly string[]>>
   readonly auditTier: 'economy' | 'standard' | 'reserve' | 'none'
+  /**
+   * A4 (DESIGN §9-15): owner opt-in to engine-level re-selection for AUDITOR
+   * roles. Default off — the shipped pin-stability semantics are unchanged;
+   * a healthy pin is re-selected only when the owner wrote `true`, and the
+   * executor role never rotates this way (known limitation, recorded).
+   */
+  readonly rotation: boolean
   /** Owner-declared speed order, earliest = faster. Empty means speed is UNKNOWN. */
   readonly speedOrder: readonly string[]
   readonly costOverrides: readonly ResolvedCostOverride[]
@@ -234,7 +246,22 @@ export interface ResolvedLadder {
 
 export interface ResolvedRouting {
   readonly mode: 'auto' | 'off'
+  /** The EFFECTIVE preference (see `preferenceSource`): what selections actually rank by. */
   readonly preference: RoutePreference
+  /**
+   * Whether the effective preference came from an explicit owner write or the
+   * shipped default. A2 (DESIGN section 9 item 13): the explicitness ceiling of
+   * the config loader applies — schemastery fills the declared default before
+   * `apply()` sees the value, so a preference WRITTEN as exactly the default
+   * ('balanced') is indistinguishable from an absent one and deliberately
+   * counts as 'default' on BOTH config paths (the same doctrine
+   * `modeIsExplicit` follows for role modes; the loader/plain deep-equality
+   * fixture requires one answer). Only a non-'balanced' value proves a write.
+   * 'default' is also the source when `routing.orderingAxisDefault` promoted
+   * the effective preference to 'axis' — the owner opted into the promotion,
+   * not into 'axis' itself.
+   */
+  readonly preferenceSource: 'explicit' | 'default'
   /** Every role is always present, resolved to its effective routing. */
   readonly roles: Readonly<Record<Role, RoleRouting>>
   /**
@@ -242,6 +269,14 @@ export interface ResolvedRouting {
    * so a consumer never has to distinguish "no ladder" from "an empty one".
    */
   readonly ladder: ResolvedLadder
+  /**
+   * The five work classes (DESIGN §1.2; §9 items 13/14), resolved. Fixed
+   * names for the same schemastery reason as the ladder tier names; the
+   * owner-table mapping/axis are the declared defaults, overridable per
+   * class through `routing.workClasses.<name>`. Present on every resolved
+   * routing — an owner who never wrote a class gets the owner table verbatim.
+   */
+  readonly workClasses: Readonly<Record<WorkClassName, ResolvedWorkClass>>
 }
 
 /** Resolved plugin configuration. */
@@ -275,6 +310,12 @@ export interface ResolvedConfig {
    */
   readonly governance?: {
     readonly maxAuditRoundsPerRole?: number
+    /**
+     * Unattended approval policy (default off). When on, a validated egress
+     * returns an immediate, visible, recoverable DENY instead of an owner ask
+     * (which pends forever with nobody to answer). Never auto-approves.
+     */
+    readonly unattended?: boolean
   }
 }
 
@@ -749,6 +790,7 @@ function routingActive(routing: ResolvedRouting, role: Role): boolean {
 const EMPTY_LADDER: ResolvedLadder = {
   tiers: { economy: [], standard: [], reserve: [] },
   auditTier: 'none',
+  rotation: false,
   speedOrder: [],
   costOverrides: [],
 }
@@ -788,7 +830,9 @@ function routingAxisInput(ladder: ResolvedLadder): {
 const REFUSED_ROUTING: ResolvedRouting = {
   mode: 'off',
   preference: 'balanced',
+  preferenceSource: 'default',
   ladder: EMPTY_LADDER,
+  workClasses: DEFAULT_WORK_CLASSES,
   roles: {
     executor: { mode: 'inherit' },
     planner: { mode: 'inherit' },
@@ -1233,6 +1277,15 @@ export interface StatusView {
    * here.)
    */
   readonly plannerRouting?: PlannerRoutingRecord
+  /**
+   * M3 (DESIGN §9-14/16): work-class reachability over the live catalog —
+   * per observed model, whether at least one tier-bound work class's member
+   * set includes it. Present exactly after THIS run read a catalog snapshot
+   * for a routing decision (the report is computed from that same read);
+   * absent before, and never fabricated. `'reachable'` is the only outcome
+   * that claims anything.
+   */
+  readonly routingReachability?: WorkClassReachabilityReport
   readonly diagnostic?: string
 }
 
@@ -1494,6 +1547,16 @@ export class AutopilotEngine {
    * cleared whenever the planning window closes without one.
    */
   private readonly plannerReloadStamps = new Set<RunId>()
+  /**
+   * M3 (DESIGN §9-14/16): the last work-class reachability report THIS run
+   * actually produced, computed from the SAME cached catalog snapshot the
+   * run's routing decisions read. Engine-local on purpose: the report is a
+   * live-facts view, not durable run state — a restart simply has no report
+   * until the next routed dispatch recomputes one, and StatusView projects
+   * NOTHING while the map has no entry (the absent field is the honest
+   * record of "never observed").
+   */
+  private readonly reachabilityReports = new Map<RunId, WorkClassReachabilityReport>()
 
   constructor(
     private readonly agents: AgentsRef,
@@ -1529,7 +1592,17 @@ export class AutopilotEngine {
      * live routing, byte-identical to the previous behavior.
      */
     private readonly routingSource: (() => ResolvedRouting) | undefined = undefined,
-  ) {}
+  ) {
+    // M7b: keep the catalog port where the engine can ALSO read it on the
+    // status path (`refreshReachability`), not just inside `selectForRole`.
+    this.catalog = routingPorts.catalog
+  }
+
+  /**
+   * M7b: the catalog port, kept for `refreshReachability`. Same value the
+   * routing core receives through `routingPorts.catalog`.
+   */
+  private readonly catalog: RouteCatalog | undefined
 
   /**
    * Dispose: abort new work, then WAIT (bounded) for in-flight transactions to
@@ -1643,6 +1716,52 @@ export class AutopilotEngine {
     const snapshot = this.current(root.id)
     if (snapshot === undefined) return undefined
     return this.projectStatus(snapshot)
+  }
+
+  /**
+   * M7b: refresh every materialized run's work-class reachability report from
+   * the CURRENT routing config and a current catalog snapshot, then return.
+   *
+   * `status()` stays synchronous and pure; the status READER awaits this first
+   * (see `autopilot_status` in `./tools.ts`), so the report a reader projects
+   * describes the routing section in force NOW rather than the ladder some
+   * earlier FRESH selection happened to run under. That distribution was the
+   * predecessor M7 defect: `reachabilityReports` had exactly one writer, inside
+   * `selectForRole`, and a healthy-pin REUSE never reaches that method, so after
+   * a config edit the StatusView served the pre-edit value while the onboarding
+   * section — reading the same shared `volatileRoutingAccess` closure — already
+   * reported the new ladder.
+   *
+   * Never throws. An absent catalog is the documented 0.2.0-parity path; a
+   * catalog read that fails leaves the last observed report standing (a failed
+   * read is not evidence of reachability); a live routing section that no longer
+   * resolves leaves the report absent rather than fabricating one.
+   */
+  async refreshReachability(): Promise<void> {
+    const catalog = this.catalog
+    if (catalog === undefined) return
+    let snapshot: CatalogSnapshot
+    try {
+      snapshot = await catalog.snapshot()
+    } catch {
+      return
+    }
+    const live = this.routingConfig()
+    // A live section that no longer resolves is the refusal path; the report is
+    // left as it was rather than replaced by a claim about an invalid config.
+    if (live.refused !== undefined) return
+    for (const runId of [...this.cache.keys()]) {
+      this.reachabilityReports.set(runId, workClassReachability(
+        {
+          catalogStatus: snapshot.catalogStatus,
+          models: snapshot.listedModels,
+          failedProviders: [...snapshot.providerErrors.keys()],
+        },
+        { tiers: live.routing.ladder.tiers },
+        live.routing.workClasses,
+        live.routing.ladder.auditTier,
+      ))
+    }
   }
 
   async submitPlan(caller: AgentRef, text: string): Promise<Snapshot> {
@@ -1862,6 +1981,13 @@ export class AutopilotEngine {
         toolDiagnostic = dispatched.resolution.diagnostic
 
         // Plan audits transition to plan-reviewing before awaiting the verdict.
+        // The pre-dispatch phase is captured HERE because the verdict path below
+        // can refuse the audit AFTER this transition lands (no structured
+        // verdict, an illegal verdict string, or the findings contract) — and
+        // without a recovery those refusals left the run in plan-reviewing,
+        // where assertAuditPhase refuses every further plan audit (the
+        // plan-reviewing wedge, reproduced twice on the real host).
+        const preDispatchPhase = prior.phase
         let baseline = prior
         if (request.role === 'plan') {
           baseline = await this.commit(prior, 'audit', {
@@ -1876,58 +2002,94 @@ export class AutopilotEngine {
           executionRevision: baseline.executor?.executionRevision ?? 0,
         }
 
-        const result = await run.result
-        if (result.stopReason !== 'completed' || result.structured === undefined) {
-          throw new AutopilotError(
-            `${request.role} audit returned no structured verdict (stopReason ${result.stopReason}): ${result.diagnostic ?? 'missing structured output'}`,
-            'AP_AUDIT_NO_VERDICT',
+        try {
+          const result = await run.result
+          if (result.stopReason !== 'completed' || result.structured === undefined) {
+            throw new AutopilotError(
+              `${request.role} audit returned no structured verdict (stopReason ${result.stopReason}): ${result.diagnostic ?? 'missing structured output'}`,
+              'AP_AUDIT_NO_VERDICT',
+            )
+          }
+          const structured = result.structured as { verdict?: string; note?: string }
+          const legal = request.role === 'plan' ? PLAN_VERDICTS : EXECUTION_VERDICTS
+          if (structured.verdict === undefined || !legal.includes(structured.verdict)) {
+            throw new AutopilotError(`${request.role} audit returned invalid verdict: ${String(structured.verdict)}`, 'AP_AUDIT_INVALID_VERDICT')
+          }
+
+          // Staleness CAS: reject a verdict whose baseline moved. Execution-class
+          // audits additionally CAS on the executor's execution revision so a
+          // verdict about revision N can never gate revision N+1.
+          const live = this.require(root.id)
+          if (live.revision !== captured.runRevision || live.plan.revision !== captured.planRevision) {
+            throw new AutopilotError('stale audit result: run/plan revision advanced since the audit started', 'AP_STALE_AUDIT')
+          }
+          if (request.role !== 'plan'
+            && (live.executor?.executionRevision ?? 0) !== captured.executionRevision) {
+            throw new AutopilotError('stale execution audit result: execution revision advanced since the audit started', 'AP_STALE_AUDIT')
+          }
+
+          // The narrowing rides on the audit's own route record, so a reader of
+          // the durable stream can see that THIS verdict came from an auditor
+          // whose surface was reduced, and by what. `run.result` has settled by
+          // this point, so the observed leg (`request/header`) is read from the
+          // child session HERE — the latest header is the only proof of the
+          // request route (plan v3 M4; `Agent.options` prove creation only).
+          // Route status never gates the verdict below: it is provenance for the
+          // auditor's reader, including when it records a mismatch.
+          const route = withCrossFamily(
+            withToolDiagnostic(
+              captureRoute(run.id, provider, run.localAgent?.options, run.localAgent?.session, routingDetail),
+              toolDiagnostic,
+            ),
+            familyChoice,
           )
+          return await this.applyVerdict(root, live, {
+            role: request.role,
+            verdict: structured.verdict as Verdict,
+            note: structured.note ?? '',
+            auditorId: run.id,
+            route,
+            captured,
+            ...(routingDetail === undefined ? {} : { routing: routingDetail }),
+            ...(Array.isArray((structured as { findings?: unknown }).findings)
+              ? { findings: (structured as { findings: AuditFinding[] }).findings }
+              : {}),
+          })
+        } catch (error: unknown) {
+          // PLAN-AUDIT RECOVERY (the plan-reviewing wedge). A plan audit refused
+          // by the verdict path AFTER the plan-reviewing transition landed used
+          // to leave the run in plan-reviewing forever: assertAuditPhase admits
+          // plan audits only from planning/replanning, so the dispatcher could
+          // never re-issue. When the live state still equals the captured
+          // baseline (nothing moved while the auditor ran), commit a recovery
+          // event restoring the pre-dispatch phase so the plan can be
+          // re-audited. AP_STALE_AUDIT is deliberately EXCLUDED: the baseline
+          // moved, so restoring the old phase would rewind a revision the rest
+          // of the stream already built on — that refusal stays a plain error.
+          if (request.role === 'plan'
+            && error instanceof AutopilotError
+            && (error.code === 'AP_AUDIT_NO_VERDICT'
+              || error.code === 'AP_AUDIT_INVALID_VERDICT'
+              || error.code === 'AP_AUDIT_FINDINGS_INVALID')) {
+            const live = this.current(root.id)
+            if (live !== undefined
+              && live.revision === captured.runRevision
+              && live.plan.revision === captured.planRevision) {
+              await this.commit(live, 'audit', {
+                ...live,
+                revision: live.revision + 1,
+                phase: preDispatchPhase,
+                diagnostic: `plan audit rejected (${error.code}): ${error.message}`,
+              }, {
+                role: request.role,
+                auditorId: run.id,
+                stage: 'rejected',
+                error: { code: error.code, message: error.message },
+              })
+            }
+          }
+          throw error
         }
-        const structured = result.structured as { verdict?: string; note?: string }
-        const legal = request.role === 'plan' ? PLAN_VERDICTS : EXECUTION_VERDICTS
-        if (structured.verdict === undefined || !legal.includes(structured.verdict)) {
-          throw new AutopilotError(`${request.role} audit returned invalid verdict: ${String(structured.verdict)}`, 'AP_AUDIT_INVALID_VERDICT')
-        }
-
-        // Staleness CAS: reject a verdict whose baseline moved. Execution-class
-        // audits additionally CAS on the executor's execution revision so a
-        // verdict about revision N can never gate revision N+1.
-        const live = this.require(root.id)
-        if (live.revision !== captured.runRevision || live.plan.revision !== captured.planRevision) {
-          throw new AutopilotError('stale audit result: run/plan revision advanced since the audit started', 'AP_STALE_AUDIT')
-        }
-        if (request.role !== 'plan'
-          && (live.executor?.executionRevision ?? 0) !== captured.executionRevision) {
-          throw new AutopilotError('stale execution audit result: execution revision advanced since the audit started', 'AP_STALE_AUDIT')
-        }
-
-        // The narrowing rides on the audit's own route record, so a reader of
-        // the durable stream can see that THIS verdict came from an auditor
-        // whose surface was reduced, and by what. `run.result` has settled by
-        // this point, so the observed leg (`request/header`) is read from the
-        // child session HERE — the latest header is the only proof of the
-        // request route (plan v3 M4; `Agent.options` prove creation only).
-        // Route status never gates the verdict below: it is provenance for the
-        // auditor's reader, including when it records a mismatch.
-        const route = withCrossFamily(
-          withToolDiagnostic(
-            captureRoute(run.id, provider, run.localAgent?.options, run.localAgent?.session, routingDetail),
-            toolDiagnostic,
-          ),
-          familyChoice,
-        )
-        return await this.applyVerdict(root, live, {
-          role: request.role,
-          verdict: structured.verdict as Verdict,
-          note: structured.note ?? '',
-          auditorId: run.id,
-          route,
-          captured,
-          ...(routingDetail === undefined ? {} : { routing: routingDetail }),
-          ...(Array.isArray((structured as { findings?: unknown }).findings)
-            ? { findings: (structured as { findings: AuditFinding[] }).findings }
-            : {}),
-        })
       } finally {
         if (run !== undefined) await run.dispose()
       }
@@ -2734,6 +2896,49 @@ export class AutopilotEngine {
         enforcement: { ...prior.enforcement, ownerApprovals: approvals },
       }, { seq: open.seq, command: command.slice(0, 500) })
       return open.seq
+    })
+  }
+
+  /**
+   * Record one egress ask/deny decision on the run (unattended-approval
+   * visibility, P1). The pre-execute seam calls this so the outcome is durable
+   * and readable from autopilot_status (`enforcement.egressDecisions`) and the
+   * event stream — an unattended run never sits on a silent pending ask, and a
+   * refused egress names its recovery path. Append-only; never gates anything.
+   * @returns the recorded decision's seq, or undefined when no run is bound.
+   */
+  async recordEgressOutcome(rootSessionId: string, decision: {
+    readonly outcome: 'asked' | 'denied-unattended'
+    readonly target: string
+    readonly commands: readonly string[]
+    readonly command: string
+    readonly manifestPath: string
+    readonly at: string
+    readonly recovery?: string
+  }): Promise<number | undefined> {
+    return this.transact(rootSessionId, async () => {
+      const prior = this.current(rootSessionId)
+      if (prior === undefined) return undefined
+      const entry: EgressDecision = {
+        seq: prior.enforcement.egressDecisions?.length ?? 0,
+        outcome: decision.outcome,
+        target: decision.target,
+        commands: [...decision.commands],
+        command: decision.command.slice(0, 500),
+        manifestPath: decision.manifestPath,
+        at: decision.at,
+        ...(decision.recovery === undefined ? {} : { recovery: decision.recovery }),
+      }
+      await this.commit(prior, 'log', {
+        ...prior,
+        revision: prior.revision + 1,
+        logCount: prior.logCount + 1,
+        enforcement: {
+          ...prior.enforcement,
+          egressDecisions: [...(prior.enforcement.egressDecisions ?? []), entry],
+        },
+      }, entry)
+      return entry.seq
     })
   }
 
@@ -3623,7 +3828,7 @@ export class AutopilotEngine {
     const routing = live.routing
     const roleRouting = routing.roles[role]
     const policy = this.readPolicy(root)
-    const catalog = this.routingPorts.catalog
+    const catalog = this.catalog
 
     if (role === 'planner') {
       // The planner IS the root agent (plan "Roles and routing"); it is routed
@@ -3755,6 +3960,32 @@ export class AutopilotEngine {
         if (dead === undefined) {
           dead = this.pinStillAuthorized(role, pinRoute, policy)
         }
+        // M4 (DESIGN §9-15, item 15): owner-opted engine-level rotation. A
+        // HEALTHY auditor pin yields to a full re-selection when
+        // `routing.ladder.rotation` is on — the SAME selectForRole path a
+        // first dispatch walks (authorization, preflight and audit
+        // independence all re-run; a rotation that blocks, e.g.
+        // AP_ROUTE_NO_REACHABLE_WORK_CLASS, escalates instead of keeping the
+        // pin). The rotation ordinal is derived from the run's own audit
+        // stream inside selectForRole (replay-safe, no mutable counter), and
+        // the selector applies the offset WITHIN the independence class — it
+        // can never rotate a candidate out of the independent group (§1.2:
+        // rotation does not override independence). AUDITOR roles only: the
+        // executor's stability weights higher than rotation, so engine-level
+        // executor rotation is a recorded known limitation, not a silent gap.
+        // Default off leaves the reuse semantics below untouched.
+        if (dead === undefined && routing.ladder.rotation && AUDITOR_ROLE_SET.includes(role)) {
+          const rotated = await this.selectForRole(role, routing.preference, routing.preferenceSource, roleRouting, prior, policy, catalog, routing.ladder, routing.workClasses)
+          return this.decorateRepinned(
+            this.resolutionOfDecision(role, roleRouting, rotated, undefined),
+            {
+              provider: pin.provider,
+              model: pin.model,
+              ...(pin.reasoningEffort === undefined ? {} : { reasoningEffort: pin.reasoningEffort }),
+            },
+            'rotation: routing.ladder.rotation is on — this auditor role re-selects instead of reusing its healthy pin (the pin was live, preflighted and authorized when this decision started)',
+          )
+        }
         if (dead === undefined) {
           // F9 (PR #2 Codex round 4): the reuse label's pool inference is
           // auditor-only, mirroring pinStillAuthorized. Persist/recover
@@ -3841,7 +4072,7 @@ export class AutopilotEngine {
             },
           }
         }
-        const reselected = await this.selectForRole(role, routing.preference, roleRouting, prior, policy, catalog, routing.ladder)
+        const reselected = await this.selectForRole(role, routing.preference, routing.preferenceSource, roleRouting, prior, policy, catalog, routing.ladder, routing.workClasses)
         core = this.decorateRepinned(
           this.resolutionOfDecision(role, roleRouting, reselected, undefined),
           {
@@ -3852,10 +4083,10 @@ export class AutopilotEngine {
           dead,
         )
       } else {
-        core = this.resolutionOfDecision(role, roleRouting, await this.selectForRole(role, routing.preference, roleRouting, prior, policy, catalog, routing.ladder), undefined)
+        core = this.resolutionOfDecision(role, roleRouting, await this.selectForRole(role, routing.preference, routing.preferenceSource, roleRouting, prior, policy, catalog, routing.ladder, routing.workClasses), undefined)
       }
     } else {
-      core = this.resolutionOfDecision(role, roleRouting, await this.selectForRole(role, routing.preference, roleRouting, prior, policy, catalog, routing.ladder), undefined)
+      core = this.resolutionOfDecision(role, roleRouting, await this.selectForRole(role, routing.preference, routing.preferenceSource, roleRouting, prior, policy, catalog, routing.ladder, routing.workClasses), undefined)
       // F16 (PR #2 Codex round 7): a locked dispatch is COMPOSED here
       // (lock route + riding legacy tuning — `lockedAgentOptions`), and the
       // composed object — not just the bare lock the selector validated — is
@@ -4231,13 +4462,66 @@ export class AutopilotEngine {
   private async selectForRole(
     role: Role,
     preference: RoutePreference,
+    preferenceSource: 'explicit' | 'default',
     roleRouting: RoleRouting,
     prior: Snapshot,
     policy: SessionPolicyState,
     catalog: RouteCatalog,
     ladder: ResolvedLadder,
+    workClasses: Readonly<Record<WorkClassName, ResolvedWorkClass>>,
   ): Promise<SelectionDecision> {
     const executorPin = AUDITOR_ROLE_SET.includes(role) ? this.executorPinOf(prior) : undefined
+    // WORK CLASS (DESIGN §1.2; §9 items 13/14): the class this auto-role
+    // dispatch draws from — the owner's per-role override, else the role
+    // default — resolved against the live ladder. `ladder.auditTier`, when
+    // set, is the owner's explicit override of the AUDIT class's tier
+    // mapping (auditor roles only; owner-explicit beats the seeded mapping,
+    // and the selector's why names it). Locked/inherit roles make no
+    // selection, so no class is computed for them.
+    const workClass =
+      roleRouting.mode === 'auto'
+        ? (() => {
+            const className = roleRouting.workClass ?? DEFAULT_ROLE_WORK_CLASS[role]
+            const resolved = workClasses[className]
+            const seeded = DEFAULT_WORK_CLASSES[className]
+            // Did the OWNER engage this class? A per-role assignment or a
+            // class definition differing from the owner-table default both
+            // count; with neither and an empty ladder the selection is
+            // recorded, not applied (0.2.0 parity — DESIGN §1.2).
+            const ownerOverridden =
+              roleRouting.workClass !== undefined ||
+              resolved.axis !== seeded.axis ||
+              resolved.tiers.length !== seeded.tiers.length ||
+              resolved.tiers.some((tier, index) => tier !== seeded.tiers[index])
+            return resolveWorkClassSelection(
+              workClasses,
+              ladder.tiers,
+              className,
+              AUDITOR_ROLE_SET.includes(role) ? ladder.auditTier : undefined,
+              ownerOverridden,
+            )
+          })()
+        : undefined
+    // M3 (DESIGN §9-14/16): refresh the run's work-class reachability report
+    // from the SAME cached catalog snapshot this decision is about to read
+    // (RouteCatalog caches per commit, so this is one read, not two). The
+    // auditTier override reaches the report exactly as it reaches the
+    // selector — the report must answer with the effective audit mapping,
+    // never the superseded seeded one.
+    const catalogSnapshot = await catalog.snapshot()
+    this.reachabilityReports.set(
+      prior.runId,
+      workClassReachability(
+        {
+          catalogStatus: catalogSnapshot.catalogStatus,
+          models: catalogSnapshot.listedModels,
+          failedProviders: [...catalogSnapshot.providerErrors.keys()],
+        },
+        { tiers: ladder.tiers },
+        workClasses,
+        ladder.auditTier,
+      ),
+    )
     // The rotation ordinal (owner coverage requirement): how many audit
     // records this role's mapped audit role already holds in the run's OWN
     // durable stream. Derived, never a mutable counter, so replay recomputes
@@ -4246,7 +4530,7 @@ export class AutopilotEngine {
     // own `routeRoleOf` is the INVERSE and is deliberately NOT used here.
     const auditRole = AUDIT_ROLE_OF_ROUTING_ROLE[role]
     const rotation = auditRole === undefined ? undefined : prior.audits.filter((record) => record.role === auditRole).length
-    return await selectRoute({
+    const decision = await selectRoute({
       role,
       risk: prior.triage.risk,
       // F2: the preference as read at THIS decision's start, passed down so a
@@ -4264,7 +4548,27 @@ export class AutopilotEngine {
       // the selector, so an owner override changes the selected route.
       ...routingAxisInput(ladder),
       ...(rotation === undefined ? {} : { rotation }),
+      ...(workClass === undefined ? {} : { workClass }),
+      // Mechanical entry is an EFFORT LICENSE (owner table: holders of a
+      // real `low` effort; `low` absent ⇒ disqualified) — a fail-closed
+      // sufficiency threshold, never a ranking axis.
+      ...(workClass?.name === 'mechanical' ? { requirements: { effortIds: ['low'] } } : {}),
     })
+    // A2 (DESIGN section 9 item 13): the one preference transition a record
+    // must never hide — the owner wrote no explicit preference and the
+    // `routing.orderingAxisDefault` opt-in promoted the effective preference
+    // to axis. Explicit preferences and the plain shipped default say what
+    // they are in the selector's own preference line; the promotion does not.
+    if (preferenceSource === 'default' && preference === 'axis' && 'why' in decision) {
+      return {
+        ...decision,
+        why: [
+          ...decision.why,
+          'preference source: default — no explicit routing.preference is detectable; routing.orderingAxisDefault promoted the effective preference to axis (an explicit preference would have been used verbatim)',
+        ],
+      }
+    }
+    return decision
   }
 
   /** Which config surface named a locked route, for the grant's `source` field. */
@@ -5148,6 +5452,10 @@ export class AutopilotEngine {
         return planner?.kind === 'armed' ? { plannerRouting: planner.record } : {}
       })(),
       ...(snapshot.diagnostic === undefined ? {} : { diagnostic: snapshot.diagnostic }),
+      ...((): { routingReachability?: WorkClassReachabilityReport } => {
+        const report = this.reachabilityReports.get(snapshot.runId)
+        return report === undefined ? {} : { routingReachability: report }
+      })(),
     }
   }
 }

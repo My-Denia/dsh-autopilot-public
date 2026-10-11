@@ -28,6 +28,8 @@
 
 import { AutopilotEngine } from './engine.js'
 import type { AgentOptionsLike, AgentRef, EnvironmentProbes, ResolvedConfig, ResolvedCostOverride, ResolvedLadder, ResolvedRouting, RoutingPorts } from './engine.js'
+import { observeOnboardingReachability, renderRoutingOnboarding } from './routing/onboarding.js'
+import type { WorkClassReachabilityReport } from './routing/coverage.js'
 import { installChildEgressGuard, installRootGate } from './gate/install.js'
 import type { GateAgentRef } from './gate/install.js'
 import { installPreExecuteGate } from './gate/preexecute.js'
@@ -47,6 +49,8 @@ import type { SkillPublicationResult, SkillRegistryLike } from './skill-register
 import type { SkillSyncResult } from './skill-install.js'
 import { DEFAULT_ROLE_MIN_CONTEXT } from './routing/select.js'
 import type { Role, RoleRouting, RoutePreference } from './routing/select.js'
+import { DEFAULT_WORK_CLASSES, WORK_CLASS_AXES, WORK_CLASS_NAMES } from './routing/work-class.js'
+import type { ResolvedWorkClass, WorkClassAxis, WorkClassName, WorkClassTier } from './routing/work-class.js'
 import { toRoutePin } from './routing/identity.js'
 import { RouteCatalog } from './routing/catalog.js'
 import type { LlmRuntimeSubset } from './routing/catalog.js'
@@ -105,6 +109,20 @@ export {
 export type { AutopilotWebRoute, EnforcementProjection, RunProjection, RunsBody } from './web.js'
 export { Config, DEFAULT_EXECUTOR_TOOLS, StoreKindSchema } from './config.js'
 export type { Role, RoleRouting, RoutePreference } from './routing/select.js'
+export { coverageReport, coverageRouteKey, workClassReachability } from './routing/coverage.js'
+export type {
+  CoverageCatalog,
+  CoverageLadder,
+  CoverageOutcome,
+  CoverageReport,
+  ModelReachability,
+  ReachabilityOutcome,
+  WorkClassReachabilityReport,
+} from './routing/coverage.js'
+export { DEFAULT_WORK_CLASSES, WORK_CLASS_AXES, WORK_CLASS_NAMES, resolveWorkClassSelection } from './routing/work-class.js'
+export type { ResolvedWorkClass, WorkClassAxis, WorkClassName, WorkClassSelection, WorkClassTier } from './routing/work-class.js'
+export { observeOnboardingReachability, renderRoutingOnboarding } from './routing/onboarding.js'
+export type { RoutingOnboardingInput } from './routing/onboarding.js'
 export type { ResolvedCostOverride, ResolvedLadder } from './engine.js'
 export {
   BUNDLED_SKILL_REFERENCES,
@@ -235,6 +253,15 @@ export interface ConfigInput {
    */
   readonly governance?: {
     readonly maxAuditRoundsPerRole?: number
+    /**
+     * Unattended approval policy (default off). When on, a validated egress
+     * returns an immediate, visible, recoverable DENY instead of an owner ask —
+     * an ask pends forever when nobody is present to answer. The manifest
+     * stands; the owner later grants `autopilot_signal owner-approve` and the
+     * call is retried. This never auto-approves anything; it only makes the
+     * refusal explicit and recoverable.
+     */
+    readonly unattended?: boolean
   }
 }
 
@@ -260,12 +287,39 @@ export interface RoleRoutingInput {
   readonly mode?: 'auto' | 'inherit' | 'locked'
   readonly lock?: RouteLockInput
   readonly minContext?: number
+  /**
+   * The work class this role draws from (DESIGN §1.2). Absent = the role
+   * default (`DEFAULT_ROLE_WORK_CLASS`: executor/planner `simple`, auditors
+   * `audit`). Written alongside a resolved locked/inherit role it is dropped,
+   * not honored — the same doctrine as `minContext`: those modes make no
+   * selection, so no class governs them.
+   */
+  readonly workClass?: WorkClassName
+}
+
+/** One work class as a profile may override it (`routing.workClasses.<name>`). */
+export interface WorkClassInput {
+  /** The ladder tiers this class draws members from. Empty = entry by the class's own thresholds (mechanical). */
+  readonly tiers?: readonly WorkClassTier[]
+  /** The dominant ordering axis of the class. */
+  readonly axis?: WorkClassAxis
 }
 
 /** The `routing` section as a profile may write it. */
 export interface RoutingInput {
   readonly mode?: 'auto' | 'off'
   readonly preference?: 'balanced' | 'economy' | 'quality' | 'axis'
+  /**
+   * A2 (DESIGN section 9 item 13): the owner opt-in that lets the ordering-axis
+   * path become the effective default. It applies ONLY when no explicit
+   * preference is detectable (`preferenceSource === 'default'` — see
+   * `resolveRouting` for why a written 'balanced' counts as default): an
+   * owner who never picked a preference gets 'axis' instead of the provisional
+   * 'balanced', while any explicit preference (including an explicit 'axis')
+   * is untouched. Shipped default `false` — the plugin never flips a
+   * deployment's ranking on its own.
+   */
+  readonly orderingAxisDefault?: boolean
   readonly roles?: {
     readonly executor?: RoleRoutingInput
     readonly planner?: RoleRoutingInput
@@ -280,8 +334,27 @@ export interface RoutingInput {
       readonly reserve?: readonly string[]
     }
     readonly auditTier?: 'economy' | 'standard' | 'reserve' | 'none'
+    /**
+     * Engine-level rotation for auditor roles (DESIGN §9-15). Volatile,
+     * default off: when true, a healthy auditor pin yields to a full
+     * re-selection at the role's next dispatch (repinFrom + reason rotation),
+     * offset within its independence class — never overriding independence.
+     */
+    readonly rotation?: boolean
     readonly speedOrder?: readonly string[]
     readonly costOverrides?: readonly string[]
+  }
+  /**
+   * Per-class overrides of the owner-table work classes (DESIGN §1.2). Class
+   * names are fixed paths (the same schemastery volatile constraint as the
+   * ladder tier names); a class absent here keeps the owner-table default.
+   */
+  readonly workClasses?: {
+    readonly mechanical?: WorkClassInput
+    readonly simple?: WorkClassInput
+    readonly hard?: WorkClassInput
+    readonly audit?: WorkClassInput
+    readonly extreme?: WorkClassInput
   }
 }
 
@@ -505,14 +578,41 @@ function legacyRouteFor(role: Role, input?: ConfigInput): { provider: string; mo
  * the floor governs auto selections only (a locked route is an explicit
  * owner selection and an inherited dispatch runs on the deployment default).
  */
+/**
+ * Whether this host exposes a config-edit surface the root agent may use to
+ * fix the routing ladder itself (DESIGN §9 item 12): the plan's
+ * `ctx.configEditor.edit()` / `ctx.settings.edit()` surfaces, probed
+ * structurally. A host without either (the desktop host this run targets
+ * included) takes the owner-edit degrade path in the onboarding text.
+ */
+function probeConfigEditor(rawCtx: unknown): boolean {
+  const hasEdit = (service: unknown) => typeof (service as { edit?: unknown } | undefined)?.edit === 'function'
+  return hasEdit(lookupService(rawCtx, 'configEditor')) || hasEdit(lookupService(rawCtx, 'settings'))
+}
+
 function resolveRouting(input?: ConfigInput): ResolvedRouting {
   const routing = input?.routing
   const mode = readSetting(routing?.mode) ?? 'auto'
-  const preference = readSetting(routing?.preference) ?? 'balanced'
+  const writtenPreference = readSetting(routing?.preference)
+  const preference = writtenPreference ?? 'balanced'
   if (mode !== 'auto' && mode !== 'off') throw new Error(`routing.mode must be 'auto' or 'off' (got ${JSON.stringify(mode)})`)
   if (preference !== 'balanced' && preference !== 'economy' && preference !== 'quality' && preference !== 'axis') {
     throw new Error(`routing.preference must be 'balanced', 'economy', 'quality' or 'axis' (got ${JSON.stringify(preference)})`)
   }
+  // A2 (DESIGN section 9 item 13): explicit-vs-default preference. The ceiling
+  // documented above applies verbatim — a preference WRITTEN as exactly the
+  // default is indistinguishable from an absent one on the loader path, so
+  // only a non-'balanced' value counts as explicit, on BOTH paths (the
+  // deep-equality fixture forbids path-dependent answers). The axis promotion
+  // fires only on the default source AND the owner's explicit opt-in leaf:
+  // the plugin never re-ranks a deployment that did not ask for it.
+  const preferenceSource: 'explicit' | 'default' =
+    writtenPreference !== undefined && writtenPreference !== 'balanced' ? 'explicit' : 'default'
+  const axisDefault = readSetting(routing?.orderingAxisDefault) ?? false
+  if (typeof axisDefault !== 'boolean') {
+    throw new Error(`routing.orderingAxisDefault must be a boolean (got ${JSON.stringify(axisDefault)})`)
+  }
+  const effectivePreference = preferenceSource === 'explicit' ? preference : (axisDefault ? 'axis' : preference)
   const roles = {} as Record<Role, RoleRouting>
   for (const key of ROLE_CONFIG_KEYS) {
     const role = ROLE_OF[key]
@@ -520,6 +620,10 @@ function resolveRouting(input?: ConfigInput): ResolvedRouting {
     const entryMode = readSetting(entry?.mode)
     const lockRoute = lockRouteOf(readSetting(entry?.lock))
     const minContext = readSetting(entry?.minContext)
+    const workClass = readSetting(entry?.workClass)
+    if (workClass !== undefined && !WORK_CLASS_NAMES.includes(workClass as WorkClassName)) {
+      throw new Error(`routing.roles.${key}.workClass must be one of ${WORK_CLASS_NAMES.join(' | ')} (got ${JSON.stringify(workClass)})`)
+    }
     const modeIsExplicit = entryMode !== undefined && entryMode !== DEFAULT_ROLE_MODE[role]
     if (entryMode === 'locked' && lockRoute === undefined) {
       throw new Error(`routing.roles.${key}.mode is "locked" but lock names no provider/model route — refusing to guess a route`)
@@ -544,9 +648,50 @@ function resolveRouting(input?: ConfigInput): ResolvedRouting {
       roles[role] = { mode: 'locked', ...legacy }
       continue
     }
-    roles[role] = { mode: 'auto', minContext: minContext ?? DEFAULT_ROLE_MIN_CONTEXT[role] }
+    roles[role] = {
+      mode: 'auto',
+      minContext: minContext ?? DEFAULT_ROLE_MIN_CONTEXT[role],
+      ...(workClass === undefined ? {} : { workClass: workClass as WorkClassName }),
+    }
   }
-  return { mode, preference, roles, ladder: resolveLadder(input) }
+  return { mode, preference: effectivePreference, preferenceSource, roles, ladder: resolveLadder(input), workClasses: resolveWorkClasses(input) }
+}
+
+/**
+ * Resolve the five work classes (DESIGN §1.2). Owner values win per class; a
+ * silent class keeps the owner-table default. A malformed tier or axis is
+ * REFUSED with its path, never dropped — a silently ignored class override
+ * would leave the owner believing a dispatch draws from tiers it does not.
+ */
+function resolveWorkClasses(input?: ConfigInput): Readonly<Record<WorkClassName, ResolvedWorkClass>> {
+  const raw = input?.routing?.workClasses
+  const out = {} as Record<WorkClassName, ResolvedWorkClass>
+  for (const name of WORK_CLASS_NAMES) {
+    const defaults = DEFAULT_WORK_CLASSES[name]
+    const entry = readSetting(raw?.[name])
+    const rawTiers = readSetting(entry?.tiers)
+    let tiers: readonly WorkClassTier[] = defaults.tiers
+    if (rawTiers !== undefined) {
+      if (!Array.isArray(rawTiers)) {
+        throw new Error(`routing.workClasses.${name}.tiers must be an array of 'economy' | 'standard' | 'reserve'`)
+      }
+      const seen: WorkClassTier[] = []
+      for (const tier of rawTiers) {
+        const value = readSetting(tier)
+        if (value !== 'economy' && value !== 'standard' && value !== 'reserve') {
+          throw new Error(`routing.workClasses.${name}.tiers entry must be 'economy', 'standard' or 'reserve' (got ${JSON.stringify(value)})`)
+        }
+        if (!seen.includes(value)) seen.push(value)
+      }
+      tiers = seen
+    }
+    const axis = readSetting(entry?.axis) ?? defaults.axis
+    if (!WORK_CLASS_AXES.includes(axis as WorkClassAxis)) {
+      throw new Error(`routing.workClasses.${name}.axis must be one of ${WORK_CLASS_AXES.join(' | ')} (got ${JSON.stringify(axis)})`)
+    }
+    out[name] = { name, tiers, axis: axis as WorkClassAxis }
+  }
+  return out
 }
 
 /** `provider/model=inputPerM/outputPerM`. Anything else is refused, never ignored. */
@@ -593,6 +738,7 @@ function resolveLadder(input?: ConfigInput): ResolvedLadder {
       reserve: ladderList(readSetting(tiers?.reserve)),
     },
     auditTier: auditTier ?? 'none',
+    rotation: readSetting(raw?.rotation) === true,
     speedOrder: ladderList(readSetting(raw?.speedOrder)),
     costOverrides: ladderList(readSetting(raw?.costOverrides)).map(parseCostOverride),
   }
@@ -627,11 +773,15 @@ export function resolveConfig(input?: ConfigInput): ResolvedConfig {
     skillInstall: input?.skillInstall ?? 'auto',
     // Mirrors the loader path field-for-field: an unset governance section
     // resolves to an EMPTY object on both paths (the engine reads
-    // governance?.maxAuditRoundsPerRole and treats absent as off).
+    // governance?.maxAuditRoundsPerRole / governance?.unattended and treats
+    // absent as off).
     governance: {
       ...(input?.governance?.maxAuditRoundsPerRole === undefined
         ? {}
         : { maxAuditRoundsPerRole: input.governance.maxAuditRoundsPerRole }),
+      ...(input?.governance?.unattended === undefined
+        ? {}
+        : { unattended: input.governance.unattended }),
     },
   }
 }
@@ -1022,6 +1172,14 @@ export interface RoutingWiring {
    * semantics — the port simply appears when the import lands.
    */
   readonly installerReady: Promise<void>
+  /**
+   * The session policy KIND for one agent's session, read through the SAME
+   * reader the engine authorizes with. The M5 onboarding notice needs it:
+   * `absent`/`unreachable` means the ladder selects nothing in this session,
+   * and a notice about unreachable models that stayed silent about that would
+   * read as if autonomous selection were live.
+   */
+  readonly policyStateFor: (root: { session: unknown }) => SessionPolicyState['kind']
   /** Releases the mirror projection registration and the adapters-updated subscription. */
   dispose: () => void
 }
@@ -1167,6 +1325,12 @@ export function createRoutingWiring(rawCtx: unknown, onWarn: (message: string) =
   return {
     ports,
     installerReady,
+    /**
+     * The rendering session's policy KIND, for the M5 onboarding notice: the
+     * same reader the engine authorizes with, so the notice and the dispatch
+     * can never disagree about whether this session can select at all.
+     */
+    policyStateFor: (root: { session: unknown }): SessionPolicyState['kind'] => policyReader(root as AgentRef).kind,
     dispose: () => {
       for (const dispose of disposers.splice(0).reverse()) {
         try {
@@ -1531,6 +1695,10 @@ export async function apply(rawCtx: unknown, config?: ConfigInput): Promise<() =
   // host-surface registrations behind, and every retry would stack another
   // stale listener; the failure path holds its own reference and disposes it.
   let wiringForFailure: RoutingWiring | undefined
+  // Mirror of wiringForFailure for the M5 onboarding subscription: a mount
+  // that fails AFTER subscribing must release it, or a remount stacks a
+  // second `llm/adapters-updated` listener (the F19 doctrine).
+  let onboardingRefreshForFailure: (() => void) | undefined
   try {
     // Seam installation is PER ROOT AGENT, so the record of it is too: one
     // root's `tools/pre-execute` registration can succeed while another's
@@ -1563,6 +1731,9 @@ export async function apply(rawCtx: unknown, config?: ConfigInput): Promise<() =
     // unresolvable module keeps the port honestly `undefined`), hence this
     // await cannot unwind the mount.
     await routing.installerReady
+    // Hoisted so the M5 onboarding section below reads the SAME live routing
+    // the engine re-resolves per decision (volatile leaves, HMR applies).
+    const liveRouting = volatileRoutingAccess(config)
     const engine = new AutopilotEngine(
       ctx.agents as never,
       ctx.subagents as never,
@@ -1575,7 +1746,7 @@ export async function apply(rawCtx: unknown, config?: ConfigInput): Promise<() =
       // exactly when the routing leaves arrived as volatile references (the
       // Cordis loader path); `undefined` on the plain path, whose
       // `config.routing` snapshot is therefore still the live truth.
-      volatileRoutingAccess(config),
+      liveRouting,
     )
 
     // ── Policy prompt section (zero tokens without a run) ──────────────────
@@ -1588,13 +1759,64 @@ export async function apply(rawCtx: unknown, config?: ConfigInput): Promise<() =
         const parentId = agent.session.header.parentSession
         if (parentId === undefined) {
           const snapshot = engine.peek(agent.id)
-          return snapshot === undefined ? '' : renderRootPolicy(snapshot)
+          return snapshot === undefined ? '' : renderRootPolicy(snapshot, engine.config.governance?.unattended === true)
         }
         const parentRun = engine.peek(parentId)
         if (parentRun?.executor?.childId === agent.id && parentRun.executor.state !== 'revoked') {
           return renderExecutorPolicy(parentRun)
         }
         return ''
+      },
+    })
+
+    // ── Routing onboarding section (M5, DESIGN §9 item 12) ────────────────
+    // Zero tokens unless the LIVE catalog lists models no tier-bound work
+    // class can reach; the notice derives from the same work-class
+    // reachability metric the engine surfaces (one truth, coverage.ts). The
+    // report is cached at mount and on `llm/adapters-updated`, and
+    // revalidated stale-by-one when a rendered notice fires — a config fix
+    // clears the section on the NEXT prompt assembly (the sync renderer
+    // cannot await a catalog read).
+    let onboardingReport: WorkClassReachabilityReport | undefined
+    const refreshOnboarding = (): void => {
+      const catalog = routing.ports.catalog
+      if (catalog === undefined) {
+        onboardingReport = undefined
+        return
+      }
+      const current = liveRouting?.() ?? resolved.routing
+      void observeOnboardingReachability(catalog, current.ladder, current.workClasses)
+        .then((report) => { onboardingReport = report })
+    }
+    refreshOnboarding()
+    let disposeOnboardingRefresh: () => void = () => {}
+    try {
+      disposeOnboardingRefresh =
+        (rawCtx as { on?: (event: string, listener: () => void) => () => void }).on?.('llm/adapters-updated', () => {
+          refreshOnboarding()
+        }) ?? (() => {})
+      onboardingRefreshForFailure = disposeOnboardingRefresh
+    } catch {
+      // A host that cannot be subscribed keeps the mount-time reading only.
+    }
+    const disposeOnboardingSection = ctx.systemPrompt.section({
+      name: 'autopilot:routing-onboarding',
+      order: 61,
+      text: (context) => {
+        const agent = context.agent
+        if (agent === undefined) return ''
+        if (agent.session.header.parentSession !== undefined) return ''
+        const current = liveRouting?.() ?? resolved.routing
+        const text = renderRoutingOnboarding({
+          mode: current.mode,
+          report: onboardingReport,
+          configEditorAvailable: probeConfigEditor(rawCtx),
+          // The same reader the engine authorizes with, for THIS rendering
+          // agent: a policy-less session selects nothing, and the notice says so.
+          policyState: routing.policyStateFor({ session: agent.session } as AgentRef),
+        })
+        if (text !== '') refreshOnboarding()
+        return text
       },
     })
 
@@ -1785,6 +2007,8 @@ export async function apply(rawCtx: unknown, config?: ConfigInput): Promise<() =
 
     return async () => {
       disposeSection()
+      disposeOnboardingSection()
+      disposeOnboardingRefresh()
       registration.dispose()
       disposeRoutes()
       routing.dispose()
@@ -1810,6 +2034,7 @@ export async function apply(rawCtx: unknown, config?: ConfigInput): Promise<() =
     // that caused the unwind.
     try {
       wiringForFailure?.dispose()
+      onboardingRefreshForFailure?.()
     } catch {
       // A wiring teardown failure must not mask the original error.
     }

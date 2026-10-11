@@ -560,6 +560,32 @@ export interface OwnerApproval {
 }
 
 /**
+ * One egress ask/deny decision recorded on the run (unattended-approval
+ * visibility, P1). The pre-execute seam decides whether an egress may proceed;
+ * this record makes the outcome durable and readable from autopilot_status and
+ * the event stream, so an unattended run never sits on a silent pending ask.
+ * `outcome` is 'denied-unattended' when governance.unattended turned a
+ * validated egress into an immediate, recoverable deny; 'asked' when the
+ * owner-facing ask was issued (the run is waiting on an owner answer).
+ */
+export interface EgressDecision {
+  readonly seq: number
+  readonly outcome: 'asked' | 'denied-unattended'
+  /** The manifest target (e.g. the remote/ref pair). */
+  readonly target: string
+  /** The command class(es) the manifest declares. */
+  readonly commands: readonly string[]
+  /** The command text that was refused/asked (truncated). */
+  readonly command: string
+  /** The manifest path that authorized (or failed to authorize) the egress. */
+  readonly manifestPath: string
+  /** ISO timestamp of the decision. */
+  readonly at: string
+  /** For a deny: the recovery path the owner follows to authorize and retry. */
+  readonly recovery?: string
+}
+
+/**
  * Usage-evidence class (CC schema-9 dimension). The harness verifies that code
  * builds and passes tests; it never verified that a user-visible change was
  * OPERATED by anyone. `undeclared` is the entry state and blocks the plan gate.
@@ -951,6 +977,12 @@ export interface Enforcement {
   readonly service?: 'registered' | 'unavailable'
   /** Outbound manifests consumed (archived) by this run. */
   readonly outboundConsumed?: number
+  /**
+   * Egress ask/deny decisions recorded by the pre-execute seam (unattended
+   * visibility). Append-only; the latest entry is what the run is waiting on
+   * or was refused. ABSENT on streams written before this field existed.
+   */
+  readonly egressDecisions?: readonly EgressDecision[]
   readonly diagnostic?: string
 }
 

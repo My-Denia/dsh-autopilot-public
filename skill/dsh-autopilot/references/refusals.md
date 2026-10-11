@@ -192,12 +192,13 @@ Requires:
 - `routingPins` equal `applyRoutingDecision(prior.routingPins, detail.routing)` on a dispatch op, and do not change on any other op (replay).
 - A routing detail agrees with the audit or executor record the same commit appends: one dispatch, one role, one route (replay).
 - Routing that cannot resolve on the write path pauses the run: it commits a `set-owner-decision` and refuses the dispatch.
+- A work class with ZERO reachable routes on a configured ladder refuses the dispatch on the write path: the selection blocks with `AP_ROUTE_NO_REACHABLE_WORK_CLASS` in its reason and the run pauses through the routing-escalation path. An empty ladder restricts nothing (the shipped default); the error fires only when the owner configured a ladder and the class's mapped tiers leave no authorized live route.
 
-Why: a pin authorizes one route and must dispatch that same route. A fabricated or contradictory decision is a hand-edited or foreign stream and is rejected loudly.
+Why: a pin authorizes one route and must dispatch that same route. A fabricated or contradictory decision is a hand-edited or foreign stream and is rejected loudly. And a work class that can reach nothing is a configuration error, not an empty answer — silently inheriting a fallback would record a choice that never happened.
 
-Remedy: do not hand-author routing detail; the engine writes it. The replay codes mean the stream is not one this engine wrote. For `AP_ROUTING_ESCALATION`, the run is now `needs-owner-decision`: use `autopilot_signal` owner-resolve to arbitrate.
+Remedy: do not hand-author routing detail; the engine writes it. The replay codes mean the stream is not one this engine wrote. For `AP_ROUTING_ESCALATION`, the run is now `needs-owner-decision`: use `autopilot_signal` owner-resolve to arbitrate. For `AP_ROUTE_NO_REACHABLE_WORK_CLASS`, add provider/model members to the mapped ladder tier(s) or retarget `routing.workClasses.<name>.tiers`; the selector's `why` names the class and the mapping.
 
-Codes: `AP_ROUTING_DETAIL`, `AP_ROUTING_PINS`, `AP_ROUTING_PINS_MUTATED`, `AP_ROUTING_RECORD_MISMATCH`, `AP_ROUTING_ESCALATION`.
+Codes: `AP_ROUTING_DETAIL`, `AP_ROUTING_PINS`, `AP_ROUTING_PINS_MUTATED`, `AP_ROUTING_RECORD_MISMATCH`, `AP_ROUTING_ESCALATION`, `AP_ROUTE_NO_REACHABLE_WORK_CLASS`.
 
 ## 11. Store integrity
 
@@ -388,6 +389,7 @@ Every `AP_*` code that appears under `src/**`, its contract, and the one-line pr
 | `AP_PLAN_REVISION` | 1 | `plan.revision` never decreases |
 | `AP_RESUME_REQUIRES_NEEDS_FIX` | 7 | resume requires `executionGate` `needs-fix` and a latest `execution`/`rules` `needs-fix` at the current `executionRevision` |
 | `AP_REVISION` | 1 | `event.revision` is `prior.revision + 1` and `snapshot.revision` equals `event.revision` |
+| `AP_ROUTE_NO_REACHABLE_WORK_CLASS` | 10 | a work class whose mapped ladder tiers leave zero reachable routes blocks instead of silently shelving |
 | `AP_ROUTING_DETAIL` | 10 | dispatch `detail.routing` matches the strict routing-decision shape |
 | `AP_ROUTING_ESCALATION` | 10 | unresolvable routing pauses the run to `needs-owner-decision` instead of dispatching |
 | `AP_ROUTING_PINS` | 10 | `routingPins` equal `applyRoutingDecision(prior.routingPins, detail.routing)` on a dispatch op |
