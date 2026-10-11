@@ -302,6 +302,57 @@ describe('selectRoute — work-class membership restriction', () => {
     expectRoute(decision)
     expectWhy(decision, /owner auditTier override: reserve/)
   })
+
+  // ── M11: single-member tier collapse must SELECT, not inherit ──
+  // Found by M10 probe c (session-4ad4975f): the eligibleRoutes.length === 1
+  // short-circuit fired AFTER the tier filter, so a class mapping that
+  // collapses eligibility to exactly one route inherited the deployment
+  // default — a route OUTSIDE the class mapping — instead of selecting the
+  // surviving member. The gate (tierMembershipApplied) keeps inheritance for
+  // the unrestricted 0.2.0-parity arm only.
+  it('M11 (a): a tier mapping that collapses eligibility to ONE member SELECTS it explicitly — never inheritance', async () => {
+    const workClass = selection('audit', { economy: [], standard: ['alpha/m-b'], reserve: [] })
+    const decision = await selectRoute(input({
+      role: 'plan-auditor',
+      // Two authorized live routes; only m-b is a standard member, so the
+      // membership filter narrows eligibility to exactly one route.
+      policy: presentPolicy(['alpha', 'm-a'], ['alpha', 'm-b']),
+      catalog: catalogOf([
+        { provider: 'alpha', id: 'm-a', contextWindow: 131072 },
+        { provider: 'alpha', id: 'm-b', contextWindow: 131072 },
+      ]),
+      workClass,
+    }))
+    const route = expectRoute(decision)
+    expect(`${route.route.provider}/${route.route.model}`).toBe('alpha/m-b')
+    expect(route.authorizationSource).not.toBe('inheritance')
+    expectWhy(
+      decision,
+      /work class: audit restricts dispatch membership to tier\(s\) standard/,
+      /1 authorized route\(s\) outside the mapping are not members of this dispatch/,
+    )
+  })
+
+  it('M11 (b): parity arm — a single authorized route with NO tier restriction still INHERITS (0.2.0 unchanged)', async () => {
+    // Same two-route catalog, but the policy authorizes exactly one route and
+    // the class maps nothing restrictive: the unrestricted single-route arm is
+    // the operator's own identical choice, and inheritance stays the honest
+    // record exactly as 0.2.0 shipped it.
+    const engagedUnmapped = selection('audit', EMPTY_TIERS, undefined, true)
+    const decision = await selectRoute(input({
+      role: 'plan-auditor',
+      policy: presentPolicy(['alpha', 'm-b']),
+      catalog: catalogOf([
+        { provider: 'alpha', id: 'm-a', contextWindow: 131072 },
+        { provider: 'alpha', id: 'm-b', contextWindow: 131072 },
+      ]),
+      workClass: engagedUnmapped,
+    }))
+    expect(decision.kind).toBe('inherit')
+    // The single-route short-circuit returns its own honest why: nothing was
+    // restricted, so inheritance claims no choice and no class line exists.
+    expectWhy(decision, /the authorized set holds a single route \(alpha\/m-b\)/)
+  })
 })
 
 // ── Selector: class dominant-axis ranking ──

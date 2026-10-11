@@ -708,6 +708,15 @@ async function selectAutoRanked(
   // (AP_ROUTE_NO_REACHABLE_WORK_CLASS), so the owner sees it instead of
   // inheriting a fallback that claims nothing happened.
   let eligibleRoutes = authorized.routes
+  // M11: set when the work-class tier-membership filter below actually
+  // narrowed eligibility. The single-route inheritance short-circuit must NOT
+  // fire in that case: a tier mapping that collapses eligibility to exactly
+  // one route is a RESTRICTION, and inheriting the deployment default would
+  // dispatch a route outside the class mapping while the why-line claims the
+  // restriction held (M10 probe c). Inheritance stays only for the
+  // unrestricted 0.2.0-parity arm, where the deployment default and the
+  // single route are the operator's own identical choice.
+  let tierMembershipApplied = false
   const workClass = input.workClass
   if (workClass !== undefined && workClass.engaged) {
     if (workClass.tiers.length === 0) {
@@ -744,6 +753,7 @@ async function selectAutoRanked(
             : ' — every authorized route is a member'),
       )
       eligibleRoutes = kept
+      tierMembershipApplied = true
     }
   } else if (workClass !== undefined) {
     // Not engaged: the shipped-default shape (empty ladder, no owner
@@ -753,7 +763,7 @@ async function selectAutoRanked(
       `work class: ${workClass.name} (axis ${workClass.axis}) recorded but NOT applied — the ladder declares no members anywhere and the owner named no override for this class or role; ranking and membership follow the preference path exactly as 0.2.0 did`,
     )
   }
-  if (eligibleRoutes.length === 1) {
+  if (eligibleRoutes.length === 1 && !tierMembershipApplied) {
     const only = eligibleRoutes[0]
     if (only === undefined) throw new Error('unreachable: single-route authorized set missing its route')
     return inheritDecision([
