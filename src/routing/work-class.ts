@@ -31,9 +31,10 @@ export type WorkClassTier = 'economy' | 'standard' | 'reserve'
  *  - `speed-cost` — speed first, effective cost breaks ties (simple daily
  *    work: 速度 + 价格).
  *  - `economy-first` — effective cost ascending first: the cheapest mapped
- *    tier is tried first (难度高: 先试 economy; escalation is a request, not
- *    a prediction — the escalation channel itself is item 15's documented
- *    known limitation, so nothing here pretends to escalate).
+ *    tier is tried first (难度高: 先试 economy). The window a REQUEST opens is
+ *    `ESCALATION_TIERS` (below), not this axis's business: the axis only says
+ *    how the pool that exists is ranked, and a request widens the pool without
+ *    changing the ranking rule.
  *  - `ceiling-independence` / `ceiling` — the class adds NO ranking of its
  *    own; ceiling is carried by the tier mapping and independence by the
  *    auditor rules, both upstream of ranking.
@@ -66,17 +67,39 @@ export const DEFAULT_WORK_CLASSES: Readonly<Record<WorkClassName, ResolvedWorkCl
   mechanical: { name: 'mechanical', tiers: [], axis: 'speed' },
   simple: { name: 'simple', tiers: ['economy'], axis: 'speed-cost' },
   // `hard` = DESIGN §1.2's "try economy first; widen to the ceiling ONLY when
-  // the working model ASKS for it". The request channel is a documented
-  // non-goal (nothing here pretends to escalate), so the delivered candidate
-  // pool is the FIRST-TRY pool — economy — and the class ranks it by effective
-  // cost. Seeding standard/reserve here would hand a `hard` dispatch a ceiling
-  // route with no request behind it: exactly the prediction-style widening
-  // DESIGN forbids (`没有被请求就不升档`). An owner who wants a wider pool
-  // states it through `routing.workClasses.hard.tiers`.
+  // the working model ASKS for it". The REQUEST channel is now delivered (an
+  // `escalate` checkpoint targeting `stronger-model`); the DEFAULT mapping
+  // below stays the FIRST-TRY pool — economy — because seeding
+  // standard/reserve here would hand every `hard` dispatch a ceiling route
+  // with no request behind it: exactly the prediction-style widening DESIGN
+  // forbids (`没有被请求就不升档`). An owner who wants a permanently wider
+  // pool states it through `routing.workClasses.hard.tiers`; a REQUESTED
+  // widening resolves through ESCALATION_TIERS instead (see there).
   hard: { name: 'hard', tiers: ['economy'], axis: 'economy-first' },
   audit: { name: 'audit', tiers: ['standard'], axis: 'ceiling-independence' },
   extreme: { name: 'extreme', tiers: ['reserve'], axis: 'ceiling' },
 }
+
+/**
+ * The candidate pool a REQUESTED escalation resolves to when the owner has not
+ * overridden the mapped class's own `tiers`.
+ *
+ * WHY A SEPARATE CONSTANT RATHER THAN WIDENING `DEFAULT_WORK_CLASSES.hard`.
+ * DESIGN §1.2 makes escalation a REQUEST, not a prediction: the pool must stay
+ * economy until something asks, and widen only for the dispatch that carries
+ * the request. Putting these tiers in the class default would widen EVERY
+ * `hard` dispatch — the forbidden shape — and would also make the owner's
+ * `routing.workClasses.hard.tiers` override indistinguishable from the
+ * default. So the request path states its own floor and the owner's mapping
+ * still wins when written.
+ *
+ * The union spans all three owner tiers on purpose: the requester reported that
+ * it could not make progress, so the point of the widening is the CEILING, and
+ * which member of it is best is the ranking axes' question (cost first for
+ * `economy-first`, then the owner's declared speed order) — not a second
+ * hand-maintained tier list here.
+ */
+export const ESCALATION_TIERS: readonly WorkClassTier[] = ['economy', 'standard', 'reserve']
 
 /**
  * The class a role draws from when the owner names none. Default-optimistic

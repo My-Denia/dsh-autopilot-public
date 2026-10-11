@@ -186,9 +186,11 @@ describe('work classes — the owner table (DESIGN §1.2)', () => {
 describe('resolveWorkClassSelection', () => {
   it('unions the mapped tiers trim-exact, deduped, in tier order (a class widened by an owner override)', () => {
     // The DEFAULT `hard` pool is economy-only (DESIGN's first-try rule; the
-    // escalation request channel is a non-goal), so the union across tiers is
-    // exercised through the OWNER's override — the shape the machinery must
-    // handle when `routing.workClasses.hard.tiers` names several tiers.
+    // delivered request channel widens a SINGLE dispatch through
+    // `ESCALATION_TIERS` and leaves the class default alone), so the union
+    // across tiers is exercised through the OWNER's override — the shape the
+    // machinery must handle when `routing.workClasses.hard.tiers` names
+    // several tiers.
     const widened = {
       ...DEFAULT_WORK_CLASSES,
       hard: { ...DEFAULT_WORK_CLASSES.hard, tiers: ['economy', 'standard', 'reserve'] as const },

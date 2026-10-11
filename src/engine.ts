@@ -70,8 +70,10 @@ import { workClassReachability, type WorkClassReachabilityReport } from './routi
 import type { LlmCallConfig } from './routing/catalog.js'
 import { independenceOf, sameRoute, toRoutePin } from './routing/identity.js'
 import type { RoutePin } from './routing/identity.js'
-import { DEFAULT_ROLE_WORK_CLASS, DEFAULT_WORK_CLASSES, resolveWorkClassSelection } from './routing/work-class.js'
+import { DEFAULT_ROLE_WORK_CLASS, DEFAULT_WORK_CLASSES, ESCALATION_TIERS, resolveWorkClassSelection } from './routing/work-class.js'
 import type { ResolvedWorkClass, WorkClassName } from './routing/work-class.js'
+import { routingStatusOf } from './routing/status.js'
+import type { RoutingStatusView } from './routing/status.js'
 
 // ── Structural platform types (subset of dsh surfaces the engine touches) ──
 
@@ -1286,6 +1288,18 @@ export interface StatusView {
    * that claims anything.
    */
   readonly routingReachability?: WorkClassReachabilityReport
+  /**
+   * M12 (DESIGN §1.2 boundary (e)): the routing status a READER can act on —
+   * the effective mode/preference and its source, the session policy state as
+   * the engine read it for the dispatching session, each role's effective
+   * routing (auto/inherit/locked) and work class, the run's own pins, and the
+   * owner's ladder shape. This is the surface that answers "is routing live
+   * here", which `routingReachability` does not (it answers a coverage
+   * question and is silent on a healthy ladder). ABSENT when `routing.mode` is
+   * off — with routing off every dispatch inherits, and a block of `inherit`
+   * rows would read like a failed selection rather than a switched-off feature.
+   */
+  readonly routing?: RoutingStatusView
   readonly diagnostic?: string
 }
 
@@ -1558,6 +1572,27 @@ export class AutopilotEngine {
    */
   private readonly reachabilityReports = new Map<RunId, WorkClassReachabilityReport>()
 
+  /**
+   * M2 (DESIGN §1.2 "升档是请求，不是预测"): the run's OPEN work-class
+   * escalation requests, engine-local by deliberate choice.
+   *
+   * WHY ENGINE-LOCAL AND NOT DURABLE RUN STATE. The request is a LIVE intent
+   * ("the model that was working asked for more ceiling"), not
+   * authorization-bearing state: it widens which ladder tiers the NEXT
+   * auto dispatch of that role may draw from, and it is consumed by exactly one
+   * dispatch. Nothing about a dispatch's authority depends on it — the policy
+   * intersection, the tier membership and the independence rules all run before
+   * and after it identically — so recording it in the durable Snapshot would
+   * buy replay determinism for a value no replayable decision reads, at the
+   * cost of a new fold-validated shape. The honest boundary is therefore
+   * stated rather than hidden: a process restart forgets open requests, and the
+   * requester simply asks again (the log checkpoint that carried the request
+   * stays in `log.md`). The selection the request CAUSED is durable like any
+   * other: it rides `detail.routing` with its own `why` line and its
+   * `repinFrom`.
+   */
+  private readonly pendingEscalations = new Map<RunId, { readonly seq: number; readonly note: string }>()
+
   constructor(
     private readonly agents: AgentsRef,
     private readonly subagents: SubagentsRef,
@@ -1715,7 +1750,11 @@ export class AutopilotEngine {
     const root = this.resolveRoot(caller)
     const snapshot = this.current(root.id)
     if (snapshot === undefined) return undefined
-    return this.projectStatus(snapshot)
+    // M12: the policy state is read for the CALLER's session — the same reader
+    // the dispatch sites use, so the status cannot disagree with a dispatch
+    // about whether selection is possible. A reader with no live session (the
+    // HTTP/service path) passes nothing and gets `unobserved`.
+    return this.projectStatus(snapshot, this.readPolicy(root))
   }
 
   /**
@@ -2554,8 +2593,57 @@ export class AutopilotEngine {
         logCount: prior.logCount + 1,
       }, logEntry)
       await this.store.appendLog(root.id, logEntry)
+      // M2: an `escalate` checkpoint naming `stronger-model` IS the work-class
+      // escalation request (DESIGN §1.2: the working model asks, the root
+      // dispatches a higher ceiling). Recorded only after the checkpoint is
+      // durable, so the request can never outlive its evidence. A later
+      // request for the same role REPLACES the earlier one (last-wins): the
+      // newest evidence is the one the next dispatch should act on.
+      if (escalating && entry.escalationTarget === 'stronger-model') {
+        this.pendingEscalations.set(root.id, { seq: logEntry.seq, note: logEntry.note ?? logEntry.text })
+      }
       return next
     })
+  }
+
+  /**
+   * M2: the run's OPEN escalation request, if any. One per run, deliberately —
+   * and this is the DESIGN's own shape rather than a simplification.
+   *
+   * WHAT THE REQUEST MEANS. It is the working model reporting that the RUN
+   * could not make progress ("thinking effort maxed and it still failed", or a
+   * stall), so a later auto dispatch may draw a wider pool. It is not a
+   * statement about one role, and an engine that GUESSED a role here would
+   * widen the wrong pool: the first cut of this milestone did exactly that —
+   * a root-logged request landed on `executor` while the auditor dispatch it
+   * was meant for could never consume it, and an `audit` class name cannot
+   * even name which auditor was meant. Measured in this milestone's own test
+   * run, which is why the register holds ONE request per run and nothing about
+   * the caller is inferred.
+   *
+   * WHERE IT IS CONSUMED: inside `selectForRole`, i.e. by the next AUTO
+   * dispatch that actually runs a selection — whatever brought it there (no
+   * pin yet, a dead pin, rotation, or a healthy-pin branch forcing a
+   * re-selection). A dispatch that never selects (inherit/locked, or a
+   * degraded routing config) leaves the request OPEN for the next one, which
+   * is why this is a read-with-delete at the selection site rather than a hook
+   * on the dispatch path.
+   *
+   * WHY THAT IS SAFE. Widening a pool is not widening an authorization: the
+   * candidate set is still `policy ∩ live`, still filtered by the class's tier
+   * membership, and the auditor independence ordering still runs. A role that
+   * has nothing to gain from the widening simply ranks its (unchanged)
+   * authorized set. The one thing a request can never do is dispatch a route
+   * the session policy does not cover.
+   *
+   * Engine-local: a restart forgets an open request, and the requester asks
+   * again.
+   */
+  private takeEscalation(runId: RunId): { readonly seq: number; readonly note: string } | undefined {
+    const open = this.pendingEscalations.get(runId)
+    if (open === undefined) return undefined
+    this.pendingEscalations.delete(runId)
+    return open
   }
 
   async replan(caller: AgentRef, note: string): Promise<Snapshot> {
@@ -3986,6 +4074,36 @@ export class AutopilotEngine {
             'rotation: routing.ladder.rotation is on — this auditor role re-selects instead of reusing its healthy pin (the pin was live, preflighted and authorized when this decision started)',
           )
         }
+        // M2 (DESIGN §1.2 "升档是请求，不是预测"): an OPEN escalation request
+        // for this role forces a re-selection even though the pin is healthy.
+        //
+        // WHY THIS BRANCH MUST EXIST — measured, not assumed: a healthy auto
+        // pin is REUSED and the selection path is never entered (the whole
+        // point of the reuse branch above), so consuming a request only inside
+        // `selectForRole` left the request unreadable on the one path the
+        // request exists for. `先试 economy` pins economy on the first
+        // dispatch; without this branch the resume reuses that pin forever and
+        // the request is a no-op. Rotation is not a substitute: it is
+        // auditor-only and owner-opted.
+        //
+        // PLACEMENT IS LOAD-BEARING. It sits AFTER both the dead-pin re-select
+        // above and the rotation branch: a DEAD pin already re-selects (and
+        // must keep recording its own `repinFrom` reason), and rotation is an
+        // owner-level policy for auditors that this request must not pre-empt.
+        // The request is consumed HERE, in the branch that acts on it, so a
+        // dispatch that never reaches this point cannot eat it.
+        if (dead === undefined && this.pendingEscalations.has(prior.runId)) {
+          const escalated = await this.selectForRole(role, routing.preference, routing.preferenceSource, roleRouting, prior, policy, catalog, routing.ladder, routing.workClasses)
+          return this.decorateRepinned(
+            this.resolutionOfDecision(role, roleRouting, escalated, undefined),
+            {
+              provider: pin.provider,
+              model: pin.model,
+              ...(pin.reasoningEffort === undefined ? {} : { reasoningEffort: pin.reasoningEffort }),
+            },
+            'escalation request: an OPEN work-class escalation request is recorded for this run — this role re-selects instead of reusing its healthy pin, and the selection consumes the request and widens the pool it may draw from; the widened pool still passes the session-policy intersection, the tier membership and the independence rules',
+          )
+        }
         if (dead === undefined) {
           // F9 (PR #2 Codex round 4): the reuse label's pool inference is
           // auditor-only, mirroring pinStillAuthorized. Persist/recover
@@ -4471,6 +4589,12 @@ export class AutopilotEngine {
     workClasses: Readonly<Record<WorkClassName, ResolvedWorkClass>>,
   ): Promise<SelectionDecision> {
     const executorPin = AUDITOR_ROLE_SET.includes(role) ? this.executorPinOf(prior) : undefined
+    // M2: an OPEN escalation request is consumed HERE — at the selection, not on
+    // the dispatch path — so every auto selection widens (a first selection, a
+    // dead-pin re-selection, a rotation, and the healthy-pin branch that forces
+    // one), and a dispatch that never selects leaves the request open for the
+    // next one.
+    const escalation = roleRouting.mode === 'auto' ? this.takeEscalation(prior.runId) : undefined
     // WORK CLASS (DESIGN §1.2; §9 items 13/14): the class this auto-role
     // dispatch draws from — the owner's per-role override, else the role
     // default — resolved against the live ladder. `ladder.auditTier`, when
@@ -4478,25 +4602,69 @@ export class AutopilotEngine {
     // mapping (auditor roles only; owner-explicit beats the seeded mapping,
     // and the selector's why names it). Locked/inherit roles make no
     // selection, so no class is computed for them.
+    // M2 (DESIGN §1.2 "升档是请求，不是预测"): a REQUESTED escalation widens
+    // the pool to ESCALATION_TIERS and makes the class APPLY (engaged), and
+    // nothing else about the resolution changes — every threshold, the
+    // authorization intersection, the tier membership and the independence
+    // ordering run exactly as they do without a request. Two boundaries are
+    // deliberate and stated rather than implied:
+    //
+    //  - The owner's OWN mapping for the class beats the request's floor
+    //    (owner-explicit is the highest authority in the routing order), so a
+    //    deployment that wrote `routing.workClasses.hard.tiers` keeps it.
+    //  - The class NAME is unchanged: a request does not silently reclassify a
+    //    role, it widens the class that role already draws from. The class axis
+    //    (cost-first for `hard`) comes with that class, which is why the
+    //    widened pool is ranked by the requester's own economics rather than by
+    //    an invented one.
     const workClass =
       roleRouting.mode === 'auto'
         ? (() => {
             const className = roleRouting.workClass ?? DEFAULT_ROLE_WORK_CLASS[role]
-            const resolved = workClasses[className]
-            const seeded = DEFAULT_WORK_CLASSES[className]
-            // Did the OWNER engage this class? A per-role assignment or a
-            // class definition differing from the owner-table default both
-            // count; with neither and an empty ladder the selection is
-            // recorded, not applied (0.2.0 parity — DESIGN §1.2).
-            const ownerOverridden =
-              roleRouting.workClass !== undefined ||
+            // WHICH CLASS A REQUESTED WIDENING RESOLVES THROUGH: `hard` — the
+            // class a request raises to — unless the role's OWN class IS `hard`,
+            // in which case that same class. `hard` is also the class whose
+            // mapping the owner's authority is tested on, because the pool a
+            // request opens IS that class's pool whether or not the owner wrote
+            // its tiers. (Measured: testing the ROLE's class here — `audit` for
+            // every auditor — silently ignored an owner-written
+            // `routing.workClasses.hard.tiers` and widened anyway.)
+            const escalationClass = 'hard' as WorkClassName
+            const mappedClass =
+              escalation === undefined || className === escalationClass ? className : escalationClass
+            const resolved = workClasses[mappedClass]
+            const seeded = DEFAULT_WORK_CLASSES[mappedClass]
+            // The owner's mapping differs from the owner table ⇒ they wrote it.
+            // ONE definition of "the owner wrote a mapping", used by both arms.
+            const classOwnerMapped =
               resolved.axis !== seeded.axis ||
               resolved.tiers.length !== seeded.tiers.length ||
               resolved.tiers.some((tier, index) => tier !== seeded.tiers[index])
+            // The effective mapping: a REQUEST's own floor (ESCALATION_TIERS)
+            // unless the owner wrote the escalation class's tiers, which stand
+            // (owner-explicit is the highest authority in the routing order).
+            const effectiveClasses =
+              escalation !== undefined && !classOwnerMapped
+                ? { ...workClasses, [mappedClass]: { ...workClasses[mappedClass], tiers: ESCALATION_TIERS } }
+                : workClasses
+            // The plain arm keeps its engagement rule verbatim: a per-role
+            // assignment or a written class engages the machinery; with neither
+            // and an empty ladder the selection is recorded, not applied
+            // (0.2.0 parity — DESIGN §1.2). A REQUEST engages it by definition
+            // — that is the whole content of "被请求".
+            const ownerOverridden =
+              escalation !== undefined
+                ? true
+                : roleRouting.workClass !== undefined || classOwnerMapped
+            // ONE resolution for both arms, so the member set is always derived
+            // from the mapping that actually applies. (Measured twice: replacing
+            // `tiers` alone left `members` as the un-escalated union, so the
+            // why-line announced the widened tiers while the filter still admitted
+            // only the old members.)
             return resolveWorkClassSelection(
-              workClasses,
+              effectiveClasses,
               ladder.tiers,
-              className,
+              mappedClass,
               AUDITOR_ROLE_SET.includes(role) ? ladder.auditTier : undefined,
               ownerOverridden,
             )
@@ -4559,6 +4727,36 @@ export class AutopilotEngine {
     // `routing.orderingAxisDefault` opt-in promoted the effective preference
     // to axis. Explicit preferences and the plain shipped default say what
     // they are in the selector's own preference line; the promotion does not.
+    // M2: a requested widening is never silent — the reader of `detail.routing`
+    // must be able to see that the pool grew because something ASKED, and what
+    // evidence the request carried.
+    if (escalation !== undefined && 'why' in decision) {
+      // NAME THE TIERS THAT ACTUALLY APPLIED. The owner's own mapping wins over
+      // the request's floor, so an unconditional "widened to economy + standard
+      // + reserve" would be FALSE on a deployment that wrote
+      // `routing.workClasses.<class>.tiers` — the request was consumed, and the
+      // pool followed the owner's mapping instead. The record says which of the
+      // two happened, because the reader's next question is exactly that.
+      const applied = workClass?.tiers ?? []
+      const widened = applied.length > 0 && applied.join(' + ') === ESCALATION_TIERS.join(' + ')
+      // NAME THE CLASS WHOSE MAPPING STANDs — the ESCALATION class a request
+      // resolves through (`hard`), not necessarily `workClass.name`: a request
+      // raises the pool to `hard` even for a role whose own class is `audit`, so
+      // naming `audit` there would point the reader at a mapping that had nothing
+      // to do with the pool.
+      const mappingClass = workClass?.name === 'hard' ? workClass.name : 'hard'
+      return {
+        ...decision,
+        why: [
+          ...decision.why,
+          `escalation request: seq ${String(escalation.seq)} — ${escalation.note} (the working model asked for a higher ceiling; ` +
+            (widened
+              ? `the pool widened to ${applied.join(' + ')} for this dispatch only`
+              : `the owner's mapping for routing.workClasses.${mappingClass}.tiers ${applied.length > 0 ? applied.join(' + ') : '(no tiers)'} stands against the request's own floor of ${ESCALATION_TIERS.join(' + ')} — owner-explicit is the higher authority`) +
+            ', and every threshold, the authorization intersection and the independence rules still applied)',
+        ],
+      }
+    }
     if (preferenceSource === 'default' && preference === 'axis' && 'why' in decision) {
       return {
         ...decision,
@@ -5418,7 +5616,7 @@ export class AutopilotEngine {
    * obtained by run id, where no calling Agent exists to authorize against —
    * and projection is a pure read, so it needs none.
    */
-  projectStatus(snapshot: Snapshot): StatusView {
+  projectStatus(snapshot: Snapshot, policy?: SessionPolicyState): StatusView {
     const latest = latestVerdicts(snapshot.audits)
     const verdicts: Partial<Record<AuditRole, Verdict>> = {}
     for (const [role, record] of Object.entries(latest)) {
@@ -5455,6 +5653,10 @@ export class AutopilotEngine {
       ...((): { routingReachability?: WorkClassReachabilityReport } => {
         const report = this.reachabilityReports.get(snapshot.runId)
         return report === undefined ? {} : { routingReachability: report }
+      })(),
+      ...((): { routing?: RoutingStatusView } => {
+        const view = routingStatusOf(snapshot, this.routingConfig().routing, policy)
+        return view === undefined ? {} : { routing: view }
       })(),
     }
   }

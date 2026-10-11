@@ -8,6 +8,27 @@ Host and packaging bounds that outlive a single release are in
 Realigns the plugin with the current goal-autopilot-harness design, where a host
 adapter stays thin and the host-neutral rules live in one reference layer.
 
+### Added (routing status + the escalation request channel; 2026-10-11 M12)
+
+- The run status now carries a `routing` block answering "is routing live on this
+  deployment": effective `mode`, `preference` and its source, the session policy
+  state (`present` / `absent` / `unreachable` / `unobserved` — an unreadable
+  policy is never reported as absent), each role's effective routing and work
+  class, the run's own pins, and the ladder's shape. `mode: 'off'` projects
+  nothing. It is served on `GET /api/autopilot/run` (the route the desktop card
+  polls) and on `autopilot_status`.
+- The work-class escalation request channel (DESIGN §1.2 "升档是请求，不是预测"):
+  `autopilot_log({ stance: 'escalate', escalationTarget: 'stronger-model', note })`
+  widens the next auto dispatch that RUNS A SELECTION — a first dispatch, a
+  dead-pin re-selection, rotation, or a healthy pin forced to re-select — to
+  `economy + standard + reserve` (an owner-written
+  `routing.workClasses.<class>.tiers` still wins). The dispatch names the request
+  in its `why` trace and records the replaced pin as `repinFrom`. It is consumed
+  once, is left open by a dispatch that runs no selection, and never widens an
+  authorization: the candidate set is still the session-policy intersection,
+  still filtered by tier membership, and still ordered by the auditor
+  independence rules.
+
 ### Fixed (plan-reviewing wedge, P0; 2026-10-11 M10)
 
 - A refused plan audit no longer leaves the run wedged in `plan-reviewing`.

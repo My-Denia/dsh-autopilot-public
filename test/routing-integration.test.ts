@@ -3247,3 +3247,276 @@ describe('M7b: a work class with no authorized reachable route fails closed', ()
   })
 })
 })
+
+
+// ── M2 (DESIGN §1.2 "升档是请求，不是预测"): the work-class escalation request ──
+//
+// THE DEFECT THIS PINS, and why (a) is written against the PIN-REUSE path
+// specifically. A healthy auto pin is REUSED: `resolveRoleRoute` returns the pin
+// without ever entering `selectForRole`. A request consumed only inside the
+// selector is therefore invisible on the one path the request exists for —
+// "dispatch economy first, then the working model asks for more ceiling" would
+// widen nothing, because the resume reuses the economy pin forever. The plan
+// audit caught exactly that (rev 1), and the (a)/(b) pair discriminates it:
+// without the escalation branch (a) reuses the pin and fails; if the branch
+// fired unconditionally (b) re-selects and fails.
+
+describe('M2: the work-class escalation request (autopilot_log stance=escalate, target=stronger-model)', () => {
+  /**
+   * The tiers are chosen so the widening is DISCRIMINATING, not incidental.
+   *
+   * `standard` (the audit class's own mapping) holds exactly one member, m-a:
+   * the FIRST audit dispatch therefore selects and pins m-a deterministically —
+   * that is the healthy pin a request must be able to widen past. m-b (economy)
+   * and m-c (reserve) sit in tiers the audit class does NOT draw from, so they
+   * are unreachable for this role until a request's floor adds all three tiers
+   * — which makes "the pool widened" a fact the candidate set can show.
+   */
+  const ESCALATION_LADDER = {
+    tiers: { economy: ['alpha/m-b'], standard: ['alpha/m-a'], reserve: ['beta/m-c'] },
+  }
+
+  function escalationHarness(policy: SessionPolicyState, verdicts: number): Harness {
+    const f = fixture(MODELS, policy)
+    return makeHarness({
+      routing: f.portsFor(),
+      config: { routing: { mode: 'auto', ladder: ESCALATION_LADDER } },
+      subagents: stubSubagents({
+        verdicts: Array.from({ length: verdicts }, () => ({ verdict: 'pass', note: 'ok' })),
+      }),
+    })
+  }
+
+  async function requestEscalation(h: Harness, note = 'max effort still failed on the third attempt'): Promise<void> {
+    await h.engine.log(h.root, {
+      text: 'stalled: max effort still failed',
+      stance: 'escalate',
+      escalationTarget: 'stronger-model',
+      note,
+    })
+  }
+
+  function lastAuditorDetail(h: Harness): RoutingDecisionDetail | undefined {
+    const details = routingDetails(h).filter(detail => detail.role === 'execution-auditor')
+    return details[details.length - 1]
+  }
+
+  it('(a) a request makes the next dispatch of that role WIDEN past a healthy pin', async () => {
+    const h = escalationHarness(PRESENT_ABC3, 3)
+    await toClosing(h)
+    const firstPin = h.engine.peek(h.root.id)?.routingPins?.['execution-auditor']
+    expect(firstPin).toEqual({ provider: 'alpha', model: 'm-a', reasoningEffort: 'high' })
+
+    await requestEscalation(h)
+    await h.engine.audit(h.root, { role: 'execution', prompt: 'after the request' })
+
+    const last = lastAuditorDetail(h)
+    // The pin was HEALTHY — this is a requested widening, not a death repin.
+    expect(last?.repinFrom).toEqual(firstPin)
+    expect(last?.why?.some(entry => entry.includes('escalation request: seq 0'))).toBe(true)
+    expect(last?.why?.some(entry => entry.includes('the working model asked for a higher ceiling'))).toBe(true)
+    // The widened pool actually became the candidate set: the standard-tier
+    // member the audit class would have excluded is now a considered candidate.
+    const considered = (last?.candidates ?? []).map(candidate => `${candidate.provider}/${candidate.model}`)
+    expect(considered).toContain('beta/m-c')
+    expect(considered).toContain('alpha/m-b')
+    // The widening is in the POOL, and the record says why. Which member wins
+    // is the ranking axis's business (this class's own axis adds no ranking),
+    // so no specific winner is asserted here — asserting one would encode a
+    // preference the class does not have.
+    expect(last?.why?.some(entry => entry.includes('the pool widened to economy + standard + reserve'))).toBe(true)
+  })
+
+  it('(b) NO request ⇒ the healthy pin is reused verbatim (没有被请求就不升档)', async () => {
+    const h = escalationHarness(PRESENT_ABC3, 3)
+    await toClosing(h)
+    const firstPin = h.engine.peek(h.root.id)?.routingPins?.['execution-auditor']
+    expect(firstPin).toEqual({ provider: 'alpha', model: 'm-a', reasoningEffort: 'high' })
+
+    await h.engine.audit(h.root, { role: 'execution', prompt: 'no request at all' })
+
+    const last = lastAuditorDetail(h)
+    expect(last?.pin).toEqual(firstPin)
+    expect(last?.repinFrom).toBeUndefined()
+    expect(last?.why?.some(entry => entry.includes('pin: reusing the role pin'))).toBe(true)
+    expect(last?.why?.some(entry => entry.includes('escalation request'))).toBe(false)
+  })
+
+  it('(c) the request is consumed ONCE — the dispatch after it returns to pin stability', async () => {
+    const h = escalationHarness(PRESENT_ABC3, 4)
+    await toClosing(h)
+    await requestEscalation(h)
+    await h.engine.audit(h.root, { role: 'execution', prompt: 'the widened dispatch' })
+    const widenedPin = h.engine.peek(h.root.id)?.routingPins?.['execution-auditor']
+    expect(widenedPin).toBeDefined()
+
+    await h.engine.audit(h.root, { role: 'execution', prompt: 'the dispatch after' })
+    const last = lastAuditorDetail(h)
+    expect(last?.pin).toEqual(widenedPin)
+    expect(last?.repinFrom).toBeUndefined()
+    expect(last?.why?.some(entry => entry.includes('pin: reusing the role pin'))).toBe(true)
+    // The request is SPENT: the third dispatch never even looks at the widened
+    // pool, so the members the first request added are not considered again.
+    const considered = (last?.candidates ?? []).map(candidate => `${candidate.provider}/${candidate.model}`)
+    expect(considered).not.toContain('beta/m-c')
+    expect(considered).not.toContain('alpha/m-b')
+  })
+
+  it('(e) an OPEN request widens a FIRST selection too (no pin yet) — the consume point is the selection', async () => {
+    // The executor's FIRST dispatch: no pin exists, so the healthy-pin branch is
+    // not involved at all. This is the "先试 economy" moment the request exists
+    // for, and it must widen — the consume point is `selectForRole`, not the pin
+    // branch.
+    const h = escalationHarness(PRESENT_ABC3, 2)
+    await h.engine.init(h.root, makeTriage(STANDARD_DELEGATED))
+    await h.engine.declareUsage(h.root, makeUsageEntry({ id: 'm1' }))
+    await h.engine.submitPlan(h.root, 'plan')
+    await h.engine.audit(h.root, { role: 'plan', prompt: 'packet' })
+    expect(h.engine.peek(h.root.id)?.routingPins?.executor).toBeUndefined()
+
+    await requestEscalation(h, 'stalled on the third attempt')
+    await h.engine.startExecutor(h.root, { prompt: 'go', signal: new AbortController().signal })
+
+    const dispatch = routingDetails(h).find(detail => detail.op === 'start-executor')
+    expect(dispatch).toBeDefined()
+    expect(dispatch?.why?.some(entry => entry.includes('the pool widened to economy + standard + reserve'))).toBe(true)
+    const considered = (dispatch?.candidates ?? []).map(candidate => `${candidate.provider}/${candidate.model}`)
+    expect(considered).toContain('beta/m-c')
+    expect(considered).toContain('alpha/m-b')
+  })
+
+  it('(f) an owner-written class mapping WINS over the request floor, and the why-line says which applied', async () => {
+    // `routing.workClasses.hard.tiers` = ['standard'] only. The request is still
+    // consumed (it asked), but the owner's mapping is the higher authority, so
+    // the pool must be the standard tier — NOT economy + standard + reserve —
+    // and the record must not claim a widening that did not happen.
+    const f = fixture(MODELS, PRESENT_ABC3)
+    const h = makeHarness({
+      routing: f.portsFor(),
+      config: {
+        routing: {
+          mode: 'auto',
+          ladder: ESCALATION_LADDER,
+          workClasses: { hard: { tiers: ['standard'] } },
+        },
+      },
+      subagents: stubSubagents({ verdicts: [
+        { verdict: 'pass', note: 'plan ok' },
+        { verdict: 'pass', note: 'exec ok' },
+        { verdict: 'pass', note: 'exec ok again' },
+      ] }),
+    })
+    await toClosing(h)
+    await requestEscalation(h)
+    await h.engine.audit(h.root, { role: 'execution', prompt: 'after the request' })
+
+    const last = lastAuditorDetail(h)
+    // TWO lines mention the request: the pin branch's "forcing a re-selection"
+    // notice and the selection's own record of what the pool became. This case
+    // is about the SECOND one.
+    const escalationLine = last?.why?.find(entry => entry.includes('escalation request: seq'))
+    expect(escalationLine).toBeDefined()
+    expect(escalationLine).toContain(
+      "the owner's mapping for routing.workClasses.hard.tiers standard stands against the request's own floor",
+    )
+    expect(escalationLine).not.toContain('the pool widened to')
+  })
+
+  it('(g) a role whose OWN class is `hard` widens through that class (its own mapping is the one tested)', async () => {
+    // `routing.roles.executionAuditor.workClass = 'hard'`: the role's own class
+    // IS the escalation class, so nothing is reclassified and the owner-mapping
+    // test runs on that same class.
+    const f = fixture(MODELS, PRESENT_ABC3)
+    const h = makeHarness({
+      routing: f.portsFor(),
+      config: {
+        routing: {
+          mode: 'auto',
+          ladder: ESCALATION_LADDER,
+          roles: { executionAuditor: { workClass: 'hard' } },
+        },
+      },
+      subagents: stubSubagents({ verdicts: [
+        { verdict: 'pass', note: 'plan ok' },
+        { verdict: 'pass', note: 'exec ok' },
+        { verdict: 'pass', note: 'exec ok again' },
+      ] }),
+    })
+    await toClosing(h)
+    await requestEscalation(h)
+    await h.engine.audit(h.root, { role: 'execution', prompt: 'hard-class role' })
+
+    const last = lastAuditorDetail(h)
+    const considered = (last?.candidates ?? []).map(candidate => `${candidate.provider}/${candidate.model}`)
+    // The pre-request pool for `hard` is economy-only (escalation-ladder
+    // economy = alpha/m-b); the request's floor adds the standard and reserve
+    // members, which is exactly what the consider-set must now show.
+    expect(considered).toContain('alpha/m-a')
+    expect(considered).toContain('beta/m-c')
+    expect(last?.why?.some(entry => entry.includes('the pool widened to economy + standard + reserve'))).toBe(true)
+  })
+
+  it('(h) an owner mapping on the ROLE\'s own class is not what a request consults — the escalation class is', async () => {
+    // The owner wrote `audit.tiers = ['economy']` (their own class) AND an
+    // `auditTier: 'economy'` override. A request still resolves through `hard`
+    // (unmapped), so the pool widens on the request floor — and the why-line
+    // names `hard`, never `audit`, as the class whose mapping was consulted.
+    const f = fixture(MODELS, PRESENT_ABC3)
+    const h = makeHarness({
+      routing: f.portsFor(),
+      config: {
+        routing: {
+          mode: 'auto',
+          ladder: { ...ESCALATION_LADDER, auditTier: 'economy' },
+          workClasses: { audit: { tiers: ['economy'] } },
+        },
+      },
+      subagents: stubSubagents({ verdicts: [
+        { verdict: 'pass', note: 'plan ok' },
+        { verdict: 'pass', note: 'exec ok' },
+        { verdict: 'pass', note: 'exec ok again' },
+      ] }),
+    })
+    await toClosing(h)
+    await requestEscalation(h)
+    await h.engine.audit(h.root, { role: 'execution', prompt: 'owner mapped its own class' })
+
+    const last = lastAuditorDetail(h)
+    const escalationLine = last?.why?.find(entry => entry.includes('escalation request: seq'))
+    expect(escalationLine).toBeDefined()
+    expect(escalationLine).toContain('the pool widened to economy + standard + reserve')
+    expect(escalationLine).not.toContain('routing.workClasses.audit.tiers')
+  })
+
+  it('(d) the widened pool NEVER overrides authorization', async () => {
+    // The policy authorizes m-a only — and m-a is also the standard-tier member
+    // the plain audit class draws from, so the pre-request dispatch is a
+    // legitimate selection of it. The ladder still holds m-b and m-c, so the
+    // escalation floor WOULD add them to the pool: what must not happen is
+    // those unauthorized routes being considered or dispatched.
+    const policy: SessionPolicyState = { kind: 'present', routes: [{ provider: 'alpha', model: 'm-a' }] }
+    const h = escalationHarness(policy, 3)
+    await toClosing(h)
+    const firstPin = h.engine.peek(h.root.id)?.routingPins?.['execution-auditor']
+    expect(firstPin).toEqual({ provider: 'alpha', model: 'm-a', reasoningEffort: 'high' })
+
+    await requestEscalation(h)
+    await h.engine.audit(h.root, { role: 'execution', prompt: 'widened but unauthorized' })
+
+    const details = routingDetails(h).filter(detail => detail.role === 'execution-auditor')
+    for (const detail of details) {
+      if (detail.pin === undefined) continue
+      expect(`${detail.pin.provider}/${detail.pin.model}`).toBe('alpha/m-a')
+    }
+    // The ladder members the policy does not cover are never even CONSIDERED —
+    // the difference between widening a candidate pool and widening an
+    // authorization.
+    const requestDetail = details[details.length - 1]
+    expect(requestDetail?.why?.some(entry => entry.includes('escalation request'))).toBe(true)
+    // The widened pool never even CONSIDERS a route the policy does not cover:
+    // that is the difference between widening a candidate pool and widening an
+    // authorization.
+    expect(JSON.stringify(requestDetail?.candidates ?? [])).not.toContain('m-c')
+    expect(JSON.stringify(requestDetail?.candidates ?? [])).not.toContain('m-b')
+  })
+})

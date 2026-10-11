@@ -256,8 +256,32 @@ describe('a LIVE run projects to exactly the allow-listed fields', () => {
       'auditCount', 'auditMode', 'closeoutSubmitted', 'enforcement', 'executionGate',
       'executionMode', 'latestVerdicts', 'logCount', 'objective', 'phase', 'planGate',
       'planRevision', 'replanBudgetRemaining', 'requiredRoles', 'revision', 'risk',
-      'runId', 'size',
+      'routing', 'runId', 'size',
     ])
+  })
+
+  it('forwards the routing status when the run routes (M12): mode, policy state, and per-role class', async () => {
+    const h = makeHarness({ config: { routing: { mode: 'auto', ladder: { tiers: { economy: ['alpha/m-a'] } } } } })
+    const service = createAutopilotService(h.engine)
+    await h.engine.init(h.root, makeTriage())
+
+    const served = projectRuns(service)
+    expect(served.runs).toHaveLength(1)
+    const routing = served.runs[0]?.routing
+    expect(routing?.mode).toBe('auto')
+    // The HTTP path has no session to read a policy for: it must say so rather
+    // than claim `absent`, which would be a finding it never observed.
+    expect(routing?.policyState).toBe('unobserved')
+    expect(routing?.dispatch).toBe('unobserved')
+    const roles = routing?.roles as ReadonlyArray<{ role: string; workClass?: { name: string } }>
+    expect(roles.find(entry => entry.role === 'executor')?.workClass?.name).toBe('simple')
+    expect(roles.find(entry => entry.role === 'plan-auditor')?.workClass?.name).toBe('audit')
+    // Through the real route handler, not only the pure projection.
+    const { run: route } = routesOf(service)
+    const answer = call(route, `${AUTOPILOT_API_PREFIX}/run?id=${h.root.id}`)
+    expect(answer.status).toBe(200)
+    const body = answer.body as { run?: { routing?: { mode?: string } } }
+    expect(body.run?.routing?.mode).toBe('auto')
   })
 
   it('DROPS `diagnostic`, which the engine aliases onto an auditor note', async () => {

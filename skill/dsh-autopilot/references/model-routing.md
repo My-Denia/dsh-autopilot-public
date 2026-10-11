@@ -125,7 +125,7 @@ which ladder tiers it draws from. Five fixed classes:
 | --- | --- | --- | --- |
 | `mechanical` | speed (a real permitted `low` effort) | none — fact permit | — (no auto role defaults here) |
 | `simple` | price + speed | `economy` | executor, planner |
-| `hard` | try economy first (the escalation request channel is a documented non-goal, so the pool does NOT widen on its own) | `economy` | — |
+| `hard` | try economy first, widened only when something ASKS (see "The escalation request" below) | `economy` | — |
 | `audit` | ceiling + independence | `standard` | audit-plan, audit-execution, audit-rules |
 | `extreme` | ceiling | `reserve` | — |
 
@@ -140,6 +140,45 @@ configuration error, not an empty answer: the dispatch blocks with
 `AP_ROUTE_NO_REACHABLE_WORK_CLASS` and the run pauses through the routing
 escalation path. `mechanical` is not tier-bound (its gate is the fact permit),
 so it cannot fire that code.
+
+## The escalation request
+
+DESIGN §1.2 makes an upgrade a REQUEST, not a prediction: the pool stays economy
+until the model that is *working* reports that it could not proceed. That request
+is one tool call:
+
+```
+autopilot_log({ stance: 'escalate', escalationTarget: 'stronger-model', note: '<failure_kind> + the raw evidence' })
+```
+
+- **What it does.** The engine records the request against the run (the `note`
+  carries the evidence), and the next AUTO dispatch that runs a selection —
+  whatever brought it there: a first dispatch with no pin yet, a dead-pin
+  re-selection, rotation, or a healthy pin forced to re-select — widens its
+  candidate pool to `economy + standard + reserve`, unless the owner wrote their
+  own `routing.workClasses.<class>.tiers`, which wins (owner-explicit is the
+  highest authority in the routing order). The dispatch that acts on it says so
+  in its `why` trace, names the request's sequence number, and records the pin it
+  replaced as `repinFrom`. A dispatch that runs NO selection (an `inherit` or
+  `locked` role, a degraded routing config) leaves the request open for the next
+  one rather than spending it.
+- **What it does NOT do.** It never widens an AUTHORIZATION. The candidate set
+  is still `session policy ∩ live providers`, still filtered by the class's tier
+  membership, still ordered by the auditor independence rules, and still
+  ranked by the class's dominant axis. A route the session policy does not
+  cover is never even considered, and a pool that widens to nothing blocks with
+  `AP_ROUTE_NO_REACHABLE_WORK_CLASS` exactly as it would without a request.
+- **Consumed once.** The request covers ONE dispatch; the dispatch after it
+  returns to the ordinary pin-stability rules (a healthy pin is reused).
+- **Engine-local, and this is recorded rather than hidden.** The request is
+  live intent, not authorization-bearing state, so it is deliberately not part
+  of the durable run snapshot: a process restart forgets an open request, and
+  the requester asks again. What the request CAUSED is durable like any other
+  dispatch — it rides `detail.routing` with its own `why` line.
+- **A root-logged request speaks for the run, not for a guessed role.** The
+  engine does not infer which role a stall belongs to (an `audit` class name
+  cannot even name which auditor was meant); one open request per run is
+  consumed by whichever auto dispatch comes next.
 
 Coverage is two metrics. `coverageReport` (`kind: 'tier-coverage'`) answers "is
 every observed model claimed by some configured tier". The work-class

@@ -192,6 +192,22 @@ owner 原话：「模型一直在变化，不应该定死，也不应该机械�
 
 #### 任务档（work_class）决定哪条轴当主导
 
+> **升档请求已交付（2026-10-11，M12）。** `autopilot_log({ stance:'escalate',
+> escalationTarget:'stronger-model', note })` 即工作模型的升档请求：引擎记下该 run 的
+> 一个未消费请求，**下一次任意角色的 auto 派发**把候选池放宽到
+> `economy + standard + reserve`（owner 写了自己的 `routing.workClasses.<class>.tiers`
+> 时以 owner 为准），该次派发在 `why` 里点名请求序号与证据，并把被替换的 pin 记为
+> `repinFrom`；消费一次后回到既有 pin 稳定性语义。**请求不放宽授权**——候选集仍是
+> 「会话策略 ∩ 活体 provider」，仍过档位成员资格、独立性与主导轴排序，策略不覆盖的
+> 路由连"被考虑"都不会出现。请求是 engine-local 的（进程重启即遗忘，登记为边界而
+> 非隐藏）；它**不是**按角色猜测的：一个 run 一个请求，由下一次 auto 派发消费。
+> 交付形态见 §8.7，落地见 `src/engine.ts` 的 `consumeEscalation` 与
+> `selectForRole` 的消费点（`takeEscalation`）**以及** `resolveRoleRoute` 中"有未消费
+> 请求就强制重选"的分支（该分支必须存在的原因：健康 pin 会被**复用**，只把消费点放在
+> selector 里则请求在它唯一有用的路径上永不被读到 —— 计划审计在 rev 1 抓到过这个缺陷；
+> 消费点最终落在**选择**处，所以无 pin 的首次派发、死 pin 重选与轮转同样会放宽，而
+> inherit/locked 这类不做选择的分派不会消耗请求）。
+>
 > **已接线（2026-10-10，governance-pragmatics-v1 承接轮）。** workClass 输入已进入
 > 选择器（角色级 `routing.roles.<role>.workClass`，缺省按角色表：executor/planner
 > simple，三审计角色 audit），零可达 work_class 以 `AP_ROUTE_NO_REACHABLE_WORK_CLASS`
@@ -310,6 +326,13 @@ harness 自己的目录就自相矛盾地否证了它：`moonshotai/kimi-k3` 与
   ceiling 在派发点都没有生产者；mechanical 许可之外的努力档取自适配器自报事实。
   生产中也真正跑到的还有：角色 `minContext` 地板（executor/planner 131072，审计角色
   65536）与授权交集（会话策略路由 ∩ 活体 provider）。
+- **升档请求是 engine-local 的一次性意图，且只能放宽候选池、不能放宽授权。**
+  请求寄存器按 run 存一个条目（不写入 durable `Snapshot`，因此不触碰 fold 契约与
+  legacy replay）；被消费的那一次派发把它写进 `detail.routing.why` 与 `repinFrom`，
+  所以"这次为什么换了路线"是持久的，而"还有一个未消费的请求"不是。池放宽后仍必须
+  通过授权交集、档位成员资格与独立性判定；池为空时仍走
+  `AP_ROUTE_NO_REACHABLE_WORK_CLASS` 的阻塞路径（实测：owner 写了
+  `routing.workClasses.<class>.tiers` 时以 owner 映射为准，请求只提供默认下限）。
 - **持有活体 pin 的角色默认不重选；审计角色可由 owner 选择引擎级轮转。** 引擎在
   pin 的 provider 仍活、preflight 仍接受、授权仍覆盖时复用 pin
   （"stability over reselection"），只有 pin 死亡才带 `repinFrom` 重选。
@@ -2928,3 +2951,68 @@ reparse-alias 桩 → spawn ENOENT；修复需持久改用户 PATH 或管理员�
     （engaged 判定：ladder 已配置或 owner 改过类映射；未启用时记录而不施加，
     0.2.0 parity）；`routing.ladder.auditTier` 覆盖 audit 类档位，选择器与可达性
     报告用同一有效映射。
+
+### 8.7 M12 模型编排实况可观测 + work-class 升档请求通道（2026-10-11）
+
+两个交付物，都在 `governance-pragmatics-v1` 分支、基线 `93ea72c`（M11，r8）。
+
+1. **路由实况投影（`src/routing/status.ts`）**。此前 `StatusView` 只有一个路由字段
+   `routingReachability`，它回答的是覆盖面问题、在健康 ladder 上什么都不说；于是
+   "这台部署路由到底生效没有"在界面上无处可查——而 DESIGN §1.2 边界 (e) 已实测：
+   没有 session policy 时 auto **只做继承**。新投影给出：有效 `mode`、`preference`
+   及其来源（显式 / 默认，含 `orderingAxisDefault` 晋升）、**policy 状态**
+   （`present` / `absent` / `unreachable` / `unobserved`，其中 `unobserved` 专指
+   "读者没有会话可问"——HTTP 服务路径不读策略，绝不把它折叠成 `absent`）、每个角色的
+   有效路由（auto / inherit / locked，locked 带路由）与其 work class（名 / 轴 / 档位 /
+   是否 engaged）、本 run 已 pin 的路由、ladder 三档成员数与 `auditTier`。
+   `mode: 'off'` 时整个字段**缺席**：关掉路由后每一派发都是继承，一屏 `inherit` 行会
+   读成"选择失败"而不是"功能关掉了"。投影是纯函数、无 I/O、不猜测；它随后经
+   allow-list 转发到 `GET /api/autopilot/run`（桌面卡片轮询的同一条路由）。
+2. **work-class 升档请求通道**见 §9 第 17 项（同一轮交付）。
+
+**执行中发现并修复的三处只有真跑才暴露的问题**（都记在这里，因为它们定义了这个交付物
+的真实边界）：
+
+- **消费点必须在 pin 复用路径上。** 健康 pin 会被复用，`resolveRoleRoute` 根本不会进入
+  `selectForRole`；只把消费点放在 selector 里，请求在它唯一有用的路径上永不被读到。
+  独立计划审计在 rev 1 抓到这一点，修复是把 escalation 分支放在 `dead === undefined`
+  之后、rotation 分支之前，并补"无请求时逐字复用"的反向对照用例。
+- **请求不能按角色猜测。** 第一版按调用者归属角色，而根 agent 记录的请求落在了
+  `executor`，它想影响的审计派发永远消费不到（实测）。`audit` 这个类名也根本说不清是
+  哪个审计角色。现在一个 run 一个请求，由下一次任意 auto 派发消费。
+- **升档必须重算派生状态。** 第一版只替换 `tiers` 字段，而 `members` 是由原映射推导的；
+  实测 why 行写着 "economy + standard + reserve" 而过滤仍只放行 standard 成员。现在
+  经同一个 `resolveWorkClassSelection` 重新推导，成员集规则仍然只有一条。
+- **消费点必须在"发生选择"的地方（规则审计第二轮指出）。** 第二版把消费点放在健康 pin
+  分支上，于是文档里"下一次 auto 派发就会放宽"比代码宽：无 pin 的首次派发、死 pin 重选
+  与轮转都不放宽也不消费。现在消费点在 `selectForRole`（`takeEscalation`），健康 pin
+  分支只负责**强制重选**；不做选择的分派不消耗请求。新增用例 (e) 钉住"首次派发也放宽"。
+- **owner 权威要在正确的类上检验。** 新增用例 (f)（owner 写了
+  `routing.workClasses.hard.tiers`）当场抓出一个真缺陷：`ownerMapped` 检的是角色自己的类
+  （审计角色 = `audit`），而请求的池是从 `hard` 读的，于是 owner 写下的 hard 映射被静默
+  忽略、请求照样放宽。现在检验 `hard`（请求提升到的那个类；角色自己的类就是 `hard` 时
+  检验它自己），并且 why 行按**实际生效的档位**措辞——owner 映射生效时说的是
+  "the owner's mapping … stands against the request's own floor"，不再无条件声称
+  "widened to economy + standard + reserve"（规则审计第三轮指出的那条过宽措辞）。
+
+**如实记录的边界（M12）**：(a) 请求寄存器是 engine-local、不写入 durable `Snapshot`：
+进程重启即遗忘未消费请求（请求者需再次提出），这是刻意的取舍（请求是活意图，不是承载
+授权的状态），登记而不隐藏；被请求**导致**的那次派发是持久的（`detail.routing` 带 why 与
+`repinFrom`）。(b) 本轮**不**改桌面卡片渲染：新增 GUI 面在运行中的会话里无法被观察
+（内存副本已冻结，新会话才加载下一构建），因此只交付经真实 HTTP 路由验证的
+`api-behavior`，卡片渲染留给下一轮。(c) 升档只放宽候选池：owner 若为某类写了
+`routing.workClasses.<class>.tiers`，请求不覆盖它；ladder 已配置但请求后的池与授权交集
+为空时，仍走 `AP_ROUTE_NO_REACHABLE_WORK_CLASS` 阻塞（不静默降级）。
+
+17. **模型路由：work-class 升档请求通道**（**已交付**，2026-10-11 M12）：DESIGN §1.2 的
+    "升档是请求，不是预测"此前只有前半句落地（`hard` 档只有 economy 池，请求通道登记为
+    non-goal）。现在 `autopilot_log({ stance:'escalate', escalationTarget:'stronger-model',
+    note })` 就是请求本身：引擎按 run 记一个未消费请求，**下一次任意角色的 auto 派发**
+    把候选池放宽到 `economy + standard + reserve`（owner 写了
+    `routing.workClasses.<class>.tiers` 时以 owner 为准），该次派发在 `why` 里点名请求
+    序号与证据并把被替换的 pin 记为 `repinFrom`；消费一次后回到既有 pin 稳定性语义。
+    请求**不放宽授权**（候选集仍是授权交集，仍过档位成员资格、独立性与主导轴排序；
+    池为空仍走 `AP_ROUTE_NO_REACHABLE_WORK_CLASS`）。寄存器是 engine-local 的
+    （进程重启遗忘，登记为边界）；被派发消费的结果是持久的。测试：
+    `test/routing-integration.test.ts`（4 例，含"未请求时逐字复用健康 pin"的反向对照）
+    与 `test/routing-status.test.ts`。

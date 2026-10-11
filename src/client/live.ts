@@ -83,6 +83,12 @@ export interface LiveRun {
   readonly latestVerdicts?: Readonly<Record<string, string>>
   readonly executor?: Readonly<Record<string, unknown>>
   readonly enforcement?: Readonly<Record<string, unknown>>
+  /**
+   * M12: the routing status the host route serves. Carried as an opaque
+   * record — the browser half may DISPLAY it but must not re-derive it, the
+   * same rule the rest of this mirror follows for host-owned values.
+   */
+  readonly routing?: Readonly<Record<string, unknown>>
 }
 
 /**
@@ -259,6 +265,9 @@ export function readLiveRun(body: unknown): LiveRun | undefined {
     ...(roles === undefined ? {} : { requiredRoles: roles }),
     ...(num(run.replanBudgetRemaining) === undefined ? {} : { replanBudgetRemaining: num(run.replanBudgetRemaining) as number }),
     ...(num(run.logCount) === undefined ? {} : { logCount: num(run.logCount) as number }),
+    // M12: pass the routing block through only as a plain object; a malformed
+    // one is DROPPED (absent = not observed) rather than rendered as a claim.
+    ...(isPlainObject(run.routing) ? { routing: run.routing as Readonly<Record<string, unknown>> } : {}),
     ...(typeof run.closeoutSubmitted === 'boolean' ? { closeoutSubmitted: run.closeoutSubmitted } : {}),
     ...(verdicts === undefined ? {} : { latestVerdicts: verdicts }),
     ...(isPlainObject(run.executor) ? { executor: run.executor } : {}),

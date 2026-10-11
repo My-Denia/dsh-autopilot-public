@@ -39,6 +39,7 @@
 
 import type { Enforcement } from './domain/types.js'
 import type { StatusView } from './engine.js'
+import type { RoutingStatusView } from './routing/status.js'
 import type { AutopilotReadOnly } from './service.js'
 
 /** Same-origin API prefix. One namespace, matching the plugin's package name. */
@@ -177,6 +178,13 @@ export interface RunProjection {
   readonly closeoutSubmitted: boolean
   readonly executor?: { readonly generation: number; readonly state: string }
   readonly enforcement: EnforcementProjection
+  /**
+   * M12: the engine's routing-status projection, forwarded verbatim when the
+   * run's routing mode is `auto`. The web PARSER has no agent to read a
+   * session policy for, so `policyState` here is `unobserved` whenever the
+   * mount cannot ask — the projection never guesses on its behalf.
+   */
+  readonly routing?: RoutingStatusView
 }
 
 /** The `/runs` body. */
@@ -257,6 +265,8 @@ export function projectRun(status: StatusView): RunProjection {
       ? {}
       : { executor: { generation: status.executor.generation, state: status.executor.state } }),
     enforcement: projectEnforcement(status.enforcement),
+    // ALLOW-LIST discipline: `routing` rides only because it is named here.
+    ...(status.routing === undefined ? {} : { routing: status.routing }),
   }
 }
 
