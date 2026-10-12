@@ -376,7 +376,8 @@ adapter stays thin and the host-neutral rules live in one reference layer.
   work-class release below moved all four**: `requirements` now has one producer
   (the mechanical effort licence) and the ladder's tier membership is applied at
   the dispatch site; **auditor** rotation is delivered as an explicit owner
-  opt-in (executor rotation remains the recorded known limitation); A2 ships as
+  opt-in (executor rotation was the recorded known limitation until 2026-10-12,
+  when DESIGN §9 item 15 closed it — see the entries above); A2 ships as
   the explicit `routing.orderingAxisDefault` opt-in; and coverage is two metrics
   (tier coverage plus work-class reachability). Read the "已记录的边界" section
   of DESIGN.md, not this historical line, for the delivered set.
