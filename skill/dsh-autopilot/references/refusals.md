@@ -70,14 +70,14 @@ Requires:
 
 - `planGate === 'pass'` before `start-executor` or `submit-evidence`.
 - A `planGate` flip to `pass` leaves no unanswered usage evidence: `usageDeclarationProblems` is empty, at the write (verdict handling) and on replay.
-- An `executionGate` flip to `pass` has a latest `execution`-role audit whose verdict is `pass`.
+- An `executionGate` flip to `pass` has EITHER a latest `execution`-role audit whose verdict is `pass` OR an in-force owner pass for this generation (DESIGN §9 item 8, §17: an owner pass carries an explicit ruling with its generation and ordinal, and the write path additionally requires the evidence packet before the gate can be passed at all).
 - `planGatePassedAt` is stamped once and never restamped; it is the freshness anchor usage artifacts are measured against.
 - A new plan clears stale execution state: `submit-plan` leaves no `executionPacket` and resets `executionGate` to `pending`.
 - No executor exists before a `planGate` pass.
 
 Why: the gate is the only place the run says this is authorized. If it can open while a required declaration is missing, or with a stale artifact riding along, the authorization is false.
 
-Remedy: for `AP_PLAN_GATE_NOT_PASS` and `AP_EXECUTOR_BEFORE_GATE`, obtain a plan-audit pass (answering usage if prompted) before starting; for `AP_GATE_WITHOUT_AUDIT`, run an execution audit to a `pass` at the current execution revision; for the replay codes the stream was written wrong, so re-derive it through the engine rather than editing it.
+Remedy: for `AP_PLAN_GATE_NOT_PASS` and `AP_EXECUTOR_BEFORE_GATE`, obtain a plan-audit pass (answering usage if prompted) before starting; for `AP_GATE_WITHOUT_AUDIT`, run an execution audit to a `pass` at the current execution revision, or have the owner pass the gate explicitly (`autopilot_signal owner-gate-pass` with `gate: execution`); for the replay codes the stream was written wrong, so re-derive it through the engine rather than editing it.
 
 Codes: `AP_PLAN_GATE_NOT_PASS`, `AP_GATE_WITH_UNDECLARED_USAGE`, `AP_GATE_WITHOUT_AUDIT`, `AP_GATE_STAMP_MUTATED`, `AP_STALE_EVIDENCE`, `AP_EXECUTOR_BEFORE_GATE`.
 
@@ -194,6 +194,7 @@ Requires:
 - A routing detail agrees with the audit or executor record the same commit appends: one dispatch, one role, one route (replay).
 - Routing that cannot resolve on the write path pauses the run: it commits a `set-owner-decision` and refuses the dispatch.
 - A work class with ZERO reachable routes on a configured ladder refuses the dispatch on the write path: the selection blocks with `AP_ROUTE_NO_REACHABLE_WORK_CLASS` in its reason and the run pauses through the routing-escalation path. An empty ladder restricts nothing (the shipped default); the error fires only when the owner configured a ladder and the class's mapped tiers leave no authorized live route.
+- Engine-level rotation (owner opt-in `routing.ladder.rotation`, default off) re-selects instead of reusing a healthy pin at a NEW dispatch boundary. An AUDITOR's offset stays inside the top independence class WHEN the independence constraint is active (below the configured floor there is no such class and the offset walks the ranked survivor list); the EXECUTOR — reached only by `start-executor`, never by `resume-executor` — always offsets the ranked survivor list, since it carries no independence constraint of its own. Its ordinal is the run's own dispatch count (`executorDispatches`, §17), so replay recomputes the same rotation.
 
 Why: a pin authorizes one route and must dispatch that same route. A fabricated or contradictory decision is a hand-edited or foreign stream and is rejected loudly. And a work class that can reach nothing is a configuration error, not an empty answer — silently inheriting a fallback would record a choice that never happened.
 
@@ -256,7 +257,7 @@ Requires:
 - A tool call carries a calling Agent.
 - The caller is the live registered root and has no parent session.
 - An executor child is the live registered child, with a parent session whose agent is registered and top-level.
-- Owner-only ops (`autopilot_external_audit`, `owner-approve`, `owner-resolve`) run in the root's current turn window with a `user/message` whose source kind is `user`.
+- Owner-only ops (`autopilot_external_audit`, `owner-approve`, `owner-resolve`, `owner-gate-pass`, `owner-gate-withdraw`) run in the root's current turn window with a `user/message` whose source kind is `user`.
 
 Why: the engine is single-writer per run. An agent-generated turn or a nested caller cannot be distinguished from a delegated action, so owner authority has to be observable in the log.
 
@@ -315,6 +316,25 @@ Remedy: for amendment codes, land the delta re-audit (a plan-role `pass` at the 
 
 Codes: `AP_AMEND_PLAN_INVALID`, `AP_AMEND_REAUDIT_REQUIRED`, `AP_AMEND_STATE_INVALID`, `AP_AMEND_STATE_MUTATED`, `AP_PAUSE_STATE_INVALID`, `AP_OWNER_RESUME_INVALID`.
 
+## 17. Owner gate decisions and provenance
+
+Two fields hold the owner's gate decisions to something the stream can re-check (DESIGN §9 items 8 and 15): `gateSources` (which authority last set each gate, at which generation) and `executorDispatches` (the run's own dispatch count — the executor rotation ordinal).
+
+Requires:
+
+- The gate actions are owner-only and name exactly one gate. `owner-gate-pass` requires `detail.gate` and the shape its target allows — plan from `planning`/`plan-reviewing`/`replanning` with a submitted plan and an ANSWERED usage question, execution from `execution-reviewing` with the evidence submitted — and it must not move the other gate (`AP_OWNER_GATE_INVALID`).
+- Only a gate the OWNER passed, and only while that pass is CURRENT, can be withdrawn: `owner-gate-withdraw` on an audit-derived gate, on a decision already withdrawn, or on a pass from an earlier generation (already superseded) refuses (`AP_OWNER_GATE_NOT_PASSED`). Withdrawing one gate must also leave the other gate where it was (`AP_OWNER_GATE_INVALID`), and a withdrawal drops the named gate to the review it actually has — `pending` when this generation has none — and returns the phase to `planning` / `execution-reviewing` accordingly. The execution packet is NOT erased by any of the held-gate paths.
+- An owner pass STANDS against a later audit objection: the objection is appended (recorded, never erased) while that gate does not move. The GENERATION ends it — an `amend-plan`, a new plan submission, a replan, or `owner-resolve` with decision `resume-planning` (that decision alone: `resume-execution` restores the paused phase with provenance untouched); a pass whose `planRevision` is not the current one is not in force, so the next verdict moves the gate normally (`AP_OWNER_GATE_PRECEDENCE`).
+- A withdrawal is final for its generation: nothing but a NEW owner decision with a strictly higher ordinal may make that gate read `owner` again (`AP_OWNER_GATE_RESURRECTED`).
+- `gateSources` equals the fold's derivation at every revision (`AP_GATE_SOURCE_INVALID`), never disappears once recorded (`AP_GATE_SOURCE_SHRANK`), and is presence-gated: a stream that never recorded it folds exactly as before and reads `no-source`.
+- `executorDispatches` equals the run's own dispatch count (`AP_EXECUTOR_DISPATCH_COUNT`), where a dispatch is a NEW CHILD ID, not an op: `startExecutor` writes two `start-executor` events (a `starting` record, then the `running` one) with the same `childId`, so counting events would double every dispatch and advance the rotation ordinal two steps at a time. Presence-gated the same way, with one nuance stated rather than implied: on a stream that recorded no count, the FIRST dispatch writes 1, so the field is a lower bound — "dispatches recorded since it appeared", never a fabrication.
+
+Why: a gate is a claim about WHO decided, and the two failure modes are opposite — an owner ruling silently overwritten by the next objection, and a withdrawn ruling quietly back in force. Neither is visible in a status that shows only the gate value, so the source, its generation and its ordinal are recorded and the replay re-derives them.
+
+Remedy: end an owner pass with `owner-gate-withdraw` rather than by editing state, let the run's own reviews decide again, and pass a new gate decision deliberately if the owner still wants it. The replay codes mean the stream is not one this engine wrote.
+
+Codes: `AP_OWNER_GATE_INVALID`, `AP_OWNER_GATE_NOT_PASSED`, `AP_OWNER_GATE_PRECEDENCE`, `AP_OWNER_GATE_RESURRECTED`, `AP_GATE_SOURCE_INVALID`, `AP_GATE_SOURCE_SHRANK`, `AP_EXECUTOR_DISPATCH_COUNT`.
+
 ## Index
 
 Every `AP_*` code that appears under `src/**`, its contract, and the one-line precondition. Contract numbers refer to the sections above.
@@ -348,6 +368,7 @@ Every `AP_*` code that appears under `src/**`, its contract, and the one-line pr
 | `AP_ESCALATION_NOT_EXECUTOR` | 7 | only the run's live, authorized, `running` executor child may record an escalation request |
 | `AP_EVENT_VERSION` | 1 | `event.v` is exactly `1` |
 | `AP_EXECUTOR_BEFORE_GATE` | 4 | `start-executor` runs only with prior `planGate` pass |
+| `AP_EXECUTOR_DISPATCH_COUNT` | 17 | `executorDispatches` equals this run's own dispatch count — one per NEW child id, the executor rotation ordinal |
 | `AP_EXECUTOR_EXISTS` | 7 | no live (`starting` or `running`) executor exists at `start-executor` |
 | `AP_EXECUTOR_MISMATCH` | 7 | the caller is the live registered executor child the run names |
 | `AP_EXECUTOR_MUTATED` | 7 | executor identity is stable and state changes only to a lifecycle terminal |
@@ -357,9 +378,11 @@ Every `AP_*` code that appears under `src/**`, its contract, and the one-line pr
 | `AP_EXTERNAL_INVALID` | 6 | an external countersign is structurally valid (reviewer, run-relative `reviewRef`, optional 7-64 lowercase hex `treeHash`) |
 | `AP_EXTERNAL_WRONG_MODE` | 6 | a countersigned audit record appears only when `auditMode` is `external` |
 | `AP_FIRST_NOT_INIT` | 1 | the first event is `init` |
+| `AP_GATE_SOURCE_INVALID` | 17 | `gateSources` equals the fold's derivation (owner decisions by generation and ordinal; audit/self-check verdicts otherwise) |
+| `AP_GATE_SOURCE_SHRANK` | 17 | `gateSources` never disappears once recorded |
 | `AP_GATE_STAMP_MUTATED` | 4 | `planGatePassedAt` is stamped once and never restamped |
 | `AP_GATE_WITH_UNDECLARED_USAGE` | 4 | a `planGate` flip to `pass` leaves no unanswered usage evidence |
-| `AP_GATE_WITHOUT_AUDIT` | 4 | an `executionGate` flip to `pass` has a latest `execution`-role audit `pass` |
+| `AP_GATE_WITHOUT_AUDIT` | 4 | an `executionGate` flip to `pass` has a latest `execution`-role audit `pass`, or an in-force owner pass for this generation |
 | `AP_HANDOFF_INVALID` | 5 | the partial-delivery contract holds: outcome derived, unproven criteria bijectively handed off |
 | `AP_HANDOFF_STAMP_INVALID` | 5 | the `submit-closeout` `closeoutHandoff` stamp is the integer `1` |
 | `AP_ILLEGAL_OP` | 2 | the op is a member of `LEGAL_OPS[prior.phase]` |
@@ -381,6 +404,10 @@ Every `AP_*` code that appears under `src/**`, its contract, and the one-line pr
 | `AP_NOT_ROOT` | 13 | the root is top-level (no parent session) |
 | `AP_OUTBOUND_ARCHIVE` | 14 | a consumed manifest archives successfully before the egress is allowed |
 | `AP_OWNER_AUTHORITY_REQUIRED` | 13 | the owner-only op runs on a direct human turn in the root's current turn window |
+| `AP_OWNER_GATE_INVALID` | 17 | a gate action names exactly one gate, in a phase and shape that allow it, without moving the other gate |
+| `AP_OWNER_GATE_NOT_PASSED` | 17 | `owner-gate-withdraw` targets a gate the owner actually passed and has not already withdrawn |
+| `AP_OWNER_GATE_PRECEDENCE` | 17 | an owner pass stands against a later audit objection: the objection is recorded, the gate does not move |
+| `AP_OWNER_GATE_RESURRECTED` | 17 | a withdrawn owner decision cannot come back into force; only a higher ordinal may read `owner` again |
 | `AP_OWNER_RESUME_INVALID` | 16 | `owner-resolve(resume-execution)` restores a stamped `pausedFrom` without touching state |
 | `AP_PACKET_EXISTS` | 7 | no `executionPacket` is already present for this revision |
 | `AP_PACKET_REVISION_MISMATCH` | 7 | the packet stamp equals the live executor's `executionRevision`, `generation`, and `childId` |

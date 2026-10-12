@@ -217,7 +217,7 @@ const LadderShape = Schema.object({
     Schema.const('reserve').description('Audit roles may draw from the reserve tier.'),
     Schema.const('none').description('No tier restriction is configured (the shipped default).'),
   ]).default('none').volatile(),
-  rotation: Schema.boolean().default(false).volatile().description('Engine-level re-selection for AUDITOR roles (DESIGN §9-15): a healthy pin yields to a full re-selection at the next dispatch of the same role, offset by the audit-count ordinal within its independence class. Executor never rotates this way (stability weights higher; recorded as a known limitation). Default off preserves the shipped pin-stability semantics exactly.'),
+  rotation: Schema.boolean().default(false).volatile().description('Engine-level re-selection at a role\'s next dispatch (DESIGN §9 item 15): a healthy pin yields to a full re-selection — for an AUDITOR role the offset is its audit-count ordinal within the top independence class (never overriding independence), and for the EXECUTOR it is the run\'s own executorDispatches count (one per new child) within the ranked survivor list. A running executor child is never re-routed: only startExecutor reaches the resolver, and resumeExecutor continues the child on its recorded route. Default off preserves the shipped pin-stability semantics exactly.'),
   speedOrder: Schema.array(Schema.string()).default([]).volatile().description('Owner-declared speed order, fastest first, as provider/model. Empty means speed is unknown and is not ranked.'),
   costOverrides: Schema.array(Schema.string()).default([]).volatile().description('Owner cost overrides, "provider/model=inputPerM/outputPerM". These beat the seeded cost. A malformed entry is refused.'),
 })

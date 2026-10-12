@@ -48,6 +48,7 @@ const INVARIANT_HEADINGS = [
   'Plan Amendment and Delta Re-audit',
   'Partial Delivery and Carryover',
   'Owner-Decision Boundaries',
+  'Owner Gate Decisions and Provenance',
   'Red flags',
 ] as const
 

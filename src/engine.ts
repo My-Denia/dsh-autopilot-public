@@ -10,7 +10,7 @@
  */
 
 import { randomUUID } from 'node:crypto'
-import { applyEvent, AUDIT_ROLE_OF_ROUTING_ROLE } from './domain/fold.js'
+import { applyEvent, applyGateLedger, AUDIT_ROLE_OF_ROUTING_ROLE, withdrawnGateValue } from './domain/fold.js'
 import {
   AutopilotError,
   MAX_REPLAN_ROUNDS,
@@ -40,6 +40,8 @@ import type {
   EgressDecision,
   Enforcement,
   ExecutorRecord,
+  GateName,
+  GateSources,
   LogEntry,
   Operation,
   OwnerApproval,
@@ -1269,6 +1271,12 @@ export interface StatusView {
   readonly phase: Snapshot['phase']
   readonly planGate: Snapshot['planGate']
   readonly executionGate: Snapshot['executionGate']
+  /**
+   * Which authority last set each gate, and for which plan revision (DESIGN §9
+   * item 8). A stream that recorded no provenance projects `no-source` — the
+   * honest reading, never inferred from the gate value.
+   */
+  readonly gateSources: GateSources
   readonly planRevision: number
   readonly objective: string
   readonly size: Snapshot['triage']['size']
@@ -2842,6 +2850,149 @@ export class AutopilotEngine {
   }
 
   /**
+   * Owner-authority: pass a gate directly (DESIGN §9 item 8). The tool layer
+   * verifies the direct-human turn, exactly as it does for owner-approve and
+   * owner-resolve.
+   *
+   * WHAT THIS BUYS: the owner's own ruling that a gate is met, recorded as
+   * `owner` provenance together with the plan revision (the GENERATION) it was
+   * taken in and a monotonic ordinal. An audit objection that arrives
+   * afterwards is RECORDED and does not move that gate, and the other gate is
+   * never carried along — one owner decision, one gate. Ending the pass is an
+   * explicit `owner-gate-withdraw`.
+   *
+   * TWO COUPLINGS ARE KEPT DELIBERATELY:
+   * - the usage question: a plan gate that passed while the usage question was
+   *   unanswered would break the invariant the engine states everywhere else
+   *   ('at the revision where planGate becomes pass, the question was
+   *   answered'), so this path refuses with the same `AP_USAGE_UNDECLARED`
+   *   rather than routing around it;
+   * - evidence: the execution gate is only passable from
+   *   `execution-reviewing`, i.e. after the evidence report exists.
+   */
+  async ownerGatePass(caller: AgentRef, request: { gate: GateName; note: string }): Promise<Snapshot> {
+    const root = this.resolveRoot(caller)
+    return this.transact(root.id, async () => {
+      const prior = this.require(root.id)
+      if (TERMINAL_PHASES.includes(prior.phase) || prior.phase === 'needs-owner-decision') {
+        throw new AutopilotError(`owner-gate-pass requires a live run, got phase ${prior.phase}`, 'AP_WRONG_PHASE')
+      }
+      const detail = { gate: request.gate, note: request.note }
+      if (request.gate === 'plan') {
+        if (prior.phase !== 'planning' && prior.phase !== 'plan-reviewing' && prior.phase !== 'replanning') {
+          throw new AutopilotError(
+            `owner-gate-pass plan requires phase planning|plan-reviewing|replanning, got ${prior.phase}`,
+            'AP_OWNER_GATE_INVALID',
+          )
+        }
+        if (prior.plan.text.trim().length === 0) {
+          throw new AutopilotError('owner-gate-pass plan requires a submitted plan', 'AP_OWNER_GATE_INVALID')
+        }
+        const usageProblems = usageDeclarationProblems(prior.usage)
+        if (usageProblems.length > 0) {
+          throw new AutopilotError(
+            `plan gate refused: usage evidence must be declared before the plan gate can pass: ${usageProblems.join('; ')}`,
+            'AP_USAGE_UNDECLARED',
+          )
+        }
+        return await this.commit(prior, 'owner-gate-pass', {
+          ...prior,
+          revision: prior.revision + 1,
+          phase: 'executing',
+          planGate: 'pass',
+          consecutiveReplans: 0,
+          ...(prior.planGatePassedAt === undefined ? { planGatePassedAt: new Date().toISOString() } : {}),
+          diagnostic: `owner gate pass (plan): ${request.note}`,
+        }, detail)
+      }
+      if (prior.phase !== 'execution-reviewing') {
+        throw new AutopilotError(
+          `owner-gate-pass execution requires phase execution-reviewing, got ${prior.phase}`,
+          'AP_OWNER_GATE_INVALID',
+        )
+      }
+      if (prior.executionPacket === undefined) {
+        throw new AutopilotError('owner-gate-pass execution requires submitted execution evidence', 'AP_OWNER_GATE_INVALID')
+      }
+      return await this.commit(prior, 'owner-gate-pass', {
+        ...prior,
+        revision: prior.revision + 1,
+        phase: 'closing',
+        executionGate: 'pass',
+        // THE EXECUTOR IS TERMINATED HERE, exactly as the execution-audit pass
+        // arm does it. Without this an owner-passed delegated run had
+        // `executor.state === 'running'` while the gate said pass, and
+        // `evaluateCompletion` refuses to complete a delegated run whose
+        // executor is not `completed` — so the owner's own ruling could not
+        // close the run it was about, and the only exits were a passing review
+        // or a withdrawal. The decision is the same kind of decision either
+        // way, so the state transition is the same.
+        executor: keepOrSetExecutorState(prior.executor, 'completed'),
+        diagnostic: `owner gate pass (execution): ${request.note}`,
+      }, detail)
+    })
+  }
+
+  /**
+   * Owner-authority: take back a gate pass the owner gave (DESIGN §9 item 8).
+   *
+   * The withdrawal is an APPENDED record carrying the ordinal it takes back, so
+   * that decision can never be resurrected: the gate falls back to what the
+   * run's own audit stream says at the current plan revision (or `pending` when
+   * this generation was never reviewed) — precisely the state the owner's pass
+   * had been standing in front of. Only the owner can do this, only for a gate
+   * they passed, and only once per decision.
+   */
+  async ownerGateWithdraw(caller: AgentRef, request: { gate: GateName; note: string }): Promise<Snapshot> {
+    const root = this.resolveRoot(caller)
+    return this.transact(root.id, async () => {
+      const prior = this.require(root.id)
+      if (TERMINAL_PHASES.includes(prior.phase) || prior.phase === 'needs-owner-decision') {
+        throw new AutopilotError(`owner-gate-withdraw requires a live run, got phase ${prior.phase}`, 'AP_WRONG_PHASE')
+      }
+      const history = prior.gateSources?.[request.gate]
+      if (history === undefined || history.source !== 'owner' || history.withdrawn === true) {
+        throw new AutopilotError(
+          `owner-gate-withdraw ${request.gate}: no owner pass is in force for this gate — an audit-derived gate is not the owner's to withdraw, and a decision already withdrawn has nothing left to take back`,
+          'AP_OWNER_GATE_NOT_PASSED',
+        )
+      }
+      if (history.planRevision !== prior.plan.revision) {
+        // A pass taken in an EARLIER generation is already superseded: a new plan
+        // submission, a replan or `owner-resolve(resume-planning)` ended it, so
+        // there is nothing left to take back and writing a withdrawal here would
+        // record a retraction of a ruling that no longer exists.
+        throw new AutopilotError(
+          `owner-gate-withdraw ${request.gate}: the owner's pass belongs to plan revision ${String(history.planRevision ?? 0)} and plan revision ${prior.plan.revision} is current — a superseded pass is already out of force, nothing to withdraw`,
+          'AP_OWNER_GATE_NOT_PASSED',
+        )
+      }
+      const detail = { gate: request.gate, note: request.note }
+      if (request.gate === 'plan') {
+        const value = withdrawnGateValue(prior, 'plan')
+        return await this.commit(prior, 'owner-gate-withdraw', {
+          ...prior,
+          revision: prior.revision + 1,
+          // The plan gate is no longer passed by the owner; when this
+          // generation was never reviewed the run returns to planning rather
+          // than pretending a plan it no longer approves is under execution.
+          phase: value === 'pass' ? prior.phase : 'planning',
+          planGate: value,
+          diagnostic: `owner gate withdraw (plan): ${request.note}`,
+        }, detail)
+      }
+      const value = withdrawnGateValue(prior, 'execution')
+      return await this.commit(prior, 'owner-gate-withdraw', {
+        ...prior,
+        revision: prior.revision + 1,
+        phase: value === 'pass' ? prior.phase : 'execution-reviewing',
+        executionGate: value,
+        diagnostic: `owner gate withdraw (execution): ${request.note}`,
+      }, detail)
+    })
+  }
+
+  /**
    * Owner-authority: resolve a needs-owner-decision pause.
    *
    * Three rulings (governance pragmatics v1 adds resume-execution):
@@ -3459,27 +3610,46 @@ export class AutopilotEngine {
         }
       }
     }
+    // ── GATE LEDGER + EXECUTOR-DISPATCH LEDGER (DESIGN §9 items 8 and 15) ──
+    //
+    // Both fields are DERIVED here by the same shared function the fold
+    // re-derives with, so the committed snapshot carries no author-chosen
+    // provenance: an owner gate pass records its generation (plan revision)
+    // and ordinal, a withdrawal keeps the ordinal it took back, and the
+    // executor rotation ordinal comes from this run's own dispatch count. A
+    // legacy stream (field absent, never written) keeps folding exactly as it
+    // did, and the fold refuses the moment the two derivations disagree.
+    const ledger = applyGateLedger(
+      prior,
+      { op, ...(stampedDetail === undefined ? {} : { detail: stampedDetail }) },
+      scoped,
+    )
+    const committed: Snapshot = {
+      ...scoped,
+      ...(ledger.gateSources === undefined ? {} : { gateSources: ledger.gateSources }),
+      ...(ledger.executorDispatches === undefined ? {} : { executorDispatches: ledger.executorDispatches }),
+    }
     const candidate: RunEvent = {
       v: 1,
       op,
-      revision: scoped.revision,
+      revision: committed.revision,
       time: new Date().toISOString(),
-      snapshot: scoped,
+      snapshot: committed,
       ...(stampedDetail === undefined ? {} : { detail: stampedDetail }),
     }
     try {
       applyEvent(prior, candidate)
-      await this.store.commit(scoped.runId, op, scoped, stampedDetail)
+      await this.store.commit(committed.runId, op, committed, stampedDetail)
     } catch (error: unknown) {
       // The transition did not happen; whatever arm state this call created
       // must not survive it (disposed AND deleted — a retried transition
       // re-resolves from current facts instead of trusting a stale arm).
-      if (armedHere) this.disposePlanner(scoped.runId)
+      if (armedHere) this.disposePlanner(committed.runId)
       throw error
     }
-    this.cache.set(scoped.runId, scoped)
-    if (wasPlanning && !isPlanning) this.disposePlanner(scoped.runId)
-    return scoped
+    this.cache.set(committed.runId, committed)
+    if (wasPlanning && !isPlanning) this.disposePlanner(committed.runId)
+    return committed
   }
 
   private transact<T>(runId: RunId, operation: () => Promise<T>): Promise<T> {
@@ -4184,21 +4354,31 @@ export class AutopilotEngine {
         if (dead === undefined) {
           dead = this.pinStillAuthorized(role, pinRoute, policy)
         }
-        // M4 (DESIGN §9-15, item 15): owner-opted engine-level rotation. A
-        // HEALTHY auditor pin yields to a full re-selection when
+        // M4 + DESIGN §9 item 15 (closed here): owner-opted engine-level
+        // rotation. A HEALTHY pin yields to a full re-selection when
         // `routing.ladder.rotation` is on — the SAME selectForRole path a
         // first dispatch walks (authorization, preflight and audit
         // independence all re-run; a rotation that blocks, e.g.
         // AP_ROUTE_NO_REACHABLE_WORK_CLASS, escalates instead of keeping the
-        // pin). The rotation ordinal is derived from the run's own audit
-        // stream inside selectForRole (replay-safe, no mutable counter), and
-        // the selector applies the offset WITHIN the independence class — it
-        // can never rotate a candidate out of the independent group (§1.2:
-        // rotation does not override independence). AUDITOR roles only: the
-        // executor's stability weights higher than rotation, so engine-level
-        // executor rotation is a recorded known limitation, not a silent gap.
+        // pin). The rotation ordinal is derived from the run's own stream
+        // inside selectForRole (replay-safe, no mutable counter), and the
+        // selector applies the offset only WITHIN the group it may permute:
+        // for an auditor that is the top independence class (§1.2: rotation
+        // does not override independence), for the executor there is no
+        // independence constraint of its own, so the offset walks the ranked
+        // survivor list.
+        //
+        // WHY EXECUTOR ROTATION IS SAFE HERE, stated as a property of the call
+        // graph rather than a promise: `resolveRoleRoute('executor')` is called
+        // by `startExecutor` ONLY, i.e. at a NEW dispatch boundary. A live child
+        // is continued by `resumeExecutor`, which re-uses the child's own
+        // recorded route and never reaches this method — so continuity inside a
+        // running executor is preserved by construction. Under
+        // `executionMode: 'inline'` there is no executor dispatch at all, so
+        // nothing is rotated and nothing is claimed.
         // Default off leaves the reuse semantics below untouched.
-        if (dead === undefined && routing.ladder.rotation && AUDITOR_ROLE_SET.includes(role)) {
+        if (dead === undefined && routing.ladder.rotation
+          && (AUDITOR_ROLE_SET.includes(role) || role === 'executor')) {
           const rotated = await this.selectForRole(role, routing.preference, routing.preferenceSource, roleRouting, prior, policy, catalog, routing.ladder, routing.workClasses)
           return this.decorateRepinned(
             this.resolutionOfDecision(role, roleRouting, rotated, undefined),
@@ -4207,7 +4387,9 @@ export class AutopilotEngine {
               model: pin.model,
               ...(pin.reasoningEffort === undefined ? {} : { reasoningEffort: pin.reasoningEffort }),
             },
-            'rotation: routing.ladder.rotation is on — this auditor role re-selects instead of reusing its healthy pin (the pin was live, preflighted and authorized when this decision started)',
+            role === 'executor'
+              ? 'rotation: routing.ladder.rotation is on — this executor dispatch re-selects instead of reusing its healthy pin (the pin was live, preflighted and authorized when this decision started); a LIVE executor child is never re-routed, so continuity is preserved'
+              : 'rotation: routing.ladder.rotation is on — this auditor role re-selects instead of reusing its healthy pin (the pin was live, preflighted and authorized when this decision started)',
           )
         }
         // M2 (DESIGN §1.2 "升档是请求，不是预测"): an OPEN escalation request
@@ -4826,14 +5008,18 @@ export class AutopilotEngine {
         ladder.auditTier,
       ),
     )
-    // The rotation ordinal (owner coverage requirement): how many audit
-    // records this role's mapped audit role already holds in the run's OWN
-    // durable stream. Derived, never a mutable counter, so replay recomputes
-    // the same ordinal. The mapping is fold.ts's
-    // AUDIT_ROLE_OF_ROUTING_ROLE (routing role -> audit role); the engine's
-    // own `routeRoleOf` is the INVERSE and is deliberately NOT used here.
+    // The rotation ordinal (owner coverage requirement): for an auditor, how
+    // many audit records this role's mapped audit role already holds in the
+    // run's OWN durable stream; for the EXECUTOR (DESIGN §9 item 15), how many
+    // executor dispatches this run has already started. Both are DERIVED from
+    // the stream, never a mutable counter, so replay recomputes the same
+    // ordinal. The mapping is fold.ts's AUDIT_ROLE_OF_ROUTING_ROLE (routing
+    // role -> audit role); the engine's own `routeRoleOf` is the INVERSE and is
+    // deliberately NOT used here.
     const auditRole = AUDIT_ROLE_OF_ROUTING_ROLE[role]
-    const rotation = auditRole === undefined ? undefined : prior.audits.filter((record) => record.role === auditRole).length
+    const rotation = role === 'executor'
+      ? (prior.executorDispatches ?? 0)
+      : auditRole === undefined ? undefined : prior.audits.filter((record) => record.role === auditRole).length
     const decision = await selectRoute({
       role,
       risk: prior.triage.risk,
@@ -5482,13 +5668,19 @@ export class AutopilotEngine {
       await this.subagents.drainContinuableChildren(root, [prior.executor.childId])
       return undefined
     } catch (error: unknown) {
+      // AN OWNER PASS OUTLIVES A DRAIN FAILURE. This fallback runs on the
+      // failure path, so it must not move a gate the owner passed — the fold
+      // would refuse the commit and turn a recoverable drain failure into a
+      // thrown transition. The run still parks for the owner; the gate it
+      // passed is simply left where the owner put it.
+      const held = this.ownerPassInForce(prior, 'execution')
       return await this.commit(prior, 'set-owner-decision', {
         ...prior,
         revision: prior.revision + 1,
         phase: 'needs-owner-decision',
-        executionGate: 'needs-owner-decision',
+        executionGate: held ? prior.executionGate : 'needs-owner-decision',
         pausedFrom: prior.phase,
-        diagnostic: `executor drain failed: ${errorMessage(error)}`,
+        diagnostic: `executor drain failed: ${errorMessage(error)}${held ? ' — the execution gate was not moved: the owner\'s pass stands' : ''}`,
       })
     }
   }
@@ -5573,6 +5765,21 @@ export class AutopilotEngine {
       route: outcome.route,
     }
 
+    // OWNER-PASS PRECEDENCE ON THE WRITE PATH (DESIGN §9 item 8). When the
+    // owner's pass is in force for a gate, the verdict is RECORDED and that
+    // gate does not move. Implemented here rather than left to the fold's
+    // refusal for one reason: a refused commit loses the auditor's verdict, and
+    // erasing the objection is the single thing the precedence rule must never
+    // do. The PHASE still moves (a blocked auditor parks the run; a needs-fix
+    // sends it back to work) — what the owner set stays set, so the gate the
+    // owner passed is still the gate it reads as when the run resumes.
+    const heldPlan = this.ownerPassInForce(live, 'plan')
+    const heldExecution = this.ownerPassInForce(live, 'execution')
+    const heldInThisArm = outcome.role === 'plan' ? heldPlan : heldExecution
+    const heldGate: GateName = outcome.role === 'plan' ? 'plan' : 'execution'
+    const heldNote = (gate: GateName): string =>
+      `verdict ${outcome.verdict} was RECORDED but did not move the ${gate} gate: the owner's pass (plan revision ${String(live.gateSources?.[gate]?.planRevision ?? 0)}) takes precedence over a later audit objection — withdraw it (autopilot_signal owner-gate-withdraw) to let the run's own reviews decide again`
+
     // needs-replan from any role (governance pragmatics v1): the replan
     // budget is OBSERVED, never auto-escalated. Budget exhaustion used to
     // force needs-owner-decision on the 3rd consecutive round — a mechanical
@@ -5589,19 +5796,32 @@ export class AutopilotEngine {
       const prior = this.current(root.id) ?? live
       const drained = outcome.role !== 'plan' ? await this.drainExecutorIfRunning(root, prior) : undefined
       if (drained !== undefined) return result
+      const heldHere: GateName[] = [
+        ...(heldPlan ? (['plan'] as GateName[]) : []),
+        ...(outcome.role !== 'plan' && heldExecution ? (['execution'] as GateName[]) : []),
+      ]
       await this.commit(live, op, {
         ...live,
         revision: live.revision + 1,
         phase: 'replanning',
-        planGate: 'needs-replan',
-        executionGate: outcome.role === 'plan' ? live.executionGate : 'needs-replan',
+        planGate: heldPlan ? live.planGate : 'needs-replan',
+        executionGate: outcome.role === 'plan' || heldExecution ? live.executionGate : 'needs-replan',
         audits,
         consecutiveReplans: rounds,
         executor: keepOrSetExecutorState(live.executor, 'revoked'),
-        executionPacket: undefined,
-        ...(exhausted
+        executionPacket: heldExecution ? live.executionPacket : undefined,
+        ...(exhausted || heldHere.length > 0
           ? {
-              diagnostic: `replan budget exhausted: ${rounds} consecutive needs-replan rounds (max ${MAX_REPLAN_ROUNDS}); escalation to the owner is a deliberate choice (autopilot_signal owner-decision), not automatic`,
+              diagnostic: [
+                exhausted
+                  ? `replan budget exhausted: ${rounds} consecutive needs-replan rounds (max ${MAX_REPLAN_ROUNDS}); escalation to the owner is a deliberate choice (autopilot_signal owner-decision), not automatic`
+                  : undefined,
+                // THIS ARM attempts BOTH gates (the plan gate whatever the
+                // role, the execution gate for every non-plan role), so every
+                // held gate it would have moved is named — not just the one the
+                // auditing role happens to own.
+                ...heldHere.map(gate => heldNote(gate)),
+              ].filter((part): part is string => part !== undefined).join('; '),
             }
           : {}),
       }, routingDetail)
@@ -5707,9 +5927,10 @@ export class AutopilotEngine {
           ...live,
           revision: live.revision + 1,
           phase: 'executing',
-          executionGate: 'needs-fix',
+          executionGate: heldExecution ? live.executionGate : 'needs-fix',
           audits,
-          executionPacket: undefined,
+          executionPacket: heldExecution ? live.executionPacket : undefined,
+          ...(heldExecution ? { diagnostic: heldNote('execution') } : {}),
         }, routingDetail)
         return result
       }
@@ -5718,10 +5939,10 @@ export class AutopilotEngine {
           ...live,
           revision: live.revision + 1,
           phase: 'blocked',
-          planGate: outcome.role === 'plan' ? 'blocked' : live.planGate,
-          executionGate: outcome.role === 'plan' ? live.executionGate : 'blocked',
+          planGate: outcome.role === 'plan' && !heldPlan ? 'blocked' : live.planGate,
+          executionGate: outcome.role === 'plan' || heldExecution ? live.executionGate : 'blocked',
           audits,
-          diagnostic: outcome.note,
+          diagnostic: heldInThisArm ? `${outcome.note} — ${heldNote(heldGate)}` : outcome.note,
         }, routingDetail)
         return result
       }
@@ -5730,11 +5951,11 @@ export class AutopilotEngine {
           ...live,
           revision: live.revision + 1,
           phase: 'needs-owner-decision',
-          planGate: outcome.role === 'plan' ? 'needs-owner-decision' : live.planGate,
-          executionGate: outcome.role === 'plan' ? live.executionGate : 'needs-owner-decision',
+          planGate: outcome.role === 'plan' && !heldPlan ? 'needs-owner-decision' : live.planGate,
+          executionGate: outcome.role === 'plan' || heldExecution ? live.executionGate : 'needs-owner-decision',
           audits,
           pausedFrom: live.phase,
-          diagnostic: outcome.note,
+          diagnostic: heldInThisArm ? `${outcome.note} — ${heldNote(heldGate)}` : outcome.note,
         }, routingDetail)
         return result
       }
@@ -5752,6 +5973,18 @@ export class AutopilotEngine {
    * obtained by run id, where no calling Agent exists to authorize against —
    * and projection is a pure read, so it needs none.
    */
+  /**
+   * Whether an owner pass is in force for this gate at the run's CURRENT plan
+   * revision (DESIGN §9 item 8). A pass recorded under an older plan revision
+   * is superseded by the new generation, and a withdrawn one is spent: only a
+   * fresh owner decision can put the gate back in the owner's name.
+   */
+  private ownerPassInForce(snapshot: Snapshot, gate: GateName): boolean {
+    const history = snapshot.gateSources?.[gate]
+    return history?.source === 'owner' && history.withdrawn !== true
+      && history.planRevision === snapshot.plan.revision
+  }
+
   projectStatus(snapshot: Snapshot, policy?: SessionPolicyState): StatusView {
     const latest = latestVerdicts(snapshot.audits)
     const verdicts: Partial<Record<AuditRole, Verdict>> = {}
@@ -5764,6 +5997,17 @@ export class AutopilotEngine {
       phase: snapshot.phase,
       planGate: snapshot.planGate,
       executionGate: snapshot.executionGate,
+      // Absent provenance (a legacy stream, or one that recorded none) is the
+      // explicit `no-source` reading: the reader is told the stream cannot
+      // say, rather than being handed an inference.
+      // PER GATE, not per field: a legacy stream whose FIRST owner decision was
+      // taken on one gate records provenance for that gate alone, so the other
+      // reads `no-source` — a statement about the stream, made about the gate it
+      // is true of.
+      gateSources: {
+        plan: snapshot.gateSources?.plan ?? { source: 'no-source' },
+        execution: snapshot.gateSources?.execution ?? { source: 'no-source' },
+      },
       planRevision: snapshot.plan.revision,
       objective: snapshot.triage.objective,
       size: snapshot.triage.size,

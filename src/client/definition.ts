@@ -229,6 +229,109 @@ export interface ReachabilityMirror {
   readonly outcome?: string
 }
 
+/** One gate's provenance, mirrored for the browser half (DESIGN §9 item 8). */
+export interface GateSourceMirror {
+  readonly source: string
+  readonly planRevision?: number
+  readonly ownerDecision?: number
+  readonly withdrawn?: boolean
+  readonly note?: string
+}
+
+/** Per-gate provenance as the host route serves it. */
+export interface GateSourcesMirror {
+  readonly plan?: GateSourceMirror
+  readonly execution?: GateSourceMirror
+}
+
+/** One rendered line of the gate-provenance row. */
+export interface GateSourceLine {
+  readonly gate: 'plan' | 'execution'
+  readonly text: string
+  readonly title: string
+}
+
+function readGateSourceMirror(value: unknown): GateSourceMirror | undefined {
+  if (!isPlainObject(value)) return undefined
+  const source = str(value.source)
+  if (source === undefined) return undefined
+  const planRevision = num(value.planRevision)
+  const ownerDecision = num(value.ownerDecision)
+  const note = str(value.note)
+  return {
+    source,
+    ...(planRevision === undefined ? {} : { planRevision }),
+    ...(ownerDecision === undefined ? {} : { ownerDecision }),
+    ...(value.withdrawn === true ? { withdrawn: true } : {}),
+    ...(note === undefined ? {} : { note }),
+  }
+}
+
+/**
+ * Read the gate-provenance projection out of a route body.
+ *
+ * Malformed input answers `undefined` (the caller treats that as absence rather
+ * than inventing a source), and a record with no usable gate at all is absence
+ * too. An UNKNOWN source string is carried through verbatim rather than mapped:
+ * a reader must be able to see a vocabulary this build does not know instead of
+ * being shown a source the stream never recorded.
+ */
+export function readGateSourcesMirror(value: unknown): GateSourcesMirror | undefined {
+  if (!isPlainObject(value)) return undefined
+  const plan = readGateSourceMirror(value.plan)
+  const execution = readGateSourceMirror(value.execution)
+  if (plan === undefined && execution === undefined) return undefined
+  return {
+    ...(plan === undefined ? {} : { plan }),
+    ...(execution === undefined ? {} : { execution }),
+  }
+}
+
+/** What a source MEANS, in the reader's terms. */
+function describeGateSource(source: string): string {
+  switch (source) {
+    case 'owner': return 'the OWNER (an explicit owner-gate-pass)'
+    case 'auditor': return 'a dispatched auditor'
+    case 'self-check': return 'a self-check'
+    case 'pending': return 'nothing yet — not decided'
+    case 'no-source': return 'not recorded by this stream'
+    default: return source
+  }
+}
+
+/** The explanatory title every provenance line carries. */
+const GATE_SOURCE_TITLE = 'who last set this gate, and the generation it belongs to. An owner pass stands against a later audit objection — the objection is recorded but the gate does not move — and only the owner can withdraw it; a withdrawn decision never comes back into force. "not recorded by this stream" is a statement about THIS STREAM, not a claim that nobody decided.'
+
+/**
+ * The gate-provenance lines, as DATA (DESIGN §9 item 8).
+ *
+ * WHY THE SOURCE IS THE HEADLINE AND THE GATE VALUE IS NOT: the card already
+ * shows each gate's value. What a value cannot say is WHO put it there — and
+ * that is the difference between a gate a review passed and one the owner
+ * passed, which the precedence rule turns into different futures (a later
+ * objection moves the first and is merely recorded against the second).
+ *
+ * @param mirror - the provenance the host route served.
+ * @returns one line per gate, plan first.
+ */
+export function gateSourceLines(mirror: GateSourcesMirror): readonly GateSourceLine[] {
+  const lines: GateSourceLine[] = []
+  for (const gate of ['plan', 'execution'] as const) {
+    const record = mirror[gate]
+    if (record === undefined) continue
+    const details: string[] = []
+    if (record.planRevision !== undefined) details.push(`plan revision ${record.planRevision}`)
+    if (record.ownerDecision !== undefined) details.push(`owner decision ${record.ownerDecision}`)
+    if (record.withdrawn === true) details.push('withdrawn')
+    lines.push({
+      gate,
+      text: `${gate} gate: ${describeGateSource(record.source)}${details.length === 0 ? '' : ` (${details.join(', ')})`}`,
+      title: GATE_SOURCE_TITLE,
+    })
+  }
+  return lines
+}
+
 function strListOrUndefined(value: unknown): readonly string[] | undefined {
   if (!Array.isArray(value)) return undefined
   return value.every(entry => typeof entry === 'string') ? (value as readonly string[]) : undefined
@@ -536,6 +639,12 @@ export interface AutopilotRunChatData {
    * that reason.
    */
   readonly routingReachability?: Observed<ReachabilityMirror>
+  /**
+   * DESIGN §9 item 8: per-gate provenance (who set the gate, for which plan
+   * revision), carried as its own observation so a stale value is never shown
+   * as current.
+   */
+  readonly gateSources?: Observed<GateSourcesMirror>
   /** Ascending by seq. */
   readonly audits: readonly AutopilotAuditRow[]
   /** Ascending by seq. */
@@ -1066,6 +1175,13 @@ export function applyResult(state: AutopilotRunState, match: CardMatch): Autopil
     data = reachability === undefined
       ? clear(data, 'routingReachability')
       : merge(data, 'routingReachability', reachability, revision, seq)
+    // PRESENCE-GATED THE OTHER WAY ROUND: the engine always projects
+    // `gateSources` (a stream that recorded none reads `no-source`), so a
+    // session-log payload WITHOUT the field is an observation from before this
+    // build — not a claim that provenance is absent. It therefore neither
+    // merges nor CLEARS what is already known.
+    const gateSources = readGateSourcesMirror(payload.gateSources)
+    if (gateSources !== undefined) data = merge(data, 'gateSources', gateSources, revision, seq)
     // `status` mirrors five triage fields, but init's ARGUMENTS are strictly
     // richer (acceptanceCriteria, scope, nonGoals, baseline, usageIds are not
     // in StatusView at all) and are immutable per DESIGN §3. So status only

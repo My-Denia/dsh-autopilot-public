@@ -40,7 +40,8 @@ import { describe, expect, it } from 'vitest'
 import {
   AUTOPILOT_RUN_ID, AUTOPILOT_RUN_KIND, applyCall, applyResult, createAutopilotRunDefinition,
   emptyState, isAppendSurfaceEventMirror, readCall, readDispatch, readDispatchStart, readReachabilityMirror,
-  readResult, readRoutingMirror, routeStatusView, routingLines, safeJsonObject,
+  gateSourceLines, readGateSourcesMirror, readResult, readRoutingMirror, routeStatusView, routingLines,
+  safeJsonObject,
 } from '../src/client/definition.js'
 import type {
   AutopilotRunChatData, AutopilotRunDefinition, AutopilotRunState, CardEvent, CardMatch,
@@ -1185,6 +1186,54 @@ function foldStatus(state: AutopilotRunState, payload: Record<string, unknown>, 
   const withCall = applyCall(state, { event: call, role: state.data.revision === 0 ? 'start' : 'update', location: null })
   return applyResult(withCall, { event: result, role: 'update', location: null })
 }
+
+describe('DESIGN §9 item 8 — the card carries gate provenance', () => {
+  it('publishes the per-gate sources from a status result, stamped with their revision', () => {
+    const state = foldStatus(emptyState(), {
+      revision: 5,
+      phase: 'closing',
+      gateSources: {
+        plan: { source: 'owner', planRevision: 2, ownerDecision: 1 },
+        execution: { source: 'auditor', planRevision: 2 },
+      },
+    })
+    expect(state.data.gateSources?.revision).toBe(5)
+    expect(state.data.gateSources?.value.plan?.source).toBe('owner')
+    const lines = gateSourceLines(state.data.gateSources!.value)
+    expect(lines.map(line => line.gate)).toEqual(['plan', 'execution'])
+    expect(lines[0]?.text).toContain('the OWNER')
+    expect(lines[0]?.text).toContain('plan revision 2')
+    expect(lines[1]?.text).toContain('a dispatched auditor')
+  })
+
+  it('a status result WITHOUT the field does not erase what was already known', () => {
+    // Presence-gated the other way round: the engine always projects the field,
+    // so a payload without it is a session-log observation from before this
+    // build — not a statement that provenance is absent.
+    const withSources = foldStatus(emptyState(), {
+      revision: 4,
+      phase: 'executing',
+      gateSources: { plan: { source: 'owner', planRevision: 1, ownerDecision: 1 } },
+    })
+    const after = foldStatus(withSources, { revision: 5, phase: 'executing' }, 20)
+    expect(after.data.gateSources?.value.plan?.source).toBe('owner')
+  })
+
+  it('reads an UNKNOWN source verbatim instead of mapping it to something false', () => {
+    expect(readGateSourcesMirror({ plan: { source: 'future-source', planRevision: 1 } })?.plan?.source)
+      .toBe('future-source')
+    expect(gateSourceLines({ plan: { source: 'future-source' } })[0]?.text).toContain('future-source')
+  })
+
+  it('treats a malformed block as absence, never as a claim — and shows a withdrawal', () => {
+    expect(readGateSourcesMirror('not an object')).toBeUndefined()
+    expect(readGateSourcesMirror({ plan: { planRevision: 3 } })).toBeUndefined()
+    expect(readGateSourcesMirror({ execution: { source: 'pending' } })?.plan).toBeUndefined()
+    const withdrawn = gateSourceLines({ plan: { source: 'pending', planRevision: 1, ownerDecision: 1, withdrawn: true } })
+    expect(withdrawn[0]?.text).toContain('withdrawn')
+    expect(withdrawn[0]?.text).toContain('owner decision 1')
+  })
+})
 
 describe('M13 R1 — the fold carries the routing block and the coverage report', () => {
   it('publishes both from a status result, stamped with their revision and seq', () => {

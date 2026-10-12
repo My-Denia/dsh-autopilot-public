@@ -195,6 +195,13 @@ export interface RunProjection {
    * routing block, where a reader would take it for a dispatch record.
    */
   readonly routingReachability?: WorkClassReachabilityReport
+  /**
+   * DESIGN §9 item 8: which authority last set each gate, for which plan
+   * revision. Forwarded verbatim — the card renders it so a reader can tell a
+   * gate a review passed from one the owner passed, which the precedence rule
+   * turns into different futures.
+   */
+  readonly gateSources: StatusView['gateSources']
 }
 
 /** The `/runs` body. */
@@ -282,6 +289,10 @@ export function projectRun(status: StatusView): RunProjection {
     // which observed models a tier-bound work class can reach — a statement
     // about the ladder and the live catalog, never about what ran.
     ...(status.routingReachability === undefined ? {} : { routingReachability: status.routingReachability }),
+    // ALLOW-LIST discipline again: gate provenance rides because it is NAMED
+    // here, exactly like every other field. It is never absent (the engine
+    // projects `no-source` for a stream that recorded none).
+    gateSources: status.gateSources,
   }
 }
 

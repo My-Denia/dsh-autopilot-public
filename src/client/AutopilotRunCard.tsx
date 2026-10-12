@@ -20,9 +20,9 @@
 import { useEffect, useRef, useState } from 'react'
 import type { CSSProperties } from 'react'
 import type {
-  AutopilotAuditRow, AutopilotRunChatData, Observed, ReachabilityMirror, RoutingMirror,
+  AutopilotAuditRow, AutopilotRunChatData, GateSourcesMirror, Observed, ReachabilityMirror, RoutingMirror,
 } from './definition.js'
-import { routeStatusView, routingLines } from './definition.js'
+import { gateSourceLines, routeStatusView, routingLines } from './definition.js'
 import { fetchLiveRun, overlayLive, pollDelayMs, pollKey, shouldPoll } from './live.js'
 import type { LiveFetch, LiveRun } from './live.js'
 
@@ -241,6 +241,30 @@ function Field({ label, at }: { label: string; at: Observed<unknown> | undefined
   )
 }
 
+/**
+ * Gate provenance (DESIGN §9 item 8): which authority last set each gate, and
+ * for which plan revision.
+ *
+ * WHY THE CARD NEEDS THIS AT ALL: the grid above already shows the gate VALUES,
+ * and a value cannot say who put it there — which is the difference between a
+ * gate a review passed and one the owner passed. The precedence rule turns that
+ * difference into different futures, so a reader who cannot see the source
+ * cannot tell whether a later objection will move the gate.
+ *
+ * @param props.gates - the merged provenance observation from the host route.
+ */
+function GateSourceRow({ gates }: { readonly gates: Observed<GateSourcesMirror> }): JSX.Element {
+  return (
+    <div style={{ marginTop: 6 }} data-autopilot-gate-sources="">
+      {gateSourceLines(gates.value).map(line => (
+        <div key={line.gate} style={muted} title={line.title} data-autopilot-gate-source={line.gate}>
+          {line.text}
+        </div>
+      ))}
+    </div>
+  )
+}
+
 /** One audit dispatch row: role, verdict, and the auditor that produced it. */
 function AuditRow({ row }: { row: AutopilotAuditRow }): JSX.Element {
   const verdict = row.failed ? 'errored' : row.settled ? (row.verdict ?? 'no verdict') : 'in flight'
@@ -364,6 +388,8 @@ export function AutopilotRunCard({ node, sessionId, fetchJson }: AutopilotRunCar
         <Field label="replan budget" at={data.replanBudgetRemaining} />
         <Field label="log entries" at={data.logCount} />
       </div>
+
+      {data.gateSources !== undefined ? <GateSourceRow gates={data.gateSources} /> : null}
 
       {triage !== undefined
         ? (

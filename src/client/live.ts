@@ -32,9 +32,9 @@
  */
 
 import type {
-  AutopilotRunChatData, Observed, ReachabilityMirror, RoutingMirror,
+  AutopilotRunChatData, GateSourcesMirror, Observed, ReachabilityMirror, RoutingMirror,
 } from './definition.js'
-import { readReachabilityMirror, readRoutingMirror } from './definition.js'
+import { readGateSourcesMirror, readReachabilityMirror, readRoutingMirror } from './definition.js'
 
 /**
  * Terminal phases, mirrored from `../domain/types.js`.
@@ -97,6 +97,8 @@ export interface LiveRun {
    * labels it as coverage; this half never re-derives it.
    */
   readonly routingReachability?: Readonly<Record<string, unknown>>
+  /** DESIGN §9 item 8: the per-gate provenance the host route serves. */
+  readonly gateSources?: Readonly<Record<string, unknown>>
 }
 
 /**
@@ -338,6 +340,7 @@ export function readLiveRun(body: unknown): LiveRun | undefined {
     ...(isPlainObject(run.routingReachability)
       ? { routingReachability: run.routingReachability as Readonly<Record<string, unknown>> }
       : {}),
+    ...(isPlainObject(run.gateSources) ? { gateSources: run.gateSources as Readonly<Record<string, unknown>> } : {}),
     ...(typeof run.closeoutSubmitted === 'boolean' ? { closeoutSubmitted: run.closeoutSubmitted } : {}),
     ...(verdicts === undefined ? {} : { latestVerdicts: verdicts }),
     ...(isPlainObject(run.executor) ? { executor: run.executor } : {}),
@@ -458,6 +461,24 @@ export function mergeRouting(
  * @param liveRevision - the revision the route answer was read at.
  * @returns the coverage to render, or undefined.
  */
+/**
+ * Merge the gate provenance the route serves under the SAME revision rule as
+ * the coverage report: a live answer older than what the card already shows is
+ * dropped, and equal revisions keep the fold (it carries strictly more). The
+ * route is the only source for this field, so there is no session-vs-route
+ * precedence question to answer here.
+ */
+export function mergeGateSources(
+  fold: Observed<GateSourcesMirror> | undefined,
+  liveGateSources: unknown,
+  liveRevision: number,
+): Observed<GateSourcesMirror> | undefined {
+  const live = readGateSourcesMirror(liveGateSources)
+  if (live === undefined) return fold
+  if (fold !== undefined && liveRevision <= fold.revision) return fold
+  return liveObserved(live, liveRevision)
+}
+
 export function mergeReachability(
   fold: Observed<ReachabilityMirror> | undefined,
   liveReachability: unknown,
@@ -510,13 +531,16 @@ export function overlayLive(data: AutopilotRunChatData, live: LiveRun | undefine
     // that has nothing to reconcile.
     const routing = mergeRouting(data.routing, live.routing, live.revision)
     const reachability = mergeReachability(data.routingReachability, live.routingReachability, live.revision)
+    const gateSources = mergeGateSources(data.gateSources, live.gateSources, live.revision)
     const routingChanged = routing !== undefined && routing !== data.routing
     const reachabilityChanged = reachability !== undefined && reachability !== data.routingReachability
-    if (!routingChanged && !reachabilityChanged) return data
+    const gateSourcesChanged = gateSources !== undefined && gateSources !== data.gateSources
+    if (!routingChanged && !reachabilityChanged && !gateSourcesChanged) return data
     return {
       ...data,
       ...(routingChanged ? { routing } : {}),
       ...(reachabilityChanged ? { routingReachability: reachability } : {}),
+      ...(gateSourcesChanged ? { gateSources } : {}),
     }
   }
   const at = live.revision
@@ -525,6 +549,7 @@ export function overlayLive(data: AutopilotRunChatData, live: LiveRun | undefine
   // session's policy, so its `unobserved` must not overwrite one.
   const routing = mergeRouting(data.routing, live.routing, at)
   const routingReachability = mergeReachability(data.routingReachability, live.routingReachability, at)
+  const gateSources = mergeGateSources(data.gateSources, live.gateSources, at)
   return {
     ...data,
     revision: at,
@@ -542,6 +567,7 @@ export function overlayLive(data: AutopilotRunChatData, live: LiveRun | undefine
     ...(live.enforcement === undefined ? {} : { enforcement: liveObserved(live.enforcement, at) }),
     ...(routing === undefined ? {} : { routing }),
     ...(routingReachability === undefined ? {} : { routingReachability }),
+    ...(gateSources === undefined ? {} : { gateSources }),
     stale: false,
   }
 }

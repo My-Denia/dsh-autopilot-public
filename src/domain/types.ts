@@ -60,6 +60,41 @@ export type ExecutionGate =
   | 'blocked'
   | 'needs-owner-decision'
 
+/**
+ * Which authority last SET a gate's value (DESIGN §9 item 8: gate
+ * provenance). `owner` is an explicit `autopilot_signal` gate decision;
+ * `auditor` / `self-check` are the dispatched review verdicts (an external
+ * countersign rides as an audit record and reads `auditor`); `pending` is the
+ * reset state a fresh run starts in; `no-source` is the honest reading of a
+ * stream that predates the field — it recorded nothing, so nothing may be
+ * claimed about it.
+ */
+export type GateSource = 'owner' | 'auditor' | 'self-check' | 'pending' | 'no-source'
+
+/** The two gates every run carries. */
+export type GateName = 'plan' | 'execution'
+
+/**
+ * One gate's provenance. `planRevision` is the GENERATION the record is
+ * current for: a new plan revision supersedes every owner decision taken
+ * under the old one. `ownerDecision` is the ordinal of the gate's owner
+ * decisions — the one in force, or (with `withdrawn`) the one the owner took
+ * back; a withdrawn decision can never come back into force, and only a
+ * strictly higher ordinal may make the gate read `owner` again. An absent
+ * `planRevision` means the reading comes from a stream that recorded no
+ * provenance at all (legacy `no-source`).
+ */
+export interface GateProvenance {
+  readonly source: GateSource
+  readonly planRevision?: number
+  readonly ownerDecision?: number
+  readonly withdrawn?: boolean
+  readonly note?: string
+}
+
+/** Per-gate provenance, recorded on the snapshot from init on. */
+export type GateSources = Partial<Record<GateName, GateProvenance>>
+
 /** Auditor verdict enum (union of both gates' decision spaces). */
 export type Verdict = 'pass' | 'needs-fix' | 'needs-replan' | 'blocked' | 'needs-owner-decision'
 
@@ -1123,6 +1158,23 @@ export interface Snapshot {
    * fold from ops, exactly like routingPins.
    */
   readonly planAmendedAtRevision?: number
+  /**
+   * Per-gate provenance (DESIGN §9 item 8). ABSENT on every stream that
+   * predates the field — those read as `no-source`, which claims nothing
+   * about them. From init on it is present and advances only by the fold's
+   * own derivation (`applyGateLedger`), exactly like `routingPins`: the
+   * writer composes the same call, so an invented owner pass, a resurrected
+   * withdrawn decision, or an audit quietly taking a gate the owner passed is
+   * refused on replay.
+   */
+  readonly gateSources?: GateSources
+  /**
+   * How many executor dispatches this run has started, derived by the fold
+   * from its own `start-executor` ops (DESIGN §9 item 15: the engine-level
+   * executor rotation ordinal). ABSENT on streams that predate the field and
+   * on a run that never dispatched one.
+   */
+  readonly executorDispatches?: number
   readonly diagnostic?: string
 }
 
@@ -1144,6 +1196,8 @@ export type Operation =
   | 'set-owner-decision'
   | 'owner-approve'
   | 'owner-resolve'
+  | 'owner-gate-pass'
+  | 'owner-gate-withdraw'
   | 'consume-approval'
   | 'reminder'
   | 'sandbox'

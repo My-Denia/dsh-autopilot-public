@@ -533,11 +533,12 @@ export function installRootTools(
 
     register(defineTool({
       name: 'autopilot_signal',
-      description: 'Run control signals. replan: rewrite the plan (drains any executor). block / owner-decision: stop the run. owner-approve: grant ONE egress approval (owner-only; requires a direct human turn). owner-resolve: resolve a needs-owner-decision pause (owner-only; decision resume-planning, resume-execution to restore the paused-from phase with gates/evidence untouched, or block).',
+      description: 'Run control signals. replan: rewrite the plan (drains any executor). block / owner-decision: stop the run. owner-approve: grant ONE egress approval (owner-only; requires a direct human turn). owner-resolve: resolve a needs-owner-decision pause (owner-only; decision resume-planning, resume-execution to restore the paused-from phase with gates/evidence untouched, or block). owner-gate-pass / owner-gate-withdraw: pass or take back ONE gate directly (owner-only; requires a direct human turn, and a gate named by `gate`). A gate the owner passed stands against a later audit objection — the objection is recorded, not erased — and one owner decision never carries the other gate.',
       parameters: {
-        action: { type: 'string', required: true, enum: ['replan', 'block', 'owner-decision', 'owner-approve', 'owner-resolve'] },
+        action: { type: 'string', required: true, enum: ['replan', 'block', 'owner-decision', 'owner-approve', 'owner-resolve', 'owner-gate-pass', 'owner-gate-withdraw'] },
         note: { type: 'string', required: true, description: 'Reason / ruling / approval target description.' },
         ownerDecision: { type: 'string', enum: ['resume-planning', 'resume-execution', 'block'], description: 'owner-resolve only. resume-execution restores the paused-from phase with gates/evidence untouched (requires a pause that stamped it); resume-planning fully resets.' },
+        gate: { type: 'string', enum: ['plan', 'execution'], description: 'owner-gate-pass / owner-gate-withdraw only: which gate the owner decision is about. One decision names exactly one gate.' },
       },
       output: jsonOutput(JSON_VALUE),
       async execute(args, exec) {
@@ -568,6 +569,24 @@ export function installRootTools(
             }
             const snapshot = await engine.ownerResolve(agent, { decision, note: args.note })
             return { runId: snapshot.runId, revision: snapshot.revision, phase: snapshot.phase } as never
+          }
+          case 'owner-gate-pass': {
+            requireDirectHumanTurn(agent, 'owner-gate-pass')
+            const gate = args.gate
+            if (gate !== 'plan' && gate !== 'execution') {
+              throw new AutopilotError('owner-gate-pass requires gate plan|execution', 'AP_INVALID_ARGUMENT')
+            }
+            const snapshot = await engine.ownerGatePass(agent, { gate, note: args.note })
+            return { runId: snapshot.runId, revision: snapshot.revision, phase: snapshot.phase, gateSources: snapshot.gateSources } as never
+          }
+          case 'owner-gate-withdraw': {
+            requireDirectHumanTurn(agent, 'owner-gate-withdraw')
+            const gate = args.gate
+            if (gate !== 'plan' && gate !== 'execution') {
+              throw new AutopilotError('owner-gate-withdraw requires gate plan|execution', 'AP_INVALID_ARGUMENT')
+            }
+            const snapshot = await engine.ownerGateWithdraw(agent, { gate, note: args.note })
+            return { runId: snapshot.runId, revision: snapshot.revision, phase: snapshot.phase, gateSources: snapshot.gateSources } as never
           }
           default:
             // UNREACHABLE through the tool surface, kept as defence in depth:

@@ -335,10 +335,13 @@ export interface RoutingInput {
     }
     readonly auditTier?: 'economy' | 'standard' | 'reserve' | 'none'
     /**
-     * Engine-level rotation for auditor roles (DESIGN §9-15). Volatile,
-     * default off: when true, a healthy auditor pin yields to a full
-     * re-selection at the role's next dispatch (repinFrom + reason rotation),
-     * offset within its independence class — never overriding independence.
+     * Engine-level rotation (DESIGN §9 item 15). Volatile, default off: when
+     * true a healthy pin yields to a full re-selection at the role's next
+     * dispatch (repinFrom + reason rotation). An auditor's offset stays within
+     * its independence class — never overriding independence; the executor's
+     * offset is its own dispatch count within the ranked survivor list, and a
+     * LIVE executor child is never re-routed (only `startExecutor` reaches the
+     * resolver; `resumeExecutor` continues the child on its recorded route).
      */
     readonly rotation?: boolean
     readonly speedOrder?: readonly string[]

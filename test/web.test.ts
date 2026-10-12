@@ -254,10 +254,16 @@ describe('a LIVE run projects to exactly the allow-listed fields', () => {
     // here without someone naming it in projectRun.
     expect(Object.keys(run).sort()).toEqual([
       'auditCount', 'auditMode', 'closeoutSubmitted', 'enforcement', 'executionGate',
-      'executionMode', 'latestVerdicts', 'logCount', 'objective', 'phase', 'planGate',
-      'planRevision', 'replanBudgetRemaining', 'requiredRoles', 'revision', 'risk',
-      'routing', 'runId', 'size',
+      'executionMode', 'gateSources', 'latestVerdicts', 'logCount', 'objective', 'phase',
+      'planGate', 'planRevision', 'replanBudgetRemaining', 'requiredRoles', 'revision',
+      'risk', 'routing', 'runId', 'size',
     ])
+    // …and the field is the engine's own projection, not a second opinion: this
+    // run has recorded no gate decision yet, and the route says exactly that.
+    expect(run.gateSources).toEqual({
+      plan: { source: 'pending', planRevision: 1 },
+      execution: { source: 'pending', planRevision: 1 },
+    })
   })
 
   it('forwards the routing status when the run routes (M12): mode, policy state, and per-role class', async () => {

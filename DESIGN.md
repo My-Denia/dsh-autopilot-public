@@ -112,13 +112,14 @@ Visitor landing page: [README.md](README.md).
   例外（"合适的 owner 交互式任务可留在主上下文，计划里写明理由"）**已经成立**——
   `inline` 在任何风险下都合法——但"默认委派"没有机械化，因此
   `references/governance-invariants.md` 把它标成 `discipline` 而不是声称强制。
-- **owner gate pass / withdraw 通道**：Codex GAH 有
+- **owner gate pass / withdraw 通道**（**2026-10-12 已交付**，见 §8.9）：Codex GAH 有
   `--owner-gate-pass plan|execution` / `--owner-gate-withdraw`，把门禁来源记成
   `owner` / `auditor` / `self-check` / `pending` / `no-source`，并规定
-  "同一 run/gate/generation/plan 内的 owner pass 优先于之后的审计异议"。本引擎
-  的 `autopilot_signal` 只有 `owner-approve`（出站一次性）与 `owner-resolve`
-  （解开 needs-owner-decision），**没有** gate 级 owner pass，也没有 gate 来源
-  溯源。这是真正的功能缺口，登记在 §9 而不是假装已对齐。
+  "同一 run/gate/generation/plan 内的 owner pass 优先于之后的审计异议"。本引擎现在
+  同样有：`autopilot_signal` 的 gate 级 owner 决定（owner-only，与 owner-approve
+  同一道 direct-human-turn 闸，一次只针对一道门禁）、快照 `gateSources` 的逐门禁
+  溯源（`source` + plan revision + owner 决定序数 + `withdrawn`），以及写路径上的
+  优先级实现——异议被**记录**、门禁不动，另一道门禁也不被顺带通过。
 
 **本次未做。** `lib/` 未重建（`.gitignore` 第 2 行忽略它，仓库不跟踪），
 因此本仓库的工作树**是源码就绪，不是已安装**：正在运行的宿主仍然加载已发布的
@@ -263,9 +264,11 @@ independenceFloor——`counter`、`history`、`prior`、`rotation`、`used` **�
 条数，replay 得同一序数）；选择器在审计独立性类内按序数偏移轮转（独立性永远先于轮转，
 组内 ≤1 成员时如实记 NO-OP）。引擎级重选作为 owner 显式 opt-in
 （`routing.ladder.rotation`，默认关）交付给**审计角色**：活体 pin 在下一次同角色派发
-让位整轮重选（§9 第 15 项）。executor 的引擎级轮转**未交付**——inline 模式下 executor
-路由对选择器不可观察（unknown-family，轮转组为空，NO-OP），且稳定性权重更高；登记为
-已知限制，不是静默缺口。
+让位整轮重选（§9 第 15 项）。**2026-10-12：executor 角色同样轮转**——序数取自 run
+自身的 `executorDispatches`（每次派发是一个新 child），偏移走排序后的存活列表；
+**运行中的 executor child 永不被改道**：只有 `startExecutor` 会调用路由解析，活体
+child 由 `resumeExecutor` 沿自己的记录路由续用。`inline` 模式下没有 executor 派发，
+因此什么都不轮转、也不声称。详见 §8.9 与 §9 第 15 项。
 
 **边界**："有活干"≠"每轮都有活"。某 run 内没有机械活时 `glm-5.3` 那一轮不上场是正确的。
 可强制的是**可达性 + 轮转**。
@@ -338,8 +341,9 @@ harness 自己的目录就自相矛盾地否证了它：`moonshotai/kimi-k3` 与
   （"stability over reselection"），只有 pin 死亡才带 `repinFrom` 重选。
   `routing.ladder.rotation: true`（owner 显式 opt-in，默认关，出厂语义逐字节保留）时，
   **审计角色**在下一次同角色派发让位整轮重选，why 行点名 rotation 是原因，序数取自
-  run 自身审计记录数，轮转偏移落在审计独立性类内（永不凌驾独立性）。executor 永不
-  进入该分支（§9 第 15 项：引擎级 executor 轮转未交付，登记为已知限制）。
+  run 自身审计记录数，轮转偏移落在审计独立性类内（永不凌驾独立性）；**executor
+  角色同样进入该分支**（2026-10-12，§9 第 15 项），序数取自 `executorDispatches`，
+  偏移走排序后的存活列表，活体 child 不受影响。
 - **`balanced` 默认值与 owner 显式写下的 `balanced` 仍不可区分**（显式性上限：
   schemastery 在 `apply()` 之前已填默认值，loader 与 plain 两条配置路径必须同值；
   写成恰好等于默认值的 `balanced` 在两条路径上都如实记为 `default`）。A2 的交付
@@ -2857,16 +2861,22 @@ reparse-alias 桩 → spawn ENOENT；修复需持久改用户 PATH 或管理员�
    是一次公开类型变更；该接口是测试缝，本包内只有 `defaultIo` 与
    `test/skill-install.test.ts` 用它。）
 
-8. **owner gate pass / withdraw + gate 来源溯源**（**未交付**；2026-10-09 的 governance
-   pragmatics v1 交付了相邻的 owner-resolve(resume-execution) 状态保留与 pausedFrom
-   溯源，但本条的 gate 级 owner pass/withdraw 与门禁来源记录仍开放。原登记于
-   2026-10-08 Codex GAH
-   对齐时登记）：`autopilot_signal` 增加 gate 级 owner 决定（`owner-gate-pass` /
-   `owner-gate-withdraw`），快照记录每条门禁的来源
-   （`owner` / `auditor` / `self-check` / `pending` / `no-source`），
-   并实现"同一 run/gate/generation/plan 内的当前 owner pass 优先于之后的审计异议、
-   不抹除异议、也不顺带通过另一道门禁"。撤回是追加记录，之后的普通重置或 pass
-   不能复活它。理由与缺口见 §1.1；这是一项状态机改动，需要自己的计划与审计。
+8. **owner gate pass / withdraw + gate 来源溯源**（**已交付**，2026-10-12，见 §8.9；
+   2026-10-09 的 governance pragmatics v1 交付了相邻的
+   owner-resolve(resume-execution) 状态保留与 pausedFrom 溯源）：`autopilot_signal`
+   增加 gate 级 owner 决定（`owner-gate-pass` / `owner-gate-withdraw`），快照
+   `gateSources` 记录每条门禁的来源（`owner` / `auditor` / `self-check` /
+   `pending` / `no-source`）连同它所属的 generation（plan revision）与 owner 决定的
+   序数，并实现"同一 run/gate/plan revision 内的当前 owner pass 优先于之后的审计
+   异议、不抹除异议、也不顺带通过另一道门禁"。撤回是追加记录，之后的普通重置或 pass
+   不能复活它。**一处刻意的既有规则放宽，写在这里而不是悄悄改掉**：fold 原先要求
+   `executionGate` 翻到 `pass` 必须有一条最新的 execution 审计 pass
+   （`AP_GATE_WITHOUT_AUDIT`），现在"该 generation 内的有效 owner pass"同样成立——
+   否则 owner 对执行门禁的裁决只能永远跟在审计之后，优先级规则本身也就空了。放宽
+   保留了规则的实质：门禁不会凭空 pass，要么有审计 pass，要么有 owner 明确且带世代
+   序数的裁决，且执行门禁仍要求证据包已在场；从未记录 provenance 的旧流读法逐字节
+   不变。测试见 `test/owner-gates.test.ts`（本轮 22 例，见 §8.9 的证据文件；正文只
+   主张该文件覆盖这些规则，不主张计数会成为长期事实）。
 9. **medium+ 默认派发 executor lead**（**未交付**）：Codex GAH 把 medium/high/
    critical 默认交给 executor lead，inline 例外需在计划里写明理由。本引擎
    `executionMode` 在 init 固定，无法在执行期做 task-shaped 的委派决策；引入它
@@ -2939,13 +2949,19 @@ reparse-alias 桩 → spawn ENOENT；修复需持久改用户 PATH 或管理员�
     `workClassReachability`（`kind: 'work-class-reachability'`，经 StatusView
     `routingReachability` 暴露）。run 级 triage 的 workClass 字段未引入（登记为
     非目标，见 §1.2"已接线"注）。
-15. **模型路由 A4：安全的引擎级重选**（**部分交付——仅审计角色**，2026-10-10）：
-    `routing.ladder.rotation: true`（owner 显式 opt-in，默认关）时，审计角色的活体
-    pin 在下一次同角色派发让位整轮重选（`repinFrom` 指向原 pin，why 行点名 rotation
-    为原因）；轮转序数取自 run 自身审计记录数，偏移落在审计独立性类内，**永不凌驾
-    独立性**；escalate/blocked 结果直通，不吞。executor 的引擎级轮转**未交付**：
-    inline 模式下 executor 路由对选择器不可观察（轮转组为空，NO-OP 如实记录），且
-    executor 稳定性权重更高；登记为已知限制，不是静默缺口。
+15. **模型路由 A4：安全的引擎级重选**（**已交付**：2026-10-10 审计角色，2026-10-12
+    executor 角色，见 §8.9）：`routing.ladder.rotation: true`（owner 显式 opt-in，
+    默认关）时，活体 pin 在下一次同角色派发让位整轮重选（`repinFrom` 指向原 pin，why
+    行点名 rotation 为原因）；**审计角色**的轮转序数取自 run 自身审计记录数，偏移落在
+    审计独立性类内，**永不凌驾独立性**；**executor 角色**的序数取自 run 自身的派发
+    计数 `executorDispatches`（计数单位是**新 child**：`startExecutor` 为一次派发写两条
+    `start-executor` 事件，starting 与 running 同 `childId`；按事件数会翻倍），偏移走
+    排序后的存活列表（executor 自身没有独立性约束）。**连续性由调用图保证，而不是
+    承诺**：`resolveRoleRoute('executor')` 只有 `startExecutor` 一个调用者，活体 child
+    由 `resumeExecutor` 按自己的记录路由续用，永远不经过轮转分支；`inline` 模式下没有
+    executor 派发，因此什么都不轮转、也不声称。escalate/blocked 结果直通，不吞。
+    测试：`test/routing-integration.test.ts`（rotation ON/OFF 两臂 + 活体 child 拒绝
+    重派发）。
 16. **模型路由：把 ladder 接入派发成员资格**（**已交付**，2026-10-10）：tier-bound
     work class 的候选集即其 `tiers` 映射的档位成员，选择器在资格判定阶段施加
     （engaged 判定：ladder 已配置或 owner 改过类映射；未启用时记录而不施加，
@@ -3100,3 +3116,83 @@ root 的治理出口；两个入口写入同一个寄存器（`commitLogEntry` �
     `test/child-escalation.test.ts`（6 例，含"非本 run 子代理被拒""已完成 executor 被拒"
     "子代理仍然不能调 `autopilot_log`"与真实 pin 复用路径上的消费）、
     `test/child-setup.test.ts`（子面第四个工具的事务化安装与回滚）。
+
+### 8.9 Owner gates + engine-level executor rotation（2026-10-12）：关闭 §9 第 8/15 项
+
+两个交付物，分支 `governance-pragmatics-v1`，基线 `cc4276a`（M13）。
+
+1. **gate 级 owner 决定与逐门禁来源溯源（§9 第 8 项）**。`autopilot_signal` 新增
+   `owner-gate-pass` / `owner-gate-withdraw`（owner-only，工具层与 `owner-approve`
+   同一道 `requireDirectHumanTurn` 闸；参数 `gate: plan|execution`）。快照新增
+   `gateSources`，逐门禁记 `{source, planRevision, ownerDecision?, withdrawn?, note?}`：
+   - 来源词汇 `owner` / `auditor` / `self-check` / `pending` / `no-source`；
+   - **世代**就是 plan revision：新一次 plan 提交（含 amend/replan/owner-resolve
+     resume-planning）使旧世代的 owner 裁决失效；`withdraw` 保留它收回的序数，之后的
+     普通 reset 或 pass **不能**复活它；
+   - 写路径优先级：owner pass 有效期内，审计异议被**记录**（record 追加、note 保留）、
+     该门禁**不动**，另一道门禁不被顺带通过。实现放在写路径而不是留给 fold 拒绝，因为
+     被拒的提交会丢掉审计判决——那恰是优先级规则最不该做的事；
+   - 派生是双端共用的一条函数 `applyGateLedger`（与 `applyRoutingDecision` 同一写法）：
+     引擎写、fold 重算并拒绝任何不一致；**对从未记录 provenance 的旧流不做回溯填充**
+     （读作 `no-source`），因此 0.2.0 流与既有 fixture 逐字节照旧。
+   一处既有规则的**刻意放宽**写在 §9 第 8 项：`executionGate` 翻 `pass` 现在接受
+   "该世代内有效的 owner pass"作为审计 pass 之外的第二个来源（规则的实质保留：门禁不
+   凭空 pass；证据包必须在场是**写路径**性质，fold 对伪造流从来不设防——同一条流伪造
+   一条 execution `pass` 审计记录本就能翻门禁，所以这条放宽没有新增能力）。可见面：
+   `autopilot_status` 的 `gateSources`（模型侧）与卡片/`GET /api/autopilot/run`（人侧，
+   见第 4 条）。
+   测试：`test/owner-gates.test.ts`（init 起即记录、plan/execution 两个方向、
+   用量耦合、优先级对照臂、撤回后回退与不可复活、fold 的
+   `AP_OWNER_GATE_RESURRECTED` / `AP_OWNER_GATE_PRECEDENCE` /
+   `AP_OWNER_GATE_INVALID` 三条拒收）与 `test/tools.test.ts`（agent 生成回合被拒、
+   user 回合通过、`gate` 缺失即参数错误）。
+
+2. **引擎级 executor 轮转（§9 第 15 项）**。`routing.ladder.rotation` 的分支从"仅审计
+   角色"扩到 executor；新增快照计数 `executorDispatches`（fold 从自己的流派生，计数
+   单位是**新 child**：一次派发写两条 `start-executor`，starting 与 running 同
+   `childId`），它就是 executor 的轮转序数；reuse 分支的 why 行按角色分别措辞，
+   executor 那一条点名"活体 child 永不改道，因此连续性得以保留"。连续性不靠承诺而靠
+   调用图：只有 `startExecutor` 会调 `resolveRoleRoute('executor')`，活体 child 由
+   `resumeExecutor` 沿自己的记录路由续用，永不经过轮转分支；`inline` 模式下没有
+   executor 派发，因此什么都不轮转、也不声称。测试：`test/routing-integration.test.ts`
+   （ON：新边界带 `repinFrom` + `rotation: ordinal 1 into the ranked survivor list`；
+   OFF：跨边界逐字复用 pin；活体 child 重派发被 `AP_EXECUTOR_EXISTS` 拒绝）。
+
+3. **收尾校正（规则审计的 5 条 blocking 全部处理）**。真机/真流证据见
+   `goal-runs/m15-owner-gates-executor-rotation/evidence/`（机器本地、入仓被 gitignore）：
+   - **F1/B1（blocking）**：fold 的优先级守卫漏了**世代判断**（同一谓词四处实现，一处
+     失明）。`amend-plan` 抬高 plan revision 但不改 `gateSources`，于是守卫把上一世代的
+     owner pass 当作仍有效，拒掉了写侧已判定合法的门禁移动——**丢掉审计判决**，并把 run
+     留在 `plan-reviewing`（那里既不能 `submit-plan` 也不能 `replan`）。修法是把世代比较
+     补进守卫（与 `ownerPassInForce` 一致），并补回归测试；变异检验：删掉该行 → 该测试
+     恰好失败，其余全绿。
+   - **F2/B3（blocking）**：`AP_GATE_SOURCE_SHRANK` 曾经不可达（派生相等检查排在它前面
+     就会用更笼统的码先拒）。它现在排在相等检查之前，并有专门测试。
+   - **B2**：refusals §4 的规范段（`AP_GATE_WITHOUT_AUDIT`）与 Remedy 补齐 owner 分支。
+   - **B4**：DESIGN §1.2 两处、`src/config.ts` 的 schema 描述（**owner 直接读到的那个**）、
+     `src/index.ts` 的公开注释里的"executor 永不轮转/未交付"全部改正。
+   - **B5**：本节原先写了当次精确计数，落笔当天即与实测差一（DESIGN §8 自己的 Moving-Anchor
+     规则禁止这种锚）。现在改为**下限 + 证据文件**：回归基线 ≥1544 例，当次全绿输出、
+     client 声明检查、bundle 断言与真流回放分别存于 evidence/ 下的四个文件；正文不再
+     声称任何"当前计数"。基线提交也改正为 `35c8e90`（本轮 diff 的父提交；`cc4276a` 是
+     M13，即它的父）。
+   - 非阻塞项一并处理：`executorDispatches` 的口径改为"新 child 数"并说明旧流首次派发即
+     写入 1 的下限语义（N2）；审计轮转的独立性类只在约束生效时存在（N3）；世代终止只由
+     `resume-planning` 触发，`resume-execution` 原样保留（N4）；撤回的回退值/相位与"持有
+     期间不清空证据包"写进 §17（N5）；**delegated run 的 owner 执行门禁裁决现在把 executor
+     置为 `completed`**，因此它真能收尾（原先 `evaluateCompletion` 会拒，N6——这一条是改代码
+     而不是改措辞）；`status.gateSources` 改为**逐门禁**回落 `no-source`（N7）；`withdraw`
+     补上"另一道门禁不许动"的守卫（N8）；drain 失败回退不再移动 owner 已通过的门禁（N9）；
+     不变量章节补一句"owner pass 是裁决，不是机械逃生"（N10）。
+4. **可见面（N6 之外的第二处补交付）**。`gateSources` 现在真的走到用户眼前：
+   `GET /api/autopilot/run` 的 allow-list 转发它（`src/web.ts` 的 `projectRun`），客户端
+   镜像 + 合并（`definition.ts` / `live.ts`），卡片在 gate 行下方渲染 `data-autopilot-gate-source`
+   行（"plan gate: the OWNER (an explicit owner-gate-pass) (plan revision 1, owner decision 1)"）。
+   这是规则审计点名 N7 之后才补的：此前只有模型侧的 `autopilot_status` 能看到来源，卡片和
+   路由都看不到——而"谁定的门禁"正是这个功能的全部意义。
+5. **校验收口（当次实测，数字取自证据文件，正文不写死）**：`pnpm run check` 干净；
+   `pnpm run test` 全绿（回归基线 ≥1544 例）；`DSH_SRC=~/dsh-client-deps/src pnpm run check:client`
+   3 条声明路径在场、`pnpm run build` 产出 `lib/client.js`；
+   `DSH_STORE=~/dsh-client-deps/store pnpm run test:client-bundle` 19/19 断言全绿。
+   `check:client` / `test:client-bundle` 用的声明与运行时来自按精确版本取回的 npm 包
+   （`~/dsh-client-deps/`，机器本地、不入仓），因为本机没有带依赖的 0.2.0-rc.2 源树。

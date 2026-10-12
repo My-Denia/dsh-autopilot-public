@@ -74,7 +74,14 @@ they overlap they are summaries; the contract itself is owned once, and
 `autopilot_status` shows phase, gates, required roles, replan budget, and
 enforcement. `autopilot_log` records four-cell checkpoints
 (`on-plan|detour|grind|escalate`). `autopilot_signal` carries replan /
-block / owner-decision / owner-approve / owner-resolve.
+block / owner-decision / owner-approve / owner-resolve, plus the gate actions
+`owner-gate-pass` and `owner-gate-withdraw` (owner-only, and both name exactly
+one gate with `gate: plan|execution`). A gate the owner passed stands against a
+later audit objection — the objection is recorded, the gate does not move, and
+the other gate is never carried along — and `status.gateSources` says which
+authority set each gate, for which plan revision. The reading is PER GATE: a
+gate the stream recorded nothing about answers `no-source`, which is a
+statement about the stream rather than a claim that nobody decided.
 `owner-resolve` takes `resume-planning` (full reset), `resume-execution`
 (restore the paused-from phase with gates/evidence untouched — requires a
 pause that stamped it), or `block`. Replan-budget exhaustion never forces an

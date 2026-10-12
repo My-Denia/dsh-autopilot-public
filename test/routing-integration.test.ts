@@ -2989,13 +2989,18 @@ describe('routing integration: work-class reachability on the StatusView', () =>
     expect(report?.kind).toBe('work-class-reachability')
   })
 })
-// ── M4 (DESIGN §9-15): owner-opted engine-level rotation for auditor roles ──
+// ── M4 + §9 item 15: owner-opted engine-level rotation, auditors AND executor ──
 //
-// A healthy auditor pin yields to a FULL re-selection when
-// `routing.ladder.rotation` is on. The re-selection walks the same
-// selectForRole path as a first dispatch, and the selector's ordinal offset
-// applies WITHIN the independence class — never overriding it. Default off
-// leaves pin reuse untouched; the executor role never rotates this way.
+// A healthy pin yields to a FULL re-selection when `routing.ladder.rotation`
+// is on. The re-selection walks the same selectForRole path as a first
+// dispatch: for an auditor the selector's ordinal offset applies WITHIN the top
+// independence class (never overriding it), and for the EXECUTOR — which has no
+// independence constraint of its own — it walks the ranked survivor list. The
+// executor's ordinal is the run's own `executorDispatches` count, and its
+// rotation can only ever fire at a NEW dispatch boundary, because
+// `resolveRoleRoute('executor')` is reached by `startExecutor` alone: a live
+// child is continued by `resumeExecutor` on its own recorded route. Default off
+// leaves pin reuse untouched.
 
 describe('routing integration: M4 engine-level rotation (routing.ladder.rotation)', () => {
   it('rotation ON + auditor role: the healthy pin yields to a re-selection with repinFrom and reason rotation', async () => {
@@ -3071,6 +3076,131 @@ describe('routing integration: M4 engine-level rotation (routing.ladder.rotation
     expect(planDetail?.repinFrom).toBeUndefined()
     expect(planDetail?.pin).toBeDefined()
     expect(planDetail?.why?.some(entry => entry.includes('rotation: ordinal 0'))).toBe(true)
+  })
+
+  // §9 item 15: the EXECUTOR rotates too, and continuity is a property of the
+  // call graph rather than a promise — `startExecutor` is the only caller of
+  // `resolveRoleRoute('executor')`, so an in-flight child cannot have its route
+  // swapped under it.
+  it('rotation ON + the EXECUTOR role: a NEW dispatch boundary rotates, an in-flight child cannot', async () => {
+    const f = fixture(MODELS, PRESENT_ABC3)
+    const h = makeHarness({
+      routing: f.portsFor(),
+      config: { routing: { mode: 'auto', ladder: { rotation: true } } },
+      subagents: stubSubagents({ verdicts: [
+        { verdict: 'pass', note: 'plan ok' },
+        { verdict: 'pass', note: 'plan ok again' },
+      ] }),
+    })
+    const signal = new AbortController().signal
+    await h.engine.init(h.root, makeTriage(STANDARD_DELEGATED), [undeclaredSeed('m1')])
+    await h.engine.declareUsage(h.root, makeUsageEntry({ id: 'm1' }))
+    await h.engine.submitPlan(h.root, 'plan')
+    await h.engine.audit(h.root, { role: 'plan', prompt: 'packet' })
+
+    // FIRST dispatch: ordinal 0, which the selector names as the no-op, and the
+    // ledger records exactly one dispatch.
+    const first = await h.engine.startExecutor(h.root, { prompt: 'implement', signal })
+    const firstPin = first.routingPins?.executor
+    expect(firstPin).toBeDefined()
+    expect(first.executorDispatches).toBe(1)
+    const firstDetail = routingDetails(h).filter(detail => detail.op === 'start-executor' && detail.role === 'executor').pop()
+    expect(firstDetail?.repinFrom).toBeUndefined()
+    expect(firstDetail?.why?.some(entry => entry.includes('rotation: ordinal 0'))).toBe(true)
+
+    // CONTINUITY: while the child is live there is no new dispatch boundary, so
+    // the start is refused outright and the pin cannot be rotated away.
+    await expect(h.engine.startExecutor(h.root, { prompt: 'implement again', signal }))
+      .rejects.toMatchObject({ code: 'AP_EXECUTOR_EXISTS' })
+    expect(h.engine.peek(h.root.id)?.routingPins?.executor).toEqual(firstPin)
+
+    // SECOND dispatch — a genuine new boundary (replan revoked the first child):
+    // the healthy pin yields, the ordinal comes from the run's own dispatch
+    // count, and the offset lands in the ranked survivor list.
+    await h.engine.replan(h.root, 'round two')
+    await h.engine.submitPlan(h.root, 'plan v2')
+    await h.engine.audit(h.root, { role: 'plan', prompt: 'packet' })
+    const second = await h.engine.startExecutor(h.root, { prompt: 'implement again', signal })
+    const secondDetail = routingDetails(h).filter(detail => detail.op === 'start-executor' && detail.role === 'executor').pop()
+    expect(second.executorDispatches).toBe(2)
+    expect(secondDetail?.repinFrom).toEqual(firstPin)
+    expect(secondDetail?.why?.some(entry =>
+      entry.includes('this executor dispatch re-selects instead of reusing its healthy pin'))).toBe(true)
+    expect(secondDetail?.why?.some(entry =>
+      entry.includes('rotation: ordinal 1 into the ranked survivor list'))).toBe(true)
+    expect(secondDetail?.pin).not.toEqual(firstPin)
+  })
+
+  it('rotation ON never touches a LIVE child: resume re-uses its recorded route and re-selects nothing', async () => {
+    // §9 item 15's continuity claim, asserted rather than argued: the rotation
+    // branch is reached only by `startExecutor`, so continuing a running child
+    // must add NO routing decision and leave the pin exactly where it was.
+    const f = fixture(MODELS, PRESENT_ABC3)
+    const h = makeHarness({
+      routing: f.portsFor(),
+      config: { routing: { mode: 'auto', ladder: { rotation: true } } },
+      subagents: stubSubagents({ verdicts: [
+        { verdict: 'pass', note: 'plan ok' },
+        { verdict: 'needs-fix', note: 'missing test' },
+      ] }),
+    })
+    const signal = new AbortController().signal
+    await h.engine.init(h.root, makeTriage(STANDARD_DELEGATED), [undeclaredSeed('m1')])
+    await h.engine.declareUsage(h.root, makeUsageEntry({ id: 'm1' }))
+    await h.engine.submitPlan(h.root, 'plan')
+    await h.engine.audit(h.root, { role: 'plan', prompt: 'packet' })
+
+    const started = await h.engine.startExecutor(h.root, { prompt: 'go', signal })
+    const pin = h.engine.peek(h.root.id)?.routingPins?.executor
+    expect(pin).toBeDefined()
+    const dispatchesBefore = h.engine.peek(h.root.id)?.executorDispatches
+    const detailsBefore = routingDetails(h).filter(detail => detail.op === 'start-executor' && detail.role === 'executor').length
+
+    const child = fakeAgent(started.executor?.childId as string, h.root.id)
+    h.agents.add(child)
+    await h.engine.submitExecutionPacket(child, { packet: 'work', residualRisks: [], executionRevision: 1 })
+    await h.engine.audit(h.root, { role: 'execution', prompt: 'audit' })
+    expect(h.engine.peek(h.root.id)?.executionGate).toBe('needs-fix')
+
+    await h.engine.resumeExecutor(h.root, { findings: 'missing test', nextPrompt: 'add it', signal })
+    const after = h.engine.peek(h.root.id)
+    expect(after?.routingPins?.executor).toEqual(pin)
+    expect(after?.executorDispatches).toBe(dispatchesBefore)
+    expect(routingDetails(h).filter(detail => detail.op === 'start-executor' && detail.role === 'executor').length)
+      .toBe(detailsBefore)
+    expect(routingDetails(h).some(detail => detail.op === 'resume-executor')).toBe(false)
+  })
+
+  it('rotation OFF for the executor: the healthy pin is REUSED across dispatch boundaries', async () => {
+    const f = fixture(MODELS, PRESENT_ABC3)
+    const h = makeHarness({
+      routing: f.portsFor(),
+      config: { routing: { mode: 'auto', ladder: { rotation: false } } },
+      subagents: stubSubagents({ verdicts: [
+        { verdict: 'pass', note: 'plan ok' },
+        { verdict: 'pass', note: 'plan ok again' },
+      ] }),
+    })
+    const signal = new AbortController().signal
+    await h.engine.init(h.root, makeTriage(STANDARD_DELEGATED), [undeclaredSeed('m1')])
+    await h.engine.declareUsage(h.root, makeUsageEntry({ id: 'm1' }))
+    await h.engine.submitPlan(h.root, 'plan')
+    await h.engine.audit(h.root, { role: 'plan', prompt: 'packet' })
+    const first = await h.engine.startExecutor(h.root, { prompt: 'implement', signal })
+    const firstPin = first.routingPins?.executor
+    expect(firstPin).toBeDefined()
+
+    await h.engine.replan(h.root, 'round two')
+    await h.engine.submitPlan(h.root, 'plan v2')
+    await h.engine.audit(h.root, { role: 'plan', prompt: 'packet' })
+    const second = await h.engine.startExecutor(h.root, { prompt: 'implement again', signal })
+    const secondDetail = routingDetails(h).filter(detail => detail.op === 'start-executor' && detail.role === 'executor').pop()
+    // The DISPATCH LEDGER still advances (it counts dispatches, not rotations),
+    // while the route itself is the shipped stability semantics: reused.
+    expect(second.executorDispatches).toBe(2)
+    expect(secondDetail?.pin).toEqual(firstPin)
+    expect(secondDetail?.repinFrom).toBeUndefined()
+    expect(secondDetail?.why?.some(entry => entry.includes('rotation: routing.ladder.rotation is on'))).toBe(false)
   })
 
 

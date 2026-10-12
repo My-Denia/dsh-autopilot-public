@@ -358,6 +358,52 @@ test failures — those are engineering problems with engineering remedies.
 **enforced: engine (no forced owner escalation; `pausedFrom` derivation;
 `AP_OWNER_RESUME_INVALID`) + discipline (the boundary judgment).**
 
+## Owner Gate Decisions and Provenance
+
+A gate is a claim about WHO decided, so the run records the source of every
+gate — `owner` / `auditor` / `self-check` / `pending`, and `no-source` for a
+stream too old to say — together with the GENERATION (the plan revision) the
+record is current for. `autopilot_signal` gains `owner-gate-pass` and
+`owner-gate-withdraw`, both owner-only (a direct human turn, like
+owner-approve) and both naming exactly ONE gate.
+
+- One owner decision, one gate: passing the plan gate never carries the
+execution gate along, and the reverse holds too.
+- An owner pass STANDS against a later audit objection. The objection is
+  appended and never erased — it is evidence that a review ran and disagreed —
+  while the gate it objects to does not move. Ending the pass is an explicit
+  `owner-gate-withdraw`; the GENERATION ends it too: an `amend-plan`, a new plan
+  submission, a replan, or `owner-resolve(resume-planning)` (that decision
+  alone — `resume-execution` restores the paused phase with provenance
+  untouched). A pass from an earlier plan revision is simply not in force, so
+  the next verdict moves the gate as usual.
+- A withdrawal is final for its generation: nothing but a NEW owner decision
+  with a strictly higher ordinal may put the owner's name back on that gate. A
+  later ordinary reset or pass never resurrects it.
+- Only a gate the owner passed, and only while that pass is CURRENT, can be
+  withdrawn. An audit-derived gate is not the owner's to revoke, a decision
+  already withdrawn has nothing to take back, and a pass from an earlier
+  generation is already superseded. Withdrawing one gate leaves the other
+  where it was.
+- An owner pass is a RULING, not a mechanical escape: it answers "this gate is
+  met" where the owner judges it met, and it never substitutes for the
+  engineering remedies above (budget exhaustion, audit-round limits, failing
+  tests). Completing a run still requires every required audit role's latest
+  verdict to be `pass`, so an owner pass cannot close a run that was never
+  reviewed.
+- The couplings that already existed are kept, not routed around: the plan gate
+  still requires the usage question answered, the execution gate still requires
+  the evidence submitted, and the execution gate's pass still requires a review
+  or the owner's own recorded pass for that generation.
+- A stream that recorded no provenance is never retro-fitted: it reads
+  `no-source`, which claims nothing, and folds exactly as it did before.
+
+**enforced: engine (the owner-only ops, the write-path precedence that keeps the
+objection, `gateSources` derivation) + fold (`AP_OWNER_GATE_INVALID`,
+`AP_OWNER_GATE_NOT_PASSED`, `AP_OWNER_GATE_PRECEDENCE`,
+`AP_OWNER_GATE_RESURRECTED`, `AP_GATE_SOURCE_INVALID`,
+`AP_GATE_SOURCE_SHRANK`) + discipline (deciding whether a gate is met).**
+
 ## Red flags
 
 - "The tests pass" with no command, cwd or exit status recorded.

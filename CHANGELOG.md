@@ -8,6 +8,82 @@ Host and packaging bounds that outlive a single release are in
 Realigns the plugin with the current goal-autopilot-harness design, where a host
 adapter stays thin and the host-neutral rules live in one reference layer.
 
+### Added (owner gate decisions with provenance, and executor rotation; 2026-10-12, DESIGN §9 items 8 and 15)
+
+- `autopilot_signal` gains `owner-gate-pass` and `owner-gate-withdraw` — the
+  owner's own ruling that one gate is met, and its withdrawal. Both are
+  owner-only (a direct human turn, the same gate as `owner-approve`) and both
+  name exactly one gate (`gate: plan|execution`).
+- A gate the owner passed **stands against a later audit objection**: the
+  objection is recorded — the audit record is appended with its notes, never
+  erased — while the gate it objects to does not move, and the other gate is
+  never carried along. Ending the pass is an explicit withdrawal; a new plan
+  submission, a replan or an owner resolution supersedes the generation it was
+  taken in, and a withdrawn decision never comes back into force.
+- `autopilot_status` gains `gateSources`: which authority last set each gate
+  (`owner` / `auditor` / `self-check` / `pending`), for which plan revision,
+  with the owner-decision ordinal and the withdrawal flag. A stream that
+  recorded no provenance reads `no-source` — a statement about the stream, never
+  an inference about the gate.
+- The execution gate's pass now accepts an in-force owner pass alongside a
+  latest execution-audit pass (`AP_GATE_WITHOUT_AUDIT`), disclosed because it is
+  a deliberate relaxation of an existing rule rather than a silent change; the
+  evidence packet is still required before the gate can be passed at all.
+- The couplings are kept where they already existed: passing the plan gate with
+  the usage question unanswered is still refused (`AP_USAGE_UNDECLARED`), and
+  the plan gate is only passable from a planning phase with a submitted plan.
+- The engine-level rotation opt-in (`routing.ladder.rotation`) now covers the
+  **executor** as well as auditor roles — see the next block.
+
+### Added (engine-level executor rotation; 2026-10-12, DESIGN §9 item 15)
+
+- With the owner opt-in `routing.ladder.rotation: true`, a **new executor
+  dispatch** now rotates within the ranked eligible list exactly as auditor
+  roles rotate within their independence class. The rotation ordinal is the
+  run's own `executorDispatches` count (derived by the fold; one dispatch = one
+  new child), the replaced pin is recorded as `repinFrom`, and the why-line
+  names rotation as the reason.
+- **A running executor child is never re-routed**: `resumeExecutor` continues the
+  child on the route it was dispatched with, and the rotation branch is reached
+  only at a new dispatch boundary. Rotation stays off by default, so an
+  unconfigured deployment keeps the shipped stability semantics byte for byte.
+
+### Changed (the two gaps closed after an independent audit; 2026-10-12)
+
+- `gateSources` reaches the USER, not only the model: it is forwarded by
+  `GET /api/autopilot/run`, merged by the card, and rendered under the gate row
+  ("plan gate: the OWNER (an explicit owner-gate-pass) (plan revision 1, owner
+  decision 1)"). Who set a gate is the whole point of the field, and a reader
+  who cannot see it cannot tell whether a later objection will move the gate.
+- An owner pass on the **execution** gate now marks the executor `completed`, so
+  a delegated run the owner ruled met can actually close (`evaluateCompletion`
+  requires it, and the previous behavior left no exit but a passing review or a
+  withdrawal).
+- An amended plan no longer leaves a superseded owner pass holding the gate: the
+  fold compares the generation in its precedence guard exactly as the engine
+  does, so a delta re-audit that returns `needs-replan` lands, is recorded and
+  moves the gate instead of being refused (and its verdict lost).
+- `status.gateSources` falls back to `no-source` PER GATE, so a stream that
+  recorded provenance for one gate does not have the other described in the
+  shape of a record it never wrote.
+- `AP_GATE_SOURCE_SHRANK` is reachable (its check now precedes the derivation
+  equality it used to be shadowed by); `owner-gate-withdraw` refuses a pass from
+  an earlier generation and may not move the other gate; a failed executor drain
+  no longer moves a gate the owner passed.
+
+### Added (owner-verbatim requirements, recorded inline reasons, command records; 2026-10-12)
+
+- `autopilot_init` records `ownerRequirements` verbatim (immutable with triage)
+  and surfaces them in status and the root policy, so an audit packet checks the
+  owner's actual words rather than a paraphrase.
+- `autopilot_init` requires a recorded `inlineReason` for an inline run at
+  medium risk or above (`AP_INLINE_REASON_REQUIRED`): the reason is recorded and
+  surfaced, never approved — the refusal is for the missing record, not for the
+  choice to stay inline.
+- `autopilot_submit_closeout` accepts structured `commandRecords`
+  (`{command, cwd, exitStatus, coverage}`), shape-validated at write time; a
+  record without its exit fact is refused.
+
 ### Added (the routing block in the card; 2026-10-12 M13)
 
 - The desktop card now RENDERS the routing status instead of leaving it to the
