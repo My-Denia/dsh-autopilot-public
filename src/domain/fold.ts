@@ -1415,8 +1415,14 @@ export function applyEvent(prior: Snapshot | undefined, event: RunEvent): Snapsh
     const executionAudits = next.audits.filter(record => record.role === 'execution')
     const latest = executionAudits[executionAudits.length - 1]
     const owner = next.gateSources?.execution
+    // THE GENERATION COMPARISON, spelled the same way the other three copies of
+    // this predicate spell it (prior.plan.revision, not next.plan.revision).
+    // They agree today — only submit-plan/amend-plan/init raise the plan
+    // revision and none of those is a gate-mover — and this bug was born from
+    // exactly this predicate existing in four places with one form different
+    // from the rest, so the forms are kept identical on purpose.
     const ownerInForce = owner?.source === 'owner' && owner.withdrawn !== true
-      && owner.planRevision === next.plan.revision
+      && owner.planRevision === prior.plan.revision
     if (!ownerInForce && (latest === undefined || latest.verdict !== 'pass')) {
       fail('executionGate pass without a latest execution-audit pass (or an in-force owner pass for this generation)', 'AP_GATE_WITHOUT_AUDIT')
     }

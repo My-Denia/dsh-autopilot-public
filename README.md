@@ -115,7 +115,7 @@ The plugin automatically initializes the run, requests read-only sandbox mode, c
 - ⏱️ **Turn Reminder &amp; Usage Governance**  
   A bounded 3x nudge prevents agents from silently stopping mid-execution. Standard runs must declare observable usage states before mutations are unlocked.
 - 🧭 **Governed Model Routing**  
-  An owner-declared `routing.ladder` (economy / standard / reserve tiers) drives work-class dispatch membership, ordering-axis selection (price, then owner-declared speed — opt-in via `routing.orderingAxisDefault`), engine-level auditor rotation (`routing.ladder.rotation`), and two coverage metrics (tier coverage + work-class reachability). A work class with zero reachable routes blocks with `AP_ROUTE_NO_REACHABLE_WORK_CLASS` instead of silently shelving; a first-use onboarding prompt helps classify models the ladder cannot reach. Nothing is inferred from model names.
+  An owner-declared `routing.ladder` (economy / standard / reserve tiers) drives work-class dispatch membership, ordering-axis selection (price, then owner-declared speed — opt-in via `routing.orderingAxisDefault`), engine-level rotation (`routing.ladder.rotation`: auditor roles offset within their independence class, the executor by its own dispatch count — a running executor child is never re-routed), and two coverage metrics (tier coverage + work-class reachability). A work class with zero reachable routes blocks with `AP_ROUTE_NO_REACHABLE_WORK_CLASS` instead of silently shelving; a first-use onboarding prompt helps classify models the ladder cannot reach. Nothing is inferred from model names.
 
 ---
 

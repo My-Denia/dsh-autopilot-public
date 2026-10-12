@@ -4403,13 +4403,14 @@ export class AutopilotEngine {
         // `selectForRole` left the request unreadable on the one path the
         // request exists for. `先试 economy` pins economy on the first
         // dispatch; without this branch the resume reuses that pin forever and
-        // the request is a no-op. Rotation is not a substitute: it is
-        // auditor-only and owner-opted.
+        // the request is a no-op. Rotation is not a substitute: it is a
+        // whole-list offset the owner opted into, and it can fire for an
+        // auditor or for the executor (DESIGN §9 item 15).
         //
         // PLACEMENT IS LOAD-BEARING. It sits AFTER both the dead-pin re-select
         // above and the rotation branch: a DEAD pin already re-selects (and
         // must keep recording its own `repinFrom` reason), and rotation is an
-        // owner-level policy for auditors that this request must not pre-empt.
+        // owner-level policy that this request must not pre-empt.
         // The request is consumed HERE, in the branch that acts on it, so a
         // dispatch that never reaches this point cannot eat it.
         if (dead === undefined && this.pendingEscalations.has(prior.runId)) {

@@ -276,12 +276,12 @@ adapter stays thin and the host-neutral rules live in one reference layer.
   `routing.orderingAxisDefault: true` promotes the ordering-axis path (price,
   then owner-declared speed) to the deployment default without touching
   deployments that never wrote it.
-- Engine-level auditor rotation (A4, DESIGN §9-15, auditor roles only):
-  `routing.ladder.rotation: true` (default off) makes a healthy auditor pin
-  yield to a full re-selection at the next same-role dispatch, offset by the
-  audit-count ordinal within its independence class — rotation never overrides
-  cross-family independence, and executor engine-level rotation stays an
-  explicitly recorded known limitation.
+- Engine-level rotation (A4, DESIGN §9-15): `routing.ladder.rotation: true`
+  (default off) makes a healthy pin yield to a full re-selection at the next
+  same-role dispatch — for an auditor offset by the audit-count ordinal within
+  its independence class, so rotation never overrides cross-family
+  independence. (Executor rotation was an explicitly recorded known limitation
+  until 2026-10-12, when DESIGN §9 item 15 closed it — see the entries above.)
 - Coverage upgraded to work-class reachability: `workClassReachability`
   (`kind: 'work-class-reachability'`, five outcomes over the same non-empty
   observation floor, `auditTier` overrides reflected, non-tier-bound classes

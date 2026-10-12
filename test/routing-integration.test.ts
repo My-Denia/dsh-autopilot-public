@@ -2032,7 +2032,10 @@ describe('F17 (PR #2 round 7): the pool liveness skip distinguishes a catalog ou
     // No liveness skip was recorded — the leg never ran — and the outage is
     // the infrastructure fact it is (F14 wording family), on the cached read.
     expect(routing?.why?.some(entry => entry.includes('is not live in the catalog snapshot'))).toBe(false)
-    expect(catalog.snapshot()).resolves.toMatchObject({ catalogStatus: 'unavailable' })
+    // AWAITED: an unawaited `resolves` assertion passes whether or not the
+    // promise ever settles, and vitest 3 turns the warning into a failure. This
+    // one predates the current work and is repaired here rather than inherited.
+    await expect(catalog.snapshot()).resolves.toMatchObject({ catalogStatus: 'unavailable' })
     // Preflight was the actual gate: resolveCallConfig ran for the pick.
     expect(llm.preflights.some(config => config.provider === 'gamma' && config.model === 'm-d')).toBe(true)
   })
