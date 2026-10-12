@@ -600,7 +600,7 @@ describe('§2 the engine\'s tool filters against a real registry', () => {
     } as never)
 
     const engine = makeEngine(mounted.ctx.subagents, agents)
-    await engine.init(root, { ...BASE_TRIAGE, risk: 'medium', size: 'standard', auditMode: 'independent' },
+    await engine.init(root, { ...BASE_TRIAGE, risk: 'medium', size: 'standard', auditMode: 'independent', inlineReason: 'fixture: the filter capture runs inline' },
       [{ id: 'm1', usageClass: 'undeclared', boundaryStates: [], artifacts: [], attempted: [] }])
     await engine.submitPlan(root, 'plan')
     await engine.declareUsage(root, { id: 'm1', usageClass: 'internal', boundaryStates: [], artifacts: [], attempted: [] })

@@ -524,6 +524,22 @@ export interface CloseoutHandoff {
   readonly nextAuthorizedAction?: string
 }
 
+/**
+ * One command the run actually executed, recorded as a fact rather than a
+ * narrative line (governance pragmatics v2). `commands` stays the free-text
+ * log; `commandRecords` is the structured counterpart an auditor can check
+ * field by field.
+ */
+export interface CommandRecord {
+  readonly command: string
+  /** Working directory; absent means the run workspace root. */
+  readonly cwd?: string
+  /** The exit fact: a status code ('0', '1') or an interruption word ('timeout', 'killed'). */
+  readonly exitStatus: string
+  /** What the command's result was relied on for. */
+  readonly coverage?: string
+}
+
 /** Structured closeout (CC Phase 5 contract). Completion is refused without it. */
 export interface Closeout {
   readonly summary: string
@@ -546,6 +562,12 @@ export interface Closeout {
    * the engine, derived-checked by the fold whenever present.
    */
   readonly outcome?: 'complete' | 'partial'
+  /**
+   * Optional structured command records ({command, cwd, exitStatus, coverage})
+   * alongside the free-text `commands` log (governance pragmatics v2).
+   * Additive; ABSENT on legacy streams, validated for shape at write only.
+   */
+  readonly commandRecords?: readonly CommandRecord[]
 }
 
 /** One owner egress approval (v1 stand-in for the CC outbound evidence manifest). */
@@ -1006,6 +1028,21 @@ export interface Triage {
    * Immutable like the rest of triage, so a run cannot retcon its ancestry.
    */
   readonly carryover?: Carryover
+  /**
+   * Owner-verbatim requirement strings the run must honour (governance
+   * pragmatics v2, shared doctrine owner-requirement traceability). Recorded
+   * once at init, surfaced in status and the root policy, so an audit packet
+   * can check compliance against the owner's actual words rather than a
+   * dispatcher's paraphrase. Immutable like the rest of triage.
+   */
+  readonly ownerRequirements?: readonly string[]
+  /**
+   * The recorded reason this run implements INLINE at medium+ risk (shared
+   * doctrine §9: a reason is required and recorded, never an approval gate).
+   * `init` refuses inline medium/high/critical without it
+   * (`AP_INLINE_REASON_REQUIRED`).
+   */
+  readonly inlineReason?: string
 }
 
 /**
@@ -1683,6 +1720,10 @@ export function validateTriage(triage: Triage): string[] {
   }
   if (triage.executionMode === 'delegated' && triage.size === 'lightweight') {
     problems.push('lightweight runs are always inline (CC parity)')
+  }
+  if (triage.ownerRequirements !== undefined
+    && triage.ownerRequirements.some(requirement => requirement.trim().length === 0)) {
+    problems.push('ownerRequirements entries must be non-blank strings')
   }
   return problems
 }

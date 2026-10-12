@@ -146,6 +146,15 @@ export function installRootTools(
         carryoverFromRunId: { type: 'string', description: 'Declare this run as the continuation of a COMPLETED predecessor run (cross-run carryover). The predecessor must exist in the store and be completed; refused otherwise.' },
         carryoverNote: { type: 'string', description: 'What this run carries forward from the predecessor (required with carryoverFromRunId).' },
         carryoverInherits: { type: 'array', items: { type: 'string' }, description: 'Named items inherited from the predecessor (verified results, open items, decisions, evidence refs). Required non-empty with carryoverFromRunId.' },
+        ownerRequirements: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Owner-verbatim requirement strings this run must honour. Recorded once, surfaced in status and policy, so auditors check compliance against the owner\'s actual words rather than a paraphrase.',
+        },
+        inlineReason: {
+          type: 'string',
+          description: 'REQUIRED when executionMode is inline and risk is medium or above (AP_INLINE_REASON_REQUIRED otherwise): the recorded reason this run does not delegate. A reason is recorded, never approved.',
+        },
       },
       output: jsonOutput(JSON_VALUE),
       async execute(args, exec) {
@@ -173,6 +182,8 @@ export function installRootTools(
               inherits: args.carryoverInherits ?? [],
             },
           }),
+          ...(args.ownerRequirements === undefined ? {} : { ownerRequirements: args.ownerRequirements }),
+          ...(args.inlineReason === undefined ? {} : { inlineReason: args.inlineReason }),
         }
         // Usage seeding is STANDARD-ONLY: lightweight runs skip mechanical
         // enforcement across the board (CC parity — the same exemption the
@@ -620,6 +631,20 @@ export function installRootTools(
           },
         },
         handoffNextAuthorizedAction: { type: 'string', description: 'The next authorized action, persisted with the handoff so a follow-up run inherits intent, not guesswork.' },
+        commandRecords: {
+          type: 'array',
+          description: 'Optional structured command records alongside the free-text commands log: each entry states the command, its working directory, its exit fact, and what its result was relied on for.',
+          items: {
+            type: 'object',
+            additionalProperties: false,
+            properties: {
+              command: { type: 'string', required: true },
+              cwd: { type: 'string', description: 'Working directory; omit when the run workspace root.' },
+              exitStatus: { type: 'string', required: true, description: "The exit fact: a status code ('0', '1') or an interruption word ('timeout', 'killed')." },
+              coverage: { type: 'string', description: 'What the result was relied on for.' },
+            },
+          },
+        },
       },
       output: jsonOutput(JSON_VALUE),
       async execute(args, exec) {
@@ -637,6 +662,7 @@ export function installRootTools(
           exclusions: args.exclusions ?? [],
           workspaceCleanup: args.workspaceCleanup,
           drift: args.drift,
+          ...(args.commandRecords === undefined ? {} : { commandRecords: args.commandRecords }),
           ...(args.handoffOpenItems === undefined
             ? {}
             : {

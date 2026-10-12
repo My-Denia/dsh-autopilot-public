@@ -207,8 +207,22 @@ Medium and above default to a delegated executor in the Codex GAH. This adapter
 does not: `executionMode` is chosen at `autopilot_init` and `delegated` is
 refused for a lightweight run, while `inline` stays legal at every risk because
 this engine cannot observe whether an "executor lead" would have been better.
-An inline medium+ run still takes the independent reviews its risk requires.
+At medium risk or above an inline run must RECORD its reason at init
+(`inlineReason`, refused when absent: `AP_INLINE_REASON_REQUIRED`) — recorded
+and surfaced, never approved; the refusal is for the missing record, not the
+choice. An inline medium+ run still takes the independent reviews its risk
+requires.
 **enforced: engine (mode legality) + discipline (the delegation decision).**
+
+## Owner-Verbatim Requirements
+
+A run may record the owner's requirements VERBATIM at `autopilot_init`
+(`ownerRequirements`). They are immutable with the triage, surfaced in
+`autopilot_status` and in the root policy block, and an audit packet checks
+compliance against those words — not against the dispatcher's paraphrase of
+them. Blank entries are refused at triage validation. **enforced: engine**
+(carries, validates and surfaces them); **discipline** (the dispatcher
+declares them honestly; the auditor checks compliance).
 
 ## State and evidence
 
@@ -241,6 +255,10 @@ contract acceptance and the applicable independent gates.
 Every closeout reports: changes made, validation mapped to each acceptance
 criterion, required audit decisions, unresolved work, limitations, workspace
 cleanup, and prompt/workspace drift (`none found` or exact facts).
+
+The free-text `commands` log may be paired with structured `commandRecords`
+(`{command, cwd, exitStatus, coverage}` per command, shape-validated at write
+— a record without its exit fact is a narrative, not a record).
 
 Source-ready is not installed. Installed is not activated. Do not report one as
 another.

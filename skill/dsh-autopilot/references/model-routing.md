@@ -141,6 +141,20 @@ configuration error, not an empty answer: the dispatch blocks with
 escalation path. `mechanical` is not tier-bound (its gate is the fact permit),
 so it cannot fire that code.
 
+## Reasoning effort ceilings
+
+The effort a dispatch carries is composed in ONE order — the role lock's named
+effort, else the route's adapter-declared `defaultEffort`, else NOTHING: an
+adapter that publishes no efforts is a fixed-reasoning route, and its fixed
+setting IS the ceiling. The engine never invents an effort to satisfy a role
+preference, and no agent should spin trying to raise one: asking a fixed route
+for "more reasoning" asks for a control that does not exist. Every dispatch and
+resume packet carries an `[autopilot] routing:` line naming the child's
+provider/model and the pinned effort — or stating plainly that none is pinned
+because the route publishes none — so the worker knows its own ceiling without
+guessing, and an inherit dispatch says "inherited" rather than fabricating a
+route.
+
 ## The escalation request
 
 DESIGN §1.2 makes an upgrade a REQUEST, not a prediction: the pool stays economy
@@ -186,6 +200,16 @@ is one channel with two doors, never two escalation semantics.
   ranked by the class's dominant axis. A route the session policy does not
   cover is never even considered, and a pool that widens to nothing blocks with
   `AP_ROUTE_NO_REACHABLE_WORK_CLASS` exactly as it would without a request.
+- **Escalation is a new-context handoff, never a mid-run swap.** The widened
+  pool answers the request at the NEXT dispatch — a new child generation with
+  its own context. It never re-models the working context in place, and a
+  RESUME (`autopilot_executor` resume after needs-fix) that keeps the same
+  child at its recorded route is contract continuity, not escalation; the two
+  must not be conflated in logs or audits.
+- **The root may escalate on its own observation.** The `autopilot_log` door
+  is not only a relay for the worker's request: a root that sees the anomaly
+  itself — repeated needs-fix on one layer, a stall pattern in the execution
+  log — escalates the same way, without waiting for the worker to ask.
 - **Consumed once.** The request covers ONE dispatch; the dispatch after it
   returns to the ordinary pin-stability rules (a healthy pin is reused).
 - **Engine-local, and this is recorded rather than hidden.** The request is

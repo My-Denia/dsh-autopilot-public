@@ -225,13 +225,14 @@ Requires:
 - `init` only when the session has no run, or its run is terminal (`completed`/`blocked`): a non-terminal run refuses as active, a terminal run refuses as exhausted.
 - Every engine op requires an initialized run.
 - The engine is not disposed.
-- `validateTriage` passes at init: a non-empty objective, at least one acceptance criterion, `self-check` only for `lightweight` plus `low`, no self-review at medium risk or above, and `lightweight` always `inline`.
+- `validateTriage` passes at init: a non-empty objective, at least one acceptance criterion, `self-check` only for `lightweight` plus `low`, no self-review at medium risk or above, `lightweight` always `inline`, and `ownerRequirements` entries, when present, non-blank (`AP_TRIAGE_INVALID`).
+- An `inline` run at medium risk or above records `inlineReason` at init — a reason, not an approval; the refusal is for the missing record, not the choice (`AP_INLINE_REASON_REQUIRED`).
 
 Why: the one-run-per-session rule is what keeps `runId` a stable identity and the stream the single writer's record.
 
 Remedy: finish or abandon the active run and start a new session for a new run; call `autopilot_init` first; fix the named triage combination.
 
-Codes: `AP_ALREADY_ACTIVE`, `AP_RUN_EXHAUSTED`, `AP_NOT_INITIALIZED`, `AP_DISPOSED`, `AP_TRIAGE_INVALID`.
+Codes: `AP_ALREADY_ACTIVE`, `AP_RUN_EXHAUSTED`, `AP_NOT_INITIALIZED`, `AP_DISPOSED`, `AP_TRIAGE_INVALID`, `AP_INLINE_REASON_REQUIRED`.
 
 Carryover (governance pragmatics v1): a run may declare at init that it continues a COMPLETED predecessor's authorized work.
 
@@ -369,6 +370,7 @@ Every `AP_*` code that appears under `src/**`, its contract, and the one-line pr
 | `AP_INIT_PHASE` | 1 | the `init` snapshot is in phase `planning` |
 | `AP_INIT_REVISION` | 1 | the `init` event and snapshot are at revision `1` |
 | `AP_INIT_ROUTING_PINS` | 1 | the `init` snapshot carries no `routingPins` |
+| `AP_INLINE_REASON_REQUIRED` | 12 | inline execution at medium+ risk records its reason (`inlineReason`) at `init` |
 | `AP_INVALID_ARGUMENT` | 15 | the named argument is present and satisfies its stated shape |
 | `AP_NO_AGENT` | 13 | the tool call carries a calling Agent |
 | `AP_NO_EXECUTOR` | 7 | the op requires an executor record (resume or submit) |

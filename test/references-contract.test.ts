@@ -40,6 +40,7 @@ const INVARIANT_HEADINGS = [
   'Stated-Contract Invariant',
   'Sizing and replanning',
   'Delegation',
+  'Owner-Verbatim Requirements',
   'State and evidence',
   'Closeout',
   'Audit Findings Grading',

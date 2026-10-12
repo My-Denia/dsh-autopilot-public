@@ -3004,13 +3004,11 @@ reparse-alias 桩 → spawn ENOENT；修复需持久改用户 PATH 或管理员�
 `routing.workClasses.<class>.tiers`，请求不覆盖它；ladder 已配置但请求后的池与授权交集
 为空时，仍走 `AP_ROUTE_NO_REACHABLE_WORK_CLASS` 阻塞（不静默降级）。
 
-`AP_ROUTE_NO_REACHABLE_WORK_CLASS` 阻塞（不静默降级）。
-
 ### 8.8 M13 路由实况进入真实 GUI + executor child 升档通道（2026-10-12）
 
 三个交付物 + 两处只有真跑才暴露的缺陷，基线 `23fdd47`（M12，r8），候选制品
 `dsh-goal-autopilot-0.2.0-candidate-routing-m1-m13-r9.tgz`（sha256
-`67fa39f042477d68ddd5945411eaa838f44dbd5a48dabd87308f769a83bf0400`）。
+`92570729ff15faca0422c204800183103eb44eca3a8f832f5916753f3f091f1d`）。
 
 1. **卡片渲染路由实况**。`AutopilotRunChatData` 新增 `routing` 与
    `routingReachability` 两个折叠字段（来自会话内的 `autopilot_status` 结果，
@@ -3019,8 +3017,6 @@ reparse-alias 桩 → spawn ENOENT；修复需持久改用户 PATH 或管理员�
    `ladder`（owner 配置的三档成员**计数** + audit tier——计数而非成员表，因为那表是 owner 的）、
    `roles`（五角色有效路由 + 其 work class）、`dispatched`（本 run 实际派发落定的路由）、
    `candidate coverage`（`routingReachability`，行内显式写 "NOT a dispatch record"）。
-   `GET /api/autopilot/run` 增加 `routingReachability` 字段（与 `routing` **分开**服务，
-   否则卡片会把候选覆盖当成派发记录）。`mode: 'off'` 时整块不渲染，且不留替代文案。
    `GET /api/autopilot/run` 增加 `routingReachability` 字段（与 `routing` **分开**服务，
    否则卡片会把候选覆盖当成派发记录）。`mode: 'off'` 时整块不渲染，且不留替代文案。
 2. **policy 三元组的诚实性**。`{policyState, policyRouteCount, dispatch}` 作为**一个原子

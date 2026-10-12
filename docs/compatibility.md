@@ -148,6 +148,26 @@ The domain store backend has been driven to `autopilot_init` and no further
 on that path; artifact settlement and some store-error arms are file-backend
 evidence only. See [DESIGN.md §6](../DESIGN.md).
 
+## Host capability map (measured, 0.2.0-rc.2)
+
+Which host capabilities this plugin rides on, and which it must carry
+itself — established against the published `@deepseek-ai/*` 0.2.0-rc.2
+packages and the Windows Desktop app (2026-10-10/12):
+
+| Capability | Host status | Plugin stance |
+| --- | --- | --- |
+| LLM catalog (`ctx.llm.listProviders` / `listModels` / `resolveModelInfo`) | present | **used** — work-class reachability and routing selection read the live catalog; no parallel model list exists in the plugin |
+| Custom-provider discovery (`discoverModels`) | present | **not called** — the plugin reads the live catalog directly (the row above); owner-added custom models surface there because the host's own provider config feeds it, never through plugin-side re-entry |
+| Subagent route authorization (`subagentModelSelection` session policy) | present | **used** — the session's allowed-model lock bounds every routing selection (see the policy-triad rule above) |
+| Reasoning effort (`reasoningEffort` at dispatch, `defaultEffort` per model) | present | **used** — the dispatch packet names the pinned effort; a route with none means the fixed setting IS the ceiling and the plugin never invents one |
+| Token cost / usage metering | **absent** | the price seed in `references/model-routing.md` is a dated, provenance-labelled tie-break seed, never a live fact |
+| Host-native goal-autopilot surface | **absent** | this plugin IS the DSH GAH; there is no host system to defer to or duplicate |
+| Skill registry | present | **used** — the adapter ships as a skill installed through the host's own registry |
+| Run storage backends | `file` / `storageDomain` | both supported; Desktop needs the shipped `storeKind: file` pin (see the profile-patch hazard above) |
+
+The rule behind the table: a host capability that EXISTS is ridden, not
+rebuilt; one that is absent is named absent, not wished into the docs.
+
 ## Client half
 
 The client types and bundle tests itself against a dsh source tree at the

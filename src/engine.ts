@@ -692,6 +692,26 @@ function packetRevisionHint(executionRevision: number): string {
   return `[autopilot] executionRevision=${String(executionRevision)}. Pass this integer as autopilot_submit_packet.executionRevision; a stale or missing value is refused.`
 }
 
+/**
+ * Dispatch text that tells the child WHICH ROUTE it runs on (shared doctrine
+ * 2026-10-09: a dispatch packet must state the child's model+effort — a child
+ * that cannot see its own tier cannot judge when escalation is the honest
+ * answer). `pin` is the dispatch decision's pin: present on explicit routes,
+ * absent on inheritance. An absent reasoningEffort on an explicit route means
+ * the adapter publishes no adjustable effort (or no default) — the doctrine's
+ * 2026-10-10 ceiling rule: a fixed-reasoning route's fixed setting IS the
+ * ceiling, so the line must say so instead of implying a higher effort exists.
+ */
+function dispatchRoutingLine(pin: RoutingPin | undefined): string {
+  if (pin === undefined) {
+    return '[autopilot] routing: inherited — no explicit route was pinned for this dispatch; your provider/model is the parent session\'s route, unobserved from here.'
+  }
+  const effort = pin.reasoningEffort === undefined
+    ? 'reasoning effort: none pinned — this route publishes no adjustable effort; its fixed/default setting IS the ceiling, so do not request a higher effort that does not exist'
+    : `reasoning effort: ${pin.reasoningEffort}`
+  return `[autopilot] routing: dispatched as ${pin.provider}/${pin.model} (${effort}). Escalation, if needed, is a NEW dispatch from a wider pool — never a mid-run model swap of this context.`
+}
+
 function withToolDiagnostic(route: RouteRecord, note: string | undefined): RouteRecord {
   if (note === undefined) return route
   return {
@@ -1301,6 +1321,10 @@ export interface StatusView {
    */
   readonly routing?: RoutingStatusView
   readonly diagnostic?: string
+  /** Owner-verbatim requirements declared at init (traceability surface); absent when none were declared. */
+  readonly ownerRequirements?: readonly string[]
+  /** The recorded inline-at-medium+ reason; absent when the run delegates or is low-risk. */
+  readonly inlineReason?: string
 }
 
 /**
@@ -1693,6 +1717,18 @@ export class AutopilotEngine {
       if (seedProblems.length > 0) {
         throw new AutopilotError(`usage seed rejected: ${seedProblems.join('; ')}`, 'AP_USAGE_INVALID')
       }
+    }
+    // Governance pragmatics v2 (shared doctrine §9): a medium+ risk run that
+    // implements INLINE must record WHY it does not delegate. The reason is
+    // recorded and surfaced, never gated on approval — but its absence is a
+    // hard refusal, because an unrecorded inline choice at real risk is the
+    // quiet path around the executor/auditor separation.
+    if (triage.executionMode === 'inline' && triage.risk !== 'low'
+      && (triage.inlineReason === undefined || triage.inlineReason.trim().length === 0)) {
+      throw new AutopilotError(
+        'inline execution at medium+ risk requires inlineReason — the recorded reason this run does not delegate (a reason, not an approval)',
+        'AP_INLINE_REASON_REQUIRED',
+      )
     }
     return this.transact(root.id, async () => {
       const prior = this.current(root.id)
@@ -2381,7 +2417,7 @@ export class AutopilotEngine {
             provider,
             label: 'autopilot-executor',
             request: {
-              prompt: [{ type: 'text', text: `${request.prompt}\n\n${packetRevisionHint(executor.executionRevision)}` }],
+              prompt: [{ type: 'text', text: `${request.prompt}\n\n${dispatchRoutingLine(routingDetail?.pin)}\n\n${packetRevisionHint(executor.executionRevision)}` }],
               parent: root,
               persona: request.persona ?? this.config.executor.persona,
               toolFilter: { allow },
@@ -2464,7 +2500,7 @@ export class AutopilotEngine {
       await this.subagents.sendMessage(
         root,
         prior.executor.childId,
-        [{ type: 'text', text: `[audit findings]\n${request.findings}\n\n[next dispatch]\n${request.nextPrompt}\n\n${packetRevisionHint(nextRevision)}` }],
+        [{ type: 'text', text: `[audit findings]\n${request.findings}\n\n[next dispatch]\n${request.nextPrompt}\n\n${dispatchRoutingLine(prior.executor.route.selected)}\n\n${packetRevisionHint(nextRevision)}` }],
         { signal: request.signal },
       )
       return await this.commit(prior, 'resume-executor', {
@@ -2568,7 +2604,7 @@ export class AutopilotEngine {
   }
 
   /**
-   * M4a: the EXECUTOR CHILD's escalation request — the second entry point into
+   * M13: the EXECUTOR CHILD's escalation request — the second entry point into
    * the ONE request channel.
    *
    * WHY THIS EXISTS. M12 delivered the channel (an `escalate` checkpoint naming
@@ -2915,6 +2951,18 @@ export class AutopilotEngine {
           `closeout refused: ${kindProblems.map(problem => problem.message).join('; ')}`,
           firstKindProblem.code,
         )
+      }
+      // Structured command records (governance pragmatics v2): optional, but
+      // when carried every record must state the command and its exit fact.
+      if (closeout.commandRecords !== undefined) {
+        for (const record of closeout.commandRecords) {
+          if (record.command.trim().length === 0 || record.exitStatus.trim().length === 0) {
+            throw new AutopilotError(
+              'closeout refused: every commandRecord needs a non-empty command and exitStatus',
+              'AP_INVALID_ARGUMENT',
+            )
+          }
+        }
       }
       // PARTIAL DELIVERY (governance pragmatics v1): the outcome label is
       // DERIVED here and never trusted from the caller — 'partial' iff any
@@ -5722,6 +5770,10 @@ export class AutopilotEngine {
       risk: snapshot.triage.risk,
       executionMode: snapshot.triage.executionMode,
       auditMode: snapshot.triage.auditMode,
+      ...(snapshot.triage.ownerRequirements === undefined
+        ? {}
+        : { ownerRequirements: snapshot.triage.ownerRequirements }),
+      ...(snapshot.triage.inlineReason === undefined ? {} : { inlineReason: snapshot.triage.inlineReason }),
       requiredRoles: requiredRoles(snapshot.triage),
       latestVerdicts: verdicts,
       latestAuditRecords: auditStatusRecords(snapshot),

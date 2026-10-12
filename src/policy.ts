@@ -85,6 +85,11 @@ export function renderRootPolicy(snapshot: Snapshot, unattended = false): string
     `Run state: phase=${snapshot.phase} planGate=${snapshot.planGate} executionGate=${snapshot.executionGate} planRev=${snapshot.plan.revision} replanBudget=${Math.max(0, MAX_REPLAN_ROUNDS - snapshot.consecutiveReplans)}`,
     `Triage: size=${triage.size} risk=${triage.risk} exec=${triage.executionMode} audit=${triage.auditMode} requiredRoles=[${roles.join(', ')}] latest: ${verdictLine}`,
     `Objective: ${triage.objective}`,
+    ...((triage.ownerRequirements?.length ?? 0) > 0
+      ? ['Owner requirements (verbatim — audit packets check compliance against THESE words, not a paraphrase):',
+          ...(triage.ownerRequirements ?? []).map(requirement => `- ${requirement}`)]
+      : []),
+    triage.inlineReason === undefined ? '' : `Inline reason (recorded, not approved): ${triage.inlineReason}`,
     triage.nonGoals.length > 0 ? `Non-goals: ${triage.nonGoals.join('; ')}` : '',
     '',
     PHASE_TEXT[snapshot.phase].replaceAll(AUDIT_TOOL_TOKEN, auditToolFor(triage.auditMode)),
@@ -99,6 +104,6 @@ export function renderExecutorPolicy(snapshot: Snapshot): string {
     `Scope: ${snapshot.triage.scope.join('; ') || '(as per plan)'}`,
     snapshot.triage.nonGoals.length > 0 ? `Non-goals (must not change): ${snapshot.triage.nonGoals.join('; ')}` : '',
     '',
-    `Contract: implement within the approved plan with free choice of means; run the closest validation after each coherent edit; never audit or approve your own work. If you are STUCK — max effort and still failing, or stalled — say so with autopilot_request_escalation(text, note): the engine records an escalate checkpoint naming stronger-model, and the next automatic dispatch may draw from a wider pool that is STILL inside the same authorization. It is a request, not a permission. When done (or when you need a planner/owner decision), submit your execution packet with autopilot_submit_packet: what changed, commands run with results, validation evidence, residual risks, AND executionRevision=${String(snapshot.executor?.executionRevision ?? 1)} (the live executor revision; a stale or missing value is refused). Your final message must BE your deliverable, never a status update. Owner-only boundaries (push/PR/release/credentials/destructive) stay with the owner — do not cross them.`,
+    `Contract: implement within the approved plan with free choice of means; run the closest validation after each coherent edit; never audit or approve your own work. If you are STUCK — max effort and still failing, or stalled — say so with autopilot_request_escalation(text, note): the engine records an escalate checkpoint naming stronger-model, and the next automatic dispatch may draw from a wider pool that is STILL inside the same authorization. It is a request, not a permission. Your dispatch and resume prompts carry an [autopilot] routing line naming your provider/model and reasoning effort (or inheritance); if it says no effort is pinned, that route's fixed setting IS the ceiling — request escalation only when a genuinely stronger route might exist, never a higher effort on a route that has none. When done (or when you need a planner/owner decision), submit your execution packet with autopilot_submit_packet: what changed, commands run with results, validation evidence, residual risks, AND executionRevision=${String(snapshot.executor?.executionRevision ?? 1)} (the live executor revision; a stale or missing value is refused). Your final message must BE your deliverable, never a status update. Owner-only boundaries (push/PR/release/credentials/destructive) stay with the owner — do not cross them.`,
   ].filter(line => line.length > 0).join('\n')
 }

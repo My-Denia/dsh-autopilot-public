@@ -9,8 +9,8 @@ rule's defining text — its table, its menu, its contract — belongs to exactl
 place:
 
 Two defining blocks are *mechanically* censused today (the usage-class table and
-the boundary-state menu, by `test/references-contract.test.ts`), plus the 14
-governance headings. Outside those anchors this is a review discipline, not an
+the boundary-state menu, by `test/references-contract.test.ts`), plus the
+declared census of governance-invariant headings. Outside those anchors this is a review discipline, not an
 invariant: the manual-install commands and the closeout/external-audit
 summaries deliberately appear in more than one layer, because an operator
 reading this page should not have to open the adapter to copy two files. Where
@@ -34,7 +34,12 @@ they overlap they are summaries; the contract itself is owned once, and
 
 1. `autopilot_init` — triage: objective, scope, non-goals, acceptance
    criteria, risk, size, executionMode (inline/delegated), auditMode
-   (self-check/independent/external). Standard runs also seed usage ids
+   (self-check/independent/external). An inline run at medium risk or
+   above must also record `inlineReason` — a reason, not an approval
+   (`AP_INLINE_REASON_REQUIRED`). May record `ownerRequirements`:
+   owner-verbatim requirement strings, immutable with the triage, surfaced
+   in status and the root policy so an audit checks the owner's words, not
+   a paraphrase. Standard runs also seed usage ids
    (default: one entry, `m1`). Optionally declares `carryoverFromRunId` +
    `carryoverNote` + `carryoverInherits`: this run continues a COMPLETED
    predecessor's authorized work (refused when the predecessor is missing or
@@ -62,7 +67,9 @@ they overlap they are summaries; the contract itself is owned once, and
    item (`implemented-unverified` / `not-implemented` /
    `known-limitation`), optionally `handoffNextAuthorizedAction`; the
    outcome label (`complete`/`partial`) is DERIVED by the engine, never
-   taken from the caller.
+   taken from the caller. Structured `commandRecords`
+   (`{command, cwd, exitStatus, coverage}` per command) may accompany the
+   free-text `commands` log; a record without its exit fact is refused.
 
 `autopilot_status` shows phase, gates, required roles, replan budget, and
 enforcement. `autopilot_log` records four-cell checkpoints
