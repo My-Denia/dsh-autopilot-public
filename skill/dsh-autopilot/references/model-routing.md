@@ -108,13 +108,14 @@ route costs what it does not.
 `rotation: true` is an explicit owner opt-in to engine-level re-selection for
 AUDITOR roles: a healthy pin yields to a full re-selection at the next dispatch
 of the same role, offset by the audit-count ordinal within its independence
-class (rotation never overrides cross-family independence). Executor never
-rotates this way — see boundary (b) below.
+class (rotation never overrides cross-family independence). The executor
+rotates too, by its own dispatch count — see boundary (b) below.
 
 The resolved ladder is recorded so a decision can cite what the owner said. Its
 tiers feed the owner-tier threshold, work-class dispatch membership, and both
 coverage metrics; boundary (b) below records the one rotation surface that is
-still not delivered.
+still bounded rather than delivered in full — a LIVE executor child is never
+re-routed.
 
 ## Work classes
 
@@ -256,16 +257,18 @@ opt into engine-level rotation.** The engine reuses a role's recorded pin while
 its provider is still live, its preflight still accepts and its authority still
 covers it — stability over re-selection — and re-selects only a dead pin, with
 `repinFrom` recorded. With `routing.ladder.rotation: true` (explicit owner
-opt-in, off by default) an auditor role re-selects in full at the next dispatch
-of the same role: the why line names rotation as the cause, the ordinal comes
-from the run's own audit records (replay-safe), and the offset lands within the
-audit independence class, so rotation never overrides independence. Executor
-never enters that branch, and the reason is mechanical rather than incidental:
-`AUDIT_ROLE_OF_ROUTING_ROLE` has no executor entry, so the engine supplies no
-rotation ordinal for it and the engine's rotation branch is gated on
-`AUDITOR_ROLE_SET` — no executor NO-OP line is ever recorded. Stability weighs
-higher. Engine-level executor rotation is a recorded known limitation, not a
-silent gap.
+opt-in, off by default) a role re-selects in full at the next dispatch of the
+same role: the why line names rotation as the cause, the ordinal comes from the
+run's own durable stream (replay-safe), and for an AUDITOR the offset lands
+within the audit independence class, so rotation never overrides independence.
+The EXECUTOR enters that branch too (2026-10-12): its ordinal is the run's own
+`executorDispatches` count — a NEW CHILD, because one dispatch writes two
+`start-executor` events — and the offset lands in the ranked survivor list,
+which is the whole list for a role that carries no independence constraint of
+its own. What stays bounded is CONTINUITY, and it is mechanical rather than
+incidental: `resolveRoleRoute('executor')` is called by `startExecutor` alone,
+so a LIVE child continued by `resumeExecutor` keeps the route it was dispatched
+with and never passes through the rotation branch at all.
 
 **(c) The `balanced` default and an explicitly written `balanced` are still
 indistinguishable through the config's explicitness ceiling; the axis path is

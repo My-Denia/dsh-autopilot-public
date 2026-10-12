@@ -237,10 +237,12 @@ export interface ResolvedLadder {
   readonly tiers: Readonly<Record<'economy' | 'standard' | 'reserve', readonly string[]>>
   readonly auditTier: 'economy' | 'standard' | 'reserve' | 'none'
   /**
-   * A4 (DESIGN §9-15): owner opt-in to engine-level re-selection for AUDITOR
-   * roles. Default off — the shipped pin-stability semantics are unchanged;
-   * a healthy pin is re-selected only when the owner wrote `true`, and the
-   * executor role never rotates this way (known limitation, recorded).
+   * A4 (DESIGN §9 item 15): owner opt-in to engine-level re-selection at a
+   * role's next dispatch. Default off — the shipped pin-stability semantics are
+   * unchanged, and a healthy pin is re-selected only when the owner wrote
+   * `true`. AUDITOR roles offset within their independence class; the EXECUTOR
+   * offsets within the ranked survivor list by its own dispatch count, and a
+   * LIVE child is never re-routed (only `startExecutor` reaches the resolver).
    */
   readonly rotation: boolean
   /** Owner-declared speed order, earliest = faster. Empty means speed is UNKNOWN. */
