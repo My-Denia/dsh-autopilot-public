@@ -39,15 +39,16 @@ import { describe, expect, it } from 'vitest'
 
 import {
   AUTOPILOT_RUN_ID, AUTOPILOT_RUN_KIND, applyCall, applyResult, createAutopilotRunDefinition,
-  emptyState, isAppendSurfaceEventMirror, readCall, readDispatch, readDispatchStart, readResult,
-  routeStatusView, safeJsonObject,
+  emptyState, isAppendSurfaceEventMirror, readCall, readDispatch, readDispatchStart, readReachabilityMirror,
+  readResult, readRoutingMirror, routeStatusView, routingLines, safeJsonObject,
 } from '../src/client/definition.js'
 import type {
   AutopilotRunChatData, AutopilotRunDefinition, AutopilotRunState, CardEvent, CardMatch,
 } from '../src/client/definition.js'
 import {
-  MIN_POLL_MS, STALE_POLL_MS, STEADY_POLL_MS, fetchLiveRun, isTerminalPhase, overlayLive,
-  pollDelayMs, pollKey, readLiveRun, runRouteUrl, shouldPoll,
+  MIN_POLL_MS, STALE_POLL_MS, STEADY_POLL_MS, fetchLiveRun, isTerminalPhase, mergeReachability,
+  mergeRouting, overlayLive, pollDelayMs, pollKey, readLiveRun, routingReconcileNeeded, runRouteUrl,
+  shouldPoll,
 } from '../src/client/live.js'
 import type { LiveFetch, LiveRun } from '../src/client/live.js'
 
@@ -1124,5 +1125,454 @@ describe('the fold passes the M4 route record through to the card verbatim', () 
     // And the rendering decision reads exactly what the fold preserved.
     expect(routeStatusView(row?.route).suffix).toBe(' (route mismatch)')
     expect(String(routeStatusView(row?.route).title)).toContain('m-imposter')
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
+// M13 — the routing block: TWO sources, THREE kinds of claim.
+//
+// The block exists because a reader asked "is routing actually live here, and
+// which route does each role stand on". The tests below hold the three claims
+// apart (configuration / actual dispatch / candidate coverage) and pin the one
+// inference the block exists to prevent: reading "we could not look" as "you
+// have no authorization".
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** The engine's own projection, in the shape `autopilot_status` serves. */
+function routingProjection(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    mode: 'auto',
+    preference: 'balanced',
+    preferenceSource: 'default',
+    policyState: 'present',
+    policyRouteCount: 8,
+    dispatch: 'live',
+    roles: [
+      { role: 'executor', effective: 'auto', workClass: { name: 'simple', axis: 'speed-cost', tiers: ['economy'], engaged: true } },
+      { role: 'planner', effective: 'inherit' },
+      { role: 'plan-auditor', effective: 'auto', workClass: { name: 'audit', axis: 'ceiling-independence', tiers: ['standard'], engaged: true } },
+      { role: 'execution-auditor', effective: 'auto', workClass: { name: 'audit', axis: 'ceiling-independence', tiers: ['standard'], engaged: true } },
+      { role: 'rules-auditor', effective: 'auto', workClass: { name: 'audit', axis: 'ceiling-independence', tiers: ['standard'], engaged: true } },
+    ],
+    pins: [{ role: 'executor', provider: 'alpha', model: 'm-b' }],
+    workClasses: [],
+    ladderTiers: { economy: 4, standard: 1, reserve: 1 },
+    auditTier: 'none',
+    ...overrides,
+  }
+}
+
+/** One `autopilot_status` call/result pair, the way the host delivers it. */
+function statusPair(seq: number, payload: Record<string, unknown>): readonly [CardEvent, CardEvent] {
+  const callId = `call-${seq}`
+  return [
+    { type: 'tool/call', seq, time: 0, surfaceOp: 'append', data: { name: 'autopilot_status', callId, arguments: '{}' } },
+    {
+      type: 'tool/result', seq: seq + 1, time: 0, surfaceOp: 'append',
+      data: {
+        message: {
+          source: { kind: 'tool', callId },
+          content: [{ content: [{ type: 'text', text: JSON.stringify(payload) }] }],
+        },
+      },
+    },
+  ]
+}
+
+/** Fold one status result into a state, the way the assembler does. */
+function foldStatus(state: AutopilotRunState, payload: Record<string, unknown>, seq = 10): AutopilotRunState {
+  const [call, result] = statusPair(seq, payload)
+  const withCall = applyCall(state, { event: call, role: state.data.revision === 0 ? 'start' : 'update', location: null })
+  return applyResult(withCall, { event: result, role: 'update', location: null })
+}
+
+describe('M13 R1 — the fold carries the routing block and the coverage report', () => {
+  it('publishes both from a status result, stamped with their revision and seq', () => {
+    const state = foldStatus(emptyState(), {
+      revision: 5,
+      phase: 'executing',
+      routing: routingProjection(),
+      routingReachability: { reachable: ['alpha/m-b'], unreachable: ['beta/m-c'], outcome: 'partial' },
+    })
+    expect(state.data.routing?.revision).toBe(5)
+    expect(state.data.routing?.seq).toBe(11)
+    expect(state.data.routing?.value.policyState).toBe('present')
+    // STAMPED, not guessed: this came from a session result, which is the only
+    // channel that can read a policy at all.
+    expect(state.data.routing?.value.policyStateFrom).toBe('session')
+    expect(state.data.routing?.value.pins).toEqual([{ role: 'executor', provider: 'alpha', model: 'm-b' }])
+    expect(state.data.routingReachability?.value.unreachable).toEqual(['beta/m-c'])
+  })
+
+  it('CLEARS a previously folded block when a later status carries none (mode off, not a stale block)', () => {
+    // `autopilot_status` serves the whole status view, so a result without a
+    // routing block is the engine SAYING there is none (mode is not auto).
+    // Keeping the old one would leave the card asserting a state the newest
+    // observation contradicts.
+    let state = foldStatus(emptyState(), { revision: 5, phase: 'executing', routing: routingProjection() })
+    expect(state.data.routing).toBeDefined()
+    state = foldStatus(state, { revision: 6, phase: 'executing' }, 20)
+    expect(state.data.routing).toBeUndefined()
+    expect('routing' in state.data).toBe(false)
+  })
+
+  it('drops a malformed block rather than rendering a defaulted claim', () => {
+    const state = foldStatus(emptyState(), {
+      revision: 1,
+      phase: 'executing',
+      routing: { mode: 'auto' },
+      routingReachability: { reachable: 'not-an-array' },
+    })
+    expect(state.data.routing).toBeUndefined()
+    expect(state.data.routingReachability).toBeUndefined()
+  })
+
+  it('reads a well-formed projection and refuses every malformed variant', () => {
+    expect(readRoutingMirror(routingProjection(), 'session')?.mode).toBe('auto')
+    expect(readRoutingMirror(undefined, 'session')).toBeUndefined()
+    expect(readRoutingMirror('nope', 'session')).toBeUndefined()
+    expect(readRoutingMirror({ ...routingProjection(), mode: 7 }, 'session')).toBeUndefined()
+    expect(readRoutingMirror({ ...routingProjection(), policyState: undefined }, 'session')).toBeUndefined()
+    expect(readRoutingMirror({ ...routingProjection(), dispatch: undefined }, 'session')).toBeUndefined()
+    // A role entry that is not one makes the whole projection unusable rather
+    // than silently dropping a role from a five-role census.
+    expect(readRoutingMirror({ ...routingProjection(), roles: [{ role: 'executor' }] }, 'session')).toBeUndefined()
+    expect(readRoutingMirror({ ...routingProjection(), pins: [{ role: 'executor' }] }, 'session')).toBeUndefined()
+    expect(readReachabilityMirror({ reachable: [], unreachable: [] })).toEqual({ reachable: [], unreachable: [] })
+    expect(readReachabilityMirror({ reachable: [] })).toBeUndefined()
+  })
+})
+
+describe('M13 R2 — the route cannot answer the policy question, and must not be believed if it tries', () => {
+  const folded = { value: readRoutingMirror(routingProjection(), 'session')!, revision: 4, seq: 11 }
+
+  it('keeps a SESSION-observed policy state when the fresher route says `unobserved`', () => {
+    // The measured hazard: `src/service.ts` projects with no policy argument,
+    // so every route answer says `unobserved` — for every deployment, forever.
+    // Letting the fresher answer win would print "we could not look" over a
+    // policy the engine really did read.
+    const route = routingProjection({ policyState: 'unobserved', dispatch: 'unobserved', policyRouteCount: undefined })
+    const merged = mergeRouting(folded, route, 9)
+    expect(merged?.value.policyState).toBe('present')
+    expect(merged?.value.policyStateFrom).toBe('session')
+    expect(merged?.value.policyRouteCount).toBe(8)
+    expect(merged?.revision).toBe(9)
+  })
+
+  it('keeps `dispatch` PAIRED with the policy state (no "policy present · dispatch unobserved")', () => {
+    const route = routingProjection({ policyState: 'unobserved', dispatch: 'unobserved', policyRouteCount: undefined })
+    const merged = mergeRouting(folded, route, 9)
+    expect(merged?.value.policyState).toBe('present')
+    expect(merged?.value.dispatch).toBe('live')
+  })
+
+  it('takes every field the route CAN read from the fresher answer', () => {
+    const route = routingProjection({
+      policyState: 'unobserved',
+      dispatch: 'unobserved',
+      policyRouteCount: undefined,
+      preference: 'quality',
+      preferenceSource: 'explicit',
+      pins: [{ role: 'plan-auditor', provider: 'gamma', model: 'm-z' }],
+      ladderTiers: { economy: 1, standard: 2, reserve: 3 },
+    })
+    const merged = mergeRouting(folded, route, 9)
+    expect(merged?.value.preference).toBe('quality')
+    expect(merged?.value.preferenceSource).toBe('explicit')
+    expect(merged?.value.pins).toEqual([{ role: 'plan-auditor', provider: 'gamma', model: 'm-z' }])
+    expect(merged?.value.ladderTiers).toEqual({ economy: 1, standard: 2, reserve: 3 })
+  })
+
+  it('without a session observation the route triple stands, honestly labelled as the route\'s', () => {
+    const route = routingProjection({ policyState: 'unobserved', dispatch: 'unobserved', policyRouteCount: undefined })
+    const merged = mergeRouting(undefined, route, 9)
+    expect(merged?.value.policyState).toBe('unobserved')
+    expect(merged?.value.policyStateFrom).toBe('route')
+    expect(merged?.value.dispatch).toBe('unobserved')
+  })
+
+  it('a session-observed `absent` is also a finding, and also outranks the route', () => {
+    const absent = { value: readRoutingMirror(routingProjection({ policyState: 'absent', dispatch: 'inherit-only', policyRouteCount: undefined }), 'session')!, revision: 4 }
+    const merged = mergeRouting(absent, routingProjection({ policyState: 'unobserved', dispatch: 'unobserved' }), 9)
+    expect(merged?.value.policyState).toBe('absent')
+    expect(merged?.value.dispatch).toBe('inherit-only')
+  })
+
+  it('neither source having a block leaves the card with no block at all', () => {
+    expect(mergeRouting(undefined, undefined, 9)).toBeUndefined()
+    expect(mergeRouting(undefined, { mode: 'auto' }, 9)).toBeUndefined()
+  })
+
+  it('never regresses to an OLDER live answer than the fold it already has', () => {
+    const merged = mergeRouting(folded, routingProjection({ preference: 'quality' }), 4)
+    expect(merged?.value.preference).toBe('balanced')
+    expect(merged?.revision).toBe(4)
+  })
+
+  it('takes the route\'s coverage when it parses, else keeps the session\'s', () => {
+    const foldCov = { value: { reachable: ['a'], unreachable: [] }, revision: 4 }
+    expect(mergeReachability(foldCov, { reachable: ['a', 'b'], unreachable: [] }, 9)?.value.reachable).toEqual(['a', 'b'])
+    expect(mergeReachability(foldCov, { reachable: 'nope' }, 9)).toBe(foldCov)
+    expect(mergeReachability(undefined, { reachable: ['a'], unreachable: ['b'] }, 9)?.value.unreachable).toEqual(['b'])
+    expect(mergeReachability(undefined, undefined, 9)).toBeUndefined()
+  })
+
+  it('the overlay the card actually renders carries the merged block (AC2 end to end)', () => {
+    const data: AutopilotRunChatData = {
+      runId: 'session-1', revision: 4, audits: [], calls: [], reinitSeqs: [], stale: true,
+      phase: { value: 'executing', revision: 4, seq: 11 },
+      routing: folded,
+    }
+    const next = overlayLive(data, {
+      runId: 'session-1',
+      revision: 9,
+      phase: 'executing',
+      routing: routingProjection({ policyState: 'unobserved', dispatch: 'unobserved', policyRouteCount: undefined }),
+      routingReachability: { reachable: ['alpha/m-b'], unreachable: [] },
+    })
+    expect(next.routing?.value.policyState).toBe('present')
+    expect(next.routing?.value.policyStateFrom).toBe('session')
+    expect(next.routingReachability?.value.reachable).toEqual(['alpha/m-b'])
+  })
+})
+
+describe('M13 R3 — the rendered lines keep three kinds of claim apart', () => {
+  const at = <T,>(value: T, revision = 5): { value: T; revision: number } => ({ value, revision })
+
+  it('the unobserved state says it is the ABSENCE of a read, and never implies no authorization', () => {
+    const view = readRoutingMirror(
+      routingProjection({ policyState: 'unobserved', dispatch: 'unobserved', policyRouteCount: undefined }),
+      'route',
+    )!
+    const line = routingLines(at(view))[0]!
+    expect(line.text).toContain('policy unobserved')
+    // The source is VISIBLE on the line, not only in the hover text.
+    expect(line.text).toContain('[from the host route]')
+    expect(line.title).toContain('ABSENCE OF AN OBSERVATION')
+    expect(line.title).toContain('NOT a statement that no policy exists')
+    // And the forbidden reading is named as forbidden.
+    expect(line.title).not.toContain('no authorization is available')
+  })
+
+  it('a session-observed `present` names its state, its route count, and its source', () => {
+    const line = routingLines(at(readRoutingMirror(routingProjection(), 'session')!))[0]!
+    expect(line.text).toContain('policy present (8 routes)')
+    expect(line.text).toContain('[read in this session]')
+    expect(line.text).toContain('dispatch live')
+  })
+
+  it('labels actual dispatches and candidate coverage DIFFERENTLY, and coverage says what it is not', () => {
+    const lines = routingLines(
+      at(readRoutingMirror(routingProjection(), 'session')!),
+      at({ reachable: ['alpha/m-b'], unreachable: ['beta/m-c'], outcome: 'partial' }),
+    )
+    const labels = lines.map(line => line.label)
+    expect(labels).toEqual(['routing', 'ladder', 'roles', 'dispatched', 'candidate coverage'])
+    const dispatched = lines.find(line => line.label === 'dispatched')!
+    const coverage = lines.find(line => line.label === 'candidate coverage')!
+    expect(dispatched.label).not.toBe(coverage.label)
+    expect(dispatched.text).toContain('executor alpha/m-b')
+    expect(coverage.text).toContain('1/2 observed model(s)')
+    expect(coverage.text).toContain('NOT a dispatch record')
+    expect(dispatched.text).not.toContain('NOT a dispatch record')
+  })
+
+  it('renders the LADDER line with the owner\'s own tier counts and the audit tier (AC1)', () => {
+    const lines = routingLines(at(readRoutingMirror(routingProjection(), 'session')!))
+    const ladder = lines.find(line => line.label === 'ladder')!
+    expect(ladder.text).toBe('economy 4 · standard 1 · reserve 1 · audit tier none')
+    // The OWNER's audit-tier override is what the line reports, verbatim.
+    const overridden = routingLines(at(readRoutingMirror(routingProjection({ auditTier: 'reserve' }), 'session')!))
+    expect(overridden.find(line => line.label === 'ladder')?.text).toContain('audit tier reserve')
+    // A tier the mirror did not report reads as 0, never as a missing word.
+    const sparse = routingLines(at(readRoutingMirror(routingProjection({ ladderTiers: { economy: 2 } }), 'session')!))
+    expect(sparse.find(line => line.label === 'ladder')?.text).toBe('economy 2 · standard 0 · reserve 0 · audit tier none')
+  })
+
+  it('renders NO coverage line when no report was observed', () => {
+    const lines = routingLines(at(readRoutingMirror(routingProjection(), 'session')!))
+    expect(lines.map(line => line.label)).toEqual(['routing', 'ladder', 'roles', 'dispatched'])
+  })
+
+  it('a TERMINAL run still polls ONCE when its routing block is behind the card (M13)', () => {
+    // Measured: the card's routing block came from a status result at r5 while
+    // the run ended at r10, so it listed one dispatched auditor instead of two.
+    // The card's own revision is 9 (the run ended at 10 on the route), while the
+    // routing block it folded belongs to revision 5 — the measured shape.
+    const stale: AutopilotRunChatData = {
+      runId: 'session-1', revision: 9, audits: [], calls: [], reinitSeqs: [], stale: true,
+      phase: { value: 'completed', revision: 5, seq: 40 },
+      routing: { value: readRoutingMirror(routingProjection(), 'session')!, revision: 5, seq: 49 },
+    }
+    expect(routingReconcileNeeded(stale)).toBe(true)
+    expect(shouldPoll(stale)).toBe(true)
+
+    // Once the route answers at the card's own revision, the gap is closed and
+    // the poll stops again — a reconciliation, not a heartbeat.
+    const reconciled = overlayLive(stale, {
+      runId: 'session-1', revision: 10, phase: 'completed',
+      routing: routingProjection({ policyState: 'unobserved', dispatch: 'unobserved', policyRouteCount: undefined }),
+    })
+    expect(reconciled.routing?.revision).toBe(10)
+    expect(routingReconcileNeeded(reconciled)).toBe(false)
+    expect(shouldPoll(stale, { runId: 'session-1', revision: 10, phase: 'completed' })).toBe(false)
+  })
+
+  it('a terminal run with NO routing block does not poll (the gate is unchanged for it)', () => {
+    const done: AutopilotRunChatData = {
+      runId: 'session-1', revision: 10, audits: [], calls: [], reinitSeqs: [], stale: false,
+      phase: { value: 'completed', revision: 10, seq: 40 },
+    }
+    expect(routingReconcileNeeded(done)).toBe(false)
+    expect(shouldPoll(done)).toBe(false)
+    expect(shouldPoll(done, undefined, 'session-1')).toBe(false)
+  })
+
+  it('a routing block at the card\'s own revision is not "behind"', () => {
+    const current: AutopilotRunChatData = {
+      runId: 'session-1', revision: 9, audits: [], calls: [], reinitSeqs: [], stale: false,
+      phase: { value: 'completed', revision: 9, seq: 49 },
+      routing: { value: readRoutingMirror(routingProjection(), 'session')!, revision: 9, seq: 49 },
+    }
+    expect(routingReconcileNeeded(current)).toBe(false)
+    expect(shouldPoll(current)).toBe(false)
+  })
+
+  it('reconciles the routing block from an answer that is NOT newer than the card (M13)', () => {
+    // The measured shape exactly: the fold reached revision 10 through the
+    // closeout result while its routing block came from a status at revision 5,
+    // and the route's answer is also revision 10 — so the ORDINARY overlay rule
+    // ("publish only a newer answer") would drop the one answer that can fix the
+    // block. The routing block is compared against its OWN observation instead.
+    const stale: AutopilotRunChatData = {
+      runId: 'session-1', revision: 10, audits: [], calls: [], reinitSeqs: [], stale: false,
+      phase: { value: 'completed', revision: 10, seq: 60 },
+      planGate: { value: 'pass', revision: 5, seq: 40 },
+      routing: { value: readRoutingMirror(routingProjection(), 'session')!, revision: 5, seq: 49 },
+    }
+    const next = overlayLive(stale, {
+      runId: 'session-1',
+      revision: 10,
+      phase: 'completed',
+      routing: routingProjection({
+        policyState: 'unobserved', dispatch: 'unobserved', policyRouteCount: undefined,
+        pins: [
+          { role: 'plan-auditor', provider: 'alpha', model: 'm-a' },
+          { role: 'execution-auditor', provider: 'beta', model: 'm-c' },
+        ],
+      }),
+    })
+    // The routing block caught up: two dispatched routes, the SESSION's policy
+    // triple kept, and the block stamped at the revision the route answered for.
+    expect(next.routing?.value.pins.map(p => `${p.provider}/${p.model}`)).toEqual(['alpha/m-a', 'beta/m-c'])
+    expect(next.routing?.value.policyState).toBe('present')
+    expect(next.routing?.value.policyStateFrom).toBe('session')
+    expect(next.routing?.revision).toBe(10)
+    expect(next.routing?.seq).toBeUndefined()
+    // NOTHING ELSE MOVED: the ordinary fields keep the fold's observations.
+    expect(next.phase).toBe(stale.phase)
+    expect(next.planGate).toBe(stale.planGate)
+    // And the reconciliation is over: no further polling for this card.
+    expect(routingReconcileNeeded(next)).toBe(false)
+    expect(shouldPoll(next)).toBe(false)
+  })
+
+  it('still returns the SAME object when a non-newer answer has nothing to reconcile', () => {
+    const plain: AutopilotRunChatData = {
+      runId: 'session-1', revision: 9, audits: [], calls: [], reinitSeqs: [], stale: false,
+      phase: { value: 'completed', revision: 9, seq: 49 },
+    }
+    const live = { runId: 'session-1', revision: 9, phase: 'completed' }
+    expect(overlayLive(plain, live)).toBe(plain)
+    // A card whose routing is already current also stays reference-identical.
+    const current: AutopilotRunChatData = {
+      ...plain,
+      routing: { value: readRoutingMirror(routingProjection(), 'session')!, revision: 9, seq: 49 },
+    }
+    expect(overlayLive(current, { ...live, routing: routingProjection() })).toBe(current)
+  })
+
+  it('renders the roles line with each mode, and names a class only where one is consulted', () => {
+    const roles = routingLines(at(readRoutingMirror(routingProjection(), 'session')!)).find(line => line.label === 'roles')!
+    expect(roles.text).toContain('executor auto/simple')
+    expect(roles.text).toContain('planner inherit')
+    expect(roles.text).not.toContain('planner inherit/')
+    expect(roles.text).toContain('plan-auditor auto/audit')
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
+// M13 R0 — the two tool-result ENVELOPE shapes.
+//
+// THE DEFECT THIS PINS, measured on a real 0.2.0 session rather than imagined:
+// `readResult` knew only the WRAPPED shape (`content[0].content[0].text`, with
+// `isError` on the wrapper), which is what this file's fixtures carry. The 0.2.0
+// host delivers the FLAT shape (`content[0]` is the text block itself, `isError`
+// on the message), so EVERY result folded to `payload: undefined` and the card
+// rendered as a hollow shell — revision 0, no phase, no gates, no audit
+// verdicts, no routing block — with no error anywhere to notice. Replaying the
+// real session through the shipped definition is what exposed it; these cases
+// keep both arms alive so neither host generation can hollow the card out again.
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('M13 R0 — both tool-result envelope shapes fold, and agree', () => {
+  const payload = { revision: 7, phase: 'executing', planGate: 'pass', runId: 'session-x' }
+
+  /** `tool/call` + `tool/result` for one status call, in the requested envelope shape. */
+  function statusFold(shape: 'wrapped' | 'flat', isError = false): AutopilotRunChatData {
+    const call: CardEvent = {
+      type: 'tool/call', seq: 10, time: 0, surfaceOp: 'append',
+      data: { name: 'autopilot_status', callId: 'call-1', arguments: '{}' },
+    }
+    const text = JSON.stringify(payload)
+    const message = shape === 'wrapped'
+      ? {
+          source: { kind: 'tool', callId: 'call-1' },
+          content: [{ isError, content: [{ type: 'text', text }] }],
+        }
+      : {
+          source: { kind: 'tool', callId: 'call-1' },
+          isError,
+          content: [{ type: 'text', text }],
+        }
+    const result: CardEvent = { type: 'tool/result', seq: 11, time: 0, surfaceOp: 'append', data: { message } }
+    let state = applyCall(emptyState(), { event: call, role: 'start', location: null })
+    state = applyResult(state, { event: result, role: 'update', location: null })
+    return state.data
+  }
+
+  it('folds the WRAPPED (legacy 0.1.x) envelope — the shape the fixtures carry', () => {
+    const data = statusFold('wrapped')
+    expect(data.revision).toBe(7)
+    expect(data.phase).toEqual({ value: 'executing', revision: 7, seq: 11 })
+    expect(data.planGate?.value).toBe('pass')
+  })
+
+  it('folds the FLAT (current 0.2.0) envelope — the shape a live session carries', () => {
+    const data = statusFold('flat')
+    expect(data.revision).toBe(7)
+    expect(data.phase).toEqual({ value: 'executing', revision: 7, seq: 11 })
+    expect(data.planGate?.value).toBe('pass')
+  })
+
+  it('produces the SAME folded state from both shapes (the reducer is envelope-agnostic)', () => {
+    expect(JSON.stringify(statusFold('flat'))).toBe(JSON.stringify(statusFold('wrapped')))
+  })
+
+  it('reads `isError` from whichever level carries it, and folds nothing on an error', () => {
+    for (const shape of ['wrapped', 'flat'] as const) {
+      expect(readResult({
+        type: 'tool/result', seq: 1, time: 0, surfaceOp: 'append',
+        data: { message: shape === 'wrapped'
+          ? { source: { kind: 'tool', callId: 'c' }, content: [{ isError: true, content: [{ type: 'text', text: '{"revision":9}' }] }] }
+          : { source: { kind: 'tool', callId: 'c' }, isError: true, content: [{ type: 'text', text: '{"revision":9}' }] } },
+      }), shape).toEqual({ callId: 'c', isError: true, payload: undefined })
+    }
+    expect(statusFold('flat', true).revision).toBe(0)
+    expect(statusFold('flat', true).calls.at(-1)?.failed).toBe(true)
+  })
+
+  it('keeps refusing a result with no callId (nothing can be attributed)', () => {
+    expect(readResult({ type: 'tool/result', seq: 1, time: 0, data: { message: { content: [] } } })).toBeUndefined()
   })
 })

@@ -2564,6 +2564,94 @@ export class AutopilotEngine {
     blockingScope?: LogEntry['blockingScope']
   }): Promise<Snapshot> {
     const root = this.resolveRoot(caller)
+    return this.commitLogEntry(root, entry)
+  }
+
+  /**
+   * M4a: the EXECUTOR CHILD's escalation request — the second entry point into
+   * the ONE request channel.
+   *
+   * WHY THIS EXISTS. M12 delivered the channel (an `escalate` checkpoint naming
+   * `stronger-model` widens the pool of the next auto selection), but its only
+   * producer was `log`, which is registered into the ROOT agent's scope and
+   * resolves its caller through `resolveRoot` — a method that throws
+   * `AP_NOT_ROOT` for ANY caller whose session has a `parentSession`. The
+   * executor child's own surface carried exactly one tool
+   * (`autopilot_submit_packet`). So the delegated executor — the agent that
+   * actually does the work, and the one DESIGN §1.2's "the working model asks"
+   * is about — could not ask for anything.
+   *
+   * WHAT IT IS ALLOWED TO BE, exactly, and nothing more:
+   *  - the caller must be the LIVE registered child of a top-level run
+   *    ({@link resolveChildRoot}) AND that run's AUTHORIZED executor, still
+   *    `running`: a stranger child, a stale child id, or an executor that has
+   *    been revoked/completed is refused with `AP_ESCALATION_NOT_EXECUTOR`;
+   *  - the entry is FIXED to `stance: 'escalate'` with
+   *    `escalationTarget: 'stronger-model'`. A child may not write arbitrary
+   *    checkpoints into the run's record, and may not request the governance
+   *    exits (`owner`, `external-review`) that belong to the root — those are
+   *    decisions about the RUN, not requests for capability;
+   *  - it lands through {@link commitLogEntry}, so the request register is
+   *    written at the SAME single site as the root path. There is one channel
+   *    with two entry points, never two escalation semantics.
+   *
+   * WHAT IT CANNOT DO is widen an authorization: the request only widens the
+   * candidate POOL, which is still `session policy ∩ live catalog`, still
+   * filtered by the class's tier membership and still ordered by the
+   * independence rules. A child cannot switch its own model, gain a route the
+   * policy does not cover, or write policy.
+   *
+   * @param caller - the calling agent; only the authorized executor child is accepted.
+   * @param request - the checkpoint text plus the required note (the evidence the request carries).
+   * @returns the committed snapshot.
+   */
+  async requestEscalation(caller: AgentRef, request: { text: string; note: string }): Promise<Snapshot> {
+    const root = this.resolveChildRoot(caller)
+    const prior = this.require(root.id)
+    if (prior.executor === undefined || prior.executor.childId !== caller.id) {
+      throw new AutopilotError(
+        `Agent ${caller.id} is not the authorized executor of run ${root.id}; only the executor child may request an escalation`,
+        'AP_ESCALATION_NOT_EXECUTOR',
+      )
+    }
+    if (prior.executor.state !== 'running') {
+      throw new AutopilotError(
+        `the executor of run ${root.id} is ${prior.executor.state}, not running; a finished executor cannot request an escalation`,
+        'AP_ESCALATION_NOT_EXECUTOR',
+      )
+    }
+    if (TERMINAL_PHASES.includes(prior.phase) || prior.phase === 'needs-owner-decision') {
+      throw new AutopilotError(`cannot request an escalation in phase ${prior.phase}`, 'AP_WRONG_PHASE')
+    }
+    return this.commitLogEntry(root, {
+      text: request.text,
+      stance: 'escalate',
+      escalationTarget: 'stronger-model',
+      note: request.note,
+    })
+  }
+
+  /**
+   * The ONE site where a log entry lands — shared by the root-only `log` and by
+   * the executor child's {@link requestEscalation}.
+   *
+   * The request register is written HERE and nowhere else
+   * (`pendingEscalations.set` below), which is what makes "one channel with two
+   * entry points" a structural fact rather than a convention: a second entry
+   * point cannot invent its own escalation semantics, because there is no other
+   * place that records one.
+   *
+   * @param root - the resolved top-level root agent (the authority for the run).
+   * @param entry - the checkpoint to append.
+   * @returns the committed snapshot.
+   */
+  private async commitLogEntry(root: AgentRef, entry: {
+    text: string
+    stance: Stance
+    note?: string
+    escalationTarget?: LogEntry['escalationTarget']
+    blockingScope?: LogEntry['blockingScope']
+  }): Promise<Snapshot> {
     if (entry.text.trim().length === 0) throw new AutopilotError('log text is empty', 'AP_INVALID_ARGUMENT')
     if (entry.stance === 'escalate' && (entry.note === undefined || entry.note.trim().length === 0)) {
       throw new AutopilotError('escalate checkpoints require a note (CC checkpoint contract)', 'AP_INVALID_ARGUMENT')

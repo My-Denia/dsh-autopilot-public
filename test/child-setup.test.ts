@@ -44,7 +44,7 @@ interface RecordedChild extends ContinuableChildContext {
   readonly toolNames: string[]
   readonly guards: number
   readonly events: string[]
-  /** Disposer invocations in the order they happened: 'seam' | 'packet-tool' | 'egress-guard'. */
+  /** Disposer invocations in the order they happened: 'seam' | 'packet-tool' | 'escalation-tool' | 'egress-guard'. */
   readonly disposed: string[]
   pre?: (exec: { name: string; arguments: unknown; callId?: string }, next: () => Promise<unknown>) => Promise<unknown>
   guardFn?: (execution: { name: string; arguments: unknown }) => string | undefined
@@ -58,7 +58,7 @@ interface ChildFailures {
   /** `tools.guard` throws (the egress-guard step). */
   guardThrows?: boolean
   /** These steps' DISPOSERS throw when invoked. */
-  disposerThrows?: ReadonlyArray<'seam' | 'packet-tool' | 'egress-guard'>
+  disposerThrows?: ReadonlyArray<'seam' | 'packet-tool' | 'escalation-tool' | 'egress-guard'>
   /** `tools.guard` throws a FROZEN error object (annotation with defineProperty would throw). */
   guardThrowsFrozen?: boolean
 }
@@ -79,7 +79,7 @@ function childContext(
   const toolNames: string[] = []
   const events: string[] = []
   const disposed: string[] = []
-  const disposer = (step: 'seam' | 'packet-tool' | 'egress-guard') => () => {
+  const disposer = (step: 'seam' | 'packet-tool' | 'escalation-tool' | 'egress-guard') => () => {
     disposed.push(step)
     if (options.disposerThrows?.includes(step)) throw new Error(`inject: ${step} disposer failed`)
   }
@@ -95,8 +95,12 @@ function childContext(
     tools: {
       register(definition: unknown) {
         if (options.registerThrows === true) throw new Error('inject: tools.register failed')
-        toolNames.push((definition as { name?: string }).name ?? '<unnamed>')
-        return disposer('packet-tool')
+        const name = (definition as { name?: string }).name ?? '<unnamed>'
+        toolNames.push(name)
+        // M13: the child surface registers TWO tools — the packet tool and the
+        // escalation channel — so the recorded step has to name WHICH disposer
+        // this is, or a rollback assertion could not tell them apart.
+        return disposer(name === 'autopilot_request_escalation' ? 'escalation-tool' : 'packet-tool')
       },
       guard(fn: (execution: { name: string; arguments: unknown }) => string | undefined) {
         if (options.guardThrowsFrozen === true) throw Object.freeze(new Error('inject: frozen tools.guard failure'))
@@ -150,7 +154,7 @@ describe('createContinuableChildSetup', () => {
     expect(child.agent).toBe(h.childAgent)
 
     const dispose = createContinuableChildSetup(h.engine as AutopilotEngine, GATE)(child)
-    expect(child.toolNames).toEqual(['autopilot_submit_packet'])
+    expect(child.toolNames).toEqual(['autopilot_submit_packet', 'autopilot_request_escalation'])
     expect(child.guards).toBe(1)
     expect(child.events).toEqual(['tools/pre-execute', 'tools/execute'])
     expect(() => dispose()).not.toThrow()
@@ -196,7 +200,7 @@ describe('createContinuableChildSetup', () => {
     expect(child.get('agent')).toBe(h.childAgent)
     expect(child.agent).toBeUndefined()
     createContinuableChildSetup(h.engine as AutopilotEngine, GATE)(child)
-    expect(child.toolNames).toEqual(['autopilot_submit_packet'])
+    expect(child.toolNames).toEqual(['autopilot_submit_packet', 'autopilot_request_escalation'])
     expect(child.guards).toBe(1)
   })
 
@@ -243,6 +247,20 @@ describe('createContinuableChildSetup', () => {
     const after = await h.engine.submitExecutionPacket(h.childAgent, { packet: 'done', residualRisks: [], executionRevision: 1 })
     expect(after.executionPacket).toBe('done')
     expect(after.phase).toBe('execution-reviewing')
+  })
+
+  it('the escalation tool it registers is the one an executor child asks through (M13)', async () => {
+    const h = await delegatedRunning()
+    const child = childContext(h.childAgent, 'property')
+    createContinuableChildSetup(h.engine as AutopilotEngine, GATE)(child)
+    // Installed into the child's OWN layer, so it does not depend on the owner's
+    // tool allow-list — the same guarantee the packet tool has.
+    expect(child.toolNames).toContain('autopilot_request_escalation')
+    // …and the engine really accepts a request from that child, so the tool name
+    // is not the only thing being asserted.
+    const after = await h.engine.requestEscalation(h.childAgent, { text: 'stalled', note: 'max effort failed' })
+    expect(after.logCount).toBe(1)
+    expect(after.revision).toBeGreaterThan(1)
   })
 })
 
@@ -291,7 +309,7 @@ describe('createContinuableChildSetup: the executor STATE half of the binding', 
     expect(h.engine.peek(h.root.id)?.executor?.state).toBe('running')
     const child = childContext(h.childAgent, 'property')
     createContinuableChildSetup(h.engine as AutopilotEngine, GATE)(child)
-    expect(child.toolNames).toEqual(['autopilot_submit_packet'])
+    expect(child.toolNames).toEqual(['autopilot_submit_packet', 'autopilot_request_escalation'])
     expect(child.guards).toBe(1)
   })
 })
@@ -353,12 +371,12 @@ describe('createContinuableChildSetup: transactional, fail-closed install', () =
     expect((caught as { rollbackFailures?: unknown }).rollbackFailures).toBeUndefined()
   })
 
-  it('(b) guard registration throws after seam + packet tool: rolled back in REVERSE order [packet-tool, seam], the error propagates', async () => {
+  it('(b) guard registration throws after seam + BOTH child tools: rolled back in REVERSE order, the error propagates', async () => {
     const h = await delegatedRunning()
     const child = childContext(h.childAgent, 'property', { guardThrows: true })
     expect(() => createContinuableChildSetup(h.engine as AutopilotEngine, GATE)(child)).toThrow('inject: tools.guard failed')
-    expect(child.toolNames).toEqual(['autopilot_submit_packet'])
-    expect(child.disposed).toEqual(['packet-tool', 'seam'])
+    expect(child.toolNames).toEqual(['autopilot_submit_packet', 'autopilot_request_escalation'])
+    expect(child.disposed).toEqual(['escalation-tool', 'packet-tool', 'seam'])
     expect(child.guards).toBe(0)
   })
 
@@ -366,13 +384,13 @@ describe('createContinuableChildSetup: transactional, fail-closed install', () =
     const h = await delegatedRunning()
     const child = childContext(h.childAgent, 'property')
     const dispose = createContinuableChildSetup(h.engine as AutopilotEngine, GATE)(child)
-    expect(child.toolNames).toEqual(['autopilot_submit_packet'])
+    expect(child.toolNames).toEqual(['autopilot_submit_packet', 'autopilot_request_escalation'])
     expect(child.guards).toBe(1)
     expect(child.disposed).toEqual([])
     dispose()
-    expect(child.disposed).toEqual(['egress-guard', 'packet-tool', 'seam'])
+    expect(child.disposed).toEqual(['egress-guard', 'escalation-tool', 'packet-tool', 'seam'])
     dispose()
-    expect(child.disposed).toEqual(['egress-guard', 'packet-tool', 'seam'])
+    expect(child.disposed).toEqual(['egress-guard', 'escalation-tool', 'packet-tool', 'seam'])
   })
 
   it('(d) an unrelated child is a no-op: nothing registered, nothing thrown — even with every injection armed', async () => {
@@ -400,15 +418,15 @@ describe('createContinuableChildSetup: transactional, fail-closed install', () =
     expect((caught as AggregateError).message).toMatch(/cleanup failed at packet-tool/)
     expect((caught as AggregateError).errors.map(error => (error as Error).message)).toEqual(['inject: packet-tool disposer failed'])
     // The seam disposer still ran AFTER the failing one.
-    expect(child.disposed).toEqual(['egress-guard', 'packet-tool', 'seam'])
+    expect(child.disposed).toEqual(['egress-guard', 'escalation-tool', 'packet-tool', 'seam'])
     // Second call: nothing left to attempt, nothing thrown.
     expect(() => dispose()).not.toThrow()
-    expect(child.disposed).toHaveLength(3)
+    expect(child.disposed).toHaveLength(4)
   })
 
   it('(f) a cleanup failure during rollback never masks the ORIGINAL install error; it is attached as rollbackFailures', async () => {
     const h = await delegatedRunning()
-    // guard throws -> rollback disposes packet-tool then seam; the seam disposer itself throws.
+    // guard throws -> rollback disposes both child tools then the seam; the seam disposer itself throws.
     const child = childContext(h.childAgent, 'property', { guardThrows: true, disposerThrows: ['seam'] })
     const cleanupFailures: string[] = []
     let caught: unknown
@@ -418,7 +436,7 @@ describe('createContinuableChildSetup: transactional, fail-closed install', () =
       caught = error
     }
     expect((caught as Error).message).toBe('inject: tools.guard failed')
-    expect(child.disposed).toEqual(['packet-tool', 'seam'])
+    expect(child.disposed).toEqual(['escalation-tool', 'packet-tool', 'seam'])
     expect(cleanupFailures).toEqual(['seam'])
     const attached = (caught as { rollbackFailures?: Array<{ step: string; error: Error }> }).rollbackFailures
     expect(attached?.map(failure => failure.step)).toEqual(['seam'])
@@ -450,14 +468,14 @@ describe('createContinuableChildSetup: transactional, fail-closed install', () =
     expect(Object.isFrozen(caught)).toBe(true)
     expect((caught as { rollbackFailures?: unknown }).rollbackFailures).toBeUndefined()
     // Rollback still ran and still reported, which is where the failures actually live.
-    expect(child.disposed).toEqual(['packet-tool', 'seam'])
+    expect(child.disposed).toEqual(['escalation-tool', 'packet-tool', 'seam'])
     expect(cleanupFailures).toEqual(['seam'])
   })
 
   it('(h) a THROWING onCleanupFailure during rollback stops nothing: every disposer is attempted and the ORIGINAL error propagates', async () => {
     const h = await delegatedRunning()
-    // guard throws -> rollback must dispose packet-tool then seam; BOTH disposers throw and
-    // the reporter throws on the first failure it is handed.
+    // guard throws -> rollback must dispose both child tools then the seam; BOTH disposers
+    // throw and the reporter throws on the first failure it is handed.
     const child = childContext(h.childAgent, 'property', { guardThrows: true, disposerThrows: ['seam', 'packet-tool'] })
     const seen: string[] = []
     let caught: unknown
@@ -470,8 +488,9 @@ describe('createContinuableChildSetup: transactional, fail-closed install', () =
       caught = error
     }
     expect((caught as Error).message).toBe('inject: tools.guard failed')
-    // Both steps were attempted despite the reporter throwing on the first one.
-    expect(child.disposed).toEqual(['packet-tool', 'seam'])
+    // Every step was attempted despite the reporter throwing on the first one.
+    expect(child.disposed).toEqual(['escalation-tool', 'packet-tool', 'seam'])
+    // Only the disposers that THREW are reported: the escalation tool's succeeded.
     expect(seen).toEqual(['packet-tool', 'seam'])
     const attached = (caught as { rollbackFailures?: Array<{ step: string }> }).rollbackFailures
     expect(attached?.map(failure => failure.step)).toEqual(['packet-tool', 'seam'])
@@ -494,7 +513,7 @@ describe('createContinuableChildSetup: transactional, fail-closed install', () =
     expect(caught).toBeInstanceOf(AggregateError)
     expect((caught as Error).message).toContain('egress-guard')
     expect((caught as Error).message).toContain('seam')
-    expect(child.disposed).toEqual(['egress-guard', 'packet-tool', 'seam'])
+    expect(child.disposed).toEqual(['egress-guard', 'escalation-tool', 'packet-tool', 'seam'])
     expect(seen).toEqual(['egress-guard', 'seam'])
   })
 })

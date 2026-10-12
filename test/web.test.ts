@@ -284,6 +284,47 @@ describe('a LIVE run projects to exactly the allow-listed fields', () => {
     expect(body.run?.routing?.mode).toBe('auto')
   })
 
+  it('serves the CANDIDATE-COVERAGE report separately from routing (M13)', async () => {
+    // Two fields, two claims: `routing` is the configuration and the run's own
+    // pins; `routingReachability` is which OBSERVED models a tier-bound work
+    // class can reach. The card labels the second as coverage, and it can only
+    // do that if the route serves it as its own value — a route that folded it
+    // into the routing block would have the card calling coverage a dispatch.
+    //
+    // The catalog port is a STUB on purpose: this file is about what crosses the
+    // HTTP boundary, and a real adapter listing would make it a test of the
+    // provider. The report's own content is asserted by the coverage suites.
+    const catalog = {
+      snapshot: async () => ({
+        catalogStatus: 'live' as const,
+        providers: [],
+        listedModels: [{ provider: 'alpha', id: 'm-a' }, { provider: 'alpha', id: 'm-b' }],
+        providerErrors: new Map<string, string>(),
+      }),
+    }
+    const h = makeHarness({
+      config: { routing: { mode: 'auto', ladder: { tiers: { economy: ['alpha/m-a'], standard: ['alpha/m-b'] } } } },
+      routing: { catalog: catalog as never },
+    })
+    const service = createAutopilotService(h.engine)
+    await h.engine.init(h.root, makeTriage())
+    await h.engine.refreshReachability()
+
+    const served = projectRuns(service)
+    expect(served.runs[0]?.routing?.mode).toBe('auto')
+    const report = served.runs[0]?.routingReachability
+    expect(report?.kind).toBe('work-class-reachability')
+    expect([...(report?.reachable ?? [])].sort()).toEqual(['alpha/m-a', 'alpha/m-b'])
+    expect(report?.unreachable).toEqual([])
+
+    // And through the real route handler, not only the pure projection.
+    const { run: route } = routesOf(service)
+    const answer = call(route, `${AUTOPILOT_API_PREFIX}/run?id=${h.root.id}`)
+    expect(answer.status).toBe(200)
+    const body = answer.body as { run?: { routingReachability?: { kind?: string } } }
+    expect(body.run?.routingReachability?.kind).toBe('work-class-reachability')
+  })
+
   it('DROPS `diagnostic`, which the engine aliases onto an auditor note', async () => {
     const h = makeHarness()
     const service = createAutopilotService(h.engine)

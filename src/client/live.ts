@@ -31,7 +31,10 @@
  * @module dsh-autopilot/client/live
  */
 
-import type { AutopilotRunChatData, Observed } from './definition.js'
+import type {
+  AutopilotRunChatData, Observed, ReachabilityMirror, RoutingMirror,
+} from './definition.js'
+import { readReachabilityMirror, readRoutingMirror } from './definition.js'
 
 /**
  * Terminal phases, mirrored from `../domain/types.js`.
@@ -89,6 +92,11 @@ export interface LiveRun {
    * same rule the rest of this mirror follows for host-owned values.
    */
   readonly routing?: Readonly<Record<string, unknown>>
+  /**
+   * M13: the candidate-coverage report, carried the same opaque way. The card
+   * labels it as coverage; this half never re-derives it.
+   */
+  readonly routingReachability?: Readonly<Record<string, unknown>>
 }
 
 /**
@@ -198,13 +206,72 @@ export function pollKey(data: AutopilotRunChatData, sessionId?: string | undefin
  * @param sessionId - the session this card is rendered in, if the host supplied it.
  * @returns true when a poll is warranted.
  */
+/**
+ * Whether the card's ROUTING block is BEHIND the rest of what it shows.
+ *
+ * THE STALE STATE THIS CLOSES, measured in the real GUI: the routing block is
+ * folded from an `autopilot_status` RESULT, and a run can keep advancing after
+ * that call — the run on the isolated instance ended at revision 10 while the
+ * card's last status observation sat at revision 5, so the card listed ONE
+ * dispatched auditor while two had actually run. Every value was true about
+ * revision 5, and the card said so, but a reader who does not go looking for the
+ * revision line reads an out-of-date picture as the current one.
+ *
+ * This is decidable WITHOUT asking the server: the card already knows its own
+ * newest revision, and it knows the revision its routing block belongs to.
+ *
+ * @param data - the folded card data.
+ * @returns true when a routing block exists and is older than the card's revision.
+ */
+export function routingReconcileNeeded(data: AutopilotRunChatData): boolean {
+  if (data.routing === undefined) return false
+  return data.routing.revision < data.revision
+}
+
+/**
+ * Whether to poll at all.
+ *
+ * THE GATE IS "NOT TERMINAL", NOT "STALE". An earlier draft gated on the
+ * `stale` badge, which is wrong in the one case the whole feature exists for:
+ * `stale` is computed from the SESSION LOG (highest revision seen vs. newest
+ * phase observation), so a session whose log carries no new events never
+ * recomputes it, and the badge can stay false for the entire time the run is
+ * advancing elsewhere. Gating on it would mean the card polls exactly when it
+ * already knows it is behind and stays quiet when it has no idea. Staleness
+ * accelerates the cadence instead ({@link pollDelayMs}).
+ *
+ * THE TERMINAL GATE HAS ONE EXCEPTION, added in M13: a run that has STOPPED can
+ * still leave the card's routing block behind, because that block is folded from
+ * a status RESULT and nothing forces another `autopilot_status` call before the
+ * run closes. When the card can SEE that gap ({@link routingReconcileNeeded}) it
+ * asks the host route once; the answer is stamped at the live revision, the gap
+ * closes, and this returns false again — so it is a reconciliation, not a
+ * heartbeat. A host that never answers leaves the card showing exactly what it
+ * shows today, with its revision labelled.
+ *
+ * An id is required because the route is keyed by one — see {@link pollKey} for
+ * why that id no longer has to come from the session log.
+ *
+ * @param data - the folded card data.
+ * @param live - the newest live answer, if one has landed.
+ * @param sessionId - the session this card is rendered in, if the host supplied it.
+ * @returns true when a poll is warranted.
+ */
 export function shouldPoll(
   data: AutopilotRunChatData,
   live?: LiveRun | undefined,
   sessionId?: string | undefined,
 ): boolean {
   if (pollKey(data, sessionId) === undefined) return false
-  return !isTerminalPhase(displayedPhase(data, live))
+  if (!isTerminalPhase(displayedPhase(data, live))) return true
+  // The run has stopped: the only thing left to reconcile is a routing block
+  // that is older than the revision the card already holds. ONE reconciliation,
+  // not a heartbeat — once ANY live answer has landed the card has been told
+  // what the route knows, and a route that omits the routing block (the engine
+  // serves none when routing mode is not `auto`) has nothing further to say. The
+  // card then keeps whatever it folded, labelled with its own revision.
+  if (live !== undefined) return false
+  return routingReconcileNeeded(data)
 }
 
 /**
@@ -268,6 +335,9 @@ export function readLiveRun(body: unknown): LiveRun | undefined {
     // M12: pass the routing block through only as a plain object; a malformed
     // one is DROPPED (absent = not observed) rather than rendered as a claim.
     ...(isPlainObject(run.routing) ? { routing: run.routing as Readonly<Record<string, unknown>> } : {}),
+    ...(isPlainObject(run.routingReachability)
+      ? { routingReachability: run.routingReachability as Readonly<Record<string, unknown>> }
+      : {}),
     ...(typeof run.closeoutSubmitted === 'boolean' ? { closeoutSubmitted: run.closeoutSubmitted } : {}),
     ...(verdicts === undefined ? {} : { latestVerdicts: verdicts }),
     ...(isPlainObject(run.executor) ? { executor: run.executor } : {}),
@@ -310,6 +380,96 @@ function liveObserved<T>(value: T, revision: number): Observed<T> {
 }
 
 /**
+ * The policy states that ARE an observation of the session's policy.
+ *
+ * `unobserved` is deliberately not in this list, and that is the entire point of
+ * the constant: it is the ABSENCE of a read, so it can never be allowed to
+ * replace one. `src/routing/status.ts` defines the four; three are findings.
+ */
+const OBSERVED_POLICY_STATES: readonly string[] = ['present', 'absent', 'unreachable']
+
+/**
+ * Merge the two routing sources, WITHOUT letting the route answer a question it
+ * cannot be asked.
+ *
+ * THE HAZARD THIS CLOSES (measured in the code, not imagined). The host route
+ * projects through `../service.ts`, which has no dispatching session and
+ * therefore calls `projectStatus(snapshot)` with no policy argument — so the
+ * engine honestly reports `policyState: 'unobserved'` on EVERY route answer,
+ * for every deployment, forever. The session's own `autopilot_status` result is
+ * the only place a `present`/`absent`/`unreachable` can appear. A card that
+ * let the fresher route answer win would therefore show "cannot observe" over a
+ * policy state the engine really did read — reading "we could not look" as "you
+ * have no authorization".
+ *
+ * WHY THE TRIPLE IS ATOMIC. `dispatch` is not an independent field: the engine
+ * DERIVES it from `policyState` (`status.ts`: present ⇒ live, unobserved ⇒
+ * unobserved, otherwise inherit-only). Taking `policyState` from the session
+ * and `dispatch` from the route would print "policy present · dispatch
+ * unobserved", a header that contradicts itself. So `policyState`,
+ * `policyRouteCount`, `policyStateFrom` and `dispatch` move together, always
+ * from ONE source; when no session observation exists, the route's triple
+ * stands — `unobserved`, honestly labelled as coming from the route.
+ *
+ * EVERY OTHER FIELD takes the fresher answer, because the route can read all of
+ * them (the config, the roles, the pins, the ladder counts).
+ *
+ * THE RESIDUAL LIMIT, stated rather than hidden: a session-observed triple can
+ * lag until the next `autopilot_status`. The card carries the revision it
+ * belongs to, exactly as it does for every other field, so a reader can see the
+ * age of the claim instead of being told a fresher one it does not have.
+ *
+ * @param fold - the routing block a session result carried, if any.
+ * @param liveRouting - the raw `routing` value off the host route, if any.
+ * @param liveRevision - the revision the route answer was read at.
+ * @returns the merged block, or undefined when neither source has one.
+ */
+export function mergeRouting(
+  fold: Observed<RoutingMirror> | undefined,
+  liveRouting: unknown,
+  liveRevision: number,
+): Observed<RoutingMirror> | undefined {
+  const live = readRoutingMirror(liveRouting, 'route')
+  if (fold === undefined) return live === undefined ? undefined : liveObserved(live, liveRevision)
+  if (live === undefined || liveRevision <= fold.revision) return fold
+  const sessionObserved = OBSERVED_POLICY_STATES.includes(fold.value.policyState)
+  const triple = sessionObserved
+    ? {
+        policyState: fold.value.policyState,
+        policyStateFrom: fold.value.policyStateFrom,
+        dispatch: fold.value.dispatch,
+        ...(fold.value.policyRouteCount === undefined ? {} : { policyRouteCount: fold.value.policyRouteCount }),
+      }
+    : {
+        policyState: live.policyState,
+        policyStateFrom: live.policyStateFrom,
+        dispatch: live.dispatch,
+        ...(live.policyRouteCount === undefined ? {} : { policyRouteCount: live.policyRouteCount }),
+      }
+  return liveObserved({ ...live, ...triple }, liveRevision)
+}
+
+/**
+ * Take the route's coverage report when it parses, else keep what the session
+ * observed. `undefined` on both sides means the card renders no coverage line.
+ *
+ * @param fold - the coverage the session's status carried, if any.
+ * @param liveReachability - the raw value off the host route.
+ * @param liveRevision - the revision the route answer was read at.
+ * @returns the coverage to render, or undefined.
+ */
+export function mergeReachability(
+  fold: Observed<ReachabilityMirror> | undefined,
+  liveReachability: unknown,
+  liveRevision: number,
+): Observed<ReachabilityMirror> | undefined {
+  const live = readReachabilityMirror(liveReachability)
+  if (live === undefined) return fold
+  if (fold !== undefined && liveRevision <= fold.revision) return fold
+  return liveObserved(live, liveRevision)
+}
+
+/**
  * Fold a live answer over the session-log reconstruction.
  *
  * PRECEDENCE IS BY REVISION, NOT BY SOURCE. A live answer older than what the
@@ -335,8 +495,36 @@ function liveObserved<T>(value: T, revision: number): Observed<T> {
  */
 export function overlayLive(data: AutopilotRunChatData, live: LiveRun | undefined): AutopilotRunChatData {
   if (live === undefined) return data
-  if (live.revision <= data.revision) return data
+  if (live.revision <= data.revision) {
+    // THE ROUTING-ONLY RECONCILIATION. An answer that is not newer than the
+    // card's own revision may not replace any ordinary field — that is the
+    // reference-stability rule the page relies on, and it stays. But the ROUTING
+    // block is measured against its OWN observation, and the gap is real and
+    // measured: the run's closeout result carried revision 10 while the last
+    // `autopilot_status` sat at revision 5, so the card listed ONE dispatched
+    // auditor while two had run. The route knows about revision 10, so it can
+    // answer THAT question even though it may not answer the others.
+    //
+    // A card with no routing block never takes this path (both merges return
+    // their input), so the old behaviour is exactly preserved for every card
+    // that has nothing to reconcile.
+    const routing = mergeRouting(data.routing, live.routing, live.revision)
+    const reachability = mergeReachability(data.routingReachability, live.routingReachability, live.revision)
+    const routingChanged = routing !== undefined && routing !== data.routing
+    const reachabilityChanged = reachability !== undefined && reachability !== data.routingReachability
+    if (!routingChanged && !reachabilityChanged) return data
+    return {
+      ...data,
+      ...(routingChanged ? { routing } : {}),
+      ...(reachabilityChanged ? { routingReachability: reachability } : {}),
+    }
+  }
   const at = live.revision
+  // M13: the routing block merges under its OWN rule (see `mergeRouting`) — the
+  // route is fresher for the config and for the run's pins, but it cannot read a
+  // session's policy, so its `unobserved` must not overwrite one.
+  const routing = mergeRouting(data.routing, live.routing, at)
+  const routingReachability = mergeReachability(data.routingReachability, live.routingReachability, at)
   return {
     ...data,
     revision: at,
@@ -352,6 +540,8 @@ export function overlayLive(data: AutopilotRunChatData, live: LiveRun | undefine
     ...(live.latestVerdicts === undefined ? {} : { latestVerdicts: liveObserved(live.latestVerdicts, at) }),
     ...(live.executor === undefined ? {} : { executor: liveObserved(live.executor, at) }),
     ...(live.enforcement === undefined ? {} : { enforcement: liveObserved(live.enforcement, at) }),
+    ...(routing === undefined ? {} : { routing }),
+    ...(routingReachability === undefined ? {} : { routingReachability }),
     stale: false,
   }
 }

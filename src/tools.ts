@@ -661,6 +661,43 @@ export function installRootTools(
   }
 }
 
+/**
+ * Build the executor-child ESCALATION tool (installed only into the authorized
+ * executor, alongside the packet tool).
+ *
+ * WHY THE CHILD NEEDS ITS OWN TOOL rather than inheriting `autopilot_log`: the
+ * log tool lives in the ROOT agent's scope, and its engine entry point refuses
+ * every caller with a parent session (`AP_NOT_ROOT`). So a delegated executor
+ * that maxed out its effort had no way to say so — the one agent doing the work
+ * was the one agent that could not ask for a stronger model.
+ *
+ * WHAT IT MAY DO, in the engine's words (`requestEscalation`): record ONE
+ * `escalate`/`stronger-model` checkpoint, from the live authorized executor
+ * child, and nothing else. It cannot write arbitrary log entries, cannot
+ * request the governance exits, cannot switch its own model and cannot widen
+ * its own authorization — the request only widens the candidate pool a LATER
+ * auto dispatch may draw from, still inside `policy ∩ live ∩ tier membership`.
+ *
+ * @param engine - the run engine the child talks to.
+ * @returns the tool definition.
+ */
+export function escalationToolDefinition(engine: AutopilotEngine): unknown {
+  return defineTool({
+    name: 'autopilot_request_escalation',
+    description: 'Executor Lead only: ask the run for a STRONGER MODEL when you are stuck (max effort and still failing, or a stall). Records an escalate checkpoint naming stronger-model; the next automatic dispatch of an auto role consumes it and may draw from a wider pool. This is a REQUEST: it does not widen your authorization, and it does not switch your model by itself — say what stalled and why.',
+    parameters: {
+      text: { type: 'string', required: true, description: 'What stalled — the step, and the failure you observed.' },
+      note: { type: 'string', required: true, description: 'The evidence this request carries (required, like every escalate checkpoint).' },
+    },
+    output: jsonOutput(JSON_VALUE),
+    async execute(args, exec) {
+      const child = callingAgent(exec.agent, 'autopilot_request_escalation')
+      const snapshot = await engine.requestEscalation(child, { text: args.text, note: args.note })
+      return { runId: snapshot.runId, revision: snapshot.revision, phase: snapshot.phase } as never
+    },
+  })
+}
+
 /** Build the executor-child packet tool definition (installed only into the authorized executor). */
 export function packetToolDefinition(engine: AutopilotEngine): unknown {
   return defineTool({

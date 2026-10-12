@@ -145,11 +145,29 @@ so it cannot fire that code.
 
 DESIGN §1.2 makes an upgrade a REQUEST, not a prediction: the pool stays economy
 until the model that is *working* reports that it could not proceed. That request
-is one tool call:
+is one call, and there are TWO entry points into the SAME channel:
 
 ```
 autopilot_log({ stance: 'escalate', escalationTarget: 'stronger-model', note: '<failure_kind> + the raw evidence' })
 ```
+
+from the ROOT agent, and
+
+```
+autopilot_request_escalation({ text: '<what stalled>', note: '<failure_kind> + the raw evidence' })
+```
+
+from the EXECUTOR CHILD. The child entry exists because the root entry could not
+serve it: `autopilot_log` is registered into the root agent's scope and its
+engine path refuses any caller with a parent session (`AP_NOT_ROOT`), so a
+delegated executor — the agent actually doing the work — had no way to ask for
+anything at all. The child entry is deliberately NARROW: it is available only to
+the run's live, authorized executor while that executor is `running`
+(`AP_ESCALATION_NOT_EXECUTOR` otherwise), it fixes `stance` to `escalate` and
+`escalationTarget` to `stronger-model`, and a child can neither write arbitrary
+checkpoints nor request the governance exits (`owner`, `external-review`) that
+belong to the root. Both entries land at the same single register site, so this
+is one channel with two doors, never two escalation semantics.
 
 - **What it does.** The engine records the request against the run (the `note`
   carries the evidence), and the next AUTO dispatch that runs a selection —
@@ -175,10 +193,10 @@ autopilot_log({ stance: 'escalate', escalationTarget: 'stronger-model', note: '<
   of the durable run snapshot: a process restart forgets an open request, and
   the requester asks again. What the request CAUSED is durable like any other
   dispatch — it rides `detail.routing` with its own `why` line.
-- **A root-logged request speaks for the run, not for a guessed role.** The
+- **A request speaks for the run, not for a guessed role.** The
   engine does not infer which role a stall belongs to (an `audit` class name
   cannot even name which auditor was meant); one open request per run is
-  consumed by whichever auto dispatch comes next.
+  consumed by whichever auto dispatch comes next, whoever asked.
 
 Coverage is two metrics. `coverageReport` (`kind: 'tier-coverage'`) answers "is
 every observed model claimed by some configured tier". The work-class

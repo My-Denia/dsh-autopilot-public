@@ -3004,6 +3004,82 @@ reparse-alias 桩 → spawn ENOENT；修复需持久改用户 PATH 或管理员�
 `routing.workClasses.<class>.tiers`，请求不覆盖它；ladder 已配置但请求后的池与授权交集
 为空时，仍走 `AP_ROUTE_NO_REACHABLE_WORK_CLASS` 阻塞（不静默降级）。
 
+`AP_ROUTE_NO_REACHABLE_WORK_CLASS` 阻塞（不静默降级）。
+
+### 8.8 M13 路由实况进入真实 GUI + executor child 升档通道（2026-10-12）
+
+三个交付物 + 两处只有真跑才暴露的缺陷，基线 `23fdd47`（M12，r8），候选制品
+`dsh-goal-autopilot-0.2.0-candidate-routing-m1-m13-r9.tgz`（sha256
+`67fa39f042477d68ddd5945411eaa838f44dbd5a48dabd87308f769a83bf0400`）。
+
+1. **卡片渲染路由实况**。`AutopilotRunChatData` 新增 `routing` 与
+   `routingReachability` 两个折叠字段（来自会话内的 `autopilot_status` 结果，
+   白名单逐字段读取、畸形即丢弃），卡片渲染五行、**各自标注来源**：
+   `routing`（mode / preference 及其来源 / policy 状态 / dispatch 判定）、
+   `ladder`（owner 配置的三档成员**计数** + audit tier——计数而非成员表，因为那表是 owner 的）、
+   `roles`（五角色有效路由 + 其 work class）、`dispatched`（本 run 实际派发落定的路由）、
+   `candidate coverage`（`routingReachability`，行内显式写 "NOT a dispatch record"）。
+   `GET /api/autopilot/run` 增加 `routingReachability` 字段（与 `routing` **分开**服务，
+   否则卡片会把候选覆盖当成派发记录）。`mode: 'off'` 时整块不渲染，且不留替代文案。
+   `GET /api/autopilot/run` 增加 `routingReachability` 字段（与 `routing` **分开**服务，
+   否则卡片会把候选覆盖当成派发记录）。`mode: 'off'` 时整块不渲染，且不留替代文案。
+2. **policy 三元组的诚实性**。`{policyState, policyRouteCount, dispatch}` 作为**一个原子
+   三元组**取源：HTTP 路由没有会话可问，恒答 `unobserved`；卡片绝不让这个"读不到"覆盖
+   会话已经观察到的 `present`/`absent`/`unreachable`——行内可见 `[read in this session]`
+   的来源标注，路由的说法只在会话没有任何观察时成立。`dispatch` 由 policyState 派生，
+   所以两者必须同源（否则头部会印出 "policy present · dispatch unobserved" 这种自相矛盾）。
+3. **executor child 的升档通道**（见 §9 第 18 项）。
+
+**真跑暴露并修复的两处缺陷**（都写在 CHANGELOG 的 Fixed 段，这里记下它们为什么只有真跑
+才发现）：
+
+- **卡片在真实 0.2.0 宿主上一行数据都折不到。** `readResult` 只认 **wrapped** 信封
+  （`message.content[0].content[0].text`，`isError` 在外层包装上），而 0.2.0 交付的是
+  **flat** 形状（`message.content[0]` 就是文本块，`isError` 在 message 上）。于是每个结果
+  都折成 `payload: undefined`，卡片渲染成空壳：revision 0、没有 phase、没有 gate、没有审计
+  裁决、没有路由块，**而且任何地方都不报错**。`test/fixtures/card/` 的夹具只带 wrapped
+  形状，所以 100 多个单测全绿也照样漏掉。发现路径：隔离实例 + 真实会话 + 真实 Chromium
+  捕获 → 看到空壳 → 把真实 85 事件会话喂给**出厂**定义做回放
+  （`goal-runs/m13-routing-gui-escalation/instruments/m13-replay-fold.mjs`）→ 复现
+  revision 0（红）。修复后同一条真实会话回放得到 revision 9、两个 gate、两条已裁决审计与
+  完整的路由块（绿），两份输出都归档。
+- **路由块可能落后于卡片自身 revision。** 折叠的 revision 由**任何**结果推进（实测：closeout
+  结果把 revision 推到 10），而路由块来自更早的一次 `autopilot_status`（revision 5），于是
+  卡片只列出一个已派发的审计者、而实际跑了两个。修复分两半：`routingReconcileNeeded` 让
+  终态运行也允许**一次**对账（一次，不是心跳：任何 live 答案落地后即停），`overlayLive`
+  在"答案不比卡片新"时仍允许**只**更新路由块（它有自己的观察 revision 作基线）。
+
+**真实验收（隔离实例 + 真实 Chromium，非 HTTP 200、非单测）**：`m13-accept`
+（desktop-stack profile、独立 storeRoot、装 r9）上跑真实会话，用 CDP 直驱本机
+chromium-1217 打开该会话并展开进程折叠区，卡片 DOM 里读到五行（`routing auto ·
+preference axis (default) · policy present (8 routes) [read in this session] · dispatch
+live` / `ladder economy 4 · standard 1 · reserve 1 · audit tier none` / 五角色 / 两个实际
+派发 / `candidate coverage 6/8 … NOT a dispatch record`），22 条断言
+（`m13-gui-assert.cjs`）全部通过；`mode: off` 的第二个实例渲染出卡片但**没有**
+任何路由块，8 条断言通过，其中包括"卡片确实向宿主路由发过请求"（否则"没显示"与"没加载"
+无法区分）。截图与 DOM 文本归档在 `goal-runs/m13-routing-gui-escalation/evidence/`。
+
+**真实子代理升档（隔离实例 `m13-escalation`，`routing.ladder.rotation: false`）**：
+真实 executor child 在自己的会话里调用 `autopilot_request_escalation`
+（`m13-actor-evidence.cjs` 从两个会话流分别取证：**子会话**有该工具调用与参数、**根会话**
+没有；子会话里 `autopilot_log` 调用数为 0），引擎记下 `stance=escalate /
+escalationTarget=stronger-model` 的检查点（seq 2），随后一次真实的 execution-auditor 派发
+把它消费掉：`repinFrom` = 请求前的 `deepseek-official/deepseek-v4-pro`，why 行点名
+"escalation request: seq 2"，新 pin 为 `kimi-coding/k3`（reserve 档）——**真实结果是升档**
+（standard → reserve），所以本轮**没有**、也不需要任何排序改动；计划里那条"按档位上限
+排序"的条件修复被计划审计判定为违规（把阈值当排序轴、与 §1.2 的轴集合冲突），已在 rev 2
+整体删除，这里如实记录实测方向。
+
+**如实记录的边界（M13）**：(a) 子入口刻意窄：只接受本 run 的活体、已授权、`running` 的
+executor（否则 `AP_ESCALATION_NOT_EXECUTOR`），`stance` 固定 `escalate`、target 固定
+`stronger-model`，子代理不能写任意检查点、也不能请求 `owner`/`external-review` 这类属于
+root 的治理出口；两个入口写入同一个寄存器（`commitLogEntry` 是唯一写入点），所以是
+"一个通道两扇门"而不是两套语义。(b) 请求寄存器仍是 engine-local（M12 的既有边界）。
+(c) 真机验收的隔离实例里 rotation 必须关闭才能把"重选"归因给请求：rotation 分支每次审计
+派发都会调 `selectForRole`，而消费点就在其中——这不是产品缺陷，是验收配置的必要条件，
+已写进探针配置注释。(d) 未 push：本会话审批策略为 `never`，egress 会被自动拒绝，因此候选
+只落在本地 `plugin-artifacts/`，Draft PR #3 仍是 `23fdd470`。
+
 17. **模型路由：work-class 升档请求通道**（**已交付**，2026-10-11 M12）：DESIGN §1.2 的
     "升档是请求，不是预测"此前只有前半句落地（`hard` 档只有 economy 池，请求通道登记为
     non-goal）。现在 `autopilot_log({ stance:'escalate', escalationTarget:'stronger-model',
@@ -3016,3 +3092,15 @@ reparse-alias 桩 → spawn ENOENT；修复需持久改用户 PATH 或管理员�
     （进程重启遗忘，登记为边界）；被派发消费的结果是持久的。测试：
     `test/routing-integration.test.ts`（4 例，含"未请求时逐字复用健康 pin"的反向对照）
     与 `test/routing-status.test.ts`。
+
+18. **模型路由：executor child 的升档入口**（**已交付**，2026-10-12 M13）：M12 的请求通道
+    只有一扇门（`autopilot_log` 注册在 root 作用域，引擎路径对任何带 parent session 的
+    调用者抛 `AP_NOT_ROOT`），于是真正干活的 executor child 反而无法提出请求。现在子面注册
+    `autopilot_request_escalation({ text, note })`（与 packet 工具一样装在**子自己的层**，
+    不依赖 owner 的 toolAllowList），引擎 `requestEscalation` 只接受本 run 活体、已授权、
+    `running` 的 executor，并把条目固定为 `escalate`/`stronger-model`；两个入口都经同一个
+    `commitLogEntry` 落库，寄存器写入点唯一。请求**不放宽授权**：候选集仍是会话策略 ∩ 活体
+    目录 ∩ 档位成员，仍过一次性与独立性排序。真机：见 §8.8。测试：
+    `test/child-escalation.test.ts`（6 例，含"非本 run 子代理被拒""已完成 executor 被拒"
+    "子代理仍然不能调 `autopilot_log`"与真实 pin 复用路径上的消费）、
+    `test/child-setup.test.ts`（子面第四个工具的事务化安装与回滚）。

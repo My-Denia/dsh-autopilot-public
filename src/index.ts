@@ -7,7 +7,7 @@
  * - the native egress seam (tools/pre-execute + tools/execute) with the
  *   synchronous guard as its fail-closed fallback
  * - the autopilot:policy prompt section (root and executor-child flavors)
- * - the executor-child packet tool + guard (continuable setup)
+ * - the executor-child packet tool + its escalation channel + guard (continuable setup)
  * - the read-only `ctx.autopilot` service
  *
  * Config (all optional; the declared schema is `./config.js`):
@@ -42,7 +42,7 @@ import { RunStore, defaultStoreRoot } from './store/file.js'
 import { DomainRunStore } from './store/domain.js'
 import type { DomainFacilityLike } from './store/domain.js'
 import type { RunStoreLike } from './store/types.js'
-import { installRootTools, packetToolDefinition } from './tools.js'
+import { escalationToolDefinition, installRootTools, packetToolDefinition } from './tools.js'
 import { DEFAULT_EXECUTOR_TOOLS } from './config.js'
 import { BUNDLED_SKILL_PROVIDER_NAME, BUNDLED_SKILL_PROVIDER_RANK, publishBundledSkill } from './skill-register.js'
 import type { SkillPublicationResult, SkillRegistryLike } from './skill-register.js'
@@ -1439,8 +1439,8 @@ export interface ContinuableChildContext {
 }
 
 /**
- * Build the executor-child setup callback: packet tool + egress guard + native
- * egress seam, bound to the PARENT run.
+ * Build the executor-child setup callback: packet tool + escalation tool +
+ * egress guard + native egress seam, bound to the PARENT run.
  *
  * EXTRACTED FROM `apply()` so it has a surface a test can drive. It used to be
  * reachable only through `ctx.subagents.registerContinuableSetup` (dsh 0.1.1;
@@ -1520,16 +1520,16 @@ export function recognizeExecutorChild(
 
 /** Cleanup failures collected while rolling back or disposing a child surface. */
 export interface ChildSurfaceCleanupFailure {
-  readonly step: 'seam' | 'packet-tool' | 'egress-guard'
+  readonly step: 'seam' | 'packet-tool' | 'escalation-tool' | 'egress-guard'
   readonly error: unknown
 }
 
 /**
  * Install the recognized executor child's surface — pre-execute seam, packet
- * tool, egress guard — TRANSACTIONALLY.
+ * tool, escalation tool, egress guard — TRANSACTIONALLY.
  *
  * CONTRACT (owner ruling 2026-09-04, Codex P2 on PR #6):
- *  - the three steps install in order; each successful step's disposer is
+ *  - the four steps install in order; each successful step's disposer is
  *    kept;
  *  - when a later step throws, every already-installed step is rolled back in
  *    REVERSE order, each in its own try/catch, and then the ORIGINAL error is
@@ -1582,6 +1582,12 @@ export function installExecutorChildSurface(
     const childSeam = installPreExecuteGate(childCtx as unknown as PreExecuteHost, rootId, engine)
     installed.push({ step: 'seam', dispose: childSeam.dispose })
     installed.push({ step: 'packet-tool', dispose: childCtx.tools.register(packetToolDefinition(engine)) })
+    // M13: the child's escalation channel. Installed into the child's OWN layer
+    // for the same reason the packet tool is — the owner's tool allow-list is a
+    // statement about the WORK surface, and an executor that cannot ask for help
+    // is the exact shape this tool exists to remove. The engine still refuses
+    // every caller that is not this run's live, authorized, running executor.
+    installed.push({ step: 'escalation-tool', dispose: childCtx.tools.register(escalationToolDefinition(engine)) })
     installed.push({
       step: 'egress-guard',
       dispose: installChildEgressGuard(childCtx.tools, rootId, engine, {
@@ -1867,7 +1873,7 @@ export async function apply(rawCtx: unknown, config?: ConfigInput): Promise<() =
         for (const dispose of disposers.reverse()) dispose()
       })
     }
-    // ── Executor-child surface: packet tool + guard + native egress seam ───
+    // ── Executor-child surface: packet tool + escalation tool + guard + seam ──
     //
     // Until dsh 0.1.1 this went through `ctx.subagents.registerContinuableSetup`,
     // a registry the subagent manager applied inside each child's creation

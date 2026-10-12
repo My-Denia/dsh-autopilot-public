@@ -139,6 +139,7 @@ Requires:
 - `start-executor` from a predecessor or from `starting`, and `resume-executor`, carry exactly the `executionRevision`, `generation`, and `childId` the transition allows; resume is `running` to `running` at revision plus one.
 - `resume-executor` and `submit-packet` require a live executor in state `running`.
 - Only the registered executor child may submit the packet, and only once per revision.
+- Only the run's live, authorized executor child, still in state `running`, may record an escalation request (`requestEscalation`, the child-facing `autopilot_request_escalation` tool). The entry is fixed to `escalate` with `escalationTarget: stronger-model`; a child cannot write other checkpoints and cannot name the governance targets. It lands at the same single register site as the root's `log`, so there is one request channel with two entry points.
 - `submit-packet` declares an integer `executionRevision`; on a current-format stream (a `bearerBase` is present) it also carries `generation` and `childId`. The stamp equals the live executor's, and the folded snapshot retains it.
 - Resume is the `needs-fix` channel only: `executionGate` is `needs-fix`, and the latest `execution`/`rules` audit is a `needs-fix` at the current `executionRevision`.
 
@@ -146,7 +147,7 @@ Why: a packet is the executor's claim about the work. Binding it to a generation
 
 Remedy: for a live-slot or state refusal, wait for the audit cycle to revoke or complete the executor, or resume it through a `needs-fix`; for a revision refusal, resend the packet with the executor's current revision. The replay codes mean the stream contradicts the lifecycle the engine can write.
 
-Codes: `AP_EXECUTOR_OP`, `AP_EXECUTOR_REVISION`, `AP_EXECUTOR_EXISTS`, `AP_EXECUTOR_MUTATED`, `AP_EXECUTOR_NOT_RUNNING`, `AP_NO_EXECUTOR`, `AP_EXECUTOR_MISMATCH`, `AP_PACKET_EXISTS`, `AP_PACKET_REVISION_REQUIRED`, `AP_PACKET_REVISION_MISMATCH`, `AP_PACKET_REVISION_MUTATED`, `AP_RESUME_REQUIRES_NEEDS_FIX`, `AP_WRONG_EXECUTION_MODE`.
+Codes: `AP_EXECUTOR_OP`, `AP_EXECUTOR_REVISION`, `AP_EXECUTOR_EXISTS`, `AP_EXECUTOR_MUTATED`, `AP_EXECUTOR_NOT_RUNNING`, `AP_NO_EXECUTOR`, `AP_EXECUTOR_MISMATCH`, `AP_ESCALATION_NOT_EXECUTOR`, `AP_PACKET_EXISTS`, `AP_PACKET_REVISION_REQUIRED`, `AP_PACKET_REVISION_MISMATCH`, `AP_PACKET_REVISION_MUTATED`, `AP_RESUME_REQUIRES_NEEDS_FIX`, `AP_WRONG_EXECUTION_MODE`.
 
 ## 8. Usage-evidence declaration
 
@@ -343,6 +344,7 @@ Every `AP_*` code that appears under `src/**`, its contract, and the one-line pr
 | `AP_EVIDENCE_KIND_INVALID` | 9 | an evidence kind is exactly `path` or `command` (any stamp) |
 | `AP_EVIDENCE_KIND_REQUIRED` | 9 | a proven entry carries a kind; write always, replay only under `evidenceKinds:1` |
 | `AP_EVIDENCE_KIND_STAMP_INVALID` | 9 | the `submit-closeout` `evidenceKinds` stamp is the integer `1` |
+| `AP_ESCALATION_NOT_EXECUTOR` | 7 | only the run's live, authorized, `running` executor child may record an escalation request |
 | `AP_EVENT_VERSION` | 1 | `event.v` is exactly `1` |
 | `AP_EXECUTOR_BEFORE_GATE` | 4 | `start-executor` runs only with prior `planGate` pass |
 | `AP_EXECUTOR_EXISTS` | 7 | no live (`starting` or `running`) executor exists at `start-executor` |

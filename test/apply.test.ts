@@ -53,7 +53,7 @@ interface Recorded {
 interface ChildInjection {
   registerThrows?: boolean
   guardThrows?: boolean
-  disposerThrows?: ReadonlyArray<'seam' | 'packet-tool' | 'egress-guard'>
+  disposerThrows?: ReadonlyArray<'seam' | 'packet-tool' | 'escalation-tool' | 'egress-guard'>
   /**
    * dsh 0.1.7+ child context: `get('agent')` is undefined and reading the
    * `agent` property throws, exactly as measured on a real 0.2.0-rc.2 host
@@ -148,7 +148,7 @@ function fakeCtx(storeRoot: string, options: { storageDomain?: unknown; seamThro
    */
   const publishChild = (spec: { childId: string }): void => {
     const injection = options.child ?? {}
-    const disposer = (step: 'seam' | 'packet-tool' | 'egress-guard') => () => {
+    const disposer = (step: 'seam' | 'packet-tool' | 'escalation-tool' | 'egress-guard') => () => {
       recordedChild.disposed.push(step)
       if (injection.disposerThrows?.includes(step)) throw new Error(`inject: ${step} disposer failed`)
     }
@@ -163,8 +163,11 @@ function fakeCtx(storeRoot: string, options: { storageDomain?: unknown; seamThro
       tools: {
         register(definition: unknown) {
           if (injection.registerThrows === true) throw new Error('inject: child tools.register failed')
-          recordedChild.toolNames.push((definition as { name?: string }).name ?? '<unnamed>')
-          return disposer('packet-tool')
+          const name = (definition as { name?: string }).name ?? '<unnamed>'
+          recordedChild.toolNames.push(name)
+          // M13: the child surface registers TWO tools, so the recorded step has
+          // to name which disposer this is.
+          return disposer(name === 'autopilot_request_escalation' ? 'escalation-tool' : 'packet-tool')
         },
         guard() {
           if (injection.guardThrows === true) throw new Error('inject: child tools.guard failed')
@@ -1037,12 +1040,12 @@ describe('apply: executor child published through agent/created (transactional, 
     await startExecutor(host)
     const run = executorOf(host)
     expect(run?.executor?.state).toBe('running')
-    expect(host.child.toolNames).toEqual(['autopilot_submit_packet'])
+    expect(host.child.toolNames).toEqual(['autopilot_submit_packet', 'autopilot_request_escalation'])
     expect(host.child.disposed).toEqual([])
     host.dispose(host.child.agent)
-    expect(host.child.disposed).toEqual(['egress-guard', 'packet-tool', 'seam'])
+    expect(host.child.disposed).toEqual(['egress-guard', 'escalation-tool', 'packet-tool', 'seam'])
     host.dispose(host.child.agent)
-    expect(host.child.disposed).toHaveLength(3)
+    expect(host.child.disposed).toHaveLength(4)
     expect(host.recorded.warnings.filter(w => w.includes('child surface'))).toEqual([])
     await dispose()
   })
@@ -1056,9 +1059,9 @@ describe('apply: executor child published through agent/created (transactional, 
 
     await startExecutor(host)
     expect(executorOf(host)?.executor?.state).toBe('running')
-    expect(host.child.toolNames).toEqual(['autopilot_submit_packet'])
+    expect(host.child.toolNames).toEqual(['autopilot_submit_packet', 'autopilot_request_escalation'])
     host.dispose(host.child.agent)
-    expect(host.child.disposed).toEqual(['egress-guard', 'packet-tool', 'seam'])
+    expect(host.child.disposed).toEqual(['egress-guard', 'escalation-tool', 'packet-tool', 'seam'])
     await dispose()
   })
 
@@ -1093,13 +1096,13 @@ describe('apply: executor child published through agent/created (transactional, 
     await startExecutor(host)
     expect(executorOf(host)?.executor?.state).toBe('running')
     expect(() => host.dispose(host.child.agent)).not.toThrow()
-    expect(host.child.disposed).toEqual(['egress-guard', 'packet-tool', 'seam'])
+    expect(host.child.disposed).toEqual(['egress-guard', 'escalation-tool', 'packet-tool', 'seam'])
     const releaseWarnings = host.recorded.warnings.filter(w => w.includes('child surface release failed'))
     expect(releaseWarnings).toHaveLength(1)
     expect(releaseWarnings[0]).toMatch(/packet-tool/)
     // Entry removed: a second agent/disposed does nothing at all.
     host.dispose(host.child.agent)
-    expect(host.child.disposed).toHaveLength(3)
+    expect(host.child.disposed).toHaveLength(4)
     expect(host.recorded.warnings.filter(w => w.includes('child surface release failed'))).toHaveLength(1)
     await dispose()
   })

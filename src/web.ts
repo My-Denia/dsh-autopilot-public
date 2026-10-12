@@ -39,6 +39,7 @@
 
 import type { Enforcement } from './domain/types.js'
 import type { StatusView } from './engine.js'
+import type { WorkClassReachabilityReport } from './routing/coverage.js'
 import type { RoutingStatusView } from './routing/status.js'
 import type { AutopilotReadOnly } from './service.js'
 
@@ -185,6 +186,15 @@ export interface RunProjection {
    * mount cannot ask — the projection never guesses on its behalf.
    */
   readonly routing?: RoutingStatusView
+  /**
+   * M13: the candidate-coverage report, served as its OWN field.
+   *
+   * It answers a different question from `routing` — "can every observed model
+   * be reached by some tier-bound work class" is a statement about the ladder
+   * and the live catalog, NOT about what ran — so it does not ride inside the
+   * routing block, where a reader would take it for a dispatch record.
+   */
+  readonly routingReachability?: WorkClassReachabilityReport
 }
 
 /** The `/runs` body. */
@@ -267,6 +277,11 @@ export function projectRun(status: StatusView): RunProjection {
     enforcement: projectEnforcement(status.enforcement),
     // ALLOW-LIST discipline: `routing` rides only because it is named here.
     ...(status.routing === undefined ? {} : { routing: status.routing }),
+    // M13: the CANDIDATE-COVERAGE report rides SEPARATELY from `routing`, and
+    // the card labels it as coverage rather than as a dispatch record. It says
+    // which observed models a tier-bound work class can reach — a statement
+    // about the ladder and the live catalog, never about what ran.
+    ...(status.routingReachability === undefined ? {} : { routingReachability: status.routingReachability }),
   }
 }
 

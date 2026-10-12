@@ -8,6 +8,57 @@ Host and packaging bounds that outlive a single release are in
 Realigns the plugin with the current goal-autopilot-harness design, where a host
 adapter stays thin and the host-neutral rules live in one reference layer.
 
+### Added (the routing block in the card; 2026-10-12 M13)
+
+- The desktop card now RENDERS the routing status instead of leaving it to the
+  API. Four separately labelled lines: `routing` (mode, effective preference and
+  its source, the policy state, the engine's `dispatch` verdict), `roles` (each
+  role's effective routing and the work class it consults), `dispatched` (the
+  routes THIS RUN's own dispatches settled on), and `candidate coverage` — the
+  reachability report, labelled in the line itself as **not** a dispatch record.
+  `GET /api/autopilot/run` gained the `routingReachability` field the last line
+  needs, served SEPARATELY from `routing` for exactly that reason.
+- The policy triple `{policyState, policyRouteCount, dispatch}` moves as ONE
+  value. The host route has no session to read a policy for, so it always answers
+  `unobserved`; a card that let that fresher answer win would print "cannot
+  observe" over a policy the engine really read. A session-observed state
+  therefore stands, the line says `[read in this session]` where it came from,
+  and the route's word is used only when no session observation exists.
+- A `mode: off` deployment renders NO routing block at all (the engine serves
+  none), and the card adds no "routing off" substitute.
+
+### Added (the executor child's escalation channel; 2026-10-12 M13)
+
+- `autopilot_request_escalation({ text, note })` — the executor child's OWN way
+  to ask for a stronger model. Until this existed the request channel had exactly
+  one door, `autopilot_log`, which is registered into the ROOT agent's scope and
+  whose engine path refuses any caller with a parent session (`AP_NOT_ROOT`): the
+  one agent doing the work could not ask for anything. The child entry is
+  deliberately narrow — accepted only from the run's live, authorized, `running`
+  executor (`AP_ESCALATION_NOT_EXECUTOR` otherwise), with `stance` fixed to
+  `escalate` and `escalationTarget` fixed to `stronger-model`, so a child can
+  neither write arbitrary checkpoints nor request the governance exits that
+  belong to the root. Both doors land at the same single register site, so this
+  is one channel with two entry points, and a request still only widens the
+  candidate pool: the session-policy intersection, tier membership and the
+  independence rules are untouched.
+
+### Fixed (the card folded NOTHING on a real 0.2.0 host; 2026-10-12 M13)
+
+- `readResult` knew only the WRAPPED tool-result envelope
+  (`message.content[0].content[0].text`, `isError` on the wrapper). The current
+  host delivers the FLAT shape (`message.content[0]` is the text block,
+  `isError` on the message), so every result folded to `payload: undefined` and
+  the card rendered as a hollow shell — revision 0, no phase, no gates, no audit
+  verdicts, no routing block — with no error anywhere to notice it. Both shapes
+  are now read (legacy replay included), and both are pinned by unit cases.
+- A routing block older than the card's own revision is now RECONCILED from the
+  host route once, even for a run that has stopped. Measured: the fold reached
+  revision 10 through the closeout result while its routing block came from a
+  status at revision 5, so the card listed one dispatched auditor while two had
+  run. The routing block is compared against its OWN observation, so an answer
+  that is not newer than the card can still correct it — and only it.
+
 ### Added (routing status + the escalation request channel; 2026-10-11 M12)
 
 - The run status now carries a `routing` block answering "is routing live on this
