@@ -167,8 +167,10 @@ export function displayedPhase(data: AutopilotRunChatData, live: LiveRun | undef
  * The fallback is sound by construction, not by heuristic: `AutopilotEngine`
  * binds `runId: root.id` at init, so a run's id IS its root session id. The
  * card renders inside that session's own view and receives `sessionId` from the
- * session-scoped slot kit, so polling it asks about exactly the run rooted
- * here. When this session has no run, the route answers 404 and
+ * session-scoped slot kit. The first run's id is that session id, so the
+ * fallback asks about it. A later run in the same session carries its own
+ * id in the fold, and that id wins. When this session has no run, the route
+ * answers 404 and
  * {@link fetchLiveRun} turns that into `undefined` — silent, no state change,
  * no worse than not polling. That is also what makes the fallback safe in a
  * CHILD session (an executor or auditor child has its own session id and is not

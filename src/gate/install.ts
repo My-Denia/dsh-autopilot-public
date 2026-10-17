@@ -70,7 +70,7 @@ export function installRootGate(
   if (config.stopReminder) {
     disposers.push(agent.ctx.on('agent/turn-stopping', async () => {
       try {
-        const snapshot = engine.peek(agent.id)
+        const snapshot = engine.peekActive(agent.id)
         if (snapshot === undefined) return
         if (snapshot.triage.size !== 'standard') return
         if (snapshot.phase !== 'executing' && snapshot.phase !== 'execution-reviewing') return
@@ -160,7 +160,7 @@ function applyDecision(
   args: unknown,
   config: GateConfig,
 ): string | undefined {
-  const snapshot = engine.peek(rootSessionId)
+  const snapshot = engine.peekActive(rootSessionId)
   const decision = decideTool(snapshot, toolName, args, config)
   switch (decision.kind) {
     case 'allow':

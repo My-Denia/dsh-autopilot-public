@@ -46,8 +46,8 @@ import { join } from 'node:path'
 import { foldRun } from '../domain/fold.js'
 import { AutopilotError } from '../domain/types.js'
 import type { LogEntry, Operation, RunEvent, RunId, Snapshot, StoreKind } from '../domain/types.js'
-import { defaultStoreRoot, runDirFor } from './file.js'
-import type { RunStoreLike } from './types.js'
+import { defaultStoreRoot, readSessionIndex, runDirFor, writeSessionIndex } from './file.js'
+import type { RunStoreLike, SessionRunIndex } from './types.js'
 
 /**
  * Structural subset of a record schema. Upstream this is a zod `ZodType`;
@@ -323,6 +323,14 @@ export class DomainRunStore implements RunStoreLike {
    */
   runDir(runId: RunId): string {
     return runDirFor(this.root, runId)
+  }
+
+  readSessionIndex(sessionId: string): SessionRunIndex | undefined {
+    return readSessionIndex(this.root, sessionId)
+  }
+
+  writeSessionIndex(index: SessionRunIndex): void {
+    writeSessionIndex(this.root, index)
   }
 
   /**

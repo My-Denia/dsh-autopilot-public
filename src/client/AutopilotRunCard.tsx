@@ -96,8 +96,9 @@ function useLiveRun(
   const latest = useRef({ data, live, sessionId })
   latest.current = { data, live, sessionId }
   // The fold's runId when the traffic reported one, else this session's id.
-  // See `pollKey`: a run's id IS its root session id, so the fallback is sound
-  // rather than a guess, and a session with no run simply 404s in silence.
+  // The first run uses the session id. A later run in the same session names
+  // its own id in the fold, and pollKey prefers that. A session with no run
+  // simply 404s in silence.
   const key = pollKey(data, sessionId)
 
   useEffect(() => {

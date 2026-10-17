@@ -610,7 +610,7 @@ describe('the outbound seam, where its fails are observable', () => {
     // the tmp+rename of the projection, so a kill in that window lands there.
     const exploding = new Proxy(h.engine, {
       get(target, property, receiver) {
-        if (property === 'peek') return () => { throw new Error('store exploded') }
+        if (property === 'peek' || property === 'peekActive') return () => { throw new Error('store exploded') }
         return Reflect.get(target, property, receiver) as unknown
       },
     })
@@ -686,7 +686,7 @@ describe('the outbound seam, where its fails are observable', () => {
     let peeks = 0
     const flaky = new Proxy(h.engine, {
       get(target, property, receiver) {
-        if (property === 'peek') {
+        if (property === 'peek' || property === 'peekActive') {
           return () => {
             peeks += 1
             throw new Error('store exploded mid-flight')

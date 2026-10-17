@@ -155,8 +155,8 @@ describe('renderRootPolicy', () => {
       'execution-reviewing': 'never your own reasoning or success claims',
       'replanning': 'OBSERVED, never auto-escalated',
       'closing': 'EVIDENCE PER ACCEPTANCE CRITERION',
-      'completed': 'no further run mutations are legal',
-      'blocked': 'a new run needs a new session',
+      'completed': 'does not inherit this run\'s gates, approvals, executor, or auditors',
+      'blocked': 'the blocked run stays queryable',
       'needs-owner-decision': 'Only a direct human turn can resolve it',
     }
     // `Record<Phase, string>` is the completeness check: a new phase in the type

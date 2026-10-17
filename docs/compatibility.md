@@ -3,17 +3,20 @@
 This page records **measured** host and packaging bounds for
 `dsh-goal-autopilot`. It is not a wish list.
 
-Current release: **0.2.0** (adapts the plugin to `dsh` 0.2.0; prepared
-locally, see [CHANGELOG](../CHANGELOG.md)). Earlier: **0.1.1**, a packaging /
-runtime compatibility fix.
+Source version: **0.2.1-rc.1**, a pre-release. It adapts the plugin to dsh
+`0.2.1-rc.2` and keeps the earlier host ranges. It is **not** npm `latest`.
+The published stable package remains **0.2.0** (the 2026-10-16 registry
+check stands; it is not evidence that 0.2.1-rc.1 has been published).
+Earlier: **0.1.1**, a packaging / runtime compatibility fix.
 
 ## Host matrix
 
 | Host `dsh` | How it was established | Install / mount | Lifecycle |
 | --- | --- | --- | --- |
+| `0.2.1-rc.2` CLI | WSL2, 2026-10-17, isolated `DSH_HOME`, local Anthropic-messages mock on 127.0.0.1, no credentials | **verified:** `dsh plugin add` of the `0.2.1-rc.1` tarball, no version exemption, exit 0. `engines.dsh` is what this host checks first | **verified with the mock:** plugin tools loaded; plan audit; delegated executor; packet rev 1; execution audit needs-fix; resume; packet rev 2; closeout of goal A; `autopilot_init` of goal B in the same session; B completed; A's run stayed `completed` with its own executor; B had no executor and a different objective. Restart with `--session-id` then `autopilot_status` returned B (`…r2`, phase `completed`). **Not verified:** a real model, Desktop, the client bundle (no local dsh checkout, so `lib/client.js` was not rebuilt) |
 | `0.2.0-rc.2` CLI | WSL2, 2026-10-07, isolated `DSH_HOME` + local mock model, no credentials | **verified:** `dsh plugin add` without exemption, mount, 12 `autopilot_*` tools, skill install; web profile serves the client bundle | **verified with a scripted mock model:** plan audit → delegated executor → packet → execution audit needs-fix → resume of the same executor → packet rev 2. **Not verified:** a real model, closeout |
-| `0.2.0-rc.1`, `0.2.0` | in the peer range; host's own compatibility check says compatible | not run | not run |
-| `0.1.7-x`, `0.2.1-x` | **outside** the peer range; dsh refuses the install | — | — |
+| `0.2.0-rc.1`, `0.2.0` | in the declared range; host's own compatibility check says compatible | not re-run for 0.2.1-rc.1 | not re-run |
+| `0.1.7-x`, other `0.2.1` prereleases | **outside** the declared range; dsh refuses the install | — | — |
 | `0.1.5-rc.1` | WSL2 live CLI, 2026-09-13 (0.1.1) | **0.1.1 peer-layout:** compose/mount + skill load + `autopilot_init` | **not verified:** write lifecycle. 0.2.0's code changes were checked against the published 0.1.5 packages, not re-run on a 0.1.5 host |
 | `0.1.2-rc.1` | Original package pin / earlier real-host work | claimed by this snapshot's design notes | earlier host traces in [DESIGN.md §8](../DESIGN.md) (not re-run) |
 | Windows Desktop 0.2.0-rc.2 (app, real account) | **run 2026-10-10**, profile `desktop`, candidate tarball | **verified:** plugin mount; the shipped system-prompt section renders against the LIVE catalog (`m7/desktop-onboarding-section.md` in the run store); the routing config on the profile patch is what the host mounts, and the session's own run stayed visible (`enforcement.store=file`) after a restart | **partially verified:** run persistence across a host restart (needs the packaged `storeKind: file` pin repeated in the profile patch — see below); the composed-config dump is a HEADLESS artifact (the managed `desktop` profile refuses `--dump-config`), so the desktop side is backed by the on-disk patch plus the restarted session's own run state; **not verified:** full write lifecycle / closeout on Desktop, macOS |

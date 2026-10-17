@@ -264,7 +264,14 @@ async function mountRuntime(options: { subagents?: boolean } = {}): Promise<Moun
   }
   await raw.plugin(SystemPromptPlugin, {})
   await raw.plugin(ToolRuntime)
-  if (options.subagents === true) await raw.plugin(SubagentRuntime)
+  if (options.subagents === true) {
+    // dsh 0.2.1-rc.2's SubagentRuntime injects `workingDirectory` and stays
+    // inactive without it, which leaves `ctx.subagents` unset.
+    raw.provide('workingDirectory', {
+      async ensure() { return '/tmp' },
+    })
+    await raw.plugin(SubagentRuntime)
+  }
   return {
     ctx,
     plugin: (plugin, config) => raw.plugin(plugin, config),
@@ -577,29 +584,24 @@ describe('§2 the engine\'s tool filters against a real registry', () => {
   })
 
   it('the AUDITOR filter — captured from a real SubagentRuntime dispatch — is restrictable', async () => {
-    // The filter is not transcribed here: it is read back off the request the
-    // engine handed to the real `ctx.subagents`, so a change to
-    // AUDITOR_TOOL_ALLOW travels into this assertion by itself.
+    // The filter is not transcribed here. On 0.2.1-rc.2 the engine arms it
+    // for `startActivation` and the mount listener applies it; this test
+    // reads that armed list back, so a change to AUDITOR_TOOL_ALLOW travels
+    // into the assertion by itself. Restrictability is still checked on a
+    // real tool registry.
     const mounted = await mountRuntime({ subagents: true })
-    const captured: Array<Record<string, unknown>> = []
+    const captured: string[][] = []
     const root = structuralAgent('boundary-root')
     const agents = new Map<string, AgentRef>([[root.id, root]])
-    mounted.ctx.subagents.registerProvider({
-      name: 'spawn',
-      capabilities: { outputSchema: true, depthLimit: true, toolFilter: true, persona: true },
-      start: (async (request: Record<string, unknown>) => {
-        captured.push(request)
-        const child = structuralAgent('boundary-auditor', root.id)
-        return {
-          id: child.id,
-          localAgent: child,
-          result: Promise.resolve({ output: [], stopReason: 'completed', structured: { verdict: 'pass', note: 'ok' } }),
-          dispose: async () => {},
-        }
-      }) as never,
-    } as never)
-
     const engine = makeEngine(mounted.ctx.subagents, agents)
+    mounted.ctx.subagents.startActivation = (async (spec: { request: { parent: { id: string } } }) => {
+      engine.restrictArmedChild(spec.request.parent.id, allow => { captured.push([...allow]) })
+      return {
+        childId: 'boundary-auditor',
+        result: Promise.resolve({ stopReason: 'completed', structured: { verdict: 'pass', note: 'ok' } }),
+        async dispose() {},
+      }
+    }) as typeof mounted.ctx.subagents.startActivation
     await engine.init(root, { ...BASE_TRIAGE, risk: 'medium', size: 'standard', auditMode: 'independent', inlineReason: 'fixture: the filter capture runs inline' },
       [{ id: 'm1', usageClass: 'undeclared', boundaryStates: [], artifacts: [], attempted: [] }])
     await engine.submitPlan(root, 'plan')
@@ -607,13 +609,11 @@ describe('§2 the engine\'s tool filters against a real registry', () => {
     const outcome = await engine.audit(root, { role: 'plan', prompt: 'audit packet' })
     expect(outcome.verdict).toBe('pass')
 
-    const request = captured[0]
-    expect(request).toBeDefined()
-    const filter = request?.['toolFilter'] as { allow: readonly string[] } | undefined
-    expect(filter?.allow).toEqual([...AUDITOR_TOOL_ALLOW])
+    const allow = captured[0]
+    expect(allow).toEqual([...AUDITOR_TOOL_ALLOW])
 
     const bed = await childBed()
-    expect(() => { compose(bed, filter as { allow: readonly string[] }) }).not.toThrow()
+    expect(() => { compose(bed, { allow: allow! }) }).not.toThrow()
     expect(visibleToChild(bed)).toEqual([...AUDITOR_TOOL_ALLOW].sort())
   })
 
@@ -684,10 +684,12 @@ describe('§2 the engine\'s tool filters against a real registry', () => {
 
   it('a provider without the toolFilter capability refuses the audit dispatch outright', async () => {
     // A DEPLOYMENT ceiling rather than a code defect, pinned so it cannot be
-    // rediscovered on a host: the engine's audit request names outputSchema,
-    // depthLimit and toolFilter, and `SubagentRuntime.assertCapabilities`
-    // rejects the whole start when the configured provider advertises none of
-    // them (`NO_START_CAPABILITIES` — every out-of-process backend).
+    // rediscovered on a host. On 0.2.1-rc.2 the audit goes through
+    // `startActivation`, which still names `outputSchema` and `maxDepth`.
+    // `toolFilter` is no longer a start argument (the plugin applies it on
+    // `agent/created`). `assertCapabilities` rejects the whole start when the
+    // provider advertises none of those capabilities
+    // (`NO_START_CAPABILITIES` — every out-of-process backend).
     const mounted = await mountRuntime({ subagents: true })
     let started = 0
     mounted.ctx.subagents.registerProvider({
@@ -695,13 +697,17 @@ describe('§2 the engine\'s tool filters against a real registry', () => {
       capabilities: NO_START_CAPABILITIES,
       start: (async () => { started += 1; throw new Error('unreachable') }) as never,
     } as never)
-    await expect(mounted.ctx.subagents.start('out-of-process', {
-      prompt: [{ type: 'text', text: 'packet' }],
-      parent: structuralAgent('boundary-root') as never,
+    await expect(mounted.ctx.subagents.startActivation({
+      provider: 'out-of-process',
+      label: 'auditor',
+      request: {
+        prompt: [{ type: 'text', text: 'packet' }],
+        parent: structuralAgent('boundary-root') as never,
+        outputSchema: { type: 'object', properties: {} },
+        maxDepth: 1,
+      },
       signal: new AbortController().signal,
-      outputSchema: { type: 'object', properties: {} },
-      maxDepth: 1,
-      toolFilter: { allow: [...AUDITOR_TOOL_ALLOW] },
+      delivery: 'caller',
     } as never)).rejects.toThrowError(/does not support the "outputSchema" capability/)
     expect(started).toBe(0)
   })

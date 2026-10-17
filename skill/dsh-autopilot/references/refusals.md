@@ -219,21 +219,22 @@ Codes: `AP_STORE_CORRUPT`, `AP_STORE_KEY`.
 
 ## 12. Run lifecycle and initialization
 
-One session carries one run, and a finished run does not recycle.
+One session has one active run. A finished run stays in the store under its own id. The next `init` starts a new run in the same session and does not copy gates, approvals, the executor, or auditors.
 
 Requires:
 
-- `init` only when the session has no run, or its run is terminal (`completed`/`blocked`): a non-terminal run refuses as active, a terminal run refuses as exhausted.
-- Every engine op requires an initialized run.
+- `init` only when the session has no run, or its current run is terminal (`completed`/`blocked`). A non-terminal run refuses as active.
+- Every engine op requires an initialized run, and it addresses the session's current run.
 - The engine is not disposed.
 - `validateTriage` passes at init: a non-empty objective, at least one acceptance criterion, `self-check` only for `lightweight` plus `low`, no self-review at medium risk or above, `lightweight` always `inline`, and `ownerRequirements` entries, when present, non-blank (`AP_TRIAGE_INVALID`).
 - An `inline` run at medium risk or above records `inlineReason` at init — a reason, not an approval; the refusal is for the missing record, not the choice (`AP_INLINE_REASON_REQUIRED`).
+- A child start finds a subagent surface the engine can call (`start` or `startActivation`, and the matching drain). On the activation surface the armed tool allow-list is applied before the child prompt (`AP_TOOL_ALLOW_UNAPPLIED` when it is not).
 
-Why: the one-run-per-session rule is what keeps `runId` a stable identity and the stream the single writer's record.
+Why: the active run is the only one a new approval or dispatch may touch. Keeping the finished run is what makes its history readable after the session moves on.
 
-Remedy: finish or abandon the active run and start a new session for a new run; call `autopilot_init` first; fix the named triage combination.
+Remedy: finish or abandon the active run before `autopilot_init` for the next goal; call `autopilot_init` first; fix the named triage combination. A missing subagent method is a host mismatch, not a retry.
 
-Codes: `AP_ALREADY_ACTIVE`, `AP_RUN_EXHAUSTED`, `AP_NOT_INITIALIZED`, `AP_DISPOSED`, `AP_TRIAGE_INVALID`, `AP_INLINE_REASON_REQUIRED`.
+Codes: `AP_ALREADY_ACTIVE`, `AP_NOT_INITIALIZED`, `AP_DISPOSED`, `AP_TRIAGE_INVALID`, `AP_INLINE_REASON_REQUIRED`, `AP_SUBAGENT_SURFACE`, `AP_TOOL_ALLOW_UNAPPLIED`.
 
 Carryover (governance pragmatics v1): a run may declare at init that it continues a COMPLETED predecessor's authorized work.
 
@@ -426,7 +427,8 @@ Every `AP_*` code that appears under `src/**`, its contract, and the one-line pr
 | `AP_ROUTING_PINS` | 10 | `routingPins` equal `applyRoutingDecision(prior.routingPins, detail.routing)` on a dispatch op |
 | `AP_ROUTING_PINS_MUTATED` | 10 | `routingPins` change only via `audit` or `start-executor` `detail.routing` |
 | `AP_ROUTING_RECORD_MISMATCH` | 10 | `detail.routing` agrees with the audit or executor record the same commit appends |
-| `AP_RUN_EXHAUSTED` | 12 | `init` requires a session that does not already carry a finished run |
+| `AP_SUBAGENT_SURFACE` | 12 | child start and drain use the host methods that actually exist (`start`/`startContinuable`/`drainContinuableChildren`, or `startActivation`/`drainChildren`) |
+| `AP_TOOL_ALLOW_UNAPPLIED` | 12 | on the activation surface, the armed tool allow-list is applied to the child before its prompt |
 | `AP_RUN_ID` | 1 | `runId` is stable across the stream |
 | `AP_STALE_AUDIT` | 6 | the audit baseline (run and plan revision; `executionRevision` for execution-class) is unchanged since dispatch |
 | `AP_STALE_EVIDENCE` | 4 | `submit-plan` leaves no `executionPacket` and resets `executionGate` to `pending` |

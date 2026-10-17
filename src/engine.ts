@@ -147,9 +147,33 @@ export interface SubagentRunRef {
   dispose(): Promise<void>
 }
 
-/** Structural subset of ctx.subagents. */
+/**
+ * One managed child on dsh 0.2.1 (`SubagentRuntime.startActivation`).
+ * `result` settles when the activation does. Disposal addresses this activation.
+ */
+export interface SubagentActivationRef {
+  readonly childId: string
+  readonly result: Promise<{
+    readonly stopReason: string
+    readonly structured?: unknown
+    readonly diagnostic?: string
+  }>
+  dispose(): Promise<void>
+}
+
+/**
+ * Structural subset of ctx.subagents.
+ *
+ * Two host generations share this mirror. dsh 0.2.0 and the 0.1.x lines expose
+ * `start` / `startContinuable` / `drainContinuableChildren`, and those calls
+ * carry `toolFilter`. dsh 0.2.1-rc.2 replaced that trio with `startActivation`
+ * / `drainChildren`. `startActivation` does not accept a tool filter; the
+ * plugin applies the allow-list itself on `agent/created`. `sendMessage` and
+ * `interrupt` kept their shapes across both. A host is used through whichever
+ * pair it actually has, never by pretending the missing methods exist.
+ */
 export interface SubagentsRef {
-  start(provider: string, request: {
+  start?(provider: string, request: {
     prompt: Array<{ type: 'text'; text: string }>
     parent: unknown
     outputSchema: object
@@ -158,7 +182,7 @@ export interface SubagentsRef {
     signal: AbortSignal
     agentOptions?: AgentOptionsLike
   }): Promise<SubagentRunRef>
-  startContinuable(spec: {
+  startContinuable?(spec: {
     childId: string
     provider: string
     label: string
@@ -171,19 +195,34 @@ export interface SubagentsRef {
     }
     signal: AbortSignal
   }): Promise<unknown>
+  startActivation?(spec: {
+    provider: string
+    label: string
+    childId?: string
+    request: {
+      prompt: Array<{ type: 'text'; text: string }>
+      parent: unknown
+      outputSchema?: object
+      maxDepth?: number
+      agentOptions?: AgentOptionsLike
+    }
+    signal: AbortSignal
+    delivery: 'parent' | 'caller'
+  }): Promise<SubagentActivationRef>
   /**
    * Deliver one message to a direct continuable child (`SubagentManager.sendMessage`).
    * The host derives sender attribution from the exact live `sender`. This is
    * the resume transport: the manager has had no `followup` since at least
    * dsh 0.1.2-rc.1 (checked against the published 0.1.2-rc.1, 0.1.5-rc.1,
    * 0.1.7-rc.2 and 0.2.0-rc.2 packages), so the earlier call threw
-   * `followup is not a function` on every real host.
+   * `followup is not a function` on every real host. 0.2.1-rc.2 still has it.
    */
   sendMessage(sender: unknown, targetId: string, content: Array<{ type: 'text'; text: string }>, options: {
     signal: AbortSignal
   }): Promise<unknown>
   interrupt(childId: string, authority: { kind: 'ancestor'; agent: unknown }): void
-  drainContinuableChildren(parent: unknown, childIds: readonly string[]): Promise<unknown>
+  drainContinuableChildren?(parent: unknown, childIds: readonly string[]): Promise<unknown>
+  drainChildren?(parent: unknown, childIds: readonly string[]): Promise<unknown>
 }
 
 /** Explicit LLM route for a dispatched child; omitted fields inherit the deployment default. */
@@ -1269,6 +1308,11 @@ export function auditStatusRecords(snapshot: Snapshot): Partial<Record<AuditRole
 
 export interface StatusView {
   readonly runId: RunId
+  /**
+   * Every run this session has started, oldest first. Present only once a
+   * second run exists, so a single-run status stays the shape it had before.
+   */
+  readonly sessionRunIds?: readonly string[]
   readonly revision: number
   readonly phase: Snapshot['phase']
   readonly planGate: Snapshot['planGate']
@@ -1741,16 +1785,11 @@ export class AutopilotEngine {
       )
     }
     return this.transact(root.id, async () => {
-      const prior = this.current(root.id)
+      const prior = this.current(this.activeRunId(root.id))
       if (prior !== undefined && !TERMINAL_PHASES.includes(prior.phase)) {
         throw new AutopilotError('an autopilot run is already active on this session', 'AP_ALREADY_ACTIVE')
       }
-      if (prior !== undefined) {
-        throw new AutopilotError(
-          'this session already carries a finished run; start a new session for a new run',
-          'AP_RUN_EXHAUSTED',
-        )
-      }
+      const runId = prior === undefined ? root.id : this.successorRunId(root.id)
 
       // CARRYOVER (governance pragmatics v1): the write path settles the
       // filesystem question once, here — the predecessor must exist and have
@@ -1773,7 +1812,8 @@ export class AutopilotEngine {
       }
       const enforcement = this.applyInitEnforcement(root, triage)
       const snapshot: Snapshot = {
-        runId: root.id,
+        runId,
+        ...(runId === root.id ? {} : { sessionId: root.id }),
         revision: 1,
         triage,
         plan: { revision: 0, text: '' },
@@ -1788,19 +1828,33 @@ export class AutopilotEngine {
         bearerBase: resolveBearerBase(root.session.header.cwd),
         enforcement,
       }
-      return await this.commit(undefined, 'init', snapshot)
+      const committed = await this.commit(undefined, 'init', snapshot)
+      if (prior !== undefined) {
+        const existing = this.store.readSessionIndex(root.id)
+        const runIds = existing?.runIds ?? [prior.runId]
+        this.store.writeSessionIndex({
+          v: 1,
+          sessionId: root.id,
+          currentRunId: runId,
+          runIds: runIds.includes(runId) ? runIds : [...runIds, runId],
+        })
+      }
+      return committed
     })
   }
 
   status(caller: AgentRef): StatusView | undefined {
     const root = this.resolveRoot(caller)
-    const snapshot = this.current(root.id)
+    const snapshot = this.current(this.activeRunId(root.id))
     if (snapshot === undefined) return undefined
     // M12: the policy state is read for the CALLER's session — the same reader
     // the dispatch sites use, so the status cannot disagree with a dispatch
     // about whether selection is possible. A reader with no live session (the
     // HTTP/service path) passes nothing and gets `unobserved`.
-    return this.projectStatus(snapshot, this.readPolicy(root))
+    const view = this.projectStatus(snapshot, this.readPolicy(root))
+    const index = this.store.readSessionIndex(root.id)
+    if (index === undefined || index.runIds.length < 2) return view
+    return { ...view, sessionRunIds: index.runIds }
   }
 
   /**
@@ -1853,7 +1907,7 @@ export class AutopilotEngine {
     const root = this.resolveRoot(caller)
     if (text.trim().length === 0) throw new AutopilotError('plan text is empty', 'AP_INVALID_ARGUMENT')
     return this.transact(root.id, async () => {
-      const prior = this.require(root.id)
+      const prior = this.require(this.activeRunId(root.id))
       if (prior.phase !== 'planning' && prior.phase !== 'replanning') {
         throw new AutopilotError(`cannot submit plan in phase ${prior.phase}`, 'AP_WRONG_PHASE')
       }
@@ -1900,7 +1954,7 @@ export class AutopilotEngine {
       throw new AutopilotError('amendment note is empty — an amendment must say what changed and why', 'AP_INVALID_ARGUMENT')
     }
     return this.transact(root.id, async () => {
-      const prior = this.require(root.id)
+      const prior = this.require(this.activeRunId(root.id))
       if (prior.phase !== 'executing' && prior.phase !== 'execution-reviewing') {
         throw new AutopilotError(
           `amend-plan requires phase executing|execution-reviewing, got ${prior.phase}`,
@@ -1924,7 +1978,7 @@ export class AutopilotEngine {
   async audit(caller: AgentRef, request: { role: AuditRole; prompt: string; provider?: string }): Promise<AuditOutcome> {
     const root = this.resolveRoot(caller)
     return this.transact(root.id, async () => {
-      const prior = this.require(root.id)
+      const prior = this.require(this.activeRunId(root.id))
       if (prior.triage.auditMode !== 'independent') {
         throw new AutopilotError(`audit dispatch requires auditMode independent (run is ${prior.triage.auditMode}); use autopilot_self_check`, 'AP_WRONG_AUDIT_MODE')
       }
@@ -2052,15 +2106,7 @@ export class AutopilotEngine {
       try {
         const dispatched = await this.dispatchWithToolAllow(
           { requested: AUDITOR_TOOL_ALLOW, required: AUDITOR_TOOL_REQUIRED, label: `${request.role} auditor` },
-          allow => this.subagents.start(provider, {
-            prompt: [{ type: 'text', text: request.prompt }],
-            parent: root,
-            outputSchema: schema,
-            maxDepth: 1,
-            toolFilter: { allow },
-            signal: this.lifecycle.signal,
-            ...(agentOptions === undefined ? {} : { agentOptions }),
-          }),
+          allow => this.startOneShot(root, provider, request.prompt, schema, agentOptions, allow, `${request.role} auditor`),
         )
         run = dispatched.value
         toolDiagnostic = dispatched.resolution.diagnostic
@@ -2104,7 +2150,7 @@ export class AutopilotEngine {
           // Staleness CAS: reject a verdict whose baseline moved. Execution-class
           // audits additionally CAS on the executor's execution revision so a
           // verdict about revision N can never gate revision N+1.
-          const live = this.require(root.id)
+          const live = this.require(this.activeRunId(root.id))
           if (live.revision !== captured.runRevision || live.plan.revision !== captured.planRevision) {
             throw new AutopilotError('stale audit result: run/plan revision advanced since the audit started', 'AP_STALE_AUDIT')
           }
@@ -2156,7 +2202,7 @@ export class AutopilotEngine {
             && (error.code === 'AP_AUDIT_NO_VERDICT'
               || error.code === 'AP_AUDIT_INVALID_VERDICT'
               || error.code === 'AP_AUDIT_FINDINGS_INVALID')) {
-            const live = this.current(root.id)
+            const live = this.current(this.activeRunId(root.id))
             if (live !== undefined
               && live.revision === captured.runRevision
               && live.plan.revision === captured.planRevision) {
@@ -2185,7 +2231,7 @@ export class AutopilotEngine {
   async selfCheck(caller: AgentRef, request: { role: AuditRole; verdict: Verdict; note: string }): Promise<AuditOutcome> {
     const root = this.resolveRoot(caller)
     return this.transact(root.id, async () => {
-      const prior = this.require(root.id)
+      const prior = this.require(this.activeRunId(root.id))
       if (prior.triage.auditMode !== 'self-check') {
         throw new AutopilotError('self-check verdicts are only legal on auditMode self-check runs', 'AP_WRONG_AUDIT_MODE')
       }
@@ -2237,7 +2283,7 @@ export class AutopilotEngine {
   }): Promise<AuditOutcome> {
     const root = this.resolveRoot(caller)
     return this.transact(root.id, async () => {
-      const prior = this.require(root.id)
+      const prior = this.require(this.activeRunId(root.id))
       if (prior.triage.auditMode !== 'external') {
         throw new AutopilotError(
           `external countersigns are only legal on auditMode external runs (run is ${prior.triage.auditMode})`,
@@ -2302,7 +2348,7 @@ export class AutopilotEngine {
     const root = this.resolveRoot(caller)
     const childId = randomUUID()
     return this.transact(root.id, async () => {
-      const prior = this.require(root.id)
+      const prior = this.require(this.activeRunId(root.id))
       if (prior.triage.executionMode !== 'delegated') {
         throw new AutopilotError('executor children are only legal on delegated runs; inline runs implement directly', 'AP_WRONG_EXECUTION_MODE')
       }
@@ -2422,19 +2468,16 @@ export class AutopilotEngine {
           // ask for. The family rule below still refuses to hand back a child
           // that lost an entire capability class the config DID ask for.
           { requested: this.config.executor.toolAllowList, required: [], label: 'executor child' },
-          allow => this.subagents.startContinuable({
-            childId,
+          allow => this.startContinuableChild(
+            root,
             provider,
-            label: 'autopilot-executor',
-            request: {
-              prompt: [{ type: 'text', text: `${request.prompt}\n\n${dispatchRoutingLine(routingDetail?.pin)}\n\n${packetRevisionHint(executor.executionRevision)}` }],
-              parent: root,
-              persona: request.persona ?? this.config.executor.persona,
-              toolFilter: { allow },
-              ...(agentOptions === undefined ? {} : { agentOptions }),
-            },
-            signal: request.signal,
-          }),
+            childId,
+            `${request.prompt}\n\n${dispatchRoutingLine(routingDetail?.pin)}\n\n${packetRevisionHint(executor.executionRevision)}`,
+            request.persona ?? this.config.executor.persona,
+            agentOptions,
+            allow,
+            request.signal,
+          ),
         )
         // A continuable child's first turn starts only AFTER `startContinuable`
         // resolves (upstream: the promise settles at inbox acceptance), so on a
@@ -2480,7 +2523,7 @@ export class AutopilotEngine {
   async resumeExecutor(caller: AgentRef, request: { findings: string; nextPrompt: string; signal: AbortSignal }): Promise<Snapshot> {
     const root = this.resolveRoot(caller)
     return this.transact(root.id, async () => {
-      const prior = this.require(root.id)
+      const prior = this.require(this.activeRunId(root.id))
       if (prior.executor === undefined) throw new AutopilotError('no executor to resume', 'AP_NO_EXECUTOR')
       if (prior.executor.state !== 'running') {
         throw new AutopilotError(`executor is ${prior.executor.state}, cannot resume`, 'AP_EXECUTOR_NOT_RUNNING')
@@ -2530,7 +2573,7 @@ export class AutopilotEngine {
   }): Promise<Snapshot> {
     const root = this.resolveChildRoot(child)
     return this.transact(root.id, async () => {
-      const prior = this.require(root.id)
+      const prior = this.require(this.activeRunId(root.id))
       if (prior.executor === undefined) throw new AutopilotError('no executor authorized', 'AP_NO_EXECUTOR')
       if (prior.executor.childId !== child.id) {
         throw new AutopilotError(`child ${child.id} is not the authorized executor`, 'AP_EXECUTOR_MISMATCH')
@@ -2586,7 +2629,7 @@ export class AutopilotEngine {
   async submitExecutionEvidence(caller: AgentRef, request: { report: string; residualRisks: readonly string[] }): Promise<Snapshot> {
     const root = this.resolveRoot(caller)
     return this.transact(root.id, async () => {
-      const prior = this.require(root.id)
+      const prior = this.require(this.activeRunId(root.id))
       if (prior.triage.executionMode !== 'inline') {
         throw new AutopilotError('inline evidence submission is illegal on delegated runs; the executor child submits the packet', 'AP_WRONG_EXECUTION_MODE')
       }
@@ -2653,7 +2696,7 @@ export class AutopilotEngine {
    */
   async requestEscalation(caller: AgentRef, request: { text: string; note: string }): Promise<Snapshot> {
     const root = this.resolveChildRoot(caller)
-    const prior = this.require(root.id)
+    const prior = this.require(this.activeRunId(root.id))
     if (prior.executor === undefined || prior.executor.childId !== caller.id) {
       throw new AutopilotError(
         `Agent ${caller.id} is not the authorized executor of run ${root.id}; only the executor child may request an escalation`,
@@ -2703,7 +2746,7 @@ export class AutopilotEngine {
       throw new AutopilotError('escalate checkpoints require a note (CC checkpoint contract)', 'AP_INVALID_ARGUMENT')
     }
     return this.transact(root.id, async () => {
-      const prior = this.require(root.id)
+      const prior = this.require(this.activeRunId(root.id))
       // Stance coupling, the converse of the rule above. `escalate` REQUIRES a
       // note; every other stance must not carry escalation fields at all.
       // Measured on the real host 2026-08-25: the driving model filled every
@@ -2783,7 +2826,7 @@ export class AutopilotEngine {
   async replan(caller: AgentRef, note: string): Promise<Snapshot> {
     const root = this.resolveRoot(caller)
     return this.transact(root.id, async () => {
-      const prior = this.require(root.id)
+      const prior = this.require(this.activeRunId(root.id))
       if (TERMINAL_PHASES.includes(prior.phase) || prior.phase === 'needs-owner-decision') {
         throw new AutopilotError(`cannot replan in phase ${prior.phase}`, 'AP_WRONG_PHASE')
       }
@@ -2805,7 +2848,7 @@ export class AutopilotEngine {
   async setBlocked(caller: AgentRef, reason: string): Promise<Snapshot> {
     const root = this.resolveRoot(caller)
     return this.transact(root.id, async () => {
-      const prior = this.require(root.id)
+      const prior = this.require(this.activeRunId(root.id))
       return await this.commit(prior, 'set-blocked', {
         ...prior,
         revision: prior.revision + 1,
@@ -2818,7 +2861,7 @@ export class AutopilotEngine {
   async setOwnerDecision(caller: AgentRef, reason: string): Promise<Snapshot> {
     const root = this.resolveRoot(caller)
     return this.transact(root.id, async () => {
-      const prior = this.require(root.id)
+      const prior = this.require(this.activeRunId(root.id))
       return await this.commit(prior, 'set-owner-decision', {
         ...prior,
         revision: prior.revision + 1,
@@ -2837,7 +2880,7 @@ export class AutopilotEngine {
     const root = this.resolveRoot(caller)
     if (target.trim().length === 0) throw new AutopilotError('approval target is empty', 'AP_INVALID_ARGUMENT')
     return this.transact(root.id, async () => {
-      const prior = this.require(root.id)
+      const prior = this.require(this.activeRunId(root.id))
       const approval: OwnerApproval = {
         seq: prior.enforcement.ownerApprovals.length,
         target,
@@ -2875,7 +2918,7 @@ export class AutopilotEngine {
   async ownerGatePass(caller: AgentRef, request: { gate: GateName; note: string }): Promise<Snapshot> {
     const root = this.resolveRoot(caller)
     return this.transact(root.id, async () => {
-      const prior = this.require(root.id)
+      const prior = this.require(this.activeRunId(root.id))
       if (TERMINAL_PHASES.includes(prior.phase) || prior.phase === 'needs-owner-decision') {
         throw new AutopilotError(`owner-gate-pass requires a live run, got phase ${prior.phase}`, 'AP_WRONG_PHASE')
       }
@@ -2948,7 +2991,7 @@ export class AutopilotEngine {
   async ownerGateWithdraw(caller: AgentRef, request: { gate: GateName; note: string }): Promise<Snapshot> {
     const root = this.resolveRoot(caller)
     return this.transact(root.id, async () => {
-      const prior = this.require(root.id)
+      const prior = this.require(this.activeRunId(root.id))
       if (TERMINAL_PHASES.includes(prior.phase) || prior.phase === 'needs-owner-decision') {
         throw new AutopilotError(`owner-gate-withdraw requires a live run, got phase ${prior.phase}`, 'AP_WRONG_PHASE')
       }
@@ -3010,7 +3053,7 @@ export class AutopilotEngine {
   async ownerResolve(caller: AgentRef, request: { decision: 'resume-planning' | 'resume-execution' | 'block'; note: string }): Promise<Snapshot> {
     const root = this.resolveRoot(caller)
     return this.transact(root.id, async () => {
-      const prior = this.require(root.id)
+      const prior = this.require(this.activeRunId(root.id))
       if (prior.phase !== 'needs-owner-decision') {
         throw new AutopilotError(`ownerResolve requires phase needs-owner-decision, got ${prior.phase}`, 'AP_WRONG_PHASE')
       }
@@ -3071,7 +3114,7 @@ export class AutopilotEngine {
       throw new AutopilotError(`usage declaration rejected: ${problems.join('; ')}`, 'AP_USAGE_INVALID')
     }
     return this.transact(root.id, async () => {
-      const prior = this.require(root.id)
+      const prior = this.require(this.activeRunId(root.id))
       const existing = prior.usage?.entries ?? []
       const replaced = existing.some(item => item.id === entry.id)
       const entries = replaced
@@ -3089,7 +3132,7 @@ export class AutopilotEngine {
   async submitCloseout(caller: AgentRef, closeout: Closeout): Promise<Snapshot> {
     const root = this.resolveRoot(caller)
     return this.transact(root.id, async () => {
-      const prior = this.require(root.id)
+      const prior = this.require(this.activeRunId(root.id))
       if (prior.phase !== 'closing') {
         throw new AutopilotError(`closeout requires phase closing, got ${prior.phase}`, 'AP_WRONG_PHASE')
       }
@@ -3173,9 +3216,21 @@ export class AutopilotEngine {
 
   // ── Read surfaces for gate/policy/tools (no root-authority requirement) ──
 
-  /** Peek the run rooted at one session id (undefined when none). */
-  peek(rootSessionId: string): Snapshot | undefined {
-    return this.current(rootSessionId)
+  /**
+   * Peek one run by its own id. A historical run stays readable after the
+   * session has moved on; this does not follow the session's current pointer.
+   */
+  peek(runId: string): Snapshot | undefined {
+    return this.current(runId)
+  }
+
+  /**
+   * The run the session is on now. The first run's id is the session id, so
+   * a store with no index answers that run. After a successor starts, this
+   * follows the index rather than the finished first run.
+   */
+  peekActive(sessionId: string): Snapshot | undefined {
+    return this.current(this.activeRunId(sessionId))
   }
 
   /**
@@ -3233,7 +3288,7 @@ export class AutopilotEngine {
 
   executorStatus(caller: AgentRef): { generation: number; executionRevision: number } | undefined {
     const root = this.resolveRoot(caller)
-    const snapshot = this.current(root.id)
+    const snapshot = this.current(this.activeRunId(root.id))
     if (snapshot?.executor === undefined) return undefined
     return { generation: snapshot.executor.generation, executionRevision: snapshot.executor.executionRevision }
   }
@@ -3260,7 +3315,7 @@ export class AutopilotEngine {
    */
   async consumeApproval(rootSessionId: string, command: string): Promise<number | undefined> {
     return this.transact(rootSessionId, async () => {
-      const prior = this.current(rootSessionId)
+      const prior = this.current(this.activeRunId(rootSessionId))
       if (prior === undefined) return undefined
       const open = prior.enforcement.ownerApprovals.find(entry =>
         entry.consumedBy === undefined && approvalAuthorizes(entry.target, command))
@@ -3294,7 +3349,7 @@ export class AutopilotEngine {
     readonly recovery?: string
   }): Promise<number | undefined> {
     return this.transact(rootSessionId, async () => {
-      const prior = this.current(rootSessionId)
+      const prior = this.current(this.activeRunId(rootSessionId))
       if (prior === undefined) return undefined
       const entry: EgressDecision = {
         seq: prior.enforcement.egressDecisions?.length ?? 0,
@@ -3336,7 +3391,7 @@ export class AutopilotEngine {
     readonly target: string
   }): Promise<number | undefined> {
     return this.transact(rootSessionId, async () => {
-      const prior = this.current(rootSessionId)
+      const prior = this.current(this.activeRunId(rootSessionId))
       if (prior === undefined) return undefined
       const consumed = (prior.enforcement.outboundConsumed ?? 0) + 1
       const next = await this.commit(prior, 'consume-manifest', {
@@ -3351,7 +3406,7 @@ export class AutopilotEngine {
   /** Bump the turn-stop reminder counter; returns the new count, or undefined when the budget is spent. */
   async bumpReminder(rootSessionId: string): Promise<number | undefined> {
     return this.transact(rootSessionId, async () => {
-      const prior = this.current(rootSessionId)
+      const prior = this.current(this.activeRunId(rootSessionId))
       if (prior === undefined) return undefined
       if (prior.enforcement.reminders >= MAX_STOP_REMINDERS) return undefined
       const next = await this.commit(prior, 'reminder', {
@@ -3364,6 +3419,204 @@ export class AutopilotEngine {
   }
 
   // ── Internals ─────────────────────────────────────────────────────────────
+
+  /** The run id the session is working on. No index means the first run, whose id is the session id. */
+  private activeRunId(sessionId: string): RunId {
+    const index = this.store.readSessionIndex(sessionId)
+    return index === undefined ? sessionId : index.currentRunId
+  }
+
+  /**
+   * Id for the next run in a session that already finished one.
+   * `.r2`, `.r3`, … stay inside the store's filename alphabet, so the path
+   * sanitizer does not merge two runs into one directory.
+   */
+  private successorRunId(sessionId: string): RunId {
+    const count = this.store.readSessionIndex(sessionId)?.runIds.length ?? 1
+    return `${sessionId}.r${count + 1}`
+  }
+
+  /** The live root agent for a run. A successor run's id is not an agent id. */
+  private sessionAgent(snapshot: Snapshot): AgentRef | undefined {
+    return this.agents.get(snapshot.sessionId ?? snapshot.runId)
+  }
+
+  private usesActivationApi(): boolean {
+    return typeof this.subagents.startActivation === 'function'
+  }
+
+  /**
+   * Allow-list waiting for the child `agent/created` listener. dsh 0.2.1's
+   * `startActivation` does not take `toolFilter`, so the listener applies it
+   * before the child's first prompt. Absent on the 0.2.0 surface, which still
+   * passes the filter into `start` / `startContinuable`.
+   */
+  private readonly armedAllows = new Map<string, {
+    allow: readonly string[]
+    required: readonly string[]
+    label: string
+    applied: boolean
+  }>()
+
+  /**
+   * Apply the allow-list armed for this parent, if one is armed and not yet
+   * applied. The mount listener calls this from `agent/created`. A second
+   * call is a no-op so a remount sweep does not restrict twice.
+   */
+  restrictArmedChild(parentId: string, restrict: (allow: readonly string[]) => void): void {
+    const armed = this.armedAllows.get(parentId)
+    if (armed === undefined || armed.applied) return
+    try {
+      restrict(armed.allow)
+    } catch (error) {
+      // One child id is reserved for the whole start. A restrict rejection
+      // must be repaired here: dispatchWithToolAllow's second attempt would
+      // reuse that id and the host answers "already exists".
+      const parsed = parseRestrictRejection(errorMessage(error))
+      if (parsed === undefined) throw error
+      this.learnedToolNames = parsed.known
+      const repaired = resolveToolAllow(armed.allow, parsed.known, armed.required, armed.label)
+      restrict(repaired.allow)
+      armed.allow = repaired.allow
+    }
+    armed.applied = true
+  }
+
+  private armChildAllow(parentId: string, allow: readonly string[], required: readonly string[], label: string): void {
+    this.armedAllows.set(parentId, { allow, required, label, applied: false })
+  }
+
+  private disarmChildAllow(parentId: string): void {
+    this.armedAllows.delete(parentId)
+  }
+
+  private assertChildAllowApplied(parentId: string): void {
+    const armed = this.armedAllows.get(parentId)
+    if (armed !== undefined && !armed.applied) {
+      throw new AutopilotError(
+        'the host started a child without applying the autopilot tool allow-list',
+        'AP_TOOL_ALLOW_UNAPPLIED',
+      )
+    }
+  }
+
+  private async startOneShot(
+    root: AgentRef,
+    provider: string,
+    prompt: string,
+    outputSchema: object,
+    agentOptions: AgentOptionsLike | undefined,
+    allow: readonly string[],
+    label: string,
+  ): Promise<SubagentRunRef> {
+    if (this.usesActivationApi()) {
+      this.armChildAllow(root.id, allow, AUDITOR_TOOL_REQUIRED, label)
+      try {
+        const activation = await this.subagents.startActivation!({
+          provider,
+          label,
+          request: {
+            prompt: [{ type: 'text', text: prompt }],
+            parent: root,
+            outputSchema,
+            maxDepth: 1,
+            ...(agentOptions === undefined ? {} : { agentOptions }),
+          },
+          signal: this.lifecycle.signal,
+          delivery: 'caller',
+        })
+        this.assertChildAllowApplied(root.id)
+        return {
+          id: activation.childId,
+          result: activation.result,
+          dispose: () => activation.dispose(),
+        }
+      } catch (error) {
+        if (error instanceof AutopilotError) throw error
+        const err = error instanceof Error ? error : new Error(String(error))
+        const stack = (err.stack ?? '').split('\n').slice(0, 8).join('\n')
+        throw new AutopilotError(`${err.message}\n${stack}`, 'AP_SUBAGENT_SURFACE')
+      } finally {
+        this.disarmChildAllow(root.id)
+      }
+    }
+    const start = this.subagents.start
+    if (start === undefined) {
+      throw new AutopilotError('the host subagent service has neither start nor startActivation', 'AP_SUBAGENT_SURFACE')
+    }
+    return start(provider, {
+      prompt: [{ type: 'text', text: prompt }],
+      parent: root,
+      outputSchema,
+      maxDepth: 1,
+      toolFilter: { allow },
+      signal: this.lifecycle.signal,
+      ...(agentOptions === undefined ? {} : { agentOptions }),
+    })
+  }
+
+  private async startContinuableChild(
+    root: AgentRef,
+    provider: string,
+    childId: string,
+    prompt: string,
+    persona: string | undefined,
+    agentOptions: AgentOptionsLike | undefined,
+    allow: readonly string[],
+    signal: AbortSignal,
+  ): Promise<void> {
+    if (this.usesActivationApi()) {
+      this.armChildAllow(root.id, allow, [], 'executor child')
+      try {
+        await this.subagents.startActivation!({
+          provider,
+          label: 'autopilot-executor',
+          childId,
+          request: {
+            prompt: [{ type: 'text', text: prompt }],
+            parent: root,
+            maxDepth: 1,
+            ...(agentOptions === undefined ? {} : { agentOptions }),
+          },
+          signal,
+          delivery: 'caller',
+        })
+        this.assertChildAllowApplied(root.id)
+        return
+      } finally {
+        this.disarmChildAllow(root.id)
+      }
+    }
+    const startContinuable = this.subagents.startContinuable
+    if (startContinuable === undefined) {
+      throw new AutopilotError('the host subagent service has neither startContinuable nor startActivation', 'AP_SUBAGENT_SURFACE')
+    }
+    await startContinuable({
+      childId,
+      provider,
+      label: 'autopilot-executor',
+      request: {
+        prompt: [{ type: 'text', text: prompt }],
+        parent: root,
+        ...(persona === undefined ? {} : { persona }),
+        toolFilter: { allow },
+        ...(agentOptions === undefined ? {} : { agentOptions }),
+      },
+      signal,
+    })
+  }
+
+  private async releaseChild(root: AgentRef, childId: string): Promise<void> {
+    if (typeof this.subagents.drainChildren === 'function') {
+      await this.subagents.drainChildren(root, [childId])
+      return
+    }
+    const drain = this.subagents.drainContinuableChildren
+    if (drain === undefined) {
+      throw new AutopilotError('the host subagent service has neither drainChildren nor drainContinuableChildren', 'AP_SUBAGENT_SURFACE')
+    }
+    await drain(root, [childId])
+  }
 
   private resolveRoot(caller: AgentRef): AgentRef {
     const live = this.agents.get(caller.id)
@@ -3451,8 +3704,9 @@ export class AutopilotEngine {
     if (!this.plannerRoutingActive()) return
     this.plannerReloadStamps.add(runId)
     if (this.plannerInstalls.has(runId)) return
-    if (this.agents.get(runId) === undefined) return
-    void this.transact(runId, async () => {
+    const sessionId = loaded.sessionId ?? runId
+    if (this.agents.get(sessionId) === undefined) return
+    void this.transact(sessionId, async () => {
       if (this.lifecycle.signal.aborted) return
       if (this.plannerInstalls.has(runId)) return
       const snapshot = this.current(runId)
@@ -5340,7 +5594,7 @@ export class AutopilotEngine {
    * decision, which records NOTHING.
    */
   private async armPlannerSelection(runId: RunId, next: Snapshot): Promise<PlannerRoutingRecord | undefined> {
-    const decision = await this.resolvePlannerRoute(this.agents.get(runId), next)
+    const decision = await this.resolvePlannerRoute(this.sessionAgent(next), next)
     return await this.armPlannerDecision(runId, decision)
   }
 
@@ -5353,7 +5607,8 @@ export class AutopilotEngine {
    * planning-phase commit's change detection compares against.
    */
   private async armPlannerDecision(runId: RunId, decision: PlannerRouteDecision): Promise<PlannerRoutingRecord | undefined> {
-    const root = this.agents.get(runId)
+    const rooted = this.current(runId)
+    const root = rooted === undefined ? this.agents.get(runId) : this.sessionAgent(rooted)
     const decisionKey = plannerDecisionKeyOf(decision)
     // F25 (PR #2 Codex round 13): the arm may land here AFTER dispose()
     // swept — the caller awaited planner route resolution (catalog/policy
@@ -5447,7 +5702,7 @@ export class AutopilotEngine {
     const state = this.plannerInstalls.get(runId)
     if (state === undefined) return undefined
     const previousDecision: PlannerDecisionKey = state.kind === 'inherit' ? { kind: 'inherit' } : state.decision
-    const decision = await this.resolvePlannerRoute(this.agents.get(runId), next)
+    const decision = await this.resolvePlannerRoute(this.sessionAgent(next), next)
     if (samePlannerDecision(previousDecision, plannerDecisionKeyOf(decision))) return undefined
     // F25: the re-resolution awaited catalog/policy facts, and the engine may
     // have been disposed under it — the old install was already taken by
@@ -5668,7 +5923,7 @@ export class AutopilotEngine {
     if (prior.executor === undefined || prior.executor.state !== 'running') return undefined
     try {
       this.subagents.interrupt(prior.executor.childId, { kind: 'ancestor', agent: root })
-      await this.subagents.drainContinuableChildren(root, [prior.executor.childId])
+      await this.releaseChild(root, prior.executor.childId)
       return undefined
     } catch (error: unknown) {
       // AN OWNER PASS OUTLIVES A DRAIN FAILURE. This fallback runs on the
@@ -5796,7 +6051,7 @@ export class AutopilotEngine {
     if (outcome.verdict === 'needs-replan') {
       const rounds = live.consecutiveReplans + 1
       const exhausted = rounds > MAX_REPLAN_ROUNDS
-      const prior = this.current(root.id) ?? live
+      const prior = this.current(this.activeRunId(root.id)) ?? live
       const drained = outcome.role !== 'plan' ? await this.drainExecutorIfRunning(root, prior) : undefined
       if (drained !== undefined) return result
       const heldHere: GateName[] = [

@@ -1362,14 +1362,14 @@ function filterCheckingSubagents(
     filters,
     async start(provider, request) {
       check(request.toolFilter.allow, [])
-      return inner.start(provider, request)
+      return inner.start!(provider, request)
     },
     async startContinuable(spec) {
       // The executor child owns the packet tool, so the fixture registers it
       // into the child's layer before restricting — the same shape the real
       // `registerContinuableSetup` contribution produces.
       check(spec.request.toolFilter?.allow, ['autopilot_submit_packet'])
-      return inner.startContinuable(spec)
+      return inner.startContinuable!(spec)
     },
   }
 }

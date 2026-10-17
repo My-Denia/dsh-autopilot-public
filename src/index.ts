@@ -1510,7 +1510,7 @@ export function recognizeExecutorChild(
     if (child === undefined || child === null) return undefined
     const parentId = child.session.header.parentSession
     if (parentId === undefined) return undefined
-    const run = engine.peek(parentId)
+    const run = engine.peekActive(parentId)
     if (run?.executor?.childId === child.id
       && (run.executor.state === 'running' || run.executor.state === 'starting')) {
       return parentId
@@ -1767,10 +1767,10 @@ export async function apply(rawCtx: unknown, config?: ConfigInput): Promise<() =
         if (agent === undefined) return ''
         const parentId = agent.session.header.parentSession
         if (parentId === undefined) {
-          const snapshot = engine.peek(agent.id)
+          const snapshot = engine.peekActive(agent.id)
           return snapshot === undefined ? '' : renderRootPolicy(snapshot, engine.config.governance?.unattended === true)
         }
-        const parentRun = engine.peek(parentId)
+        const parentRun = engine.peekActive(parentId)
         if (parentRun?.executor?.childId === agent.id && parentRun.executor.state !== 'revoked') {
           return renderExecutorPolicy(parentRun)
         }
@@ -1954,8 +1954,24 @@ export async function apply(rawCtx: unknown, config?: ConfigInput): Promise<() =
         warn(rawCtx, `dsh-autopilot: executor child surface failed to install at mount for child ${String(child.id)} (run ${String(child.session?.header?.parentSession)}); the executor record cannot be corrected from here: ${describeError(error)}`)
       }
     }
+    const restrictCreatedChild = (agent: unknown): void => {
+      const child = agent as Partial<AgentRef> & {
+        ctx?: { tools?: { restrict?: (filter: { allow: readonly string[] }) => void } }
+      }
+      const parentId = child.session?.header?.parentSession
+      const tools = child.ctx?.tools
+      const restrict = tools?.restrict
+      if (parentId === undefined || tools === undefined || restrict === undefined) return
+      // dsh 0.2.1 starts children without a toolFilter argument. The engine
+      // arms the allow-list for the duration of startActivation; this is the
+      // moment the child exists and the prompt has not been submitted yet.
+      // Call restrict as a method: pulling the function off the runtime
+      // drops `this`, and dsh-tools then reads `this.ctx` as undefined.
+      engine.restrictArmedChild(parentId, allow => restrict.call(tools, { allow }))
+    }
     const disposeCreated = ctx.on('agent/created', (payload: { agent: unknown }) => {
       maybeInstall(payload.agent)
+      restrictCreatedChild(payload.agent)
       installChild(payload.agent)
     })
     const disposeDisposed = ctx.on('agent/disposed', (payload: { agent: unknown }) => {

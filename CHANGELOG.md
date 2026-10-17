@@ -3,7 +3,41 @@
 Host and packaging bounds that outlive a single release are in
 [docs/compatibility.md](docs/compatibility.md).
 
-## Unreleased
+## 0.2.1-rc.1 — 2026-10-17
+
+Pre-release of this plugin. It is **not** npm `latest`. The published stable
+package remains `dsh-goal-autopilot@0.2.0` (verified 2026-10-16; that check is
+not repeated here and does not say this candidate is published).
+
+dsh `0.2.1-rc.2` is itself a pre-release. This plugin's `engines.dsh` names
+that exact host, plus the previously supported `0.1.2-rc.1`, `0.1.5-rc.1`, and
+`0.2.0` ranges. Other `0.2.1` prereleases are outside the range.
+
+### Fixed
+
+- Child start on dsh 0.2.1-rc.2. That host replaced `start` /
+  `startContinuable` / `drainContinuableChildren` with `startActivation` /
+  `drainChildren`. `startActivation` does not take `toolFilter`; the plugin
+  applies the allow-list on `agent/created` and refuses the start if that did
+  not happen (`AP_TOOL_ALLOW_UNAPPLIED`). Hosts that still have the 0.2.0
+  methods keep that path, including the filter on the start call.
+  `sendMessage` is still the resume transport. `web_search` and `web_fetch`
+  are host tools and are not added to the default executor allow-list.
+  DeepSeek-V4.1-Flash-1017 is reached through the live catalog; this plugin
+  does not seed a price for it.
+- A finished run no longer blocks the session. The next `autopilot_init`
+  starts a new run, leaves the finished run in the store, and does not copy
+  its gates, approvals, executor, or auditors. After a restart the session
+  index still points at the current run.
+
+### Known limits
+
+- Not measured on dsh `0.2.1-rc.1`, the `0.2.1` alphas, Desktop, or macOS.
+- The continuable `persona` field is not an argument of `startActivation` on
+  0.2.1-rc.2. The executor prompt still carries the task text.
+- A cold-resumed executor is recognized again when `agent/created` fires; a
+  host that resumes without that event is not claimed here.
+- npm `latest` is still 0.2.0.
 
 Realigns the plugin with the current goal-autopilot-harness design, where a host
 adapter stays thin and the host-neutral rules live in one reference layer.

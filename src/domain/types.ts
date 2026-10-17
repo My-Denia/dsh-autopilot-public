@@ -1094,6 +1094,13 @@ export interface Carryover {
 /** The complete durable run snapshot, written on every event. */
 export interface Snapshot {
   readonly runId: RunId
+  /**
+   * The root session this run belongs to. Absent on the session's first run,
+   * whose id is the session id, and on every stream written before sequential
+   * runs. A later run in the same session sets it so a restart can find the
+   * live agent without treating the run id as an agent id.
+   */
+  readonly sessionId?: string
   readonly revision: number
   readonly triage: Triage
   readonly plan: { readonly revision: number; readonly text: string }

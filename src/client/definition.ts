@@ -655,8 +655,22 @@ export interface AutopilotRunChatData {
    * inferring a gate from an audit verdict, which §3.2 proves unsound.
    */
   readonly stale: boolean
-  /** Non-empty when `autopilot_init` was called more than once (the engine refused the later ones). */
+  /** Non-empty when `autopilot_init` was called again and the engine refused it. */
   readonly reinitSeqs: readonly number[]
+  /**
+   * Runs this session already finished before the current one. Present only
+   * after a later `autopilot_init` succeeded with a different run id. Each
+   * entry is the archived summary; the live fields above belong to the
+   * current run only.
+   */
+  readonly priorRuns?: readonly PriorRunSummary[]
+}
+
+/** Archived summary of a run the session has moved past. */
+export interface PriorRunSummary {
+  readonly runId: string
+  readonly phase?: string
+  readonly revision: number
 }
 
 /** Internal reducer state. */
@@ -694,10 +708,10 @@ export const AUTOPILOT_RUN_KIND = 'autopilot-run'
 /**
  * The context id, a CONSTANT.
  *
- * One run IS one session: `engine.ts` binds `runId: root.id` and `init` refuses
- * a second run on the same session. So a per-session card needs exactly one
- * business identity, and a constant is the only value that cannot be produced
- * twice by `match()`, which has no history access.
+ * The card anchor stays one per session. `match()` has no history access, so
+ * a constant is the only id it can repeat without splitting one result away
+ * from its call. A later successful init names a new run id; the fold archives
+ * the previous run and keeps the live fields on the new one.
  */
 export const AUTOPILOT_RUN_ID = 'run'
 
@@ -1003,8 +1017,9 @@ export function applyCall(state: AutopilotRunState, match: CardMatch): Autopilot
 
   if (call.name === 'autopilot_init') {
     if (data.triage === undefined) {
-      // First init wins. The engine refuses every later one (AP_ALREADY_ACTIVE
-      // / AP_RUN_EXHAUSTED), but the tool/call event is appended BEFORE the
+      // First init wins the triage until a later init's result names a new run.
+      // A refused later init (AP_ALREADY_ACTIVE) still reaches this fold: the
+      // tool/call event is appended BEFORE the
       // engine ever runs, so the later calls reach us regardless.
       const triage = readTriage(call.args)
       if (triage !== undefined) data = { ...data, triage }
@@ -1121,6 +1136,29 @@ export function applyResult(state: AutopilotRunState, match: CardMatch): Autopil
   const payload = result.payload
   if (payload === undefined) return { ...state, pending, data }
 
+  let auditIndex = state.auditIndex
+  if (call.name === 'autopilot_init') {
+    const nextRunId = str(payload.runId)
+    if (nextRunId !== undefined && data.runId !== undefined && nextRunId !== data.runId) {
+      const phase = data.phase?.value
+      const triage = readTriage(call.args)
+      data = {
+        revision: 0,
+        audits: [],
+        calls: data.calls,
+        stale: false,
+        reinitSeqs: data.reinitSeqs.filter(seq => seq !== call.seq),
+        priorRuns: [...(data.priorRuns ?? []), {
+          runId: data.runId,
+          revision: data.revision,
+          ...(phase === undefined ? {} : { phase }),
+        }],
+        ...(triage === undefined ? {} : { triage }),
+      }
+      auditIndex = new Map()
+    }
+  }
+
   const seq = event.seq
   const revision = num(payload.revision) ?? 0
   if (revision > data.revision) data = { ...data, revision }
@@ -1194,7 +1232,7 @@ export function applyResult(state: AutopilotRunState, match: CardMatch): Autopil
   }
 
   if (call.name === 'autopilot_audit' || call.name === 'autopilot_self_check') {
-    const at = state.auditIndex.get(result.callId)
+    const at = auditIndex.get(result.callId)
     if (at !== undefined) {
       // DELIBERATELY does not touch phase/planGate/executionGate. AuditOutcome
       // carries none of them, and inferring `verdict:'pass' -> gate:'pass'` is
@@ -1223,7 +1261,7 @@ export function applyResult(state: AutopilotRunState, match: CardMatch): Autopil
     )
   }
 
-  return { ...state, pending, data: withStale(data) }
+  return { ...state, pending, auditIndex, data: withStale(data) }
 }
 
 /**

@@ -178,7 +178,7 @@ export function decideEgress(
   command: string,
   options: PreExecuteOptions = {},
 ): { readonly decision: PreDecision; readonly manifest?: OutboundManifest; readonly unattended?: boolean } {
-  const snapshot = engine.peek(rootSessionId)
+  const snapshot = engine.peekActive(rootSessionId)
   // UNATTENDED APPROVAL POLICY (P1). When the run's config turns
   // governance.unattended on, a validated egress cannot ASK — an ask pends
   // forever when nobody is present to answer (the M9 unattended-observation
@@ -345,7 +345,7 @@ export function installPreExecuteGate(
    */
   const isGatedRun = (): boolean => {
     try {
-      const snapshot = engine.peek(rootSessionId)
+      const snapshot = engine.peekActive(rootSessionId)
       return snapshot !== undefined && !TERMINAL_PHASES.includes(snapshot.phase)
     } catch {
       return true

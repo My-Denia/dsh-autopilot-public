@@ -69,7 +69,7 @@ A standard run follows an event-sourced state machine (`planning` → `plan-revi
 
 ## Quick Start
 
-Requires **[dsh](https://github.com/deepseek-ai/deepseek-harness)** `0.2.0` (or `0.1.2-rc.1` / `0.1.5-rc.1`) and **Node 22+**.
+Requires **[dsh](https://github.com/deepseek-ai/deepseek-harness)** `0.2.0`, or the pre-release host `0.2.1-rc.2`, or `0.1.2-rc.1` / `0.1.5-rc.1`, and **Node 22+**. This source version is the pre-release `0.2.1-rc.1`. npm `latest` is still `0.2.0`.
 
 ### 1. Install Plugin
 
@@ -124,8 +124,9 @@ The plugin automatically initializes the run, requests read-only sandbox mode, c
 | Dimension | Current Fact |
 | :--- | :--- |
 | **Maturity** | **Experimental developer preview** (not a production release). |
-| **npm Distribution** | [`dsh-goal-autopilot@0.2.0`](https://www.npmjs.com/package/dsh-goal-autopilot) |
-| **Host Support** | `dsh` 0.2.0 line, `0.1.5-rc.1`, `0.1.2-rc.1` (0.1.7 and 0.2.1 are outside the peer range). |
+| **npm Distribution** | [`dsh-goal-autopilot@0.2.0`](https://www.npmjs.com/package/dsh-goal-autopilot) is the published stable package. `0.2.1-rc.1` is this pre-release and is not npm `latest`. |
+| **Host Support** | `dsh` 0.2.0 line, exact `0.2.1-rc.2`, `0.1.5-rc.1`, `0.1.2-rc.1`. Other 0.2.1 prereleases and 0.1.7 are outside the range. |
+| **WSL2 + 0.2.1-rc.2** | **Verified 2026-10-17** with a local mock: install without a version exemption, plan audit, delegated executor, needs-fix resume, closeout, then a second goal in the same session. Restart status stayed on the second goal. Not a real-model run. |
 | **WSL2 + 0.2.0-rc.2** | **Verified:** Plugin install, mount, skill registration, plan audit, delegated executor, and needs-fix resume measured with a local mock model. |
 | **Real-Model Full Closeout** | **Unverified:** Natural-language write → live model execution audit → full closeout not yet verified with a real model. |
 | **Desktop (macOS / Windows)** | **Windows Desktop 0.2.0-rc.2 partially verified (2026-10-10):** plugin mount and the live-catalog routing onboarding section measured on the running app; file-backed run visible after a host restart. **Unverified:** macOS, and the full write lifecycle to closeout on Desktop. See [docs/compatibility.md](./docs/compatibility.md). |
