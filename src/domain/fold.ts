@@ -14,6 +14,7 @@ import {
   ROUTING_AUDITOR_ROLES,
   ROUTING_AUTHORIZATION_SOURCES,
   ROUTING_CANDIDATE_DISPOSITIONS,
+  ROUTING_COST_MATCHES,
   ROUTING_IDENTITY_AXES,
   ROUTING_INDEPENDENCE_OUTCOMES,
   ROUTING_ROLES,
@@ -23,18 +24,19 @@ import {
   TERMINAL_PHASES,
   evaluateCompletion,
   evidenceKindProblems,
+  handoffProblems,
   isAbsoluteShapedBearer,
   usageDeclarationProblems,
 } from './types.js'
-import type { AuditRole, Operation, Phase, RouteRecord, RunEvent, RoutingDecisionDetail, RoutingPin, Snapshot } from './types.js'
+import type { AuditRole, ExecutionGate, GateName, GateProvenance, GateSource, GateSources, Operation, Phase, PlanGate, RouteRecord, RunEvent, RoutingDecisionDetail, RoutingPin, Snapshot } from './types.js'
 
 /** Operations legal from each phase (undefined prior state only admits init). */
 const LEGAL_OPS: Record<Phase, readonly Operation[]> = {
-  'planning': ['submit-plan', 'audit', 'self-check', 'external-audit', 'log', 'replan', 'set-blocked', 'set-owner-decision', 'owner-approve', 'consume-approval', 'consume-manifest', 'declare-usage', 'sandbox'],
-  'plan-reviewing': ['audit', 'self-check', 'external-audit', 'log', 'set-blocked', 'set-owner-decision', 'owner-approve', 'consume-approval', 'consume-manifest', 'sandbox'],
-  'executing': ['start-executor', 'resume-executor', 'submit-packet', 'submit-evidence', 'log', 'replan', 'set-blocked', 'set-owner-decision', 'owner-approve', 'consume-approval', 'consume-manifest', 'declare-usage', 'reminder', 'audit', 'self-check', 'external-audit', 'sandbox'],
-  'execution-reviewing': ['audit', 'self-check', 'external-audit', 'log', 'replan', 'set-blocked', 'set-owner-decision', 'owner-approve', 'consume-approval', 'consume-manifest', 'reminder', 'sandbox'],
-  'replanning': ['submit-plan', 'audit', 'self-check', 'external-audit', 'log', 'set-blocked', 'set-owner-decision', 'consume-manifest', 'declare-usage', 'sandbox'],
+  'planning': ['submit-plan', 'audit', 'self-check', 'external-audit', 'log', 'replan', 'set-blocked', 'set-owner-decision', 'owner-approve', 'owner-gate-pass', 'owner-gate-withdraw', 'consume-approval', 'consume-manifest', 'declare-usage', 'sandbox'],
+  'plan-reviewing': ['audit', 'self-check', 'external-audit', 'log', 'set-blocked', 'set-owner-decision', 'owner-approve', 'owner-gate-pass', 'owner-gate-withdraw', 'consume-approval', 'consume-manifest', 'sandbox'],
+  'executing': ['start-executor', 'resume-executor', 'submit-packet', 'submit-evidence', 'amend-plan', 'log', 'replan', 'set-blocked', 'set-owner-decision', 'owner-approve', 'owner-gate-withdraw', 'consume-approval', 'consume-manifest', 'declare-usage', 'reminder', 'audit', 'self-check', 'external-audit', 'sandbox'],
+  'execution-reviewing': ['audit', 'self-check', 'external-audit', 'log', 'replan', 'amend-plan', 'set-blocked', 'set-owner-decision', 'owner-approve', 'owner-gate-pass', 'owner-gate-withdraw', 'consume-approval', 'consume-manifest', 'reminder', 'sandbox'],
+  'replanning': ['submit-plan', 'audit', 'self-check', 'external-audit', 'log', 'set-blocked', 'set-owner-decision', 'owner-gate-pass', 'owner-gate-withdraw', 'consume-manifest', 'declare-usage', 'sandbox'],
   // 'declare-usage' is legal here on purpose (added 2026-08-24): an entry
   // reverted to 'undeclared' during execution used to reach 'closing' with no
   // way back — `submit-closeout` refuses it and the entry could not be
@@ -43,7 +45,7 @@ const LEGAL_OPS: Record<Phase, readonly Operation[]> = {
   // gate and forces the whole cycle to be redone. Answering the question late
   // is strictly better than a liveness dead end, and completion still refuses
   // until it IS answered.
-  'closing': ['audit', 'self-check', 'external-audit', 'log', 'submit-closeout', 'set-blocked', 'set-owner-decision', 'owner-approve', 'consume-approval', 'consume-manifest', 'declare-usage', 'sandbox'],
+  'closing': ['audit', 'self-check', 'external-audit', 'log', 'submit-closeout', 'set-blocked', 'set-owner-decision', 'owner-approve', 'owner-gate-pass', 'owner-gate-withdraw', 'consume-approval', 'consume-manifest', 'declare-usage', 'sandbox'],
   'completed': [],
   'blocked': [],
   'needs-owner-decision': ['owner-resolve', 'log', 'owner-approve', 'consume-approval', 'consume-manifest'],
@@ -204,6 +206,31 @@ function evidenceKindStamp(detail: unknown): 'absent' | 'invalid' | 'v1' {
 }
 
 /**
+ * Same stamp pattern for the partial-delivery contract: 'absent' = written
+ * before the handoff dimension existed (legacy reading: unproven criteria
+ * legal with no handoff requirement); 'v1' = "handoff/outcome validation v1";
+ * anything else is a corrupt stamp, not an old stream.
+ */
+function closeoutHandoffStamp(detail: unknown): 'absent' | 'invalid' | 'v1' {
+  if (detail === null || typeof detail !== 'object') return 'absent'
+  if (!('closeoutHandoff' in detail)) return 'absent'
+  return (detail as { closeoutHandoff?: unknown }).closeoutHandoff === 1 ? 'v1' : 'invalid'
+}
+
+/**
+ * The owner-resolve decision an event's detail carries, when it carries one.
+ * Pre-decision streams wrote NO detail on owner-resolve — those replay as
+ * resume-planning (the only decision that existed), which is exactly what
+ * their snapshots say.
+ */
+function ownerResolveDecisionOf(detail: unknown): 'resume-planning' | 'resume-execution' | 'block' | undefined {
+  if (detail === null || typeof detail !== 'object') return undefined
+  const decision = (detail as { decision?: unknown }).decision
+  if (decision === 'resume-planning' || decision === 'resume-execution' || decision === 'block') return decision
+  return undefined
+}
+
+/**
  * The routing decision on a dispatch commit's `detail.routing`, STRICTLY
  * validated (packet M3b): `{role, pin?, why, authorizationSource,
  * fallbackFrom?, repinFrom?, candidates?}` and nothing else. Malformed ⇒ fold
@@ -275,7 +302,7 @@ function routingDecisionOf(op: Operation, detail: unknown): RoutingDecisionDetai
     fail(`${where} must be an object, got ${typeof routing}`, 'AP_ROUTING_DETAIL')
   }
   const record = routing as Record<string, unknown>
-  const known: readonly string[] = ['role', 'pin', 'why', 'authorizationSource', 'fallbackFrom', 'repinFrom', 'candidates']
+  const known: readonly string[] = ['role', 'pin', 'why', 'authorizationSource', 'fallbackFrom', 'repinFrom', 'candidates', 'costMatch']
   for (const key of Object.keys(record)) {
     if (!known.includes(key)) problems.push(`${where} has an unknown key "${key}"`)
   }
@@ -502,6 +529,10 @@ function routingDecisionOf(op: Operation, detail: unknown): RoutingDecisionDetai
       }
     }
   }
+  const costMatch = record.costMatch
+  if (costMatch !== undefined && (typeof costMatch !== 'string' || !ROUTING_COST_MATCHES.includes(costMatch))) {
+    problems.push(`${where}.costMatch must be one of ${ROUTING_COST_MATCHES.join('|')}, got ${JSON.stringify(costMatch)}`)
+  }
   if (problems.length > 0) {
     fail(`${where} is malformed: ${problems.join('; ')}`, 'AP_ROUTING_DETAIL')
   }
@@ -514,7 +545,7 @@ function routingDecisionOf(op: Operation, detail: unknown): RoutingDecisionDetai
  * it; the mapping is the one rule both sides share, so it is stated once here
  * and must move with the role vocabularies).
  */
-const AUDIT_ROLE_OF_ROUTING_ROLE: Readonly<Record<string, AuditRole>> = {
+export const AUDIT_ROLE_OF_ROUTING_ROLE: Readonly<Record<string, AuditRole>> = {
   'plan-auditor': 'plan',
   'execution-auditor': 'execution',
   'rules-auditor': 'rules',
@@ -598,6 +629,185 @@ function bindRoutingDetailToRecords(
   if (next.executor !== undefined) pinEqualsSelected('executor record', next.executor.route)
 }
 
+/** The gate a signal's `detail` names, if it names one (shared by writer and fold). */
+function gateTargetOf(detail: unknown): GateName | undefined {
+  const value = (detail as { gate?: unknown } | undefined)?.gate
+  return value === 'plan' || value === 'execution' ? value : undefined
+}
+
+/** The note a gate signal carries, when it carries a non-blank one. */
+function gateNoteOf(detail: unknown): string | undefined {
+  const value = (detail as { note?: unknown } | undefined)?.note
+  return typeof value === 'string' && value.trim().length > 0 ? value : undefined
+}
+
+/** The audit role whose verdict decides a gate. */
+function gateRoleOf(gate: GateName): AuditRole {
+  return gate === 'plan' ? 'plan' : 'execution'
+}
+
+/**
+ * The value a gate falls back to when the owner WITHDRAWS their pass (DESIGN
+ * §9 item 8). Derived from the run's own audit stream at the CURRENT plan
+ * revision: the latest verdict for the gate's audit role captured at this
+ * generation, or `pending` when this generation has no such verdict — which is
+ * the honest reading, because the gate was passed by the owner and not by a
+ * review. A record captured under an older plan revision is superseded, never
+ * resurrected.
+ */
+export function withdrawnGateValue(prior: Snapshot, gate: 'plan'): PlanGate
+export function withdrawnGateValue(prior: Snapshot, gate: 'execution'): ExecutionGate
+export function withdrawnGateValue(prior: Snapshot, gate: GateName): PlanGate | ExecutionGate {
+  const latest = latestGateRecord(prior, gate)
+  if (latest === undefined) return 'pending'
+  if (gate === 'plan') return latest.verdict === 'needs-fix' ? 'pending' : latest.verdict as PlanGate
+  return latest.verdict as ExecutionGate
+}
+
+/** The source a withdrawn gate reads as: the review that actually ran, else `pending`. */
+function withdrawnGateSource(prior: Snapshot, gate: GateName): GateSource {
+  const latest = latestGateRecord(prior, gate)
+  if (latest === undefined) return 'pending'
+  return latest.auditorId === 'self-check' ? 'self-check' : 'auditor'
+}
+
+/** The latest audit record deciding this gate at the CURRENT plan revision. */
+function latestGateRecord(prior: Snapshot, gate: GateName): Snapshot['audits'][number] | undefined {
+  const role = gateRoleOf(gate)
+  return [...prior.audits].reverse()
+    .find(record => record.role === role && record.planRevision === prior.plan.revision)
+}
+
+/** The provenance a run starts from: both gates pending at the current plan revision. */
+function pendingGateSources(next: Snapshot): GateSources {
+  return {
+    plan: { source: 'pending', planRevision: next.plan.revision },
+    execution: { source: 'pending', planRevision: next.plan.revision },
+  }
+}
+
+/**
+ * Canonical provenance equality (key order is the writer's, so fold the two
+ * JSON shapes rather than comparing objects field by field — the same argument
+ * `sameRoutingPins` makes).
+ */
+function sameGateSources(a: GateSources | undefined, b: GateSources | undefined): boolean {
+  return JSON.stringify(a) === JSON.stringify(b)
+}
+
+/**
+ * THE GATE LEDGER: the provenance every gate reads as, plus the executor
+ * dispatch count, derived from the stream alone.
+ *
+ * This is the ONE rule both sides share — the writer composes it in
+ * `AutopilotEngine.commit`, and `applyEvent` re-derives it and refuses a
+ * stream that disagrees — exactly the arrangement `applyRoutingDecision` uses
+ * for pins. The cases:
+ *
+ * - init: both gates `pending` at the initial plan revision (absent stays
+ *   absent only on a legacy stream that never records provenance at all).
+ * - plan submission / replan / owner-resolve(resume-planning): the gates are
+ *   reset, so the reading is `pending` again — a new generation.
+ * - owner-gate-pass: `owner`, at this generation, with the next ordinal.
+ * - owner-gate-withdraw: the withdrawn decision keeps its ordinal, the source
+ *   falls back to the review that actually ran (or `pending`).
+ * - audit / self-check / external-audit: the appended record names the gate;
+ *   an owner pass in force for the SAME generation is NOT taken (the
+ *   objection is recorded, the gate stands).
+ * - everything else: unchanged.
+ */
+export function applyGateLedger(
+  prior: Snapshot | undefined,
+  event: { op: Operation; detail?: unknown },
+  next: Snapshot,
+): { gateSources: GateSources | undefined; executorDispatches: number | undefined } {
+  // COUNT DISPATCHES, NOT COMMITS. `startExecutor` commits `start-executor`
+  // TWICE for one dispatch — the `starting` record, then the `running` one — so
+  // counting ops would double every dispatch and the rotation ordinal would
+  // advance two steps at a time. The honest unit is a NEW CHILD: the record's
+  // `childId` changes exactly when a dispatch creates one, a resume keeps the
+  // child it continues, and a revoked-and-restarted executor gets a new id.
+  const dispatches = event.op === 'start-executor'
+    && next.executor !== undefined
+    && next.executor.childId !== prior?.executor?.childId
+  const executorDispatches = dispatches
+    ? (prior?.executorDispatches ?? 0) + 1
+    : prior?.executorDispatches
+  if (prior === undefined) {
+    return { gateSources: next.gateSources ?? pendingGateSources(next), executorDispatches }
+  }
+  const prev = prior.gateSources
+  // A STREAM THAT RECORDED NO PROVENANCE IS NEVER RETRO-FITTED. Every 0.2.0
+  // stream — and every fixture that hand-writes its events — folds exactly as
+  // it did: the field is introduced by a run's own init (a run this engine
+  // created) or by an owner gate decision (the one event whose entire content
+  // IS provenance), and from then on it is present for the rest of that
+  // stream. This is what keeps the `no-source` reading honest for the older
+  // streams instead of back-inferring an `auditor` nobody observed.
+  if (prev === undefined && event.op !== 'owner-gate-pass' && event.op !== 'owner-gate-withdraw') {
+    return { gateSources: undefined, executorDispatches }
+  }
+  const generation = next.plan.revision
+  let gateSources: GateSources | undefined
+  if (event.op === 'submit-plan' || event.op === 'replan'
+    || (event.op === 'owner-resolve' && ownerResolveDecisionOf(event.detail) === 'resume-planning')) {
+    gateSources = pendingGateSources(next)
+  } else if (event.op === 'owner-gate-pass') {
+    const gate = gateTargetOf(event.detail)
+    const note = gateNoteOf(event.detail)
+    gateSources = gate === undefined
+      ? prev
+      : {
+          ...prev,
+          [gate]: {
+            source: 'owner',
+            planRevision: generation,
+            ownerDecision: (prev?.[gate]?.ownerDecision ?? 0) + 1,
+            ...(note === undefined ? {} : { note }),
+          },
+        }
+  } else if (event.op === 'owner-gate-withdraw') {
+    const gate = gateTargetOf(event.detail)
+    const note = gateNoteOf(event.detail)
+    const history = gate === undefined ? undefined : prev?.[gate]
+    gateSources = gate === undefined || history === undefined
+      ? prev
+      : {
+          ...prev,
+          [gate]: {
+            source: withdrawnGateSource(prior, gate),
+            planRevision: generation,
+            ...(history.ownerDecision === undefined ? {} : { ownerDecision: history.ownerDecision }),
+            withdrawn: true,
+            ...(note === undefined ? {} : { note }),
+          },
+        }
+  } else if (event.op === 'audit' || event.op === 'self-check' || event.op === 'external-audit') {
+    const source: GateSource = event.op === 'self-check' ? 'self-check' : 'auditor'
+    let acc = prev
+    for (const record of next.audits.slice(prior.audits.length)) {
+      const gate: GateName | undefined = record.role === 'plan' ? 'plan' : record.role === 'execution' ? 'execution' : undefined
+      if (gate === undefined) continue
+      const history = acc?.[gate]
+      const ownerInForce = history?.source === 'owner' && history.withdrawn !== true && history.planRevision === generation
+      if (ownerInForce) continue
+      acc = {
+        ...acc,
+        [gate]: {
+          source,
+          planRevision: generation,
+          ...(history?.ownerDecision === undefined ? {} : { ownerDecision: history.ownerDecision }),
+          ...(history?.withdrawn === true ? { withdrawn: true } : {}),
+        },
+      }
+    }
+    gateSources = acc
+  } else {
+    gateSources = prev
+  }
+  return { gateSources, executorDispatches }
+}
+
 /** Assert one event is a legal successor of the prior snapshot; returns the new snapshot. */
 export function applyEvent(prior: Snapshot | undefined, event: RunEvent): Snapshot {
   if (event.v !== 1) fail(`unsupported event version ${String((event as { v: unknown }).v)}`, 'AP_EVENT_VERSION')
@@ -613,10 +823,37 @@ export function applyEvent(prior: Snapshot | undefined, event: RunEvent): Snapsh
     if (next.routingPins !== undefined) {
       fail('init routingPins must be absent — pins derive from dispatch detail.routing only', 'AP_INIT_ROUTING_PINS')
     }
+    // Gate provenance (DESIGN §9 item 8) is presence-gated the same way: a
+    // legacy init carries none and reads `no-source` forever; an init that
+    // carries it must carry exactly the pending reading of both gates (a
+    // decision cannot predate the run).
+    if (next.gateSources !== undefined && !sameGateSources(next.gateSources, pendingGateSources(next))) {
+      fail('init gateSources must be exactly the pending reading of both gates, or absent on a legacy stream', 'AP_GATE_SOURCE_INVALID')
+    }
+    if (next.executorDispatches !== undefined) {
+      fail('init must not carry executorDispatches — the first start-executor writes it', 'AP_EXECUTOR_DISPATCH_COUNT')
+    }
     if (next.bearerBase !== undefined) {
       if (next.bearerBase.length === 0) fail('init bearerBase must not be empty when present', 'AP_BEARER_BASE_EMPTY')
       if (!isAbsoluteShapedBearer(next.bearerBase)) {
         fail('init bearerBase must be absolute-shaped when present', 'AP_BEARER_BASE_RELATIVE')
+      }
+    }
+    // Carryover shape (presence-gated): whether the predecessor run really
+    // exists and completed is a FILESYSTEM question, settled once at the
+    // engine's init; the fold re-checks only the structural claim, so replay
+    // never depends on another run's directory still being present.
+    if (next.triage.carryover !== undefined) {
+      const carry = next.triage.carryover as { fromRunId?: unknown; note?: unknown; inherits?: unknown }
+      if (typeof carry.fromRunId !== 'string' || carry.fromRunId.trim().length === 0) {
+        fail('init carryover.fromRunId must be a non-empty string when present', 'AP_CARRYOVER_INVALID')
+      }
+      if (typeof carry.note !== 'string' || carry.note.trim().length === 0) {
+        fail('init carryover.note must be a non-empty string when present', 'AP_CARRYOVER_INVALID')
+      }
+      if (!Array.isArray(carry.inherits) || carry.inherits.length < 1
+        || carry.inherits.some((item: unknown) => typeof item !== 'string' || (item as string).trim().length === 0)) {
+        fail('init carryover.inherits must be a non-empty array of non-empty strings when present', 'AP_CARRYOVER_INVALID')
       }
     }
     return next
@@ -677,6 +914,162 @@ export function applyEvent(prior: Snapshot | undefined, event: RunEvent): Snapsh
     bindRoutingDetailToRecords(event, dispatchRouting, prior, next)
   }
 
+  // ── GATE PROVENANCE + EXECUTOR-DISPATCH LEDGER (DESIGN §9 items 8 and 15) ──
+  //
+  // Both fields are DERIVED, never authored: the engine's commit composes the
+  // same `applyGateLedger` call this fold re-derives with, so the writer has no
+  // freedom to invent a source a reader would have to trust. What the equality
+  // buys, mechanically: an owner pass is recorded with its generation and
+  // ordinal; an audit objection against a gate the owner passed is recorded
+  // WITHOUT taking the gate; a withdrawn owner decision stays withdrawn
+  // (nothing but a higher ordinal may read `owner` again); and the executor
+  // rotation ordinal comes from this run's own dispatch count rather than a
+  // mutable counter.
+  const ledger = applyGateLedger(prior, event, next)
+  // Presence-gated, like every other later-added field: a stream that never
+  // recorded the count (every legacy stream) is not retro-fitted with one, and
+  // the moment either side carries it the derivation binds.
+  const dispatchesRecorded = prior.executorDispatches !== undefined || next.executorDispatches !== undefined
+  if (dispatchesRecorded && next.executorDispatches !== ledger.executorDispatches) {
+    fail(
+      `executorDispatches must be ${String(ledger.executorDispatches)} (derived from this run's own start-executor ops, and only that op may first write it), got ${String(next.executorDispatches)}`,
+      'AP_EXECUTOR_DISPATCH_COUNT',
+    )
+  }
+  // A WITHDRAWAL IS FINAL FOR ITS GENERATION: nothing but a NEW owner decision
+  // (a strictly higher ordinal) may make that gate read `owner` again. An
+  // ordinary reset or a later pass cannot resurrect it. Checked BEFORE the
+  // derivation equality below on purpose: a stream that writes the withdrawn
+  // ordinal back as `owner` is refused by THIS rule, with a diagnosis naming
+  // what actually happened, rather than by the generic 'the derivation
+  // disagrees' branch — which would leave this rule unreachable and its code
+  // decorative.
+  if (prior.gateSources !== undefined && next.gateSources !== undefined) {
+    for (const gate of ['plan', 'execution'] as const) {
+      const before = prior.gateSources[gate]
+      const after = next.gateSources[gate]
+      if (before?.withdrawn !== true || after?.source !== 'owner') continue
+      if ((after.ownerDecision ?? 0) <= (before.ownerDecision ?? 0)) {
+        fail(
+          `gate [${gate}] carries an owner pass at ordinal ${String(after.ownerDecision ?? 0)} after the owner WITHDREW ordinal ${String(before.ownerDecision ?? 0)} — a withdrawal is an appended record, and no ordinary reset or pass may resurrect it; only a new owner decision with a higher ordinal can`,
+          'AP_OWNER_GATE_RESURRECTED',
+        )
+      }
+    }
+  }
+  // One gate per owner decision: passing the plan gate must not carry the
+  // execution gate along, and vice versa. Checked BEFORE the derivation
+  // equality for the same reason the withdrawal rule is: the failure this
+  // names is a decision that reached across gates, and the generic 'the
+  // derivation disagrees' branch would hide it.
+  if (event.op === 'owner-gate-pass') {
+    const gate = gateTargetOf(event.detail)
+    if (gate === undefined) {
+      fail('owner-gate-pass must name the gate it passes (detail.gate plan|execution)', 'AP_OWNER_GATE_INVALID')
+    }
+    if (gate === 'plan') {
+      if (next.planGate !== 'pass') fail('owner-gate-pass plan must set planGate to pass', 'AP_OWNER_GATE_INVALID')
+      if (next.executionGate !== prior.executionGate) {
+        fail('owner-gate-pass plan must not touch the execution gate — one owner decision, one gate', 'AP_OWNER_GATE_INVALID')
+      }
+    } else {
+      if (next.executionGate !== 'pass') fail('owner-gate-pass execution must set executionGate to pass', 'AP_OWNER_GATE_INVALID')
+      if (next.planGate !== prior.planGate) {
+        fail('owner-gate-pass execution must not touch the plan gate — one owner decision, one gate', 'AP_OWNER_GATE_INVALID')
+      }
+    }
+  }
+
+  // Withdrawing a gate the owner never passed is refused: an audit-derived
+  // gate is not the owner's to revoke, a second withdraw of the same decision
+  // has nothing left to take back, and a pass from an EARLIER generation is
+  // already out of force (writing a withdrawal for it would record a
+  // retraction of a ruling that no longer exists).
+  if (event.op === 'owner-gate-withdraw') {
+    const gate = gateTargetOf(event.detail)
+    if (gate === undefined) {
+      fail('owner-gate-withdraw must name the gate it withdraws (detail.gate plan|execution)', 'AP_OWNER_GATE_INVALID')
+    }
+    const history = prior.gateSources?.[gate]
+    if (history === undefined || history.source !== 'owner' || history.withdrawn === true) {
+      fail(
+        `owner-gate-withdraw ${gate}: no owner pass is in force for this gate (an audit-derived gate is not the owner's to withdraw, and a decision already withdrawn has nothing left to take back)`,
+        'AP_OWNER_GATE_NOT_PASSED',
+      )
+    }
+    if (history.planRevision !== prior.plan.revision) {
+      fail(
+        `owner-gate-withdraw ${gate}: the owner's pass belongs to plan revision ${String(history.planRevision ?? 0)} while plan revision ${prior.plan.revision} is current — a superseded pass is already out of force`,
+        'AP_OWNER_GATE_NOT_PASSED',
+      )
+    }
+    // ONE GATE, the same rule the pass carries: withdrawing one gate must not
+    // move the other one (a hand-authored stream could otherwise retract the
+    // plan pass and flip the execution gate in the same event, which the
+    // ledger's per-gate derivation cannot catch because it only touches the
+    // named gate).
+    if (gate === 'plan' && next.executionGate !== prior.executionGate) {
+      fail('owner-gate-withdraw plan must not touch the execution gate — one owner decision, one gate', 'AP_OWNER_GATE_INVALID')
+    }
+    if (gate === 'execution' && next.planGate !== prior.planGate) {
+      fail('owner-gate-withdraw execution must not touch the plan gate — one owner decision, one gate', 'AP_OWNER_GATE_INVALID')
+    }
+  }
+
+  // The shrinkage rule is checked BEFORE the derivation equality for the same
+  // reason the two shape rules are: once a stream has recorded provenance, a
+  // revision that drops it is refused by THIS rule, with the diagnosis that
+  // names what happened, instead of by the generic 'the derivation disagrees'
+  // branch — which would have made this code unreachable and its documented
+  // refusal decorative.
+  if (prior.gateSources !== undefined && next.gateSources === undefined) {
+    fail(
+      'gateSources disappeared after being recorded — a stream that recorded provenance keeps it; only a gate decision, a plan reset or a logout of the run could clear it, and none of them removes the field',
+      'AP_GATE_SOURCE_SHRANK',
+    )
+  }
+  if (!sameGateSources(ledger.gateSources, next.gateSources)) {
+    fail(
+      `gateSources do not match the fold's derivation — expected ${JSON.stringify(ledger.gateSources)}, got ${JSON.stringify(next.gateSources)}: a gate's source is derived (owner decisions by generation and ordinal, audit/self-check verdicts otherwise), never chosen by the writer`,
+      'AP_GATE_SOURCE_INVALID',
+    )
+  }
+
+  // AN OWNER PASS STANDS AGAINST A LATER AUDIT OBJECTION (the precedence rule
+  // DESIGN §9 item 8 states): the objection is RECORDED — the audit record is
+  // appended and never erased — while the gate it objects to does not move,
+  // and the other gate is untouched. Ending the pass is an explicit owner act
+  // (owner-gate-withdraw); a new plan submission, a replan and an owner
+  // resolution supersede the generation it was taken in.
+  const supersedesOwnerPass = event.op === 'submit-plan' || event.op === 'replan' || event.op === 'owner-resolve'
+    || event.op === 'owner-gate-pass' || event.op === 'owner-gate-withdraw'
+  if (prior.gateSources !== undefined && !supersedesOwnerPass) {
+    for (const gate of ['plan', 'execution'] as const) {
+      const history = prior.gateSources[gate]
+      if (history?.source !== 'owner' || history.withdrawn === true) continue
+      // THE GENERATION TEST IS LOAD-BEARING, and it was missing here while
+      // `applyGateLedger`'s audit branch and `AutopilotEngine.ownerPassInForce`
+      // both had it — one predicate, three copies, one of them blind. The
+      // failure it caused was not symmetric with the feature: `amend-plan`
+      // advances the plan revision WITHOUT touching `gateSources` (the ledger
+      // preserves it), so this guard kept a pass from the PREVIOUS generation in
+      // force, refused the gate move the writer had already made legal, and threw
+      // on the commit that carried the auditor's verdict — discarding the
+      // objection and leaving the run in `plan-reviewing`, a phase from which
+      // neither `submit-plan` nor `replan` is legal. A stale owner pass is NOT in
+      // force: it belongs to a plan revision that no longer exists.
+      if (history.planRevision !== prior.plan.revision) continue
+      const before = gate === 'plan' ? prior.planGate : prior.executionGate
+      const after = gate === 'plan' ? next.planGate : next.executionGate
+      if (before !== after) {
+        fail(
+          `gate [${gate}] moved ${before} -> ${after} while an owner pass is in force (plan revision ${String(history.planRevision ?? 0)}): the owner's pass takes precedence over a later audit objection, which is recorded rather than erased — withdraw it explicitly (autopilot_signal owner-gate-withdraw) to let the run's own reviews decide again`,
+          'AP_OWNER_GATE_PRECEDENCE',
+        )
+      }
+    }
+  }
+
   // An owner countersign is validated ON REPLAY, not only where it was written.
   // This repo already paid for the other arrangement once: a class obligation
   // enforced solely by the writer, so a hand-edited or foreign stream carried
@@ -694,6 +1087,44 @@ export function applyEvent(prior: Snapshot | undefined, event: RunEvent): Snapsh
     }
     const problems = validateExternalReview(record.external)
     if (problems.length > 0) fail(`audit record ${i}: ${problems.join('; ')}`, 'AP_EXTERNAL_INVALID')
+  }
+
+  // Structured findings (governance pragmatics v1), PRESENCE-GATED like the
+  // routing detail above: the contract fires only on records that carry the
+  // field, so every pre-findings stream keeps its old reading. The rule the
+  // field buys: needs-replan is reserved for plan-shape defects (a blocking
+  // finding the PLAN layer owns); an execution- or rules-layer defect is
+  // executor-fixable and belongs in needs-fix, where it resumes the same
+  // executor instead of resetting the run.
+  for (let i = prior.audits.length; i < next.audits.length; i++) {
+    const record = next.audits[i]
+    if (record?.findings === undefined) continue
+    const findings = record.findings
+    if (!Array.isArray(findings) || findings.length === 0) {
+      fail(`audit record ${i} carries an empty findings array; absent is the legacy arm, present must grade at least one finding`, 'AP_AUDIT_FINDINGS_INVALID')
+    }
+    for (const finding of Array.isArray(findings) ? findings : []) {
+      if (typeof finding?.summary !== 'string' || finding.summary.trim().length === 0) {
+        fail(`audit record ${i} carries a finding with an empty summary`, 'AP_AUDIT_FINDINGS_INVALID')
+      }
+      if (finding?.severity !== 'blocking' && finding?.severity !== 'non-blocking') {
+        fail(`audit record ${i} carries a finding whose severity is not blocking|non-blocking ("${String(finding?.severity)}")`, 'AP_AUDIT_FINDINGS_INVALID')
+      }
+      if (finding?.layer !== 'plan' && finding?.layer !== 'execution' && finding?.layer !== 'rules') {
+        fail(`audit record ${i} carries a finding whose layer is not plan|execution|rules ("${String(finding?.layer)}")`, 'AP_AUDIT_FINDINGS_INVALID')
+      }
+    }
+    const blockingPlan = Array.isArray(findings)
+      && findings.some(finding => finding?.severity === 'blocking' && finding?.layer === 'plan')
+    if (record?.verdict === 'needs-replan' && !blockingPlan) {
+      fail(
+        `audit record ${i} returns needs-replan without a blocking plan-layer finding; an execution- or rules-layer defect is executor-fixable (needs-fix)`,
+        'AP_AUDIT_FINDINGS_INVALID',
+      )
+    }
+    if (record?.verdict === 'blocked' && !(Array.isArray(findings) && findings.some(finding => finding?.severity === 'blocking'))) {
+      fail(`audit record ${i} returns blocked without a blocking finding`, 'AP_AUDIT_FINDINGS_INVALID')
+    }
   }
 
   // Plan revision is monotonic.
@@ -723,6 +1154,127 @@ export function applyEvent(prior: Snapshot | undefined, event: RunEvent): Snapsh
   if (event.op === 'submit-plan') {
     if (next.executionPacket !== undefined) fail('submit-plan must clear the execution packet', 'AP_STALE_EVIDENCE')
     if (next.executionGate !== 'pending') fail('submit-plan must reset executionGate to pending', 'AP_STALE_EVIDENCE')
+  }
+
+  // Amend-plan (governance pragmatics v1): a plan revision that PRESERVES
+  // execution state — the mirror image of the submit-plan rule above. Gates
+  // must not reset, the packet must survive, and the amendment arms the delta
+  // re-audit binding: further submit-evidence/submit-closeout are refused
+  // until a plan-role PASS captured at or after the amended revision lands
+  // (the same binding shape as the executionGate/audit rule below). A
+  // plan change is always re-audited; what it never does again is destroy
+  // still-valid execution evidence.
+  if (event.op === 'amend-plan') {
+    if (next.plan.revision !== prior.plan.revision + 1) {
+      fail(
+        `amend-plan must advance plan revision by exactly 1 (prior ${prior.plan.revision}, next ${next.plan.revision})`,
+        'AP_AMEND_PLAN_INVALID',
+      )
+    }
+    if (prior.planGate !== 'pass' || next.planGate !== 'pass') {
+      fail('amend-plan requires planGate pass on both sides (a failed plan is replanned, not amended)', 'AP_AMEND_PLAN_INVALID')
+    }
+    if (next.executionGate !== prior.executionGate) {
+      fail('amend-plan must not reset executionGate', 'AP_AMEND_PLAN_INVALID')
+    }
+    if (next.executionPacket !== prior.executionPacket) {
+      fail('amend-plan must preserve the execution packet', 'AP_AMEND_PLAN_INVALID')
+    }
+    if (next.planAmendedAtRevision !== next.plan.revision) {
+      fail('amend-plan must arm the delta re-audit at the new plan revision', 'AP_AMEND_PLAN_INVALID')
+    }
+  } else if (event.op === 'submit-plan' || event.op === 'replan') {
+    if (next.planAmendedAtRevision !== undefined) {
+      fail(`${event.op} must clear planAmendedAtRevision (the amendment cycle is superseded)`, 'AP_AMEND_PLAN_INVALID')
+    }
+  } else if (event.op === 'audit' || event.op === 'self-check' || event.op === 'external-audit') {
+    // A plan-role PASS appended by THIS commit, captured at or after the
+    // amended revision, disarms the binding; anything else preserves it.
+    const amended = prior.planAmendedAtRevision
+    const appended = next.audits.length > prior.audits.length
+      ? next.audits.slice(prior.audits.length)
+      : []
+    const clears = amended !== undefined
+      && appended.some(record => record?.role === 'plan' && record.verdict === 'pass' && record.planRevision >= amended)
+    const expectedPlanAmended = clears ? undefined : prior.planAmendedAtRevision
+    if (next.planAmendedAtRevision !== expectedPlanAmended) {
+      fail(
+        'planAmendedAtRevision must follow the fold derivation (armed by amend-plan, cleared only by a plan-role pass at or after the amended revision)',
+        'AP_AMEND_STATE_INVALID',
+      )
+    }
+  } else if (event.op === 'owner-resolve') {
+    const decision = ownerResolveDecisionOf(event.detail)
+    const expectedPlanAmended = decision === 'resume-execution' ? prior.planAmendedAtRevision : undefined
+    if (next.planAmendedAtRevision !== expectedPlanAmended) {
+      fail(
+        'planAmendedAtRevision must be preserved by owner-resolve(resume-execution) and cleared by resume-planning/block',
+        'AP_AMEND_STATE_INVALID',
+      )
+    }
+  } else if (event.op === 'submit-evidence' || event.op === 'submit-closeout') {
+    if (prior.planAmendedAtRevision !== undefined) {
+      fail(
+        `plan amended at revision ${prior.planAmendedAtRevision} without a delta re-audit pass; ${event.op} requires a plan-role pass at or after the amended revision`,
+        'AP_AMEND_REAUDIT_REQUIRED',
+      )
+    }
+    if (next.planAmendedAtRevision !== undefined) {
+      fail(`${event.op} cannot arm planAmendedAtRevision`, 'AP_AMEND_STATE_INVALID')
+    }
+  } else if (next.planAmendedAtRevision !== prior.planAmendedAtRevision) {
+    fail(
+      `planAmendedAtRevision mutated via op ${event.op} (derives from amend-plan and plan-role passes only)`,
+      'AP_AMEND_STATE_MUTATED',
+    )
+  }
+
+  // Owner resolution (governance pragmatics v1): resume-execution restores
+  // the paused-from phase with gates, packet, executor and the amendment
+  // binding byte-identical. The pause asked the owner a question; the answer
+  // must not destroy still-valid state. resume-planning keeps its full-reset
+  // reading, and a stream that predates pause-tracking has no pausedFrom and
+  // therefore cannot take the resume-execution arm at all.
+  if (event.op === 'owner-resolve' && ownerResolveDecisionOf(event.detail) === 'resume-execution') {
+    if (prior.pausedFrom === undefined
+      || (prior.pausedFrom !== 'executing' && prior.pausedFrom !== 'execution-reviewing')) {
+      fail(
+        'owner-resolve(resume-execution) requires pausedFrom executing|execution-reviewing; pre-pause-tracking streams keep the resume-planning-only reading',
+        'AP_OWNER_RESUME_INVALID',
+      )
+    }
+    const pausedFrom = prior.pausedFrom
+    if (next.phase !== pausedFrom) {
+      fail(`owner-resolve(resume-execution) must restore phase ${pausedFrom}, got ${next.phase}`, 'AP_OWNER_RESUME_INVALID')
+    }
+    if (next.planGate !== prior.planGate || next.executionGate !== prior.executionGate) {
+      fail('owner-resolve(resume-execution) must not touch the gates', 'AP_OWNER_RESUME_INVALID')
+    }
+    if (next.executionPacket !== prior.executionPacket) {
+      fail('owner-resolve(resume-execution) must preserve the execution packet', 'AP_OWNER_RESUME_INVALID')
+    }
+    if (JSON.stringify(next.executor) !== JSON.stringify(prior.executor)) {
+      fail('owner-resolve(resume-execution) must preserve the executor record', 'AP_OWNER_RESUME_INVALID')
+    }
+  }
+
+  // pausedFrom derivation (presence-gated: a stream that never carries the
+  // field — every pre-pause-tracking stream — keeps its old reading).
+  if (prior.pausedFrom !== undefined || next.pausedFrom !== undefined) {
+    if (next.phase === 'needs-owner-decision') {
+      if (prior.phase === 'needs-owner-decision') {
+        if (next.pausedFrom !== prior.pausedFrom) {
+          fail('pausedFrom mutated while paused', 'AP_PAUSE_STATE_INVALID')
+        }
+      } else if (next.pausedFrom !== prior.phase) {
+        fail(
+          `entering needs-owner-decision from ${prior.phase} must stamp pausedFrom=${prior.phase}`,
+          'AP_PAUSE_STATE_INVALID',
+        )
+      }
+    } else if (next.pausedFrom !== undefined) {
+      fail(`leaving needs-owner-decision must clear pausedFrom (phase ${next.phase})`, 'AP_PAUSE_STATE_INVALID')
+    }
   }
 
   // Stamped packet identity must match the live executor. Absent detail is
@@ -849,12 +1401,30 @@ export function applyEvent(prior: Snapshot | undefined, event: RunEvent): Snapsh
     }
   }
 
-  // Execution gate pass requires a matching latest execution-audit pass in the record.
+  // Execution gate pass requires a matching latest execution-audit pass in the
+  // record — OR an owner pass in force for this generation (DESIGN §9 item 8).
+  //
+  // WHY THE OWNER ARM IS NOT A HOLE: the rule's substance is that a gate never
+  // flips to pass on nothing at all. An owner pass carries an explicit ruling,
+  // recorded with its generation (the plan revision) and its ordinal, and the
+  // write path additionally requires the evidence packet to exist before the
+  // execution gate can be passed at all. Every pass the owner did NOT give
+  // still needs the audit pass, and a stream that never recorded provenance
+  // (every legacy stream) keeps the old reading byte for byte.
   if (next.executionGate === 'pass' && prior.executionGate !== 'pass') {
     const executionAudits = next.audits.filter(record => record.role === 'execution')
     const latest = executionAudits[executionAudits.length - 1]
-    if (latest === undefined || latest.verdict !== 'pass') {
-      fail('executionGate pass without a latest execution-audit pass', 'AP_GATE_WITHOUT_AUDIT')
+    const owner = next.gateSources?.execution
+    // THE GENERATION COMPARISON, spelled the same way the other three copies of
+    // this predicate spell it (prior.plan.revision, not next.plan.revision).
+    // They agree today — only submit-plan/amend-plan/init raise the plan
+    // revision and none of those is a gate-mover — and this bug was born from
+    // exactly this predicate existing in four places with one form different
+    // from the rest, so the forms are kept identical on purpose.
+    const ownerInForce = owner?.source === 'owner' && owner.withdrawn !== true
+      && owner.planRevision === prior.plan.revision
+    if (!ownerInForce && (latest === undefined || latest.verdict !== 'pass')) {
+      fail('executionGate pass without a latest execution-audit pass (or an in-force owner pass for this generation)', 'AP_GATE_WITHOUT_AUDIT')
     }
   }
 
@@ -879,6 +1449,33 @@ export function applyEvent(prior: Snapshot | undefined, event: RunEvent): Snapsh
           `submit-closeout stamped evidenceKinds 1: ${problems.map(problem => problem.message).join('; ')}`,
           first.code,
         )
+      }
+    }
+    // Partial-delivery contract, same stamp pattern as evidenceKinds: the
+    // stream's own stamp decides the arm, never the reading build. Unstamped
+    // (legacy) closeouts keep the old reading — unproven criteria legal, no
+    // handoff required, no outcome recorded.
+    const handoffStamp = closeoutHandoffStamp(event.detail)
+    if (handoffStamp === 'invalid') {
+      const raw = (event.detail as { closeoutHandoff?: unknown }).closeoutHandoff
+      fail(
+        `submit-closeout closeoutHandoff stamp is not the integer 1: ${String(raw)}`,
+        'AP_HANDOFF_STAMP_INVALID',
+      )
+    }
+    if (handoffStamp === 'v1') {
+      const problems = handoffProblems(next.closeout ?? {
+        summary: '',
+        changedFiles: [],
+        commands: [],
+        evidence: [],
+        residualRisks: [],
+        exclusions: [],
+        workspaceCleanup: '',
+        drift: '',
+      }, next.triage.acceptanceCriteria)
+      if (problems.length > 0) {
+        fail(`submit-closeout stamped closeoutHandoff 1: ${problems.join('; ')}`, 'AP_HANDOFF_INVALID')
       }
     }
   }

@@ -43,6 +43,17 @@
 import type { LogEntry, Operation, RunEvent, RunId, Snapshot, StoreKind } from '../domain/types.js'
 
 /**
+ * Which runs one session has started, and which one is current.
+ * The run directories stay the history; this file is only the pointer.
+ */
+export interface SessionRunIndex {
+  readonly v: 1
+  readonly sessionId: string
+  readonly currentRunId: string
+  readonly runIds: readonly string[]
+}
+
+/**
  * The persistence contract the engine depends on. Both `RunStore` (files) and
  * `DomainRunStore` (`ctx.storageDomain`) satisfy it; nothing else about a
  * backend is visible to the engine.
@@ -116,4 +127,13 @@ export interface RunStoreLike {
 
   /** Which backend this instance is, recorded into `Enforcement.store` rather than assumed. */
   readonly kind: StoreKind
+
+  /**
+   * The session's current-run pointer. Absent means this session has only the
+   * legacy run whose id is the session id, or no run yet.
+   */
+  readSessionIndex(sessionId: string): SessionRunIndex | undefined
+
+  /** Record that `index.currentRunId` is the run the session continues. */
+  writeSessionIndex(index: SessionRunIndex): void
 }

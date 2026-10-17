@@ -124,10 +124,20 @@ describe('decideTool', () => {
     expect(decideTool(light, 'bash', { command: 'git push origin main' }, off).kind).toBe('allow')
   })
 
-  it('scans run_code code text for egress', () => {
+  it('scans run_code code text for egress in its EXECUTION shapes only (2026-10-09 accuracy fix)', () => {
     const light = makeSnapshot()
+    // Performance shapes: a tagged template runs its interior; an enumerated
+    // sink-call argument is run by the callee. Both stay fully gated.
     expect(decideTool(light, 'run_code', { code: 'await $`git push origin main`' }, CONFIG).kind).toBe('defer-egress')
     expect(decideTool(light, 'run_code', { code: 'await $`git push origin main`' }, GUARD_ONLY).kind).toBe('deny-egress')
+    expect(decideTool(light, 'run_code', { code: "const { execSync } = await import('node:child_process'); execSync('git push origin main')" }, GUARD_ONLY).kind).toBe('deny-egress')
+    expect(decideTool(light, 'run_code', { code: 'spawn("npm", ["publish"])' }, GUARD_ONLY).kind).toBe('allow') // array args carry no command phrase
+    // Data shapes: mentions in ordinary strings, comments and untagged
+    // templates are allowed — the two measured false positives.
+    expect(decideTool(light, 'run_code', { code: "const packet = 'ruling: do not git push yet'" }, GUARD_ONLY).kind).toBe('allow')
+    expect(decideTool(light, 'run_code', { code: "const note = 'no npm publish today'" }, GUARD_ONLY).kind).toBe('allow')
+    expect(decideTool(light, 'run_code', { code: '// TODO: git push after review' }, GUARD_ONLY).kind).toBe('allow')
+    expect(decideTool(light, 'run_code', { code: 'const msg = `the ruling says: git push is gated`' }, GUARD_ONLY).kind).toBe('allow')
   })
 
   describe('usage-declaration clamp', () => {
@@ -519,26 +529,39 @@ describe('the egress matcher reads a command line, and the refusal says so', () 
   })
 
   /**
-   * RECORDED CEILING (DESIGN.md §6). `run_code` carries SOURCE and
+   * CHANNEL READINGS AFTER THE 2026-10-09 ACCURACY FIX (owner P1 ruling).
+   *
+   * `run_code` carries SOURCE, and its egress-relevant execution paths are
+   * gated at their own dispatch: a program that performs an egress through the
+   * harness must call pwsh/bash/run_code as a nested tool call, and THAT call
+   * is classified by this same seam with full authorization required. A
+   * mention in program source (a quoted ruling, a test fixture, a TODO) is
+   * data, and matching it verbatim refused two legitimate operations on
+   * 2026-10-09 — an audit packet quoting "git push" from the owner's own
+   * ruling. So run_code now reads as 'source-code' and is NOT scanned here.
+   *
    * `terminal_send` carries keystrokes into a PTY whose foreground process is
-   * unknown, so neither is a shell command line and neither can distinguish a
-   * mention from a performance: `"git push"` in Python source is inert until
-   * something passes it to `shell=True`. Both keep VERBATIM matching, which
-   * keeps the deny direction intact and keeps these two rows over-inclusive.
+   * unknown: what is typed is one Enter away from execution and there is no
+   * nested-dispatch argument for it, so it keeps verbatim matching — mentions
+   * still refused, ceiling still recorded (DESIGN.md §6).
    */
-  const opaqueChannels: Array<[string, unknown]> = [
-    ['run_code', { code: '# TODO: git push after review\nprint(1)' }],
-    ['terminal_send', { sessionId: 's', text: '# git push is gated here' }],
-  ]
-
-  it('RECORDED CEILING: run_code and terminal_send are matched verbatim, mentions included', () => {
-    for (const [tool, args] of opaqueChannels) {
-      expect(decideTool(light, tool, args, GUARD_ONLY).kind, JSON.stringify(args)).toBe('deny-egress')
-      expect(decideTool(light, tool, args, CONFIG).kind, JSON.stringify(args)).toBe('defer-egress')
-    }
-    // The SAME two texts through a shell-line channel are allowed, which is what
-    // makes the two rows above a statement about the CHANNEL and not about the
-    // text. Without this control the ceiling is indistinguishable from a bug.
+  it('run_code program source is not command-scanned; terminal_send keystrokes still are', () => {
+    // The two rows that used to be the recorded ceiling, in their new reading.
+    expect(decideTool(light, 'run_code', { code: '# TODO: git push after review\nprint(1)' }, GUARD_ONLY).kind)
+      .toBe('allow')
+    expect(decideTool(light, 'run_code', { code: 'const note = "no npm publish today"' }, GUARD_ONLY).kind)
+      .toBe('allow')
+    // The measured false positives: quoted egress phrases inside data strings.
+    expect(decideTool(light, 'run_code', { code: "const packet = 'ruling: do not npm publish yet'" }, GUARD_ONLY).kind)
+      .toBe('allow')
+    expect(egressCommandOf('run_code', { code: "await tools.pwsh({ command: 'git push origin main' })" })).toBeUndefined()
+    // terminal_send keeps the deny direction, mention included.
+    expect(decideTool(light, 'terminal_send', { sessionId: 's', text: '# git push is gated here' }, GUARD_ONLY).kind)
+      .toBe('deny-egress')
+    expect(decideTool(light, 'terminal_send', { sessionId: 's', text: '# git push is gated here' }, CONFIG).kind)
+      .toBe('defer-egress')
+    // The SAME texts through a shell-line channel are allowed, which is what
+    // makes these rows statements about the CHANNEL and not about the text.
     expect(decideTool(light, 'bash', { command: '# TODO: git push after review\nprint(1)' }, GUARD_ONLY).kind)
       .toBe('allow')
     expect(decideTool(light, 'bash', { command: '# git push is gated here' }, GUARD_ONLY).kind).toBe('allow')
@@ -546,16 +569,40 @@ describe('the egress matcher reads a command line, and the refusal says so', () 
     expect(egressScanModeOf('bash')).toBe('shell-line')
     expect(egressScanModeOf('pwsh')).toBe('shell-line')
     expect(egressScanModeOf('terminal_open')).toBe('shell-line')
-    expect(egressScanModeOf('run_code')).toBe('opaque-text')
+    expect(egressScanModeOf('run_code')).toBe('source-code')
     expect(egressScanModeOf('terminal_send')).toBe('opaque-text')
     // Every shell-class tool has a mode, so adding one to SHELL_TOOLS without
     // deciding its reading cannot pass unnoticed.
     for (const tool of SHELL_TOOLS) {
-      expect(['shell-line', 'opaque-text']).toContain(egressScanModeOf(tool))
+      expect(['shell-line', 'opaque-text', 'source-code']).toContain(egressScanModeOf(tool))
     }
-    // opaque-text is the OLD behaviour, exactly: raw text, no stripping.
+    // source-code reads BARE code verbatim — a bare egress phrase in program
+    // position still matches; mentions inside ordinary literals are fused out
+    // (pinned in the run_code rows above).
+    expect(isEgressCommand('git push origin main', 'source-code')).toBe(true)
+    expect(egressSegments('git push origin main && npm publish', 'source-code').length).toBeGreaterThan(0)
+    expect(isEgressCommand("const packet = 'ruling: do not git push yet'", 'source-code')).toBe(false)
+    // opaque-text is the OLD verbatim behaviour, exactly: raw text, no stripping.
     expect(isEgressCommand('grep -rn "git push" .', 'opaque-text')).toBe(true)
     expect(isEgressCommand('grep -rn "git push" .', 'shell-line')).toBe(false)
+  })
+
+  /**
+   * THE SAFETY INVARIANT THE FIX RESTS ON (2026-10-09): a nested dispatch from
+   * inside run_code is a tool call of its own, and THIS seam classifies THAT
+   * call — so an actual egress attempt still requires the manifest. The
+   * wrapper being unscanned must never mean the wrapped command is unscanned.
+   */
+  it('a nested egress dispatch from run_code is gated at its own call', () => {
+    // The run_code program text that ATTEMPTS a push reads allow at this seam...
+    expect(egressCommandOf('run_code', { code: "await tools.pwsh({ command: 'git push origin main' })" })).toBeUndefined()
+    // ...but the pwsh dispatch it contains is classified exactly as a direct
+    // one would be: defer under the ask seam, deny under guard-only, and a
+    // manifest requirement at pre-execute. THAT is where the authorization
+    // lives, and every row of the `performed` matrix above already pins it.
+    expect(egressCommandOf('pwsh', { command: 'git push origin main' })).toBe('git push origin main')
+    expect(decideTool(light, 'pwsh', { command: 'git push origin main' }, CONFIG).kind).toBe('defer-egress')
+    expect(decideTool(light, 'pwsh', { command: 'git push origin main' }, GUARD_ONLY).kind).toBe('deny-egress')
   })
 
   /**
@@ -601,7 +648,7 @@ describe('the egress matcher reads a command line, and the refusal says so', () 
     expect(EGRESS_FAIL_CLOSED_REASON)
       .not.toContain('a quoted or commented occurrence inside an otherwise ordinary command is refused too')
     expect(EGRESS_FAIL_CLOSED_REASON).toContain('"#" comments and the contents of multi-word quoted arguments')
-    expect(EGRESS_FAIL_CLOSED_REASON).toContain('run_code and terminal_send')
+    expect(EGRESS_FAIL_CLOSED_REASON).toContain('terminal_send text is not a shell command line either and is matched verbatim, mention included')
     // and it is still the string the guard actually hands back
     const denial = decideTool(light, 'bash', { command: 'git push "origin" main' }, GUARD_ONLY)
     expect(denial.kind).toBe('deny-egress')

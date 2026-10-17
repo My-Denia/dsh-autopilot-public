@@ -2491,3 +2491,399 @@ describe('F31: exactly one selected candidate, and it is the pinned route', () =
     expect(next.routingPins).toBeUndefined()
   })
 })
+
+
+// ── costMatch: additive, optional, five kinds, validated on replay ──
+
+describe('routing detail costMatch: five kinds, optional, fold-validated', () => {
+  const PIN = { provider: 'beta', model: 'm-c', reasoningEffort: 'high' } as const
+  const STANDARD_TRIAGE = makeTriage({ size: 'standard', risk: 'medium', executionMode: 'inline', auditMode: 'independent' })
+
+  /** A legal audit event from plan-reviewing, carrying a routing decision. */
+  function auditWithRouting(prior: Snapshot, routing: unknown, pins: Snapshot['routingPins']): RunEvent {
+    return event('audit', makeSnapshot({
+      revision: prior.revision + 1,
+      phase: 'planning',
+      audits: prior.audits,
+      routingPins: pins,
+    }, STANDARD_TRIAGE), prior.revision + 1, { routing })
+  }
+
+  it('accepts each of the five costMatch kinds', () => {
+    for (const kind of ['route', 'model', 'model-case-folded', 'unknown', 'owner-override'] as const) {
+      const prior = makeSnapshot({ phase: 'plan-reviewing' }, STANDARD_TRIAGE)
+      const next = applyEvent(prior, auditWithRouting(
+        prior,
+        { role: 'plan-auditor', pin: PIN, why: ['x'], authorizationSource: 'session-policy', costMatch: kind },
+        { 'plan-auditor': PIN },
+      ))
+      expect(next.routingPins).toEqual({ 'plan-auditor': PIN })
+    }
+  })
+
+  it('a stream WITHOUT costMatch still replays — the field is additive and optional', () => {
+    const prior = makeSnapshot({ phase: 'plan-reviewing' }, STANDARD_TRIAGE)
+    const next = applyEvent(prior, auditWithRouting(
+      prior,
+      { role: 'plan-auditor', pin: PIN, why: ['x'], authorizationSource: 'session-policy' },
+      { 'plan-auditor': PIN },
+    ))
+    expect(next.routingPins).toEqual({ 'plan-auditor': PIN })
+  })
+
+  it('refuses an invalid costMatch value with an AP_ROUTING_DETAIL-shaped problem', () => {
+    const prior = makeSnapshot({ phase: 'plan-reviewing' }, STANDARD_TRIAGE)
+    expect(() => applyEvent(prior, auditWithRouting(
+      prior,
+      { role: 'plan-auditor', pin: PIN, why: ['x'], authorizationSource: 'session-policy', costMatch: 'seeded-elsewhere' },
+      { 'plan-auditor': PIN },
+    ))).toThrowError(/costMatch must be one of/)
+  })
+})
+
+// ── Governance pragmatics v1: findings grading, amend-plan, delta re-audit,
+// owner-resume, partial delivery, carryover. Every rule here is
+// presence-gated or op-gated so legacy streams keep their old reading —
+// the legacy fixtures above are the proof and must stay green untouched.
+
+describe('governance pragmatics v1 (fold)', () => {
+  function executing(overrides: Partial<Snapshot> = {}): Snapshot {
+    return makeSnapshot({
+      phase: 'executing',
+      planGate: 'pass',
+      executionGate: 'pending',
+      plan: { revision: 1, text: 'plan v1' },
+      ...overrides,
+    })
+  }
+
+  /** A closing snapshot that already satisfies requiredRoles (plan + execution pass). */
+  function closingWithRequiredAudits(): Snapshot {
+    return executing({
+      phase: 'closing',
+      executionGate: 'pass',
+      revision: 5,
+      audits: [
+        passAudit('plan', 0, { runRevision: 2 }),
+        passAudit('execution', 1, { runRevision: 4 }),
+      ],
+    })
+  }
+
+  function closeoutOf(evidence: Array<{ criterion: string; status: 'proven' | 'unproven'; bearer?: string; kind?: EvidenceKind }>) {
+    return {
+      summary: 's',
+      changedFiles: [],
+      commands: [],
+      evidence: evidence.map(entry => ({
+        criterion: entry.criterion,
+        status: entry.status,
+        bearer: entry.bearer ?? '',
+        ...(entry.kind === undefined ? {} : { kind: entry.kind }),
+      })),
+      residualRisks: [],
+      exclusions: [],
+      workspaceCleanup: 'kept',
+      drift: 'none found',
+    }
+  }
+
+  // ── findings ──
+
+  it('accepts a pass audit carrying non-blocking findings', () => {
+    const prior = executing()
+    const record = passAudit('execution', 0, {
+      findings: [{ severity: 'non-blocking', layer: 'execution', summary: 'suggest stronger rollback wording' }],
+    })
+    const next = { ...prior, revision: 2, audits: [record] }
+    expect(applyEvent(prior, event('audit', next, 2))).toEqual(next)
+  })
+
+  it('refuses needs-replan whose findings carry no blocking plan-layer item', () => {
+    const prior = executing()
+    const record = passAudit('execution', 0, {
+      verdict: 'needs-replan',
+      findings: [{ severity: 'blocking', layer: 'execution', summary: 'test gap in engine path' }],
+    })
+    const next: Snapshot = {
+      ...prior,
+      revision: 2,
+      phase: 'replanning',
+      planGate: 'needs-replan',
+      executionGate: 'needs-replan',
+      consecutiveReplans: 1,
+      audits: [record],
+      executionPacket: undefined,
+    }
+    expect(() => applyEvent(prior, event('audit', next, 2))).toThrowError(/executor-fixable/)
+  })
+
+  it('accepts needs-replan justified by a blocking plan-layer finding', () => {
+    const prior = executing()
+    const record = passAudit('plan', 0, {
+      verdict: 'needs-replan',
+      findings: [{ severity: 'blocking', layer: 'plan', summary: 'acceptance criterion not falsifiable' }],
+    })
+    const next: Snapshot = {
+      ...prior,
+      revision: 2,
+      phase: 'replanning',
+      planGate: 'needs-replan',
+      executionGate: prior.executionGate,
+      consecutiveReplans: 1,
+      audits: [record],
+    }
+    expect(applyEvent(prior, event('audit', next, 2))).toEqual(next)
+  })
+
+  it('refuses blocked without any blocking finding', () => {
+    const prior = executing()
+    const record = passAudit('execution', 0, {
+      verdict: 'blocked',
+      findings: [{ severity: 'non-blocking', layer: 'execution', summary: 'minor' }],
+    })
+    const next: Snapshot = { ...prior, revision: 2, phase: 'blocked', audits: [record] }
+    expect(() => applyEvent(prior, event('audit', next, 2))).toThrowError(/blocked without a blocking finding/)
+  })
+
+  it('refuses a malformed finding severity', () => {
+    const prior = executing()
+    const record = passAudit('execution', 0, {
+      verdict: 'pass',
+      // Deliberately malformed severity: the fold must refuse it, so the type
+      // is forced past the declared vocabulary on purpose.
+      findings: [{ severity: 'cosmetic' as never, layer: 'execution', summary: 'x' }],
+    })
+    const next = { ...prior, revision: 2, audits: [record] }
+    expect(() => applyEvent(prior, event('audit', next, 2))).toThrowError(/severity/)
+  })
+
+  it('keeps the legacy reading: needs-replan without findings folds as before', () => {
+    const prior = executing()
+    const record = passAudit('plan', 0, { verdict: 'needs-replan' })
+    const next: Snapshot = {
+      ...prior,
+      revision: 2,
+      phase: 'replanning',
+      planGate: 'needs-replan',
+      executionGate: prior.executionGate,
+      consecutiveReplans: 1,
+      audits: [record],
+    }
+    expect(applyEvent(prior, event('audit', next, 2))).toEqual(next)
+  })
+
+  // ── amend-plan + delta re-audit ──
+
+  it('accepts amend-plan that preserves gates, packet and arms the re-audit binding', () => {
+    const prior = executing({ executionPacket: 'packet-v1' })
+    const next = {
+      ...prior,
+      revision: 2,
+      plan: { revision: 2, text: 'plan v2 (amended)' },
+      planAmendedAtRevision: 2,
+    }
+    expect(applyEvent(prior, event('amend-plan', next, 2))).toEqual(next)
+  })
+
+  it('refuses amend-plan that clears the execution packet', () => {
+    const prior = executing({ executionPacket: 'packet-v1' })
+    const next = {
+      ...prior,
+      revision: 2,
+      plan: { revision: 2, text: 'plan v2' },
+      executionPacket: undefined,
+      planAmendedAtRevision: 2,
+    }
+    expect(() => applyEvent(prior, event('amend-plan', next, 2))).toThrowError(/preserve the execution packet/)
+  })
+
+  it('refuses amend-plan when planGate is not pass', () => {
+    // Phase-legality arm first: outside executing/execution-reviewing the op
+    // is illegal before the gate rule is even reached.
+    const prior = executing({ planGate: 'pending', phase: 'planning' })
+    const next = { ...prior, revision: 2, plan: { revision: 1, text: 'x' } }
+    expect(() => applyEvent(prior, event('amend-plan', next, 2))).toThrowError(/illegal in phase planning/)
+    // Defense-in-depth arm: a foreign snapshot that claims phase executing
+    // with planGate NOT pass must hit the gate rule itself (the write path
+    // refuses this earlier with AP_INVALID_ARGUMENT; §16 documents the fold
+    // arm as the replay-side re-check).
+    const foreign = executing({ planGate: 'pending' })
+    const foreignNext: Snapshot = {
+      ...foreign,
+      revision: 2,
+      plan: { revision: foreign.plan.revision + 1, text: 'amended' },
+      planAmendedAtRevision: foreign.plan.revision + 1,
+    }
+    expect(() => applyEvent(foreign, event('amend-plan', foreignNext, 2))).toThrowError(/requires planGate pass/)
+  })
+
+  it('refuses submit-evidence while the amendment awaits its delta re-audit', () => {
+    const prior = executing({ revision: 1, planAmendedAtRevision: 2, plan: { revision: 2, text: 'v2' } })
+    const next = { ...prior, revision: 2, executionPacket: 'evidence' }
+    expect(() => applyEvent(prior, event('submit-evidence', next, 2))).toThrowError(/delta re-audit/)
+  })
+
+  it('disarms the binding on a plan-role pass captured at the amended revision', () => {
+    const armed = executing({ revision: 2, planAmendedAtRevision: 2, plan: { revision: 2, text: 'v2' } })
+    const record = passAudit('plan', 0, { planRevision: 2 })
+    const disarmed = {
+      ...armed,
+      revision: 3,
+      audits: [record],
+      planAmendedAtRevision: undefined,
+    }
+    expect(applyEvent(armed, event('audit', disarmed, 3))).toEqual(disarmed)
+    const next = { ...disarmed, revision: 4, executionPacket: 'evidence' }
+    expect(applyEvent(disarmed, event('submit-evidence', next, 4))).toEqual(next)
+  })
+
+  it('keeps the binding armed when the delta pass predates the amendment', () => {
+    const armed = executing({ revision: 2, planAmendedAtRevision: 2, plan: { revision: 2, text: 'v2' } })
+    const stale = passAudit('plan', 0, { planRevision: 1 })
+    const next = { ...armed, revision: 3, audits: [stale] }
+    expect(applyEvent(armed, event('audit', next, 3)).planAmendedAtRevision).toBe(2)
+  })
+
+  // ── pausedFrom + owner-resume ──
+
+  it('stamps pausedFrom on entering needs-owner-decision and restores it on resume-execution', () => {
+    const executingSnap = executing({ executionPacket: 'packet-v1', planGate: 'pass', executionGate: 'needs-fix' })
+    const paused = {
+      ...executingSnap,
+      revision: 2,
+      phase: 'needs-owner-decision' as const,
+      pausedFrom: 'executing' as const,
+      executionGate: 'needs-fix' as const,
+    }
+    expect(applyEvent(executingSnap, event('set-owner-decision', paused, 2))).toEqual(paused)
+    const resumed = { ...paused, revision: 3, phase: 'executing' as const, pausedFrom: undefined }
+    expect(applyEvent(paused, event('owner-resolve', resumed, 3, { decision: 'resume-execution' }))).toEqual(resumed)
+  })
+
+  it('refuses resume-execution without a stamped pausedFrom (legacy arm)', () => {
+    const paused = { ...executing(), revision: 2, phase: 'needs-owner-decision' as const }
+    const resumed = { ...paused, revision: 3, phase: 'executing' as const }
+    expect(() => applyEvent(paused, event('owner-resolve', resumed, 3, { decision: 'resume-execution' })))
+      .toThrowError(/resume-planning-only/)
+  })
+
+  it('refuses resume-execution that touches the gates', () => {
+    const paused = {
+      ...executing({ executionGate: 'needs-fix' as const }),
+      revision: 2,
+      phase: 'needs-owner-decision' as const,
+      pausedFrom: 'executing' as const,
+    }
+    const resumed = { ...paused, revision: 3, phase: 'executing' as const, pausedFrom: undefined, executionGate: 'pending' as const }
+    expect(() => applyEvent(paused, event('owner-resolve', resumed, 3, { decision: 'resume-execution' })))
+      .toThrowError(/must not touch the gates/)
+  })
+
+  it('keeps the legacy pause reading: needs-owner-decision without pausedFrom folds', () => {
+    const paused = { ...executing(), revision: 2, phase: 'needs-owner-decision' as const }
+    expect(applyEvent(executing(), event('set-owner-decision', paused, 2))).toEqual(paused)
+  })
+
+  // ── partial delivery (stamped closeouts) ──
+
+  it('accepts a stamped partial closeout with a bijective handoff', () => {
+    const prior = closingWithRequiredAudits()
+    const closeout = {
+      ...closeoutOf([{ criterion: 'tests pass', status: 'unproven' as const }]),
+      outcome: 'partial' as const,
+      handoff: {
+        openItems: [{ criterion: 'tests pass', state: 'not-implemented' as const, note: 'suite not run in this stage' }],
+        nextAuthorizedAction: 'run the full suite in the follow-up run',
+      },
+    }
+    const next = { ...prior, revision: 6, phase: 'completed' as const, closeout }
+    expect(applyEvent(prior, event('submit-closeout', next, 6, { closeoutHandoff: 1 }))).toEqual(next)
+  })
+
+  it('refuses a stamped partial closeout without a handoff', () => {
+    const prior = closingWithRequiredAudits()
+    const closeout = {
+      ...closeoutOf([{ criterion: 'tests pass', status: 'unproven' as const }]),
+      outcome: 'partial' as const,
+    }
+    const next = { ...prior, revision: 6, phase: 'completed' as const, closeout }
+    expect(() => applyEvent(prior, event('submit-closeout', next, 6, { closeoutHandoff: 1 })))
+      .toThrowError(/requires a handoff/)
+  })
+
+  it('refuses an outcome that contradicts its derivation', () => {
+    const prior = closingWithRequiredAudits()
+    const closeout = {
+      ...closeoutOf([{ criterion: 'tests pass', status: 'unproven' as const }]),
+      outcome: 'complete' as const,
+      handoff: {
+        openItems: [{ criterion: 'tests pass', state: 'implemented-unverified' as const, note: 'implemented, not verified' }],
+      },
+    }
+    const next = { ...prior, revision: 6, phase: 'completed' as const, closeout }
+    expect(() => applyEvent(prior, event('submit-closeout', next, 6, { closeoutHandoff: 1 })))
+      .toThrowError(/derivation says/)
+  })
+
+  it('refuses a handoff openItem naming a non-criterion', () => {
+    const prior = closingWithRequiredAudits()
+    const closeout = {
+      ...closeoutOf([{ criterion: 'tests pass', status: 'unproven' as const }]),
+      outcome: 'partial' as const,
+      handoff: {
+        openItems: [
+          { criterion: 'tests pass', state: 'not-implemented' as const, note: 'a' },
+          { criterion: 'criterion that does not exist', state: 'known-limitation' as const, note: 'b' },
+        ],
+      },
+    }
+    const next = { ...prior, revision: 6, phase: 'completed' as const, closeout }
+    expect(() => applyEvent(prior, event('submit-closeout', next, 6, { closeoutHandoff: 1 })))
+      .toThrowError(/not an acceptance criterion/)
+  })
+
+  it('keeps the legacy reading: unstamped closeout with unproven criteria and no handoff folds', () => {
+    const prior = closingWithRequiredAudits()
+    const closeout = closeoutOf([{ criterion: 'tests pass', status: 'unproven' as const }])
+    const next = { ...prior, revision: 6, phase: 'completed' as const, closeout }
+    expect(applyEvent(prior, event('submit-closeout', next, 6))).toEqual(next)
+  })
+
+  it('refuses a complete closeout that still carries a handoff', () => {
+    const prior = closingWithRequiredAudits()
+    const closeout = {
+      ...closeoutOf([{ criterion: 'tests pass', status: 'proven' as const, bearer: 'evidence/x.log', kind: 'path' as const }]),
+      outcome: 'complete' as const,
+      handoff: { openItems: [{ criterion: 'tests pass', state: 'known-limitation' as const, note: 'n' }] },
+    }
+    const next = { ...prior, revision: 6, phase: 'completed' as const, closeout }
+    expect(() => applyEvent(prior, event('submit-closeout', next, 6, { closeoutHandoff: 1 })))
+      .toThrowError(/zero unproven criteria/)
+  })
+
+  // ── carryover ──
+
+  it('accepts init with a well-formed carryover', () => {
+    const snapshot = makeSnapshot({
+      triage: makeTriage({
+        carryover: { fromRunId: 'run-predecessor', note: 'continues stage 2', inherits: ['verified results', 'open items'] },
+      }),
+    })
+    expect(applyEvent(undefined, event('init', snapshot))).toEqual(snapshot)
+  })
+
+  it('refuses init with an empty carryover fromRunId', () => {
+    const snapshot = makeSnapshot({
+      triage: makeTriage({ carryover: { fromRunId: '  ', note: 'n', inherits: ['x'] } }),
+    })
+    expect(() => applyEvent(undefined, event('init', snapshot))).toThrowError(/carryover.fromRunId/)
+  })
+
+  it('refuses init with an empty carryover inherits list', () => {
+    const snapshot = makeSnapshot({
+      triage: makeTriage({ carryover: { fromRunId: 'r1', note: 'n', inherits: [] } }),
+    })
+    expect(() => applyEvent(undefined, event('init', snapshot))).toThrowError(/carryover.inherits/)
+  })
+})

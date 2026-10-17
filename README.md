@@ -13,9 +13,9 @@ A plan → execute → audit plugin for [DeepSeek Harness](https://github.com/de
 
 ## Install
 
-Requires dsh `0.2.0` (or `0.1.2-rc.1` / `0.1.5-rc.1`) and Node 22+.
+Requires dsh `0.2.0`, or the pre-release host `0.2.1-rc.2`, or `0.1.2-rc.1` / `0.1.5-rc.1`, and Node 22+. This source version is the pre-release `0.2.1-rc.1`. npm `latest` is still `0.2.0`.
 
-**Desktop:** Settings → Plugins → Add plugin, enter `dsh-goal-autopilot@0.2.0`, then Install and Enable.
+**Desktop:** Settings → Plugins → Add plugin, enter `dsh-goal-autopilot@0.2.0`, then Install and Enable. `0.2.1-rc.1` is not on npm `latest`; install that pre-release from its tarball.
 
 **CLI / headless / web:**
 
@@ -37,11 +37,12 @@ To drive the `autopilot_*` tools by hand, see the [operator reference](./docs/re
 
 <p align="center"><img src="./assets/workflow.svg" width="100%" alt="dsh-autopilot run loop"></p>
 
-A run moves through `planning` → `plan-reviewing` → `executing` → `execution-reviewing` → `completed`. State lives under `$DSH_HOME/storages/dsh-autopilot/runs/<sessionId>/`.
+A run moves through `planning` → `plan-reviewing` → `executing` → `execution-reviewing` → `completed`. The first run in a session lives under `$DSH_HOME/storages/dsh-autopilot/runs/<sessionId>/`. A later goal in the same session gets its own run id; the finished run stays there.
 
 - **Plan gate.** File writes and edits are blocked, and read-only sandbox mode is requested, until the plan audit passes. The plan states goal, scope, non-goals, risk, milestones and acceptance criteria, and declares observable usage states with `autopilot_usage`.
 - **Independent audits.** Auditors are one-shot subagents with read-only tools and `maxDepth: 1`, returning `pass`, `needs-replan` or `blocked`.
 - **Same-executor resume.** One continuable executor does the work; on `needs-fix` the same executor continues.
+- **Next goal.** After `completed` or `blocked`, `autopilot_init` starts another run in the same session. It does not copy the previous run's gates, approvals, executor, or auditors.
 - **Egress guard.** `git push`, `gh release` and `npm publish` are intercepted and need a valid evidence manifest (`<run>/outbound/manifest.json`) plus owner approval.
 - **Evidence-bound closeout.** `completed` is refused until both gates pass and every acceptance criterion has an artifact on disk.
 - **Turn reminder.** Up to three nudges if the agent stops mid-run.
@@ -50,20 +51,24 @@ Design details: [DESIGN.md](./DESIGN.md).
 
 ## Status
 
-Developer preview.
+Developer preview. `0.2.1-rc.1` is a pre-release of this plugin for the pre-release host dsh `0.2.1-rc.2`.
 
 | | |
 | --- | --- |
-| Tested | Install, mount, skill registration, plan audit, delegated executor and needs-fix resume on WSL2 + dsh 0.2.0-rc.2 with a local mock model |
-| Not yet tested | Full run with a real model, Desktop on macOS/Windows, native Windows, browser card rendering |
-| Host range | dsh 0.2.0 line, 0.1.5-rc.1, 0.1.2-rc.1 (0.1.7 and 0.2.1 are outside the peer range) |
-| Distribution | npm; GitHub Releases carry notes only |
+| Tested on 0.2.1-rc.2 | 2026-10-17, WSL2, local mock, no credentials: tarball install without a version exemption; plan audit; delegated executor; needs-fix resume; closeout; a second goal in the same session; restart status stayed on that second goal |
+| Tested on 0.2.0-rc.2 | Install, mount, skill registration, plan audit, delegated executor and needs-fix resume on WSL2 with a local mock model |
+| Not yet tested | Full run with a real model, Desktop on macOS/Windows for this pre-release, native Windows, browser card rendering. The client bundle was not rebuilt for 0.2.1-rc.1 |
+| Host range | dsh 0.2.0 line, exact `0.2.1-rc.2`, `0.1.5-rc.1`, `0.1.2-rc.1`. Other 0.2.1 prereleases and 0.1.7 are outside the range |
+| Distribution | npm `latest` is `0.2.0`. GitHub Releases carry notes only |
 
 See [docs/compatibility.md](./docs/compatibility.md) and [docs/security.md](./docs/security.md).
 
 ## Documentation
 
 - [DESIGN.md](./DESIGN.md): architecture, GAH mapping, state machine
+- [skill/dsh-autopilot/references/refusals.md](./skill/dsh-autopilot/references/refusals.md): what the engine refuses, and the remedy
+- [skill/dsh-autopilot/references/model-routing.md](./skill/dsh-autopilot/references/model-routing.md): routing contract, ladder, work classes
+- [skill/dsh-autopilot/references/governance-invariants.md](./skill/dsh-autopilot/references/governance-invariants.md): host-neutral governance rules
 - [docs/compatibility.md](./docs/compatibility.md): dsh versions, Desktop notes, sandbox
 - [docs/security.md](./docs/security.md): approvals, egress interception, sandbox
 - [docs/reference.md](./docs/reference.md): `autopilot_*` tools, run state, usage classes

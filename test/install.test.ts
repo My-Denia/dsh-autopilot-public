@@ -112,7 +112,7 @@ function scriptedEngine(
 ): AutopilotEngine {
   return new Proxy(engine, {
     get(target, property, receiver) {
-      if (property === 'peek') return () => snapshot
+      if (property === 'peek' || property === 'peekActive') return () => snapshot
       if (property === 'bumpReminder') {
         return async () => {
           bumps.push(bumps.length + 1)
@@ -136,7 +136,7 @@ function midExecution(overrides: Partial<Snapshot> = {}): Snapshot {
 function corruptedPeek(engine: AutopilotEngine, message: string): AutopilotEngine {
   return new Proxy(engine, {
     get(target, property, receiver) {
-      if (property === 'peek') {
+      if (property === 'peek' || property === 'peekActive') {
         return () => { throw new AutopilotError(message, 'AP_STORE_CORRUPT') }
       }
       return Reflect.get(target, property, receiver) as unknown

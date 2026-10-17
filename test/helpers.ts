@@ -10,7 +10,7 @@ import { RunStore } from '../src/store/file.js'
 import type { Snapshot, Triage, UsageEntry } from '../src/domain/types.js'
 
 export function makeTriage(overrides: Partial<Triage> = {}): Triage {
-  return {
+  const merged: Triage = {
     objective: 'test objective',
     scope: ['src/'],
     nonGoals: ['docs/'],
@@ -23,6 +23,12 @@ export function makeTriage(overrides: Partial<Triage> = {}): Triage {
     baseline: {},
     ...overrides,
   }
+  // AP_INLINE_REASON_REQUIRED: a fixture that asks for an inline medium+ run
+  // records its reason exactly like a real caller must.
+  if (merged.executionMode === 'inline' && merged.risk !== 'low' && merged.inlineReason === undefined) {
+    return { ...merged, inlineReason: 'fixture: the test exercises an inline medium+ run' }
+  }
+  return merged
 }
 
 export function makeSnapshot(overrides: Partial<Snapshot> = {}, triage: Partial<Triage> = {}): Snapshot {
@@ -82,6 +88,8 @@ export class FakeAgents {
 export interface StubVerdictScript {
   verdict: string
   note: string
+  /** Graded findings forwarded verbatim into the structured return (governance pragmatics v1). */
+  findings?: import('../src/domain/types.js').AuditFinding[]
   /**
    * Override the child's logged `request/header` route (M4 observed leg).
    * Absent ⇒ the stub logs a header AGREEING with the dispatch — what a
@@ -104,12 +112,15 @@ export function stubSubagents(script: {
   auditOptions: Array<AgentOptionsLike | undefined>
   /** The agentOptions each continuable executor dispatch received (undefined = inherit). */
   continuableOptions: Array<AgentOptionsLike | undefined>
+  /** The dispatch prompt text each continuable executor received. */
+  continuablePrompts: string[]
 } {
   const verdicts = [...(script.verdicts ?? [])]
   const followups: Array<{ childId: string; text: string }> = []
   const started: string[] = []
   const auditOptions: Array<AgentOptionsLike | undefined> = []
   const continuableOptions: Array<AgentOptionsLike | undefined> = []
+  const continuablePrompts: string[] = []
   let auditCounter = 0
   let followupFailsLeft = script.followupFails ?? 0
   return {
@@ -117,6 +128,7 @@ export function stubSubagents(script: {
     started,
     auditOptions,
     continuableOptions,
+    continuablePrompts,
     async start(_provider, request) {
       auditOptions.push(request.agentOptions)
       const next = verdicts.shift()
@@ -170,6 +182,7 @@ export function stubSubagents(script: {
       if (script.failContinuable === true) throw new Error('continuable startup failed (scripted)')
       started.push(spec.childId)
       continuableOptions.push(spec.request.agentOptions)
+      continuablePrompts.push(spec.request.prompt.map(block => block.text).join('\n'))
       script.onStartContinuable?.(spec.childId)
       return {}
     },

@@ -20,9 +20,9 @@
 import { useEffect, useRef, useState } from 'react'
 import type { CSSProperties } from 'react'
 import type {
-  AutopilotAuditRow, AutopilotRunChatData, Observed,
+  AutopilotAuditRow, AutopilotRunChatData, GateSourcesMirror, Observed, ReachabilityMirror, RoutingMirror,
 } from './definition.js'
-import { routeStatusView } from './definition.js'
+import { gateSourceLines, routeStatusView, routingLines } from './definition.js'
 import { fetchLiveRun, overlayLive, pollDelayMs, pollKey, shouldPoll } from './live.js'
 import type { LiveFetch, LiveRun } from './live.js'
 
@@ -96,8 +96,9 @@ function useLiveRun(
   const latest = useRef({ data, live, sessionId })
   latest.current = { data, live, sessionId }
   // The fold's runId when the traffic reported one, else this session's id.
-  // See `pollKey`: a run's id IS its root session id, so the fallback is sound
-  // rather than a guess, and a session with no run simply 404s in silence.
+  // The first run uses the session id. A later run in the same session names
+  // its own id in the fold, and pollKey prefers that. A session with no run
+  // simply 404s in silence.
   const key = pollKey(data, sessionId)
 
   useEffect(() => {
@@ -241,6 +242,30 @@ function Field({ label, at }: { label: string; at: Observed<unknown> | undefined
   )
 }
 
+/**
+ * Gate provenance (DESIGN §9 item 8): which authority last set each gate, and
+ * for which plan revision.
+ *
+ * WHY THE CARD NEEDS THIS AT ALL: the grid above already shows the gate VALUES,
+ * and a value cannot say who put it there — which is the difference between a
+ * gate a review passed and one the owner passed. The precedence rule turns that
+ * difference into different futures, so a reader who cannot see the source
+ * cannot tell whether a later objection will move the gate.
+ *
+ * @param props.gates - the merged provenance observation from the host route.
+ */
+function GateSourceRow({ gates }: { readonly gates: Observed<GateSourcesMirror> }): JSX.Element {
+  return (
+    <div style={{ marginTop: 6 }} data-autopilot-gate-sources="">
+      {gateSourceLines(gates.value).map(line => (
+        <div key={line.gate} style={muted} title={line.title} data-autopilot-gate-source={line.gate}>
+          {line.text}
+        </div>
+      ))}
+    </div>
+  )
+}
+
 /** One audit dispatch row: role, verdict, and the auditor that produced it. */
 function AuditRow({ row }: { row: AutopilotAuditRow }): JSX.Element {
   const verdict = row.failed ? 'errored' : row.settled ? (row.verdict ?? 'no verdict') : 'in flight'
@@ -260,6 +285,43 @@ function AuditRow({ row }: { row: AutopilotAuditRow }): JSX.Element {
         ? <span style={muted} title={status.title}> · {route.routeModel}{status.suffix}</span>
         : null}
     </li>
+  )
+}
+
+/**
+ * The routing block (M13): configuration, the roles' effective routing, what
+ * this run ACTUALLY dispatched, and — under its own label — candidate coverage.
+ *
+ * WHY THE LABELS MATTER MORE THAN THE VALUES. The four kinds of statement here
+ * are not interchangeable: a policy state is a fact about this session, a pin is
+ * a record of what ran, and coverage is a statement about the ladder and the
+ * catalog. Merging them into one sentence is how a status card starts lying
+ * without any single value being wrong, so each line states what it is, and the
+ * coverage line says out loud that it is not a dispatch record.
+ *
+ * @param props.routing - the merged routing projection (session-observed or from the host route).
+ * @param props.reachability - the candidate-coverage report, when one was observed.
+ * @returns the block element.
+ */
+function RoutingBlock({ routing, reachability }: {
+  readonly routing: Observed<RoutingMirror>
+  readonly reachability?: Observed<ReachabilityMirror> | undefined
+}): JSX.Element {
+  const lines = routingLines(routing, reachability)
+  return (
+    <div style={{ marginTop: 6 }} data-autopilot-routing="">
+      {lines.map(line => (
+        <div key={line.label} title={line.title} data-autopilot-routing-line={line.label}>
+          <span style={muted}>{line.label} </span>
+          <span>{line.text}</span>
+        </div>
+      ))}
+      <div style={muted} title="the run revision this routing block belongs to">
+        {routing.seq === undefined
+          ? `routing read at run revision ${routing.revision}`
+          : `routing observed at run revision ${routing.revision}, seq ${routing.seq}`}
+      </div>
+    </div>
   )
 }
 
@@ -328,6 +390,8 @@ export function AutopilotRunCard({ node, sessionId, fetchJson }: AutopilotRunCar
         <Field label="log entries" at={data.logCount} />
       </div>
 
+      {data.gateSources !== undefined ? <GateSourceRow gates={data.gateSources} /> : null}
+
       {triage !== undefined
         ? (
           <div style={{ ...muted, marginTop: 6 }}>
@@ -339,6 +403,16 @@ export function AutopilotRunCard({ node, sessionId, fetchJson }: AutopilotRunCar
               : ''}
           </div>
           )
+        : null}
+
+      {/*
+        M13: the routing block. Rendered ONLY when routing was observed — with
+        routing off the engine serves no block at all, and inventing an "off"
+        line here would report a routing state where the owner configured none.
+        The coverage report is passed through only when it, too, was observed.
+      */}
+      {data.routing !== undefined
+        ? <RoutingBlock routing={data.routing} reachability={data.routingReachability} />
         : null}
 
       {data.executor !== undefined

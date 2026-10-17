@@ -26,7 +26,7 @@ import { join, resolve } from 'node:path'
 import { foldRun } from '../domain/fold.js'
 import { AutopilotError, errorMessage } from '../domain/types.js'
 import type { LogEntry, Operation, RunEvent, RunId, Snapshot, StoreKind } from '../domain/types.js'
-import type { RunStoreLike } from './types.js'
+import type { RunStoreLike, SessionRunIndex } from './types.js'
 
 /**
  * Resolve the store root: $DSH_AUTOPILOT_HOME, else $DSH_HOME/storages/dsh-autopilot,
@@ -130,6 +130,39 @@ export function runDirFor(root: string, runId: RunId): string {
   return join(root, 'runs', sanitize(runId))
 }
 
+function sessionIndexPath(root: string, sessionId: string): string {
+  return join(root, 'sessions', `${sanitize(sessionId)}.json`)
+}
+
+/** Read the session's run index, or `undefined` when this session never started a second run. */
+export function readSessionIndex(root: string, sessionId: string): SessionRunIndex | undefined {
+  try {
+    const parsed = JSON.parse(readFileSync(sessionIndexPath(root, sessionId), 'utf8')) as Partial<SessionRunIndex>
+    if (parsed.v !== 1) return undefined
+    if (parsed.sessionId !== sessionId) return undefined
+    if (typeof parsed.currentRunId !== 'string' || parsed.currentRunId.length === 0) return undefined
+    if (!Array.isArray(parsed.runIds) || parsed.runIds.some(id => typeof id !== 'string' || id.length === 0)) return undefined
+    if (!parsed.runIds.includes(parsed.currentRunId)) return undefined
+    return {
+      v: 1,
+      sessionId,
+      currentRunId: parsed.currentRunId,
+      runIds: parsed.runIds,
+    }
+  } catch {
+    return undefined
+  }
+}
+
+/** Publish the session index after the new run's own stream is already durable. */
+export function writeSessionIndex(root: string, index: SessionRunIndex): void {
+  const path = sessionIndexPath(root, index.sessionId)
+  mkdirSync(join(root, 'sessions'), { recursive: true })
+  const tmp = `${path}.${process.pid}.tmp`
+  writeFileSync(tmp, `${JSON.stringify(index)}\n`)
+  renameSync(tmp, path)
+}
+
 /** Durable store for run event streams and their projections. */
 export class RunStore implements RunStoreLike {
   /** Recorded into `Enforcement.store`; never inferred by the engine. */
@@ -139,6 +172,14 @@ export class RunStore implements RunStoreLike {
 
   runDir(runId: RunId): string {
     return runDirFor(this.root, runId)
+  }
+
+  readSessionIndex(sessionId: string): SessionRunIndex | undefined {
+    return readSessionIndex(this.root, sessionId)
+  }
+
+  writeSessionIndex(index: SessionRunIndex): void {
+    writeSessionIndex(this.root, index)
   }
 
   /**

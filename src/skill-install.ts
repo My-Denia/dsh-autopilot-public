@@ -209,7 +209,7 @@ export function syncBundledSkill(options: {
           return {
             status: 'unsupported',
             dest,
-            detail: `skill home does not support hard links, and no atomic no-clobber publish is available without them; nothing was written to ${dest} — copy the bundled SKILL.md there manually to install`,
+            detail: `skill home does not support hard links, and no atomic no-clobber publish is available without them; nothing was written to ${dest} — copy ${source} there manually to install`,
           }
         }
         removeTemp(io, temp)
@@ -225,4 +225,131 @@ export function syncBundledSkill(options: {
     const detail = error instanceof Error ? error.message : String(error)
     return { status: 'error', dest, detail }
   }
+}
+
+/** Subdirectory of the skill directory holding the reference layer. */
+export const SKILL_REFERENCES_DIR = 'references'
+
+/**
+ * The reference files published alongside `SKILL.md`.
+ *
+ * A static list rather than a directory scan: the install path must stay
+ * deterministic and observable through injected IO. `test/references-contract.test.ts`
+ * asserts it equals the real directory listing, so it cannot rot.
+ */
+export const BUNDLED_SKILL_REFERENCES: readonly string[] = [
+  'governance-invariants.md',
+  'model-routing.md',
+  'refusals.md',
+]
+
+/**
+ * Bundled skill DIRECTORY: `../skill/dsh-autopilot` from both `src/` and `lib/`.
+ *
+ * The same directory the 0.2.0 provider serves as its `resourceBase`, so the
+ * filesystem fallback and the provider publish the same set.
+ */
+export function bundledSkillRoot(fromUrl: string = import.meta.url): string {
+  return dirname(bundledSkillPath(fromUrl))
+}
+
+/** One file's outcome inside a {@link SkillTreeSyncResult}. */
+export interface SkillTreeFileResult {
+  /** Path relative to the skill directory, slash-separated. */
+  readonly relative: string
+  readonly dest: string
+  readonly status: SkillInstallStatus
+  readonly detail?: string
+}
+
+export interface SkillTreeSyncResult {
+  /** Aggregate: `copied` if this call published any file, else the refusing status. */
+  readonly status: SkillInstallStatus
+  /** The `SKILL.md` destination, for callers that only track one path. */
+  readonly dest?: string
+  readonly detail?: string
+  readonly files: readonly SkillTreeFileResult[]
+}
+
+/**
+ * Publish the whole bundled skill — `SKILL.md` plus the reference layer — into
+ * the skill-scan root.
+ *
+ * Same guarantees as {@link syncBundledSkill}, held across the SET rather than
+ * one file: a dest that is not a regular file, a destination that already
+ * differs, or a filesystem that cannot hard-link writes NOTHING and reports why.
+ * A partial publish is undone by unlinking exactly the destinations THIS call
+ * created; a destination that was already there is never touched. The undo is
+ * best-effort, and when an unlink FAILS the returned detail says so and names
+ * the surviving path rather than reporting a clean rollback.
+ *
+ * Mixed states are handled rather than refused: an upgrade from the 0.1.x
+ * single-file install has SKILL.md present and identical while the reference
+ * layer is absent, and that publishes the absent files only.
+ */
+export function syncBundledSkillTree(
+  options: {
+    readonly enabled: boolean
+    readonly root?: string
+    readonly destRoot?: string
+    readonly io?: SkillSyncIo
+  } = { enabled: true },
+): SkillTreeSyncResult {
+  if (!options.enabled) return { status: 'skipped', files: [] }
+  const root = options.root ?? bundledSkillRoot()
+  const destRoot = options.destRoot ?? join(skillHome(), 'skills', 'dsh-autopilot')
+  const io = options.io ?? defaultIo
+  const skillDest = join(destRoot, 'SKILL.md')
+  const plan = [
+    { relative: 'SKILL.md', source: join(root, 'SKILL.md'), dest: skillDest },
+    ...BUNDLED_SKILL_REFERENCES.map(name => ({
+      relative: `${SKILL_REFERENCES_DIR}/${name}`,
+      source: join(root, SKILL_REFERENCES_DIR, name),
+      dest: join(destRoot, SKILL_REFERENCES_DIR, name),
+    })),
+  ]
+  const files: SkillTreeFileResult[] = []
+  const created: string[] = []
+  const rollback = (): string | undefined => {
+    if (created.length === 0) return undefined
+    const stuck: string[] = []
+    for (const dest of created) {
+      // Best effort AND REPORTED. An unlink that fails leaves the destination
+      // on disk, which is a real half-published skill — describing that as a
+      // clean undo would be the exact false claim this whole return value
+      // exists to avoid.
+      try { io.unlink(dest) } catch { stuck.push(dest) }
+    }
+    const undone = created.length - stuck.length
+    const parts = [`undid ${String(undone)} of ${String(created.length)} file(s) this call had published`]
+    if (stuck.length > 0) {
+      parts.push(`FAILED to remove ${stuck.join(', ')} — still on disk, so the skill is only partly published`)
+    }
+    return parts.join('; ')
+  }
+  try {
+    for (const entry of plan) {
+      const result = syncBundledSkill({ enabled: true, source: entry.source, dest: entry.dest, io })
+      files.push({
+        relative: entry.relative,
+        dest: entry.dest,
+        status: result.status,
+        ...(result.detail === undefined ? {} : { detail: result.detail }),
+      })
+      if (result.status === 'copied') { created.push(entry.dest); continue }
+      if (result.status === 'unchanged') continue
+      const undo = rollback()
+      return {
+        status: result.status,
+        dest: skillDest,
+        detail: [result.detail, undo].filter((part): part is string => part !== undefined).join('; ') || undefined,
+        files,
+      }
+    }
+  } catch (error: unknown) {
+    const undo = rollback()
+    const message = error instanceof Error ? error.message : String(error)
+    return { status: 'error', dest: skillDest, detail: [message, undo].filter((part): part is string => part !== undefined).join('; '), files }
+  }
+  return { status: created.length > 0 ? 'copied' : 'unchanged', dest: skillDest, files }
 }

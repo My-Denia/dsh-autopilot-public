@@ -1304,3 +1304,62 @@ describe('every trimmed tool result is self-describing', () => {
       .toEqual({ runId: 'session-1', revision: 1, phase: 'planning' })
   })
 })
+
+describe('the gate actions carry the SAME owner gate as owner-approve (DESIGN §9 item 8)', () => {
+  const MEDIUM = { size: 'standard', risk: 'medium', executionMode: 'inline', auditMode: 'independent' } as const
+  const SEED = { id: 'm1', usageClass: 'internal', boundaryStates: [], artifacts: [], attempted: [] } as const
+
+  /** A run sitting in planning with a plan submitted and the usage question answered. */
+  async function ready(h: Harness): Promise<void> {
+    await h.engine.init(h.root, makeTriage(MEDIUM), [SEED])
+    await h.engine.declareUsage(h.root, makeUsageEntry({ id: 'm1', usageClass: 'internal', boundaryStates: [], artifacts: [] }))
+    await h.engine.submitPlan(h.root, 'plan')
+  }
+
+  it('REFUSES an agent-generated turn, and the gate does not move', async () => {
+    const h = makeHarness()
+    await ready(h)
+    openTurn(h.root, { kind: 'agent' })
+    const before = h.engine.peek(h.root.id)?.revision
+
+    const tool = toolOf(h.engine, 'autopilot_signal')
+    try {
+      await tool.execute({ action: 'owner-gate-pass', gate: 'plan', note: 'let myself through' }, EXEC(h.root))
+      expect.unreachable('an agent-generated turn must not pass a gate')
+    } catch (error: unknown) {
+      expect(error).toBeInstanceOf(AutopilotError)
+      expect((error as AutopilotError).code).toBe('AP_OWNER_AUTHORITY_REQUIRED')
+    }
+    // Not merely "it threw": nothing was recorded and the gate stayed shut.
+    expect(h.engine.peek(h.root.id)?.planGate).toBe('pending')
+    expect(h.engine.peek(h.root.id)?.revision).toBe(before)
+  })
+
+  it('ACCEPTS a user-sourced turn — the positive control, and the provenance it writes', async () => {
+    const h = makeHarness()
+    await ready(h)
+    openTurn(h.root, { kind: 'user' })
+
+    const tool = toolOf(h.engine, 'autopilot_signal')
+    await tool.execute({ action: 'owner-gate-pass', gate: 'plan', note: 'the plan is fine' }, EXEC(h.root))
+    const snapshot = h.engine.peek(h.root.id)
+    expect(snapshot?.planGate).toBe('pass')
+    expect(snapshot?.gateSources?.plan).toMatchObject({ source: 'owner', planRevision: 1, ownerDecision: 1 })
+  })
+
+  it('the withdrawal is owner-only too, and declares the gate it takes back', async () => {
+    const h = makeHarness()
+    await ready(h)
+    openTurn(h.root, { kind: 'user' })
+    const tool = toolOf(h.engine, 'autopilot_signal')
+    await tool.execute({ action: 'owner-gate-pass', gate: 'plan', note: 'accept' }, EXEC(h.root))
+
+    // A missing `gate` is an argument error, not a silent whole-run decision.
+    await expect(tool.execute({ action: 'owner-gate-withdraw', note: 'take it back' }, EXEC(h.root)))
+      .rejects.toMatchObject({ code: 'AP_INVALID_ARGUMENT' })
+
+    await tool.execute({ action: 'owner-gate-withdraw', gate: 'plan', note: 'take it back' }, EXEC(h.root))
+    expect(h.engine.peek(h.root.id)?.planGate).toBe('pending')
+    expect(h.engine.peek(h.root.id)?.gateSources?.plan).toMatchObject({ withdrawn: true, ownerDecision: 1 })
+  })
+})

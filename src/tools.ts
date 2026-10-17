@@ -143,6 +143,18 @@ export function installRootTools(
           items: { type: 'string' },
           description: 'Standard runs only: ids of the user-visible changes this run will make, seeded as "undeclared". Defaults to a single entry "m1". Each must be answered with autopilot_usage before the plan gate can pass.',
         },
+        carryoverFromRunId: { type: 'string', description: 'Declare this run as the continuation of a COMPLETED predecessor run (cross-run carryover). The predecessor must exist in the store and be completed; refused otherwise.' },
+        carryoverNote: { type: 'string', description: 'What this run carries forward from the predecessor (required with carryoverFromRunId).' },
+        carryoverInherits: { type: 'array', items: { type: 'string' }, description: 'Named items inherited from the predecessor (verified results, open items, decisions, evidence refs). Required non-empty with carryoverFromRunId.' },
+        ownerRequirements: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Owner-verbatim requirement strings this run must honour. Recorded once, surfaced in status and policy, so auditors check compliance against the owner\'s actual words rather than a paraphrase.',
+        },
+        inlineReason: {
+          type: 'string',
+          description: 'REQUIRED when executionMode is inline and risk is medium or above (AP_INLINE_REASON_REQUIRED otherwise): the recorded reason this run does not delegate. A reason is recorded, never approved.',
+        },
       },
       output: jsonOutput(JSON_VALUE),
       async execute(args, exec) {
@@ -163,6 +175,15 @@ export function installRootTools(
             ...(args.baselineDirty === undefined ? {} : { dirty: args.baselineDirty }),
             ...(args.baselineNote === undefined ? {} : { note: args.baselineNote }),
           },
+          ...(args.carryoverFromRunId === undefined ? {} : {
+            carryover: {
+              fromRunId: args.carryoverFromRunId,
+              note: args.carryoverNote ?? '',
+              inherits: args.carryoverInherits ?? [],
+            },
+          }),
+          ...(args.ownerRequirements === undefined ? {} : { ownerRequirements: args.ownerRequirements }),
+          ...(args.inlineReason === undefined ? {} : { inlineReason: args.inlineReason }),
         }
         // Usage seeding is STANDARD-ONLY: lightweight runs skip mechanical
         // enforcement across the board (CC parity — the same exemption the
@@ -202,14 +223,43 @@ export function installRootTools(
     }))
 
     register(defineTool({
+      name: 'autopilot_amend_plan',
+      description: 'Amend the PASSED plan mid-execution without destroying execution state: bumps the plan revision, keeps gates/executor/evidence, and ARMS a delta re-audit — further evidence/closeout are refused until a plan-role pass at the amended revision lands. Objective/scope/acceptance criteria are immutable (triage); a material change that fails the delta audit still takes the full replan path.',
+      parameters: {
+        text: { type: 'string', required: true, description: 'The complete amended plan text.' },
+        note: { type: 'string', required: true, description: 'What changed and why — the delta the re-audit will review.' },
+      },
+      output: jsonOutput(JSON_VALUE),
+      async execute(args, exec) {
+        const agent = callingAgent(exec.agent, 'autopilot_amend_plan')
+        const snapshot = await engine.amendPlan(agent, { text: args.text, note: args.note })
+        return {
+          runId: snapshot.runId,
+          revision: snapshot.revision,
+          phase: snapshot.phase,
+          planRevision: snapshot.plan.revision,
+          planGate: snapshot.planGate,
+          planAmendedAtRevision: snapshot.planAmendedAtRevision,
+        } as never
+      },
+    }))
+
+    register(defineTool({
       name: 'autopilot_status',
       description: 'Read the autopilot run status: phase, gates, required audit roles with latest verdicts, replan budget, enforcement state.',
       parameters: {},
       output: jsonOutput(JSON_VALUE),
-      execute(_args, exec) {
+      async execute(_args, exec) {
         const agent = callingAgent(exec.agent, 'autopilot_status')
+        // M7b: refresh the work-class report from the LIVE routing config and a
+        // current catalog snapshot before projecting, so the status a reader
+        // sees describes the ladder in force now. The report used to be written
+        // only by a FRESH selection, so a pin reuse served a pre-edit value.
+        // The refresh never throws; a failed catalog read leaves the last
+        // observed report standing.
+        await engine.refreshReachability()
         const view = engine.status(agent)
-        return Promise.resolve((view ?? { initialized: false, note: 'no autopilot run on this session' }) as never)
+        return (view ?? { initialized: false, note: 'no autopilot run on this session' }) as never
       },
     }))
 
@@ -483,11 +533,12 @@ export function installRootTools(
 
     register(defineTool({
       name: 'autopilot_signal',
-      description: 'Run control signals. replan: rewrite the plan (drains any executor). block / owner-decision: stop the run. owner-approve: grant ONE egress approval (owner-only; requires a direct human turn). owner-resolve: resolve a needs-owner-decision pause (owner-only; decision resume-planning or block).',
+      description: 'Run control signals. replan: rewrite the plan (drains any executor). block / owner-decision: stop the run. owner-approve: grant ONE egress approval (owner-only; requires a direct human turn). owner-resolve: resolve a needs-owner-decision pause (owner-only; decision resume-planning, resume-execution to restore the paused-from phase with gates/evidence untouched, or block). owner-gate-pass / owner-gate-withdraw: pass or take back ONE gate directly (owner-only; requires a direct human turn, and a gate named by `gate`). A gate the owner passed stands against a later audit objection — the objection is recorded, not erased — and one owner decision never carries the other gate.',
       parameters: {
-        action: { type: 'string', required: true, enum: ['replan', 'block', 'owner-decision', 'owner-approve', 'owner-resolve'] },
+        action: { type: 'string', required: true, enum: ['replan', 'block', 'owner-decision', 'owner-approve', 'owner-resolve', 'owner-gate-pass', 'owner-gate-withdraw'] },
         note: { type: 'string', required: true, description: 'Reason / ruling / approval target description.' },
-        ownerDecision: { type: 'string', enum: ['resume-planning', 'block'], description: 'owner-resolve only.' },
+        ownerDecision: { type: 'string', enum: ['resume-planning', 'resume-execution', 'block'], description: 'owner-resolve only. resume-execution restores the paused-from phase with gates/evidence untouched (requires a pause that stamped it); resume-planning fully resets.' },
+        gate: { type: 'string', enum: ['plan', 'execution'], description: 'owner-gate-pass / owner-gate-withdraw only: which gate the owner decision is about. One decision names exactly one gate.' },
       },
       output: jsonOutput(JSON_VALUE),
       async execute(args, exec) {
@@ -513,11 +564,29 @@ export function installRootTools(
           case 'owner-resolve': {
             requireDirectHumanTurn(agent, 'owner-resolve')
             const decision = args.ownerDecision
-            if (decision !== 'resume-planning' && decision !== 'block') {
-              throw new AutopilotError('owner-resolve requires ownerDecision resume-planning|block', 'AP_INVALID_ARGUMENT')
+            if (decision !== 'resume-planning' && decision !== 'resume-execution' && decision !== 'block') {
+              throw new AutopilotError('owner-resolve requires ownerDecision resume-planning|resume-execution|block', 'AP_INVALID_ARGUMENT')
             }
             const snapshot = await engine.ownerResolve(agent, { decision, note: args.note })
             return { runId: snapshot.runId, revision: snapshot.revision, phase: snapshot.phase } as never
+          }
+          case 'owner-gate-pass': {
+            requireDirectHumanTurn(agent, 'owner-gate-pass')
+            const gate = args.gate
+            if (gate !== 'plan' && gate !== 'execution') {
+              throw new AutopilotError('owner-gate-pass requires gate plan|execution', 'AP_INVALID_ARGUMENT')
+            }
+            const snapshot = await engine.ownerGatePass(agent, { gate, note: args.note })
+            return { runId: snapshot.runId, revision: snapshot.revision, phase: snapshot.phase, gateSources: snapshot.gateSources } as never
+          }
+          case 'owner-gate-withdraw': {
+            requireDirectHumanTurn(agent, 'owner-gate-withdraw')
+            const gate = args.gate
+            if (gate !== 'plan' && gate !== 'execution') {
+              throw new AutopilotError('owner-gate-withdraw requires gate plan|execution', 'AP_INVALID_ARGUMENT')
+            }
+            const snapshot = await engine.ownerGateWithdraw(agent, { gate, note: args.note })
+            return { runId: snapshot.runId, revision: snapshot.revision, phase: snapshot.phase, gateSources: snapshot.gateSources } as never
           }
           default:
             // UNREACHABLE through the tool surface, kept as defence in depth:
@@ -567,6 +636,34 @@ export function installRootTools(
         exclusions: { type: 'array', items: { type: 'string' }, description: 'What was deliberately not changed.' },
         workspaceCleanup: { type: 'string', required: true, description: 'Self-created artifacts kept/archived/deleted/left, with reasons.' },
         drift: { type: 'string', required: true, description: '"none found" or exact upstream facts to update.' },
+        handoffOpenItems: {
+          type: 'array',
+          description: 'REQUIRED when any criterion is unproven (partial delivery): every unproven criterion must map to exactly one openItem. The outcome label (complete|partial) is derived by the engine, never taken from the caller.',
+          items: {
+            type: 'object',
+            additionalProperties: false,
+            properties: {
+              criterion: { type: 'string', required: true, description: 'The acceptance criterion this open item speaks for, verbatim.' },
+              state: { type: 'string', required: true, enum: ['implemented-unverified', 'not-implemented', 'known-limitation'] },
+              note: { type: 'string', required: true, description: 'What remains and why.' },
+            },
+          },
+        },
+        handoffNextAuthorizedAction: { type: 'string', description: 'The next authorized action, persisted with the handoff so a follow-up run inherits intent, not guesswork.' },
+        commandRecords: {
+          type: 'array',
+          description: 'Optional structured command records alongside the free-text commands log: each entry states the command, its working directory, its exit fact, and what its result was relied on for.',
+          items: {
+            type: 'object',
+            additionalProperties: false,
+            properties: {
+              command: { type: 'string', required: true },
+              cwd: { type: 'string', description: 'Working directory; omit when the run workspace root.' },
+              exitStatus: { type: 'string', required: true, description: "The exit fact: a status code ('0', '1') or an interruption word ('timeout', 'killed')." },
+              coverage: { type: 'string', description: 'What the result was relied on for.' },
+            },
+          },
+        },
       },
       output: jsonOutput(JSON_VALUE),
       async execute(args, exec) {
@@ -584,6 +681,17 @@ export function installRootTools(
           exclusions: args.exclusions ?? [],
           workspaceCleanup: args.workspaceCleanup,
           drift: args.drift,
+          ...(args.commandRecords === undefined ? {} : { commandRecords: args.commandRecords }),
+          ...(args.handoffOpenItems === undefined
+            ? {}
+            : {
+                handoff: {
+                  openItems: args.handoffOpenItems,
+                  ...(args.handoffNextAuthorizedAction === undefined
+                    ? {}
+                    : { nextAuthorizedAction: args.handoffNextAuthorizedAction }),
+                },
+              }),
         })
         return { runId: snapshot.runId, revision: snapshot.revision, phase: snapshot.phase } as never
       },
@@ -596,6 +704,43 @@ export function installRootTools(
   return () => {
     for (const dispose of disposers.reverse()) void dispose()
   }
+}
+
+/**
+ * Build the executor-child ESCALATION tool (installed only into the authorized
+ * executor, alongside the packet tool).
+ *
+ * WHY THE CHILD NEEDS ITS OWN TOOL rather than inheriting `autopilot_log`: the
+ * log tool lives in the ROOT agent's scope, and its engine entry point refuses
+ * every caller with a parent session (`AP_NOT_ROOT`). So a delegated executor
+ * that maxed out its effort had no way to say so — the one agent doing the work
+ * was the one agent that could not ask for a stronger model.
+ *
+ * WHAT IT MAY DO, in the engine's words (`requestEscalation`): record ONE
+ * `escalate`/`stronger-model` checkpoint, from the live authorized executor
+ * child, and nothing else. It cannot write arbitrary log entries, cannot
+ * request the governance exits, cannot switch its own model and cannot widen
+ * its own authorization — the request only widens the candidate pool a LATER
+ * auto dispatch may draw from, still inside `policy ∩ live ∩ tier membership`.
+ *
+ * @param engine - the run engine the child talks to.
+ * @returns the tool definition.
+ */
+export function escalationToolDefinition(engine: AutopilotEngine): unknown {
+  return defineTool({
+    name: 'autopilot_request_escalation',
+    description: 'Executor Lead only: ask the run for a STRONGER MODEL when you are stuck (max effort and still failing, or a stall). Records an escalate checkpoint naming stronger-model; the next automatic dispatch of an auto role consumes it and may draw from a wider pool. This is a REQUEST: it does not widen your authorization, and it does not switch your model by itself — say what stalled and why.',
+    parameters: {
+      text: { type: 'string', required: true, description: 'What stalled — the step, and the failure you observed.' },
+      note: { type: 'string', required: true, description: 'The evidence this request carries (required, like every escalate checkpoint).' },
+    },
+    output: jsonOutput(JSON_VALUE),
+    async execute(args, exec) {
+      const child = callingAgent(exec.agent, 'autopilot_request_escalation')
+      const snapshot = await engine.requestEscalation(child, { text: args.text, note: args.note })
+      return { runId: snapshot.runId, revision: snapshot.revision, phase: snapshot.phase } as never
+    },
+  })
 }
 
 /** Build the executor-child packet tool definition (installed only into the authorized executor). */

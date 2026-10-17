@@ -79,34 +79,45 @@ const EGRESS_PATTERNS: readonly RegExp[] = [
  * How much shell structure the scanned text is allowed to be read as.
  *
  * WHY THIS IS A PARAMETER AND NOT A CONSTANT. Two of the five shell-class
- * channels do not carry a shell command line at all:
+ * channels do not carry a shell command line at all, and they need TWO
+ * different honest answers:
  *
- * - `run_code`'s `code` is SOURCE in some language. `# TODO: git push` is a
- *   comment in Python and nothing in JavaScript; `"git push"` is an inert
- *   string literal until something hands it to `subprocess.run(..., shell=True)`
- *   or to a tagged template. There is no rule over the text that separates the
- *   mention from the performance, because the separation lives in code this
- *   module never sees.
+ * - `run_code`'s `code` is SOURCE in some language, and the egress-relevant
+ *   execution paths out of it are VISIBLE ELSEWHERE: a program that performs
+ *   an egress through the harness must dispatch `pwsh`/`bash`/`run_code`
+ *   as a nested tool call, and THAT call is classified at its own dispatch by
+ *   this same seam — full authorization still applies, per dispatch. The one
+ *   path that is not visible anywhere (`child_process` with inherited stdio)
+ *   was NEVER catchable by text matching: `'git' + ' push'` defeats any
+ *   matcher, so verbatim scanning bought no adversarial security there while
+ *   taxing every honest mention (measured 2026-10-09: two legitimate
+ *   operations refused because an audit packet QUOTED an egress phrase from a
+ *   ruling). `run_code` therefore reads as 'source-code': not a command
+ *   line, not scanned here. See DESIGN.md §6 for the full accounting.
  * - `terminal_send`'s `text` is keystrokes into a PTY whose foreground process
  *   is unknown to us. `#` opens a comment if a shell is reading, is a private
- *   field sigil if a Node REPL is, and is a literal if `cat` is.
- *
- * For those two the honest answer is that mention and performance CANNOT be
- * distinguished here, so they keep verbatim matching and stay over-inclusive —
- * recorded as a ceiling rather than papered over (DESIGN.md §6).
+ *   field sigil if a Node REPL is, and is a literal if `cat` is. There is no
+ *   nested-dispatch argument for a PTY — what is typed is one Enter away from
+ *   execution — so it keeps verbatim matching and stays over-inclusive,
+ *   recorded as a ceiling rather than papered over (DESIGN.md §6).
  *
  * `bash` / `pwsh` / `terminal_open` DO carry a command line, by their own
  * argument contract, and there the shell's own lexical rules say what is a
  * command and what is an argument. That is the difference this enum encodes.
  */
-export type EgressScanMode = 'shell-line' | 'opaque-text'
+export type EgressScanMode = 'shell-line' | 'opaque-text' | 'source-code'
 
 /** The shell-class tools whose argument is definitionally a shell command line. */
 const SHELL_LINE_TOOLS: readonly string[] = ['bash', 'pwsh', 'terminal_open']
 
+/** The channel whose text is program source: its egress paths are gated at their own dispatch. */
+const SOURCE_CODE_TOOLS: readonly string[] = ['run_code']
+
 /** Which reading applies to one tool's command text. Exported so a test can pin the split. */
 export function egressScanModeOf(toolName: string): EgressScanMode {
-  return SHELL_LINE_TOOLS.includes(toolName) ? 'shell-line' : 'opaque-text'
+  if (SHELL_LINE_TOOLS.includes(toolName)) return 'shell-line'
+  if (SOURCE_CODE_TOOLS.includes(toolName)) return 'source-code'
+  return 'opaque-text'
 }
 
 /**
@@ -162,6 +173,93 @@ interface ShellText {
   readonly skeleton: string
   /** Comments dropped, everything else verbatim — the fallback when an interpreter is present. */
   readonly literal: string
+}
+
+/**
+ * Call shapes whose quoted argument is a command someone will run.
+ *
+ * The source-code analogue of {@link INTERPRETER_WORD}: exec('git push') and
+ * a TAGGED template whose tag is the executor are performances, while a plain
+ * string assignment mentioning the same words is data. The split is an
+ * enumeration for the same reason the interpreter list is: a helper not on
+ * this list that executes its argument is allowed where it used to be
+ * denied, which is the recorded enumerated-channel ceiling, not a new one.
+ */
+const SINK_CALL = /(?:\b(?:exec|execSync|execFile|execFileSync|spawn|spawnSync|system|popen|runCommand)\s*\(\s*|\$\s*\(\s*)$/
+
+/**
+ * Read program SOURCE far enough to answer "which characters could be
+ * PERFORMED", for the two execution shapes source actually has:
+ *
+ * 1. A TAGGED template (backtick preceded by a word character, '$' or a
+ *    closing paren) — its interior is RUN by the tag, so the interior is
+ *    kept VERBATIM.
+ * 2. A quoted argument where the SINK_CALL pattern just ended —
+ *    exec('git push') — kept VERBATIM.
+ *
+ * Everything else is data under the same fusing rule the shell reader uses:
+ * comments dropped ('//' to end of line, slash-star to star-slash), plain
+ * string and UNTAGGED template interiors kept with whitespace FUSED to '_',
+ * so a mention in an ordinary literal cannot match the word boundaries the
+ * patterns key on — destroyed exactly where quoting destroyed it, and
+ * nowhere else. An unterminated quote or template runs to the end and is
+ * kept verbatim: the fail-closed direction.
+ */
+function readSourceText(source: string): string {
+  let skeleton = ''
+  let index = 0
+  const lineComment = (): void => {
+    while (index < source.length && source[index] !== '\n') index++
+  }
+  const blockComment = (): void => {
+    index += 2
+    while (index < source.length && !(source[index] === '*' && source[index + 1] === '/')) index++
+    index = Math.min(index + 2, source.length)
+  }
+  const span = (quote: string, verbatim: boolean): void => {
+    // The OPENING quote is already consumed by the caller.
+    let interior = ''
+    while (index < source.length && source[index] !== quote) {
+      if (source[index] === '\\' && index + 1 < source.length) {
+        interior += source.slice(index, index + 2)
+        index += 2
+        continue
+      }
+      interior += source[index] as string
+      index++
+    }
+    index = Math.min(index + 1, source.length) // consume the closer if present
+    skeleton += verbatim ? interior : interior.replace(/\s/g, '_')
+  }
+  while (index < source.length) {
+    const char = source[index] as string
+    if (char === '/' && source[index + 1] === '/') { lineComment(); continue }
+    if (char === '/' && source[index + 1] === '*') { blockComment(); continue }
+    // A hash opens a comment only at a word boundary (line start or after
+    // whitespace/braces), never inside this.#privateField or a URL fragment —
+    // the same small-set rule the shell reader uses.
+    if (char === '#'
+      && (index === 0 || COMMENT_OPENS_AFTER.has(source[index - 1] as string))) {
+      lineComment()
+      continue
+    }
+    if (char === "'" || char === '"') {
+      const before = source.slice(Math.max(0, index - 24), index)
+      index++ // consume the OPENING quote before span reads the interior
+      span(char, SINK_CALL.test(before))
+      continue
+    }
+    if (char === '`') {
+      const prev = index > 0 ? source[index - 1] as string : ''
+      const tagged = /[\w$)]/.test(prev)
+      index++ // consume the opening backtick
+      span('`', tagged)
+      continue
+    }
+    skeleton += char
+    index++
+  }
+  return skeleton
 }
 
 /**
@@ -234,7 +332,7 @@ function readShellText(command: string): ShellText {
  * including the two channels where verbatim matching survives.
  */
 export const EGRESS_FAIL_CLOSED_REASON =
-  'autopilot owner-only boundary: this command TEXT matches the owner-only egress command class (push, PR, release, publish) and the native pre-execute seam that validates the outbound evidence manifest is not installed on this call. Egress is refused unconditionally (fail-closed). The match is textual, over a command-shaped reading: on a bash/pwsh/terminal_open command line, "#" comments and the contents of multi-word quoted arguments are excluded first, but a line that hands a string to an interpreter (bash -c, sh -c, ssh, python, xargs, ...) is matched verbatim; for run_code and terminal_send the text is not a shell command line at all, so it is matched verbatim and a mere mention is refused too (DESIGN.md §6).'
+  'autopilot owner-only boundary: this command TEXT matches the owner-only egress command class (push, PR, release, publish) and the native pre-execute seam that validates the outbound evidence manifest is not installed on this call. Egress is refused unconditionally (fail-closed). The match is textual, over a command-shaped reading: on a bash/pwsh/terminal_open command line, "#" comments and the contents of multi-word quoted arguments are excluded first, but a line that hands a string to an interpreter (bash -c, sh -c, ssh, python, xargs, ...) is matched verbatim. terminal_send text is not a shell command line either and is matched verbatim, mention included (DESIGN.md §6); run_code program source is not scanned here at all — its egress-relevant dispatches are gated at their own call.'
 
 /** Subagent-control tools that could drive a child directly. */
 const CHILD_CONTROL_TOOLS: readonly string[] = ['send_message', 'interrupt_agent']
@@ -316,6 +414,16 @@ export function commandTextOf(toolName: string, args: unknown): string | undefin
 export function isEgressCommand(command: string, mode: EgressScanMode = 'shell-line'): boolean {
   const joined = command.replace(/\\\r?\n/g, ' ')
   const matches = (text: string): boolean => EGRESS_PATTERNS.some(pattern => pattern.test(text))
+  if (mode === 'source-code') {
+    // Program source gets a CODE-AWARE reading: tagged templates and
+    // enumerated sink-call arguments are performances and match verbatim;
+    // ordinary strings, comments and untagged templates are DATA whose word
+    // boundaries are fused, so a mention in them no longer refuses (measured
+    // 2026-10-09: two legitimate operations were refused because an audit
+    // packet QUOTED an egress phrase from the owner's own ruling). Nested
+    // dispatches additionally stay gated at their own call.
+    return matches(readSourceText(joined))
+  }
   if (mode === 'opaque-text') return matches(joined)
   const { skeleton, literal } = readShellText(joined)
   // An interpreter on the line means a quoted argument may be code, so the

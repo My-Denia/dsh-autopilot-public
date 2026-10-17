@@ -14,7 +14,22 @@ Rules that always hold:
 - Report visible progress at every phase transition ([TRIAGE]/[PLAN]/[PLAN-AUDIT]/[EXEC]/[AUDIT]/[CLOSEOUT] lines).
 - Record as you go with autopilot_log (stance: on-plan|detour|grind|escalate; escalate needs a note) — an abandoned execution log is the most pervasive historical defect.
 - Pause ONLY at owner-only boundaries: push/PR/release/publish, destructive or irreversible ops, credentials, payment, public-visible changes. Ordinary engineering steps never pause.
+- Pause ONLY at owner-only boundaries: push/PR/release/publish, destructive or irreversible ops, credentials, payment, public-visible changes. Ordinary engineering steps never pause.
 - Audit decisions are respected: needs-fix means fix it; do not argue a gate open.`
+
+/**
+ * UNATTENDED APPROVAL POLICY (P1), appended to the root doctrine when the run's
+ * config has governance.unattended on. An ask pends forever when nobody is
+ * present to answer, so a validated egress returns an immediate, visible,
+ * recoverable DENY instead. The doctrine tells the agent how to handle it:
+ * record the refusal, surface a visible pause when genuinely blocked, continue
+ * other authorized work, and never busy-retry a call that pends on an absent
+ * owner.
+ */
+const UNATTENDED = `Unattended approval policy (governance.unattended is ON):
+- A refused egress is a DENY with a recovery path, not a hang: the manifest stands, the owner later grants autopilot_signal action=owner-approve naming the egress, then the command is retried. Record it with autopilot_log (stance: escalate) so the refusal is visible.
+- When genuinely blocked on an owner-only boundary, pause visibly with autopilot_signal action=owner-decision; do not busy-retry a call that pends on an absent owner.
+- Continue every other authorized, non-egress milestone; an egress refusal never halts the whole run.`
 
 /**
  * Substituted at render time. The audit tools are NOT interchangeable:
@@ -47,16 +62,16 @@ USAGE EVIDENCE (standard runs): every change id must be answered with autopilot_
 Per-milestone loop: (1) state what you are about to change; (2) smallest coherent edit; (3) run the closest validation; (4) diagnose failures before moving on; (5) stop for replan when reality contradicts the plan. Continue autonomously while the next step is safe, reversible, in scope.
 Inline run: implement directly, then autopilot_submit_evidence with the evidence report. Delegated run: dispatch via autopilot_executor action=start; the child returns its packet; resume the SAME child on needs-fix (action=resume), never a new one.`,
   'execution-reviewing': `Phase: EXECUTION-REVIEWING. Dispatch __AUDIT_TOOL__ role=execution with a bounded packet: goal contract, approved plan, changed files, diff summary, raw validation output — never your own reasoning or success claims. If the run touches the operating layer or risk is high/critical, also dispatch role=rules.`,
-  'replanning': `Phase: REPLANNING. Reality or an auditor contradicted the plan. Rewrite the plan (autopilot_submit_plan) and pass the plan audit again. Bounded escalation: after ${MAX_REPLAN_ROUNDS} consecutive needs-replan rounds the next one forces needs-owner-decision.`,
+  'replanning': `Phase: REPLANNING. Reality or an auditor contradicted the plan. Rewrite the plan (autopilot_submit_plan) and pass the plan audit again. The replan budget is OBSERVED, never auto-escalated (governance pragmatics v1): after ${MAX_REPLAN_ROUNDS} consecutive rounds the diagnostic names the exhaustion and escalation to the owner is a deliberate autopilot_signal choice. Graded findings ride on verdicts: needs-replan must name a blocking plan-layer defect; executor-fixable defects take needs-fix.`,
   'closing': `Phase: CLOSING. Submit the structured closeout (autopilot_submit_closeout): summary, changed files, commands, EVIDENCE PER ACCEPTANCE CRITERION (exactly one bearing artifact each, or an honest "unproven"; one proven bearer may not carry two criteria — Single-Bearer both directions; unproven empty bearers do not occupy the map), residual risks, exclusions, workspace cleanup, drift ("none found" or exact upstream updates). Completion is refused mechanically until every required audit role's latest verdict is pass, and until every declared usage artifact settles (exists, non-empty, inside the run directory, captured after the plan gate, bearing the labels it claims).
 OUTBOUND: any egress (push / PR / release / publish) needs <run>/outbound/manifest.json first — runId, target, the command substrings it authorizes, one bearing artifact per claim, createdAt within 6h. Every count you state in outbound text must appear in the artifact that bears it. The manifest is archived as spent when the egress dispatches; a second egress needs a new one.`,
-  'completed': 'Phase: COMPLETED. The run is closed; no further run mutations are legal.',
-  'blocked': 'Phase: BLOCKED (terminal). Report the blocker; a new run needs a new session.',
+  'completed': 'Phase: COMPLETED. This run is closed. A new independent goal in the same session starts with autopilot_init; it does not inherit this run\'s gates, approvals, executor, or auditors. This run stays in the store.',
+  'blocked': 'Phase: BLOCKED (terminal). Report the blocker. A new goal in this session starts with autopilot_init; the blocked run stays queryable and is not reused.',
   'needs-owner-decision': 'Phase: NEEDS-OWNER-DECISION. The run is paused for the owner. Summarize the disagreement/decision needed and STOP. Only a direct human turn can resolve it (autopilot_signal action=owner-resolve).',
 }
 
 /** Render the policy section for the root controller. */
-export function renderRootPolicy(snapshot: Snapshot): string {
+export function renderRootPolicy(snapshot: Snapshot, unattended = false): string {
   const triage = snapshot.triage
   const roles = requiredRoles(triage)
   const latest = latestVerdicts(snapshot.audits)
@@ -65,10 +80,16 @@ export function renderRootPolicy(snapshot: Snapshot): string {
     .join(' ')
   return [
     COMMON,
+    ...(unattended ? ['', UNATTENDED] : []),
     '',
     `Run state: phase=${snapshot.phase} planGate=${snapshot.planGate} executionGate=${snapshot.executionGate} planRev=${snapshot.plan.revision} replanBudget=${Math.max(0, MAX_REPLAN_ROUNDS - snapshot.consecutiveReplans)}`,
     `Triage: size=${triage.size} risk=${triage.risk} exec=${triage.executionMode} audit=${triage.auditMode} requiredRoles=[${roles.join(', ')}] latest: ${verdictLine}`,
     `Objective: ${triage.objective}`,
+    ...((triage.ownerRequirements?.length ?? 0) > 0
+      ? ['Owner requirements (verbatim — audit packets check compliance against THESE words, not a paraphrase):',
+          ...(triage.ownerRequirements ?? []).map(requirement => `- ${requirement}`)]
+      : []),
+    triage.inlineReason === undefined ? '' : `Inline reason (recorded, not approved): ${triage.inlineReason}`,
     triage.nonGoals.length > 0 ? `Non-goals: ${triage.nonGoals.join('; ')}` : '',
     '',
     PHASE_TEXT[snapshot.phase].replaceAll(AUDIT_TOOL_TOKEN, auditToolFor(triage.auditMode)),
@@ -83,6 +104,6 @@ export function renderExecutorPolicy(snapshot: Snapshot): string {
     `Scope: ${snapshot.triage.scope.join('; ') || '(as per plan)'}`,
     snapshot.triage.nonGoals.length > 0 ? `Non-goals (must not change): ${snapshot.triage.nonGoals.join('; ')}` : '',
     '',
-    `Contract: implement within the approved plan with free choice of means; run the closest validation after each coherent edit; never audit or approve your own work. When done (or when you need a planner/owner decision), submit your execution packet with autopilot_submit_packet: what changed, commands run with results, validation evidence, residual risks, AND executionRevision=${String(snapshot.executor?.executionRevision ?? 1)} (the live executor revision; a stale or missing value is refused). Your final message must BE your deliverable, never a status update. Owner-only boundaries (push/PR/release/credentials/destructive) stay with the owner — do not cross them.`,
+    `Contract: implement within the approved plan with free choice of means; run the closest validation after each coherent edit; never audit or approve your own work. If you are STUCK — max effort and still failing, or stalled — say so with autopilot_request_escalation(text, note): the engine records an escalate checkpoint naming stronger-model, and the next automatic dispatch may draw from a wider pool that is STILL inside the same authorization. It is a request, not a permission. Your dispatch and resume prompts carry an [autopilot] routing line naming your provider/model and reasoning effort (or inheritance); if it says no effort is pinned, that route's fixed setting IS the ceiling — request escalation only when a genuinely stronger route might exist, never a higher effort on a route that has none. When done (or when you need a planner/owner decision), submit your execution packet with autopilot_submit_packet: what changed, commands run with results, validation evidence, residual risks, AND executionRevision=${String(snapshot.executor?.executionRevision ?? 1)} (the live executor revision; a stale or missing value is refused). Your final message must BE your deliverable, never a status update. Owner-only boundaries (push/PR/release/credentials/destructive) stay with the owner — do not cross them.`,
   ].filter(line => line.length > 0).join('\n')
 }
