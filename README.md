@@ -55,7 +55,8 @@ Developer preview. `0.2.1-rc.1` is a pre-release of this plugin for the pre-rele
 
 | | |
 | --- | --- |
-| Tested on 0.2.1-rc.2 | 2026-10-17, WSL2, local mock, no credentials: tarball install without a version exemption; plan audit; delegated executor; needs-fix resume; closeout; a second goal in the same session; restart status stayed on that second goal |
+| Tested on 0.2.1-rc.2, 2026-10-17 tarball | WSL2, local mock, no credentials: install without a version exemption; plan audit; delegated executor; needs-fix resume; closeout; a second goal in the same session; restart status stayed on that second goal. That package's client still treated one session as one run |
+| Tested on 0.2.1-rc.2, current tarball | 2026-10-18, a different isolated home, local mock. sha256 `b967e62729f9b492415a9238c8f3a3f035f156bbd5d4014564cbd86c310f3e62`. Same lifecycle through a second goal; restart status stayed on that goal |
 | Tested on 0.2.0-rc.2 | Install, mount, skill registration, plan audit, delegated executor and needs-fix resume on WSL2 with a local mock model |
 | Client bundle | Rebuilt 2026-10-18 from current `src/client`. A later goal in the same session is archived on the card. Bundle harness: 20 assertions passed. Not a live browser or Desktop render |
 | Not yet tested | Full run with a real model. On 2026-10-18 a headless session on dsh 0.2.1-rc.2 reached the configured model route and stopped with HTTP 503 before any autopilot tool ran. Also untested: Desktop on macOS/Windows for this pre-release, native Windows, browser card rendering |

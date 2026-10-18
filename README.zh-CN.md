@@ -54,10 +54,11 @@ Use dsh-autopilot to implement <goal> and verify the result.
 
 | | |
 | --- | --- |
+| 已测试，0.2.1-rc.2 当前包 | 2026-10-18，另一套隔离环境，本地 mock。包 sha256 `b967e62729f9b492415a9238c8f3a3f035f156bbd5d4014564cbd86c310f3e62`。同一会话里完成第二个目标，重启后状态仍在这个目标上。这不是 2026-10-17 那份包 |
 | 已测试 | WSL2 + dsh 0.2.0-rc.2，本地 mock 模型：安装、挂载、技能注册、计划审计、委派执行、needs-fix 续跑 |
 | 客户端包 | 2026-10-18 按当前 `src/client` 重新构建。同一会话里的后一个目标会留在卡片的历史里。包检查 20 项通过。还没有在浏览器或桌面里打开过 |
 | 尚未测试 | 真实模型完整运行。2026-10-18 在 dsh 0.2.1-rc.2 的 headless 会话里，请求已经到达配置的模型线路，对方返回 HTTP 503，还没调用任何 autopilot 工具。桌面版、原生 Windows、浏览器里的卡片也还没测 |
-| 宿主范围 | dsh 0.2.0 系列、0.1.5-rc.1、0.1.2-rc.1（0.1.7 与 0.2.1 不在 peer 范围内） |
+| 宿主范围 | dsh 0.2.0 系列、精确的 `0.2.1-rc.2`、`0.1.5-rc.1`、`0.1.2-rc.1`。其他 0.2.1 预发布和 0.1.7 不在范围内 |
 | 分发 | npm；GitHub Releases 只有说明，不附包 |
 
 见 [docs/compatibility.md](./docs/compatibility.md) 和 [docs/security.md](./docs/security.md)。
