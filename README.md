@@ -57,7 +57,8 @@ Developer preview. `0.2.1-rc.1` is a pre-release of this plugin for the pre-rele
 | --- | --- |
 | Tested on 0.2.1-rc.2 | 2026-10-17, WSL2, local mock, no credentials: tarball install without a version exemption; plan audit; delegated executor; needs-fix resume; closeout; a second goal in the same session; restart status stayed on that second goal |
 | Tested on 0.2.0-rc.2 | Install, mount, skill registration, plan audit, delegated executor and needs-fix resume on WSL2 with a local mock model |
-| Not yet tested | Full run with a real model, Desktop on macOS/Windows for this pre-release, native Windows, browser card rendering. The client bundle was not rebuilt for 0.2.1-rc.1 |
+| Client bundle | Rebuilt 2026-10-18 from current `src/client`. A later goal in the same session is archived on the card. Bundle harness: 20 assertions passed. Not a live browser or Desktop render |
+| Not yet tested | Full run with a real model, Desktop on macOS/Windows for this pre-release, native Windows, browser card rendering |
 | Host range | dsh 0.2.0 line, exact `0.2.1-rc.2`, `0.1.5-rc.1`, `0.1.2-rc.1`. Other 0.2.1 prereleases and 0.1.7 are outside the range |
 | Distribution | npm `latest` is `0.2.0`. GitHub Releases carry notes only |
 

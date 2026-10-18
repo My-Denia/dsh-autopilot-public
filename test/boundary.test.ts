@@ -601,7 +601,10 @@ describe('§2 the engine\'s tool filters against a real registry', () => {
         result: Promise.resolve({ stopReason: 'completed', structured: { verdict: 'pass', note: 'ok' } }),
         async dispose() {},
       }
-    }) as typeof mounted.ctx.subagents.startActivation
+    // The stand-in is not a SubagentActivation. childId is a plain string;
+    // the host brands it as SessionId and also requires messageId, so the
+    // two function types do not overlap enough for a direct assertion.
+    }) as unknown as typeof mounted.ctx.subagents.startActivation
     await engine.init(root, { ...BASE_TRIAGE, risk: 'medium', size: 'standard', auditMode: 'independent', inlineReason: 'fixture: the filter capture runs inline' },
       [{ id: 'm1', usageClass: 'undeclared', boundaryStates: [], artifacts: [], attempted: [] }])
     await engine.submitPlan(root, 'plan')
