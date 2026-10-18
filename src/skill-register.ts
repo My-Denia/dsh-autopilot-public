@@ -61,7 +61,7 @@
 import { readFileSync } from 'node:fs'
 import { dirname } from 'node:path'
 import { errorMessage } from './domain/types.js'
-import { bundledSkillPath, syncBundledSkill } from './skill-install.js'
+import { bundledSkillPath, syncBundledSkillTree } from './skill-install.js'
 import type { SkillSyncResult } from './skill-install.js'
 
 // ── Structural mirrors of the upstream skill-provider surface ────────────────
@@ -562,8 +562,8 @@ export interface PublishBundledSkillOptions {
   /** Reads the SKILL.md body the provider serves; default reads the in-package file. */
   readonly source?: () => string
   /**
-   * The 0.2.0 filesystem fallback. Default: `syncBundledSkill({ enabled: true })`
-   * — the exact call `apply()` made before this module existed.
+   * The 0.2.0 filesystem fallback. Default: `syncBundledSkillTree({ enabled: true })`
+   * — the whole skill directory, `SKILL.md` plus its reference layer.
    */
   readonly fileFallback?: () => SkillSyncResult
 }
@@ -581,7 +581,17 @@ export function publishBundledSkill(
   registry: SkillRegistryLike | undefined,
   options: PublishBundledSkillOptions = {},
 ): SkillPublicationResult {
-  const fileFallback = options.fileFallback ?? ((): SkillSyncResult => syncBundledSkill({ enabled: true }))
+  const fileFallback = options.fileFallback ?? ((): SkillSyncResult => {
+    // Publish the whole skill directory, not just SKILL.md: the adapter routes
+    // to its reference layer, so a copy without it installs a skill whose
+    // links point at nothing.
+    const tree = syncBundledSkillTree({ enabled: true })
+    return {
+      status: tree.status,
+      ...(tree.dest === undefined ? {} : { dest: tree.dest }),
+      ...(tree.detail === undefined ? {} : { detail: tree.detail }),
+    }
+  })
   if (registry === undefined) return fileFallback()
   const source = options.source ?? readBundledSkill
   try {

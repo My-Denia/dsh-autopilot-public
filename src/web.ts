@@ -39,6 +39,8 @@
 
 import type { Enforcement } from './domain/types.js'
 import type { StatusView } from './engine.js'
+import type { WorkClassReachabilityReport } from './routing/coverage.js'
+import type { RoutingStatusView } from './routing/status.js'
 import type { AutopilotReadOnly } from './service.js'
 
 /** Same-origin API prefix. One namespace, matching the plugin's package name. */
@@ -177,6 +179,29 @@ export interface RunProjection {
   readonly closeoutSubmitted: boolean
   readonly executor?: { readonly generation: number; readonly state: string }
   readonly enforcement: EnforcementProjection
+  /**
+   * M12: the engine's routing-status projection, forwarded verbatim when the
+   * run's routing mode is `auto`. The web PARSER has no agent to read a
+   * session policy for, so `policyState` here is `unobserved` whenever the
+   * mount cannot ask — the projection never guesses on its behalf.
+   */
+  readonly routing?: RoutingStatusView
+  /**
+   * M13: the candidate-coverage report, served as its OWN field.
+   *
+   * It answers a different question from `routing` — "can every observed model
+   * be reached by some tier-bound work class" is a statement about the ladder
+   * and the live catalog, NOT about what ran — so it does not ride inside the
+   * routing block, where a reader would take it for a dispatch record.
+   */
+  readonly routingReachability?: WorkClassReachabilityReport
+  /**
+   * DESIGN §9 item 8: which authority last set each gate, for which plan
+   * revision. Forwarded verbatim — the card renders it so a reader can tell a
+   * gate a review passed from one the owner passed, which the precedence rule
+   * turns into different futures.
+   */
+  readonly gateSources: StatusView['gateSources']
 }
 
 /** The `/runs` body. */
@@ -257,6 +282,17 @@ export function projectRun(status: StatusView): RunProjection {
       ? {}
       : { executor: { generation: status.executor.generation, state: status.executor.state } }),
     enforcement: projectEnforcement(status.enforcement),
+    // ALLOW-LIST discipline: `routing` rides only because it is named here.
+    ...(status.routing === undefined ? {} : { routing: status.routing }),
+    // M13: the CANDIDATE-COVERAGE report rides SEPARATELY from `routing`, and
+    // the card labels it as coverage rather than as a dispatch record. It says
+    // which observed models a tier-bound work class can reach — a statement
+    // about the ladder and the live catalog, never about what ran.
+    ...(status.routingReachability === undefined ? {} : { routingReachability: status.routingReachability }),
+    // ALLOW-LIST discipline again: gate provenance rides because it is NAMED
+    // here, exactly like every other field. It is never absent (the engine
+    // projects `no-source` for a stream that recorded none).
+    gateSources: status.gateSources,
   }
 }
 

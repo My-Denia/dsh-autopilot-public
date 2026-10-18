@@ -254,10 +254,81 @@ describe('a LIVE run projects to exactly the allow-listed fields', () => {
     // here without someone naming it in projectRun.
     expect(Object.keys(run).sort()).toEqual([
       'auditCount', 'auditMode', 'closeoutSubmitted', 'enforcement', 'executionGate',
-      'executionMode', 'latestVerdicts', 'logCount', 'objective', 'phase', 'planGate',
-      'planRevision', 'replanBudgetRemaining', 'requiredRoles', 'revision', 'risk',
-      'runId', 'size',
+      'executionMode', 'gateSources', 'latestVerdicts', 'logCount', 'objective', 'phase',
+      'planGate', 'planRevision', 'replanBudgetRemaining', 'requiredRoles', 'revision',
+      'risk', 'routing', 'runId', 'size',
     ])
+    // …and the field is the engine's own projection, not a second opinion: this
+    // run has recorded no gate decision yet, and the route says exactly that.
+    expect(run.gateSources).toEqual({
+      plan: { source: 'pending', planRevision: 1 },
+      execution: { source: 'pending', planRevision: 1 },
+    })
+  })
+
+  it('forwards the routing status when the run routes (M12): mode, policy state, and per-role class', async () => {
+    const h = makeHarness({ config: { routing: { mode: 'auto', ladder: { tiers: { economy: ['alpha/m-a'] } } } } })
+    const service = createAutopilotService(h.engine)
+    await h.engine.init(h.root, makeTriage())
+
+    const served = projectRuns(service)
+    expect(served.runs).toHaveLength(1)
+    const routing = served.runs[0]?.routing
+    expect(routing?.mode).toBe('auto')
+    // The HTTP path has no session to read a policy for: it must say so rather
+    // than claim `absent`, which would be a finding it never observed.
+    expect(routing?.policyState).toBe('unobserved')
+    expect(routing?.dispatch).toBe('unobserved')
+    const roles = routing?.roles as ReadonlyArray<{ role: string; workClass?: { name: string } }>
+    expect(roles.find(entry => entry.role === 'executor')?.workClass?.name).toBe('simple')
+    expect(roles.find(entry => entry.role === 'plan-auditor')?.workClass?.name).toBe('audit')
+    // Through the real route handler, not only the pure projection.
+    const { run: route } = routesOf(service)
+    const answer = call(route, `${AUTOPILOT_API_PREFIX}/run?id=${h.root.id}`)
+    expect(answer.status).toBe(200)
+    const body = answer.body as { run?: { routing?: { mode?: string } } }
+    expect(body.run?.routing?.mode).toBe('auto')
+  })
+
+  it('serves the CANDIDATE-COVERAGE report separately from routing (M13)', async () => {
+    // Two fields, two claims: `routing` is the configuration and the run's own
+    // pins; `routingReachability` is which OBSERVED models a tier-bound work
+    // class can reach. The card labels the second as coverage, and it can only
+    // do that if the route serves it as its own value — a route that folded it
+    // into the routing block would have the card calling coverage a dispatch.
+    //
+    // The catalog port is a STUB on purpose: this file is about what crosses the
+    // HTTP boundary, and a real adapter listing would make it a test of the
+    // provider. The report's own content is asserted by the coverage suites.
+    const catalog = {
+      snapshot: async () => ({
+        catalogStatus: 'live' as const,
+        providers: [],
+        listedModels: [{ provider: 'alpha', id: 'm-a' }, { provider: 'alpha', id: 'm-b' }],
+        providerErrors: new Map<string, string>(),
+      }),
+    }
+    const h = makeHarness({
+      config: { routing: { mode: 'auto', ladder: { tiers: { economy: ['alpha/m-a'], standard: ['alpha/m-b'] } } } },
+      routing: { catalog: catalog as never },
+    })
+    const service = createAutopilotService(h.engine)
+    await h.engine.init(h.root, makeTriage())
+    await h.engine.refreshReachability()
+
+    const served = projectRuns(service)
+    expect(served.runs[0]?.routing?.mode).toBe('auto')
+    const report = served.runs[0]?.routingReachability
+    expect(report?.kind).toBe('work-class-reachability')
+    expect([...(report?.reachable ?? [])].sort()).toEqual(['alpha/m-a', 'alpha/m-b'])
+    expect(report?.unreachable).toEqual([])
+
+    // And through the real route handler, not only the pure projection.
+    const { run: route } = routesOf(service)
+    const answer = call(route, `${AUTOPILOT_API_PREFIX}/run?id=${h.root.id}`)
+    expect(answer.status).toBe(200)
+    const body = answer.body as { run?: { routingReachability?: { kind?: string } } }
+    expect(body.run?.routingReachability?.kind).toBe('work-class-reachability')
   })
 
   it('DROPS `diagnostic`, which the engine aliases onto an auditor note', async () => {

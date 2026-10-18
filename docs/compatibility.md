@@ -3,20 +3,24 @@
 This page records **measured** host and packaging bounds for
 `dsh-goal-autopilot`. It is not a wish list.
 
-Current release: **0.2.0** (adapts the plugin to `dsh` 0.2.0; prepared
-locally, see [CHANGELOG](../CHANGELOG.md)). Earlier: **0.1.1**, a packaging /
-runtime compatibility fix.
+Source version: **0.2.1-rc.1**, a pre-release. It adapts the plugin to dsh
+`0.2.1-rc.2` and keeps the earlier host ranges. It is **not** npm `latest`.
+The published stable package remains **0.2.0** (the 2026-10-16 registry
+check stands; it is not evidence that 0.2.1-rc.1 has been published).
+Earlier: **0.1.1**, a packaging / runtime compatibility fix.
 
 ## Host matrix
 
 | Host `dsh` | How it was established | Install / mount | Lifecycle |
 | --- | --- | --- | --- |
+| `0.2.1-rc.2` CLI | WSL2, 2026-10-17, isolated `DSH_HOME`, local Anthropic-messages mock on 127.0.0.1, no credentials | The installed client matches the 2026-10-17 tarball. A saved install log with the exit code was not kept. `engines.dsh` is what this host checks first. `pnpm peers check` inside a profile directory lists `@deepseek-ai/dsh-tools` and `schemastery` as missing; those are host-provided | **verified with the mock, on the 2026-10-17 tarball:** plugin tools loaded; plan audit; delegated executor; packet rev 1; execution audit needs-fix; resume; packet rev 2; closeout of goal A; `autopilot_init` of goal B in the same session; B completed; A's run stayed `completed` with its own executor; B had no executor and a different objective. Restart with `--session-id` then `autopilot_status` returned B (`…r2`, phase `completed`). That tarball's `lib/index.js` matches the 2026-10-18 package. Its `lib/client.js` does not contain `priorRuns`. |
+| `0.2.1-rc.2` CLI, tarball `b967e627…` | WSL2, 2026-10-18, a different isolated home, local mock on 127.0.0.1. sha256 `b967e62729f9b492415a9238c8f3a3f035f156bbd5d4014564cbd86c310f3e62`, packed from `567b7a7`. Later doc commits are not inside that file | The installed client matches this tarball | Mock lifecycle through a second goal; restart status stayed on that goal. This does not replace the 2026-10-17 tarball. Extracted `lib/client.js` keeps the earlier run id in `priorRuns` and the live id on the later run. The 20 bundle assertions do not cover that fold. A web page on this home rendered the card for the live goal only; the card does not list `priorRuns`. **Not verified:** Desktop, and a real model. Headless calls stopped with HTTP 503 before any autopilot tool. |
 | `0.2.0-rc.2` CLI | WSL2, 2026-10-07, isolated `DSH_HOME` + local mock model, no credentials | **verified:** `dsh plugin add` without exemption, mount, 12 `autopilot_*` tools, skill install; web profile serves the client bundle | **verified with a scripted mock model:** plan audit → delegated executor → packet → execution audit needs-fix → resume of the same executor → packet rev 2. **Not verified:** a real model, closeout |
-| `0.2.0-rc.1`, `0.2.0` | in the peer range; host's own compatibility check says compatible | not run | not run |
-| `0.1.7-x`, `0.2.1-x` | **outside** the peer range; dsh refuses the install | — | — |
+| `0.2.0-rc.1`, `0.2.0` | in the declared range; host's own compatibility check says compatible | not re-run for 0.2.1-rc.1 | not re-run |
+| `0.1.7-x`, other `0.2.1` prereleases | **outside** the declared range; dsh refuses the install | — | — |
 | `0.1.5-rc.1` | WSL2 live CLI, 2026-09-13 (0.1.1) | **0.1.1 peer-layout:** compose/mount + skill load + `autopilot_init` | **not verified:** write lifecycle. 0.2.0's code changes were checked against the published 0.1.5 packages, not re-run on a 0.1.5 host |
 | `0.1.2-rc.1` | Original package pin / earlier real-host work | claimed by this snapshot's design notes | earlier host traces in [DESIGN.md §8](../DESIGN.md) (not re-run) |
-| Desktop (macOS / Windows) | **not run** | **not verified** | **not verified** |
+| Windows Desktop 0.2.0-rc.2 (app, real account) | **run 2026-10-10**, profile `desktop`, candidate tarball | **verified:** plugin mount; the shipped system-prompt section renders against the LIVE catalog (`m7/desktop-onboarding-section.md` in the run store); the routing config on the profile patch is what the host mounts, and the session's own run stayed visible (`enforcement.store=file`) after a restart | **partially verified:** run persistence across a host restart (needs the packaged `storeKind: file` pin repeated in the profile patch — see below); the composed-config dump is a HEADLESS artifact (the managed `desktop` profile refuses `--dump-config`), so the desktop side is backed by the on-disk patch plus the restarted session's own run state; **not verified:** full write lifecycle / closeout on Desktop, macOS |
 | Windows | out of scope | **not verified** | **not verified** |
 
 Windows is **not** a supported platform in this snapshot. Do not read the
@@ -34,8 +38,36 @@ plugin. Install from the Desktop plugin manager by package name
 dsh plugin --profile <name> add dsh-goal-autopilot@0.2.0
 ```
 
-Desktop itself was not run for this release (not verified on macOS or
-Windows). On a host outside the range dsh offers an exact-version exemption
+### Profile patch hazard: re-declaring the plugin id drops the packaged store pin
+
+The plugin ships its own bundle layer (`cordis.patch.yml`) which pins
+`storeKind: file`. A profile's patch layer **replaces** the config of the entry
+it targets rather than merging into it, so an owner who adds
+
+```yaml
+- id: autopilot
+  name: dsh-goal-autopilot
+  config:
+    routing: { … }
+```
+
+silently loses that pin: `storeKind` falls back to the schema default `auto`,
+the host picks the `storageDomain` backend, and every run this session already
+recorded in the file store becomes invisible (`autopilot_status` answers
+`{"initialized":false,"note":"no autopilot run on this session"}`).
+**Measured on Windows Desktop 0.2.0-rc.2, 2026-10-10**: two runs created after
+such a patch landed in `$DSH_HOME/storages/dsh_autopilot.json` (the domain
+table) while four earlier file-backed runs stayed under
+`$DSH_HOME/storages/dsh-autopilot/runs/` — the split-brain the packaged layer's
+own comment warns about. Repeat `storeKind: file` in any patch entry for this
+id.
+
+Windows Desktop **was** run for the 0.2.0-rc.2 candidate on 2026-10-10 with a
+real account and the live model catalog: the plugin mounted, the onboarding
+system-prompt section rendered against the live catalog, and the run store
+stayed file-backed once the packaged `storeKind: file` pin was repeated in the
+profile patch (see "Profile patch hazard" below). Not verified there: the full
+write lifecycle to closeout, and macOS. On a host outside the range dsh offers an exact-version exemption
 (`dsh plugin --profile <name> allow-version …`); that accepts an untested
 combination, it does not make one supported.
 
@@ -119,6 +151,26 @@ workspace-write calls. That host/model mismatch is outside this plugin's
 The domain store backend has been driven to `autopilot_init` and no further
 on that path; artifact settlement and some store-error arms are file-backend
 evidence only. See [DESIGN.md §6](../DESIGN.md).
+
+## Host capability map (measured, 0.2.0-rc.2)
+
+Which host capabilities this plugin rides on, and which it must carry
+itself — established against the published `@deepseek-ai/*` 0.2.0-rc.2
+packages and the Windows Desktop app (2026-10-10/12):
+
+| Capability | Host status | Plugin stance |
+| --- | --- | --- |
+| LLM catalog (`ctx.llm.listProviders` / `listModels` / `resolveModelInfo`) | present | **used** — work-class reachability and routing selection read the live catalog; no parallel model list exists in the plugin |
+| Custom-provider discovery (`discoverModels`) | present | **not called** — the plugin reads the live catalog directly (the row above); owner-added custom models surface there because the host's own provider config feeds it, never through plugin-side re-entry |
+| Subagent route authorization (`subagentModelSelection` session policy) | present | **used** — the session's allowed-model lock bounds every routing selection (see the policy-triad rule above) |
+| Reasoning effort (`reasoningEffort` at dispatch, `defaultEffort` per model) | present | **used** — the dispatch packet names the pinned effort; a route with none means the fixed setting IS the ceiling and the plugin never invents one |
+| Token cost / usage metering | **absent** | the price seed in `references/model-routing.md` is a dated, provenance-labelled tie-break seed, never a live fact |
+| Host-native goal-autopilot surface | **absent** | this plugin IS the DSH GAH; there is no host system to defer to or duplicate |
+| Skill registry | present | **used** — the adapter ships as a skill installed through the host's own registry |
+| Run storage backends | `file` / `storageDomain` | both supported; Desktop needs the shipped `storeKind: file` pin (see the profile-patch hazard above) |
+
+The rule behind the table: a host capability that EXISTS is ridden, not
+rebuilt; one that is absent is named absent, not wished into the docs.
 
 ## Client half
 

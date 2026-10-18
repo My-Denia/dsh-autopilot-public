@@ -159,6 +159,415 @@ export function routeStatusView(route: unknown): RouteStatusView {
   }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// The routing block (M13). TWO SOURCES, and the card must not confuse them.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Where the policy triple came from — the card's own honesty field.
+ *
+ * `session`: an `autopilot_status` result in THIS session, i.e. the engine really
+ * read the dispatching session's model-selection policy.
+ * `route`: the same-origin HTTP route, which has NO session to ask
+ * (`../service.ts` projects with no policy argument), so its `unobserved` means
+ * "this path cannot read a policy" and NEVER "there is no policy".
+ */
+export type RoutingPolicySource = 'session' | 'route'
+
+/** One role's place in the routing block. */
+export interface RoutingRoleMirror {
+  readonly role: string
+  readonly effective: string
+  /** Present only when the role actually makes a selection (auto). */
+  readonly workClass?: string
+  readonly workClassEngaged?: boolean
+  readonly lock?: string
+}
+
+/** One route this run's own dispatches settled on — an ACTUAL dispatch record. */
+export interface RoutingPinMirror {
+  readonly role: string
+  readonly provider: string
+  readonly model: string
+}
+
+/**
+ * The routing projection, mirrored field-by-field for the browser half.
+ *
+ * A MIRROR, not an opaque record: the card RENDERS these values, so each one is
+ * re-read and type-checked at the boundary ({@link readRoutingMirror}) rather
+ * than trusted — this is JSON off a socket, and a half-parsed object rendered as
+ * a claim is exactly what a status card must not do.
+ */
+export interface RoutingMirror {
+  readonly mode: string
+  readonly preference: string
+  readonly preferenceSource: string
+  /** `present|absent|unreachable|unobserved` — four states, never merged into one. */
+  readonly policyState: string
+  readonly policyRouteCount?: number
+  readonly policyStateFrom: RoutingPolicySource
+  /** `live|inherit-only|unobserved`, derived by the engine FROM `policyState`. */
+  readonly dispatch: string
+  readonly roles: readonly RoutingRoleMirror[]
+  readonly pins: readonly RoutingPinMirror[]
+  readonly ladderTiers: Readonly<Record<string, number>>
+  readonly auditTier: string
+}
+
+/**
+ * The candidate-coverage report, narrowed to what the card says out loud.
+ *
+ * THIS IS NOT A DISPATCH RECORD. It answers "is every OBSERVED model reachable
+ * by some tier-bound work class" — a statement about the configured ladder and
+ * the live catalog. The card renders it under a label that says so, because a
+ * reader who took it for "what ran" would be reading a different claim.
+ */
+export interface ReachabilityMirror {
+  readonly reachable: readonly string[]
+  readonly unreachable: readonly string[]
+  readonly outcome?: string
+}
+
+/** One gate's provenance, mirrored for the browser half (DESIGN §9 item 8). */
+export interface GateSourceMirror {
+  readonly source: string
+  readonly planRevision?: number
+  readonly ownerDecision?: number
+  readonly withdrawn?: boolean
+  readonly note?: string
+}
+
+/** Per-gate provenance as the host route serves it. */
+export interface GateSourcesMirror {
+  readonly plan?: GateSourceMirror
+  readonly execution?: GateSourceMirror
+}
+
+/** One rendered line of the gate-provenance row. */
+export interface GateSourceLine {
+  readonly gate: 'plan' | 'execution'
+  readonly text: string
+  readonly title: string
+}
+
+function readGateSourceMirror(value: unknown): GateSourceMirror | undefined {
+  if (!isPlainObject(value)) return undefined
+  const source = str(value.source)
+  if (source === undefined) return undefined
+  const planRevision = num(value.planRevision)
+  const ownerDecision = num(value.ownerDecision)
+  const note = str(value.note)
+  return {
+    source,
+    ...(planRevision === undefined ? {} : { planRevision }),
+    ...(ownerDecision === undefined ? {} : { ownerDecision }),
+    ...(value.withdrawn === true ? { withdrawn: true } : {}),
+    ...(note === undefined ? {} : { note }),
+  }
+}
+
+/**
+ * Read the gate-provenance projection out of a route body.
+ *
+ * Malformed input answers `undefined` (the caller treats that as absence rather
+ * than inventing a source), and a record with no usable gate at all is absence
+ * too. An UNKNOWN source string is carried through verbatim rather than mapped:
+ * a reader must be able to see a vocabulary this build does not know instead of
+ * being shown a source the stream never recorded.
+ */
+export function readGateSourcesMirror(value: unknown): GateSourcesMirror | undefined {
+  if (!isPlainObject(value)) return undefined
+  const plan = readGateSourceMirror(value.plan)
+  const execution = readGateSourceMirror(value.execution)
+  if (plan === undefined && execution === undefined) return undefined
+  return {
+    ...(plan === undefined ? {} : { plan }),
+    ...(execution === undefined ? {} : { execution }),
+  }
+}
+
+/** What a source MEANS, in the reader's terms. */
+function describeGateSource(source: string): string {
+  switch (source) {
+    case 'owner': return 'the OWNER (an explicit owner-gate-pass)'
+    case 'auditor': return 'a dispatched auditor'
+    case 'self-check': return 'a self-check'
+    case 'pending': return 'nothing yet — not decided'
+    case 'no-source': return 'not recorded by this stream'
+    default: return source
+  }
+}
+
+/** The explanatory title every provenance line carries. */
+const GATE_SOURCE_TITLE = 'who last set this gate, and the generation it belongs to. An owner pass stands against a later audit objection — the objection is recorded but the gate does not move — and only the owner can withdraw it; a withdrawn decision never comes back into force. "not recorded by this stream" is a statement about THIS STREAM, not a claim that nobody decided.'
+
+/**
+ * The gate-provenance lines, as DATA (DESIGN §9 item 8).
+ *
+ * WHY THE SOURCE IS THE HEADLINE AND THE GATE VALUE IS NOT: the card already
+ * shows each gate's value. What a value cannot say is WHO put it there — and
+ * that is the difference between a gate a review passed and one the owner
+ * passed, which the precedence rule turns into different futures (a later
+ * objection moves the first and is merely recorded against the second).
+ *
+ * @param mirror - the provenance the host route served.
+ * @returns one line per gate, plan first.
+ */
+export function gateSourceLines(mirror: GateSourcesMirror): readonly GateSourceLine[] {
+  const lines: GateSourceLine[] = []
+  for (const gate of ['plan', 'execution'] as const) {
+    const record = mirror[gate]
+    if (record === undefined) continue
+    const details: string[] = []
+    if (record.planRevision !== undefined) details.push(`plan revision ${record.planRevision}`)
+    if (record.ownerDecision !== undefined) details.push(`owner decision ${record.ownerDecision}`)
+    if (record.withdrawn === true) details.push('withdrawn')
+    lines.push({
+      gate,
+      text: `${gate} gate: ${describeGateSource(record.source)}${details.length === 0 ? '' : ` (${details.join(', ')})`}`,
+      title: GATE_SOURCE_TITLE,
+    })
+  }
+  return lines
+}
+
+function strListOrUndefined(value: unknown): readonly string[] | undefined {
+  if (!Array.isArray(value)) return undefined
+  return value.every(entry => typeof entry === 'string') ? (value as readonly string[]) : undefined
+}
+
+/**
+ * Read the routing projection out of a tool result or a route body.
+ *
+ * TOTAL: anything that is not the shape this card renders becomes `undefined`,
+ * which the card treats as "not observed" — the same rule the live poll follows
+ * for the whole run projection. `mode`, `preference`, `preferenceSource`,
+ * `policyState` and `dispatch` are required: without them there is no routing
+ * block to speak of, and a defaulted one would be a claim no reader made.
+ *
+ * @param value - the raw `routing` value from a status result or the host route.
+ * @param from - which channel this came from; STAMPED here, never inferred later.
+ * @returns the mirrored projection, or undefined when it is not one.
+ */
+export function readRoutingMirror(value: unknown, from: RoutingPolicySource): RoutingMirror | undefined {
+  if (!isPlainObject(value)) return undefined
+  const mode = str(value.mode)
+  const preference = str(value.preference)
+  const preferenceSource = str(value.preferenceSource)
+  const policyState = str(value.policyState)
+  const dispatch = str(value.dispatch)
+  if (mode === undefined || preference === undefined || preferenceSource === undefined
+    || policyState === undefined || dispatch === undefined) return undefined
+  const roles: RoutingRoleMirror[] = []
+  if (Array.isArray(value.roles)) {
+    for (const entry of value.roles) {
+      if (!isPlainObject(entry)) return undefined
+      const role = str(entry.role)
+      const effective = str(entry.effective)
+      if (role === undefined || effective === undefined) return undefined
+      const workClass = isPlainObject(entry.workClass) ? entry.workClass : undefined
+      const cls = workClass === undefined ? undefined : str(workClass.name)
+      const lock = isPlainObject(entry.lock)
+        ? [str(entry.lock.provider), str(entry.lock.model)].filter((part): part is string => part !== undefined).join('/')
+        : undefined
+      roles.push({
+        role,
+        effective,
+        ...(cls === undefined ? {} : { workClass: cls }),
+        ...(workClass !== undefined && typeof workClass.engaged === 'boolean' ? { workClassEngaged: workClass.engaged } : {}),
+        ...(lock === undefined || lock.length === 0 ? {} : { lock }),
+      })
+    }
+  }
+  const pins: RoutingPinMirror[] = []
+  if (Array.isArray(value.pins)) {
+    for (const entry of value.pins) {
+      if (!isPlainObject(entry)) return undefined
+      const role = str(entry.role)
+      const provider = str(entry.provider)
+      const model = str(entry.model)
+      if (role === undefined || provider === undefined || model === undefined) return undefined
+      pins.push({ role, provider, model })
+    }
+  }
+  const ladderTiers: Record<string, number> = {}
+  if (isPlainObject(value.ladderTiers)) {
+    for (const [tier, count] of Object.entries(value.ladderTiers)) {
+      if (typeof count === 'number' && Number.isFinite(count)) ladderTiers[tier] = count
+    }
+  }
+  const auditTier = str(value.auditTier)
+  return {
+    mode,
+    preference,
+    preferenceSource,
+    policyState,
+    ...(typeof value.policyRouteCount === 'number' ? { policyRouteCount: value.policyRouteCount } : {}),
+    policyStateFrom: from,
+    dispatch,
+    roles,
+    pins,
+    ladderTiers,
+    auditTier: auditTier ?? 'none',
+  }
+}
+
+/** Read the candidate-coverage report; `undefined` when it is not the shape the card renders. */
+export function readReachabilityMirror(value: unknown): ReachabilityMirror | undefined {
+  if (!isPlainObject(value)) return undefined
+  const reachable = strListOrUndefined(value.reachable)
+  const unreachable = strListOrUndefined(value.unreachable)
+  if (reachable === undefined || unreachable === undefined) return undefined
+  const outcome = str(value.outcome)
+  return { reachable, unreachable, ...(outcome === undefined ? {} : { outcome }) }
+}
+
+/** One rendered line of the routing block. */
+export interface RoutingLine {
+  readonly label: string
+  readonly text: string
+  readonly title: string
+}
+
+/**
+ * What a policy state MEANS, in the reader's terms, plus where it was read.
+ *
+ * THE `unobserved` ARM IS THE POINT OF THIS FUNCTION. Three of the four states
+ * are findings about the session's model-selection policy; the fourth is the
+ * absence of a read. A card that rendered them with one voice would let a
+ * reader conclude "no authorization" from "we could not look" — which is the one
+ * inference this whole block exists to prevent. So the branch says out loud that
+ * nothing was read and that it is not a statement about a policy.
+ *
+ * `marker` is VISIBLE on the line, not only in the tooltip: a source claim that
+ * a reader has to hover to find is not a claim they can check.
+ *
+ * @param view - the mirrored routing projection.
+ * @returns the short form for the header, the visible source marker, and the hover text.
+ */
+function policyText(view: RoutingMirror): { readonly short: string; readonly marker: string; readonly title: string } {
+  const marker = view.policyStateFrom === 'session' ? 'read in this session' : 'from the host route'
+  const from = view.policyStateFrom === 'session'
+    ? 'read in this session by autopilot_status'
+    : 'reported by the host route, which has no session to ask'
+  switch (view.policyState) {
+    case 'present':
+      return {
+        short: `policy present${view.policyRouteCount === undefined ? '' : ` (${view.policyRouteCount} routes)`}`,
+        marker,
+        title: `this session carries a model-selection policy, so auto routing may SELECT; the count is how many routes it allows (${from})`,
+      }
+    case 'absent':
+      return {
+        short: 'policy absent',
+        marker,
+        title: `no model-selection policy is recorded on this session, so auto routing INHERITS the deployment default instead of selecting (${from})`,
+      }
+    case 'unreachable':
+      return {
+        short: 'policy unreadable',
+        marker,
+        title: `the policy projection could not be read, so auto routing INHERITS the deployment default — a failed read, which is not the same as finding no policy (${from})`,
+      }
+    default:
+      return {
+        short: 'policy unobserved',
+        marker,
+        title: `NOTHING was read: this source has no session to ask (${from}). This is the ABSENCE OF AN OBSERVATION — NOT a statement that no policy exists, and not a statement that auto routing lacks authorization`,
+      }
+  }
+}
+
+/**
+ * The ladder tiers, in the order the card lists them.
+ *
+ * A LOCAL COPY, recorded rather than hidden: the tier NAMES are fixed config
+ * paths (`src/routing/work-class.ts` fixes the same three), and the browser half
+ * cannot import the host half. The card maps over THIS list, so a tier the engine
+ * reports but this list omits would be silently dropped from a header that claims
+ * to describe the ladder — which is why the list is here, next to its only reader.
+ */
+const LADDER_TIER_ORDER: readonly string[] = ['economy', 'standard', 'reserve']
+
+/**
+ * The routing block's lines, as DATA.
+ *
+ * Pure and separate from the renderer for the same reason {@link routeStatusView}
+ * is: `react` is a host-provided external this package cannot install, so no test
+ * can mount the card. Every judgement the block makes about what a value MEANS
+ * therefore lives here, where a test can hold it — and the structural judgement
+ * this block exists for is that CONFIGURATION, ACTUAL DISPATCHES and CANDIDATE
+ * COVERAGE are three different claims, so they get three different labels rather
+ * than one merged sentence.
+ *
+ * @param routing - the merged routing projection.
+ * @param reachability - the candidate-coverage report, when one was observed.
+ * @returns the lines to render, in order. The coverage line is present only when
+ *   a report was observed — an unobserved one is never rendered as "no coverage".
+ */
+export function routingLines(
+  routing: Observed<RoutingMirror>,
+  reachability?: Observed<ReachabilityMirror> | undefined,
+): readonly RoutingLine[] {
+  const view = routing.value
+  const policy = policyText(view)
+  const lines: RoutingLine[] = [
+    {
+      label: 'routing',
+      text: `${view.mode} · preference ${view.preference} (${view.preferenceSource}) · ${policy.short} [${policy.marker}] · dispatch ${view.dispatch}`,
+      title: `the routing CONFIGURATION and whether selection can happen. ${policy.title}. "dispatch" is the engine's own verdict derived from the policy state`,
+    },
+    {
+      // THE LADDER, as COUNTS per tier plus the tier the audit class draws from.
+      //
+      // Counts, not member lists: the ladder is the owner's config and the card's
+      // job is to show its SHAPE (how many routes each tier holds, and which tier
+      // audits come from), not to reprint a list the owner wrote. `mode: 'off'`
+      // never reaches here — the engine serves no routing block at all in that
+      // case, so the card renders no ladder line either.
+      label: 'ladder',
+      text: `${LADDER_TIER_ORDER.map(tier => `${tier} ${view.ladderTiers[tier] ?? 0}`).join(' · ')} · audit tier ${view.auditTier}`,
+      title: 'the configured ladder\'s member COUNT per tier, and the tier the audit class draws from (`routing.ladder.auditTier`, the owner\'s override; `none` means the class\'s own mapping stands). Counts, because the tiers are the owner\'s config — this line reports its shape, not a second copy of the list',
+    },
+    {
+      label: 'roles',
+      text: view.roles.length === 0
+        ? 'no routed role reported'
+        : view.roles.map(roleText).join(' · '),
+      title: 'each role\'s effective routing mode, and for auto roles the work class it selects from (a class marked "not engaged" is recorded but restricts nothing)',
+    },
+    {
+      label: 'dispatched',
+      text: view.pins.length === 0
+        ? 'no dispatch has settled a route yet'
+        : view.pins.map(pin => `${pin.role} ${pin.provider}/${pin.model}`).join(' · '),
+      title: 'the routes THIS RUN\'s own dispatches settled on — actual dispatch records, not candidate coverage',
+    },
+  ]
+  if (reachability !== undefined) {
+    const report = reachability.value
+    const observed = report.reachable.length + report.unreachable.length
+    const unreachable = report.unreachable.length === 0 ? '' : ` · unreachable: ${report.unreachable.join(', ')}`
+    lines.push({
+      label: 'candidate coverage',
+      text: `${report.reachable.length}/${observed} observed model(s) reachable by a tier-bound class${unreachable} · NOT a dispatch record`,
+      title: 'CANDIDATE COVERAGE, not a dispatch record: which models the configured ladder maps to some work class. A model can be perfectly reachable and still never have been dispatched, and a dispatched model is not vouched for here',
+    })
+  }
+  return lines
+}
+
+/** One role's cell: mode, plus the class it consults when it makes a selection. */
+function roleText(role: RoutingRoleMirror): string {
+  if (role.effective === 'locked') {
+    return role.lock === undefined ? `${role.role} locked` : `${role.role} locked ${role.lock}`
+  }
+  if (role.workClass === undefined) return `${role.role} ${role.effective}`
+  const engaged = role.workClassEngaged === false ? ' (not engaged)' : ''
+  return `${role.role} ${role.effective}/${role.workClass}${engaged}`
+}
+
 /** Triage as DECLARED AT INIT. Immutable per DESIGN §3; source is init's call arguments. */
 export interface AutopilotTriageView {
   readonly objective?: string
@@ -209,6 +618,33 @@ export interface AutopilotRunChatData {
   readonly closeoutSubmitted?: Observed<boolean>
   readonly enforcement?: Observed<Readonly<Record<string, unknown>>>
   readonly executor?: Observed<Readonly<Record<string, unknown>>>
+  /**
+   * M13: the routing projection, from EITHER source.
+   *
+   * An `autopilot_status` result in this session carries it (the engine really
+   * read this session's model-selection policy), and the host route carries it
+   * too — with a policy state that CANNOT be read there. `./live.ts` merges the
+   * two without ever letting the route's "cannot read" overwrite a session's
+   * "read it", and stamps the resulting triple's origin.
+   *
+   * ABSENT when routing mode is not `auto`: the engine deliberately serves no
+   * block at all in that case (`routingStatusOf` returns undefined), because a
+   * row of `inherit` would read like a routing state that failed rather than a
+   * feature the owner switched off.
+   */
+  readonly routing?: Observed<RoutingMirror>
+  /**
+   * M13: candidate COVERAGE (which observed models a tier-bound work class can
+   * reach), never a dispatch record. Rendered under its own label for exactly
+   * that reason.
+   */
+  readonly routingReachability?: Observed<ReachabilityMirror>
+  /**
+   * DESIGN §9 item 8: per-gate provenance (who set the gate, for which plan
+   * revision), carried as its own observation so a stale value is never shown
+   * as current.
+   */
+  readonly gateSources?: Observed<GateSourcesMirror>
   /** Ascending by seq. */
   readonly audits: readonly AutopilotAuditRow[]
   /** Ascending by seq. */
@@ -219,8 +655,22 @@ export interface AutopilotRunChatData {
    * inferring a gate from an audit verdict, which §3.2 proves unsound.
    */
   readonly stale: boolean
-  /** Non-empty when `autopilot_init` was called more than once (the engine refused the later ones). */
+  /** Non-empty when `autopilot_init` was called again and the engine refused it. */
   readonly reinitSeqs: readonly number[]
+  /**
+   * Runs this session already finished before the current one. Present only
+   * after a later `autopilot_init` succeeded with a different run id. Each
+   * entry is the archived summary; the live fields above belong to the
+   * current run only.
+   */
+  readonly priorRuns?: readonly PriorRunSummary[]
+}
+
+/** Archived summary of a run the session has moved past. */
+export interface PriorRunSummary {
+  readonly runId: string
+  readonly phase?: string
+  readonly revision: number
 }
 
 /** Internal reducer state. */
@@ -258,10 +708,10 @@ export const AUTOPILOT_RUN_KIND = 'autopilot-run'
 /**
  * The context id, a CONSTANT.
  *
- * One run IS one session: `engine.ts` binds `runId: root.id` and `init` refuses
- * a second run on the same session. So a per-session card needs exactly one
- * business identity, and a constant is the only value that cannot be produced
- * twice by `match()`, which has no history access.
+ * The card anchor stays one per session. `match()` has no history access, so
+ * a constant is the only id it can repeat without splitting one result away
+ * from its call. A later successful init names a new run id; the fold archives
+ * the previous run and keeps the live fields on the new one.
  */
 export const AUTOPILOT_RUN_ID = 'run'
 
@@ -484,10 +934,28 @@ export function readResult(event: CardEvent): ResultFields | undefined {
   if (callId === undefined) return undefined
   const content = message.content
   const block = Array.isArray(content) ? content[0] : undefined
-  if (!isPlainObject(block)) return { callId, isError: false, payload: undefined }
-  const isError = block.isError === true
-  const inner = Array.isArray(block.content) ? block.content[0] : undefined
-  const text = isPlainObject(inner) ? inner.text : undefined
+  if (!isPlainObject(block)) return { callId, isError: message.isError === true, payload: undefined }
+  // TWO ENVELOPE SHAPES, both MEASURED, and the card must fold either one:
+  //
+  //  (a) WRAPPED — `content[0] = { isError, content: [ { type: 'text', text } ] }`.
+  //      This is the 0.1.x-era shape the fixtures under `test/fixtures/card/`
+  //      carry, and a legacy stream still replays it. Replay compatibility is a
+  //      standing invariant, so this arm cannot be dropped.
+  //  (b) FLAT — `content[0]` IS the text block (`{ type: 'text', text }`) and
+  //      `isError` sits on the MESSAGE. Measured 2026-10-12 on a real 0.2.0
+  //      session: `data.message.content[0].text` plus `data.message.isError`.
+  //
+  // WHY THIS MATTERS, in the sharpest possible terms: before this arm existed,
+  // reading (b) produced `payload: undefined` for EVERY result, so the fold
+  // applied nothing at all — the card rendered as a hollow shell (revision 0, no
+  // phase, no gates, no audit verdicts, no routing block) on the current host,
+  // silently, with no error anywhere. The unit fixtures could not catch it
+  // because they only ever carried shape (a); a real 0.2.0 session replay did.
+  const wrapped = Array.isArray(block.content) ? block.content[0] : undefined
+  const wrappedText = isPlainObject(wrapped) ? str(wrapped.text) : undefined
+  const flatText = str(block.text)
+  const text = wrappedText ?? flatText
+  const isError = block.isError === true || message.isError === true
   return { callId, isError, payload: isError ? undefined : safeJsonObject(text) }
 }
 
@@ -549,8 +1017,9 @@ export function applyCall(state: AutopilotRunState, match: CardMatch): Autopilot
 
   if (call.name === 'autopilot_init') {
     if (data.triage === undefined) {
-      // First init wins. The engine refuses every later one (AP_ALREADY_ACTIVE
-      // / AP_RUN_EXHAUSTED), but the tool/call event is appended BEFORE the
+      // First init wins the triage until a later init's result names a new run.
+      // A refused later init (AP_ALREADY_ACTIVE) still reaches this fold: the
+      // tool/call event is appended BEFORE the
       // engine ever runs, so the later calls reach us regardless.
       const triage = readTriage(call.args)
       if (triage !== undefined) data = { ...data, triage }
@@ -667,6 +1136,29 @@ export function applyResult(state: AutopilotRunState, match: CardMatch): Autopil
   const payload = result.payload
   if (payload === undefined) return { ...state, pending, data }
 
+  let auditIndex = state.auditIndex
+  if (call.name === 'autopilot_init') {
+    const nextRunId = str(payload.runId)
+    if (nextRunId !== undefined && data.runId !== undefined && nextRunId !== data.runId) {
+      const phase = data.phase?.value
+      const triage = readTriage(call.args)
+      data = {
+        revision: 0,
+        audits: [],
+        calls: data.calls,
+        stale: false,
+        reinitSeqs: data.reinitSeqs.filter(seq => seq !== call.seq),
+        priorRuns: [...(data.priorRuns ?? []), {
+          runId: data.runId,
+          revision: data.revision,
+          ...(phase === undefined ? {} : { phase }),
+        }],
+        ...(triage === undefined ? {} : { triage }),
+      }
+      auditIndex = new Map()
+    }
+  }
+
   const seq = event.seq
   const revision = num(payload.revision) ?? 0
   if (revision > data.revision) data = { ...data, revision }
@@ -704,6 +1196,30 @@ export function applyResult(state: AutopilotRunState, match: CardMatch): Autopil
     data = merge(data, 'replanBudgetRemaining', num(payload.replanBudgetRemaining), revision, seq)
     data = merge(data, 'latestVerdicts', stringMap(payload.latestVerdicts), revision, seq)
     data = merge(data, 'closeoutSubmitted', bool(payload.closeoutSubmitted), revision, seq)
+    // M13: the routing block and the coverage report. BOTH are read from THIS
+    // result — the engine's StatusView carries both (src/engine.ts), so the card
+    // has a session-observed source for each and does not depend on the poll
+    // (which stops entirely once the run is terminal).
+    //
+    // ABSENCE CLEARS, and that is the honest direction: `autopilot_status`
+    // returns the whole status view every time, so a result that carries no
+    // routing is the engine SAYING there is none (mode is not `auto`). Keeping
+    // the previous block would leave the card asserting a routing state the
+    // newest observation contradicts. A malformed block is likewise treated as
+    // absence — never as a claim.
+    const routing = readRoutingMirror(payload.routing, 'session')
+    data = routing === undefined ? clear(data, 'routing') : merge(data, 'routing', routing, revision, seq)
+    const reachability = readReachabilityMirror(payload.routingReachability)
+    data = reachability === undefined
+      ? clear(data, 'routingReachability')
+      : merge(data, 'routingReachability', reachability, revision, seq)
+    // PRESENCE-GATED THE OTHER WAY ROUND: the engine always projects
+    // `gateSources` (a stream that recorded none reads `no-source`), so a
+    // session-log payload WITHOUT the field is an observation from before this
+    // build — not a claim that provenance is absent. It therefore neither
+    // merges nor CLEARS what is already known.
+    const gateSources = readGateSourcesMirror(payload.gateSources)
+    if (gateSources !== undefined) data = merge(data, 'gateSources', gateSources, revision, seq)
     // `status` mirrors five triage fields, but init's ARGUMENTS are strictly
     // richer (acceptanceCriteria, scope, nonGoals, baseline, usageIds are not
     // in StatusView at all) and are immutable per DESIGN §3. So status only
@@ -716,13 +1232,15 @@ export function applyResult(state: AutopilotRunState, match: CardMatch): Autopil
   }
 
   if (call.name === 'autopilot_audit' || call.name === 'autopilot_self_check') {
-    const at = state.auditIndex.get(result.callId)
+    const at = auditIndex.get(result.callId)
     if (at !== undefined) {
       // DELIBERATELY does not touch phase/planGate/executionGate. AuditOutcome
       // carries none of them, and inferring `verdict:'pass' -> gate:'pass'` is
       // UNSOUND: `applyVerdict` records a plan pass while REFUSING the gate flip
       // when a usage entry is still `undeclared`, and a `needs-replan` past
-      // MAX_REPLAN_ROUNDS yields `needs-owner-decision`, not `needs-replan`.
+      // MAX_REPLAN_ROUNDS stays in `replanning` with an exhaustion diagnostic
+      // (governance pragmatics v1 removed the forced owner escalation) — the
+      // gate values still cannot be inferred from the verdict alone.
       data = patchAudit(data, at, {
         settled: true,
         ...optional('verdict', str(payload.verdict)),
@@ -743,7 +1261,7 @@ export function applyResult(state: AutopilotRunState, match: CardMatch): Autopil
     )
   }
 
-  return { ...state, pending, data: withStale(data) }
+  return { ...state, pending, auditIndex, data: withStale(data) }
 }
 
 /**
@@ -785,6 +1303,28 @@ function merge<K extends keyof AutopilotRunChatData & string, T>(
 ): AutopilotRunChatData {
   if (value === undefined) return data
   return { ...data, [key]: observed(value, revision, seq) } as AutopilotRunChatData
+}
+
+/**
+ * Drop a key entirely — the counterpart of {@link merge} for a source that
+ * SPOKE and said "there is none".
+ *
+ * The distinction is the whole reason this exists: `merge`'s "absent value
+ * leaves the fold alone" is right for a partial result (a trimmed payload that
+ * simply does not mention a field), and wrong for a COMPLETE projection whose
+ * absent field is a statement. `autopilot_status` serves the whole status view,
+ * so its absent routing block means the engine has none to report — clearing is
+ * the honest fold, and keeping the old value would let the card assert a routing
+ * state its newest observation contradicts.
+ */
+function clear<K extends keyof AutopilotRunChatData & string>(
+  data: AutopilotRunChatData,
+  key: K,
+): AutopilotRunChatData {
+  if (data[key] === undefined) return data
+  const next = { ...data }
+  delete next[key]
+  return next
 }
 
 /** Fill only the triage keys init never supplied. */

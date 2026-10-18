@@ -113,6 +113,16 @@ describe('renderRootPolicy', () => {
     expect(text).toContain('Audit decisions are respected')
   })
 
+  it('unattended policy: the doctrine is present only when unattended is on', () => {
+    const on = renderRootPolicy(at('planning'), true)
+    expect(on).toContain('Unattended approval policy')
+    expect(on).toContain('governance.unattended is ON')
+    expect(on).toContain('owner-approve')
+    expect(on).toContain('do not busy-retry')
+    const off = renderRootPolicy(at('planning'))
+    expect(off).not.toContain('Unattended approval policy')
+  })
+
   it('states the live run state, the triage contract and the objective', () => {
     const snapshot = at('planning', { planGate: 'pending', executionGate: 'pending' })
     const text = renderRootPolicy(snapshot)
@@ -143,10 +153,10 @@ describe('renderRootPolicy', () => {
       'plan-reviewing': 'wait for its verdict before any mutation',
       'executing': 'smallest coherent edit',
       'execution-reviewing': 'never your own reasoning or success claims',
-      'replanning': 'Bounded escalation',
+      'replanning': 'OBSERVED, never auto-escalated',
       'closing': 'EVIDENCE PER ACCEPTANCE CRITERION',
-      'completed': 'no further run mutations are legal',
-      'blocked': 'a new run needs a new session',
+      'completed': 'does not inherit this run\'s gates, approvals, executor, or auditors',
+      'blocked': 'the blocked run stays queryable',
       'needs-owner-decision': 'Only a direct human turn can resolve it',
     }
     // `Record<Phase, string>` is the completeness check: a new phase in the type

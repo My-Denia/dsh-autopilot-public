@@ -610,7 +610,7 @@ describe('the outbound seam, where its fails are observable', () => {
     // the tmp+rename of the projection, so a kill in that window lands there.
     const exploding = new Proxy(h.engine, {
       get(target, property, receiver) {
-        if (property === 'peek') return () => { throw new Error('store exploded') }
+        if (property === 'peek' || property === 'peekActive') return () => { throw new Error('store exploded') }
         return Reflect.get(target, property, receiver) as unknown
       },
     })
@@ -686,7 +686,7 @@ describe('the outbound seam, where its fails are observable', () => {
     let peeks = 0
     const flaky = new Proxy(h.engine, {
       get(target, property, receiver) {
-        if (property === 'peek') {
+        if (property === 'peek' || property === 'peekActive') {
           return () => {
             peeks += 1
             throw new Error('store exploded mid-flight')
@@ -727,3 +727,112 @@ describe('the outbound seam, where its fails are observable', () => {
     expect(h.engine.peek(h.root.id)?.enforcement.outboundConsumed ?? 0).toBe(0)
   })
 })
+
+/**
+ * UNATTENDED APPROVAL POLICY (P1). With governance.unattended on, a validated
+ * egress returns an immediate, visible, recoverable DENY instead of an owner
+ * ask (which would pend forever with nobody to answer). The manifest stands;
+ * the owner later grants autopilot_signal owner-approve and retries. Off keeps
+ * the ask arm byte-identical. Both arms record the outcome on the run so
+ * autopilot_status answers "what approval is this run waiting on / was refused".
+ */
+describe('decideEgress — governance.unattended', () => {
+  /** A run parked in executing, on an unattended config. */
+  async function unattendedHarness(unattended: boolean) {
+    const h = makeHarness({ config: { governance: { unattended } } })
+    await h.engine.init(h.root, makeTriage())
+    await h.engine.submitPlan(h.root, 'plan')
+    await h.engine.selfCheck(h.root, { role: 'plan', verdict: 'pass', note: 'ok' })
+    return h
+  }
+
+  it('unattended ON: a validated egress DENIES immediately with the recovery path, no ask', async () => {
+    const h = await unattendedHarness(true)
+    const raw = JSON.stringify(manifestFor(h.root.id))
+    const { decision, manifest, unattended } = decideEgress(h.engine, h.root.id, 'git push origin main', options(raw))
+    expect(decision.kind).toBe('deny')
+    if (decision.kind !== 'deny') throw new Error('unreachable')
+    // Names command + target, states the manifest stands, gives recovery, says
+    // other work continues.
+    expect(decision.reason).toContain('git push origin main')
+    expect(decision.reason).toContain('github.com/example/repo main')
+    expect(decision.reason).toMatch(/manifest stands/i)
+    expect(decision.reason).toContain('owner-approve')
+    expect(decision.reason).toMatch(/other authorized/i)
+    // The manifest is handed back unspent, flagged unattended.
+    expect(manifest?.runId).toBe(h.root.id)
+    expect(unattended).toBe(true)
+  })
+
+  it('unattended OFF: the ask arm is byte-identical to today', async () => {
+    const h = await unattendedHarness(false)
+    const raw = JSON.stringify(manifestFor(h.root.id))
+    const { decision, manifest, unattended } = decideEgress(h.engine, h.root.id, 'git push origin main', options(raw))
+    expect(decision.kind).toBe('ask')
+    if (decision.kind !== 'ask') throw new Error('unreachable')
+    expect(decision.reason).toContain('github.com/example/repo main')
+    expect(decision.reason).toContain('Approving dispatches this command')
+    expect(manifest?.runId).toBe(h.root.id)
+    expect(unattended).toBeUndefined()
+  })
+
+  it('unattended ON: an invalid manifest still denies (unattended does not bypass validation)', async () => {
+    const h = await unattendedHarness(true)
+    const { decision, unattended } = decideEgress(h.engine, h.root.id, 'git push origin main', options('{ not json'))
+    expect(decision.kind).toBe('deny')
+    if (decision.kind !== 'deny') throw new Error('unreachable')
+    expect(decision.reason).toContain('is invalid')
+    // Not an unattended-policy deny: no unattended flag, no manifest.
+    expect(unattended).toBeUndefined()
+  })
+
+  it('the seam records denied-unattended on the run and does NOT spend the manifest', async () => {
+    const h = await unattendedHarness(true)
+    const host = fakeHost()
+    installPreExecuteGate(host, h.root.id, h.engine, options(JSON.stringify(manifestFor(h.root.id))))
+    const decision = await host.pre?.(
+      { name: 'bash', arguments: { command: 'git push origin main' }, callId: 'c1' },
+      async (): Promise<PreDecision> => ({ kind: 'allow' }),
+    )
+    expect(decision?.kind).toBe('deny')
+    const snapshot = h.engine.peek(h.root.id)
+    const decisions = snapshot?.enforcement.egressDecisions
+    expect(decisions).toHaveLength(1)
+    expect(decisions?.[0]?.outcome).toBe('denied-unattended')
+    expect(decisions?.[0]?.target).toBe('github.com/example/repo main')
+    expect(decisions?.[0]?.recovery).toBeTruthy()
+    // Nothing dispatched, nothing consumed, nothing archived.
+    expect(snapshot?.enforcement.outboundConsumed ?? 0).toBe(0)
+  })
+
+  it('the seam records asked on the run when it truly waits on the owner', async () => {
+    const h = await unattendedHarness(false)
+    const host = fakeHost()
+    installPreExecuteGate(host, h.root.id, h.engine, options(JSON.stringify(manifestFor(h.root.id))))
+    const decision = await host.pre?.(
+      { name: 'bash', arguments: { command: 'git push origin main' }, callId: 'c1' },
+      async (): Promise<PreDecision> => ({ kind: 'allow' }),
+    )
+    expect(decision?.kind).toBe('ask')
+    const decisions = h.engine.peek(h.root.id)?.enforcement.egressDecisions
+    expect(decisions).toHaveLength(1)
+    expect(decisions?.[0]?.outcome).toBe('asked')
+  })
+
+  it('owner-approve consumption regression: an open approval still allows under unattended ON', async () => {
+    // Unattended turns the ASK into a deny, but an owner approval granted via
+    // autopilot_signal owner-approve is authority already on the run; the seam
+    // must still consume it and allow (the recovery path the deny names).
+    const h = await unattendedHarness(true)
+    await h.engine.ownerApprove(h.root, 'git push origin')
+    const host = fakeHost()
+    installPreExecuteGate(host, h.root.id, h.engine, options(JSON.stringify(manifestFor(h.root.id))))
+    const decision = await host.pre?.(
+      { name: 'bash', arguments: { command: 'git push origin main' }, callId: 'c1' },
+      async (): Promise<PreDecision> => ({ kind: 'allow' }),
+    )
+    expect(decision?.kind).toBe('allow')
+    expect(h.engine.peek(h.root.id)?.enforcement.ownerApprovals[0]?.consumedBy).toBe('git push origin main')
+  })
+})
+

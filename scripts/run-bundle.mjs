@@ -274,6 +274,44 @@ assert('A18 a PTC session (run_code dispatches) yields a card from the shipped b
     calls: ptc.node?.data?.calls?.length ?? null,
   }))
 
-const TOTAL = 19
+// A19 — the gate-provenance row, through the SHIPPED bundle.
+//
+// The same M7 lesson as A18: a row that renders in the test tree and NOT in
+// `lib/client.js` is invisible on the real host, so the artifact is asked
+// directly. The payload is overlaid onto a REAL folded card rather than
+// hand-built, so the node keeps every field the card expects.
+const withGates = (() => {
+  const base = fold('inline')
+  if (base.node === null || base.node === undefined) return null
+  return {
+    ...base.node,
+    data: {
+      ...base.node.data,
+      gateSources: {
+        value: {
+          plan: { source: 'owner', planRevision: 1, ownerDecision: 1 },
+          execution: { source: 'auditor', planRevision: 1 },
+        },
+        revision: base.node.data.revision ?? 1,
+      },
+    },
+  }
+})()
+let gateMarkup = ''
+try {
+  gateMarkup = withGates === null
+    ? 'no folded node'
+    : renderToStaticMarkup(React.createElement(exports.AutopilotRunCard, { node: withGates }))
+} catch (error) {
+  gateMarkup = `render threw: ${error.message}`
+}
+assert('A19 the shipped bundle renders the gate-provenance row (owner vs auditor)',
+  gateMarkup.includes('data-autopilot-gate-source="plan"')
+  && gateMarkup.includes('the OWNER')
+  && gateMarkup.includes('a dispatched auditor')
+  && gateMarkup.includes('plan revision 1'),
+  gateMarkup.slice(0, 200))
+
+const TOTAL = 20
 console.log(`\n${failures === 0 ? `ALL GREEN (${TOTAL} assertions)` : `${failures} RED of ${TOTAL}`}`)
 process.exitCode = failures === 0 ? 0 : 1

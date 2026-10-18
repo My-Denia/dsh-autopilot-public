@@ -12,6 +12,9 @@ Visitor landing page: [README.md](README.md).
 - [Compatibility](docs/compatibility.md) — host versions, WSL/Windows, 0.1.1 runtime
 - [Security](docs/security.md) — approval, egress, sandbox assumptions
 - [Operator reference](docs/reference.md) — `autopilot_*` tools and run state
+- [Refusals](skill/dsh-autopilot/references/refusals.md) — the contract behind every engine refusal code
+- [Governance invariants](skill/dsh-autopilot/references/governance-invariants.md) — host-neutral rules this adapter consumes
+- [Model routing](skill/dsh-autopilot/references/model-routing.md) — the routing contract: authority order, thresholds vs axes, ladder, recorded boundaries
 - [Changelog](CHANGELOG.md)
 
 ## 1. 设计前提与决策
@@ -55,6 +58,328 @@ Visitor landing page: [README.md](README.md).
   被改过。）
   版本锁定 `0.1.2-rc.1`（2026-09-04 自 `0.1.1-rc.2` 升级，见 §8 本轮条目），与本机
   side-by-side 的 rc.1 源码 checkout（`DSH_SRC`）一致。
+
+### 1.1 适配器 / 参考层分离（2026-10-08 对齐最新 GAH）
+
+**背景。** 本文档第 3 行写的蓝本是"CC GAH"。CC GAH 本身已在 2026-09-25 改为
+**从 Codex GAH 派生**（其 SKILL.md 首行自述 ported from the Codex GAH），
+2026-10-08 又随 Claude / Grok 适配器一起重生成。最新 GAH 的形态是**两层**：
+一份宿主中立的共享参考（`agent-core/core/skills/agent-core/references/`，
+拥有风险、审计模式、证据充分性、委派、收尾与全部审计不变量），加上每个宿主
+一层**薄适配器**（只提供工具名、状态 schema、脚本路径与门禁接线）。本插件原先
+是旧 CC GAH 的**单体**重建：规则同时写在 `SKILL.md`、`docs/reference.md`、
+`DESIGN.md` 与 `docs/security.md` 里，没有单一的 owner。
+
+**本次对齐交付。**
+
+- **参考层**：`skill/dsh-autopilot/references/governance-invariants.md`
+  （宿主中立规则，每条不变量标注真正的强制者：`engine` / `test` /
+  `discipline`）与 `references/refusals.md`（拒绝契约，见下）。
+- **适配器**：`SKILL.md` 只保留 DSH 绑定与操作顺序，规则一律路由出去，不再复述。
+  `docs/reference.md` 与它各有单一 owner，不再互相声称是对方的副本。
+- **整目录发布**：`syncBundledSkillTree` 把 `SKILL.md` **连同** `references/`
+  发布进技能扫描根。沿用原单文件发布的三条性质并提升到集合层面：不覆盖已漂移目标、
+  无法硬链接则 `unsupported` 且该文件**本次调用不写任何字节**；部分写入由"只 unlink
+  本次调用自己创建的目标"回滚。**回滚是 best-effort，不是保证**：某个 unlink 失败时
+  目标会留在盘上，形成"SKILL.md 在、references/ 缺"的半发布，而 `detail` 会**如实
+  点名**残留路径（`FAILED to remove …`），不谎称已干净回滚。真正的全有或全无只有
+  在回滚每一步都成功时才成立，这条也由 `test/skill-install.test.ts` 的回滚用例钉住。0.1.x 的单文件安装属于
+  "SKILL.md 已在且相同、参考层缺失"，按缺失项增量补齐，不是拒绝。
+  （0.2.0 的 provider 路径本来就以技能**目录**为 `resourceBase`，这一步是让
+  文件系统回退与它发布同一集合。）
+- **审计包规则的机械化输入**：`autopilot_status` 新增 `latestAuditRecords`，
+  按角色给出**逐字段**的最新审计记录（seq / verdict / note / auditorId /
+  runRevision / planRevision / executionRevision / provider / external /
+  required），而不是一个 verdict 词。派发者据此嵌入审计包，不再凭记忆复述结论。
+
+**Stated-Contract Invariant 的处置（本次的主要发现）。** 改造前，引擎能拒绝的
+**78** 个 `AP_*` 码里，只有 **9** 个出现在任何一份读者会被路由到的文档中：
+`docs/reference.md` 述及 2 个（`AP_PACKET_REVISION_MISMATCH`、
+`AP_PACKET_REVISION_REQUIRED`），`DESIGN.md` 述及 9 个，因此二者合并后仍有
+**69 个码在可路由文档中零出现**；`DESIGN.md` 独占的是其余 **7** 个。也就是说
+**大多数拒绝契约只能靠撞上去才知道**。
+现在唯一 owner 是 `references/refusals.md`：15 条契约（按规则分组，不是一条
+拒绝一句话）+ 一张覆盖全部 78 个码的索引表。
+`test/refusals-contract.test.ts` **双向**普查（`src/` 里有而文档没有 → 红；
+文档有而 `src/` 里没有 → 红），并带基数下限，因此空文档不会伪装成通过。
+变异证明：从文档删掉一个码 → 红；把文档清空 → 红；恢复 → 绿。
+
+**未采用（诚实边界）。** 最新 GAH 还有两项本适配器**没有**引入，理由是它们要求
+本引擎目前没有的状态：
+
+- **medium+ 默认派发 executor lead**：本引擎 `executionMode` 在 init 固定，
+  `validateTriage` 只拒绝"lightweight + delegated"。Codex GAH 的 inline
+  例外（"合适的 owner 交互式任务可留在主上下文，计划里写明理由"）**已经成立**——
+  `inline` 在任何风险下都合法——但"默认委派"没有机械化，因此
+  `references/governance-invariants.md` 把它标成 `discipline` 而不是声称强制。
+- **owner gate pass / withdraw 通道**（**2026-10-12 已交付**，见 §8.9）：Codex GAH 有
+  `--owner-gate-pass plan|execution` / `--owner-gate-withdraw`，把门禁来源记成
+  `owner` / `auditor` / `self-check` / `pending` / `no-source`，并规定
+  "同一 run/gate/generation/plan 内的 owner pass 优先于之后的审计异议"。本引擎现在
+  同样有：`autopilot_signal` 的 gate 级 owner 决定（owner-only，与 owner-approve
+  同一道 direct-human-turn 闸，一次只针对一道门禁）、快照 `gateSources` 的逐门禁
+  溯源（`source` + plan revision + owner 决定序数 + `withdrawn`），以及写路径上的
+  优先级实现——异议被**记录**、门禁不动，另一道门禁也不被顺带通过。
+
+**本次未做。** `lib/` 未重建（`.gitignore` 第 2 行忽略它，仓库不跟踪），
+因此本仓库的工作树**是源码就绪，不是已安装**：正在运行的宿主仍然加载已发布的
+0.2.0 副本。DESIGN.md §1 的"source-ready is not installed"同样适用。
+
+### 1.2 模型路由：充分性阈值 + 排序轴 + 请求式升档（2026-10-09 owner 需求）
+
+owner 需求（合并四轮）：
+
+1. 放进去的模型**都要用到、都要有活干**；
+2. 按能力派不同子代理——简单普通的活 economy 档够用且快，挑一个就用；
+3. **"模型能力没有差的，有的是速度、更高上限能力"**；不一定要省钱，**还要考虑时间**；
+4. **"计划以及审计以后，其实 flash 的能力基本足够了，只有说 max 了还是失败，或者长时间
+   推进不下去，才需要让该模型主动向主 agent 提出升档。"**
+
+#### 权威顺序：最新事实 + 用户意愿，绝不写死、绝不机械判断（2026-10-09 owner 原则）
+
+**这条统摄本节其余全部内容。**
+
+owner 原话：「模型一直在变化，不应该定死，也不应该机械判断，应该根据最新事实，或者
+尊重用户意愿来配置，而不是自说自话，用着过时的训练数据，来做决定。」
+
+据此确立三条禁令 + 一条权威顺序：
+
+**禁令**（违反即是缺陷，不是风格问题）：
+
+- **不得写死**：能力/速度/质量档表不得作为策略编译进插件。模型代际几个月一变，今天
+  写死的"旗舰"很快就是错的。
+- **不得机械判断**：不得从命名词根推断性质。`*highspeed*` 不自动等于快、`*flash*`
+  不自动等于弱档、`*pro*` 不自动等于强——这类推断是**猜**，不是事实。
+- **不得用训练先验自说自话**：agent 的记忆/训练数据是**过时**的，不能作为路由决策依据。
+
+**权威顺序**（高者覆盖低者，且每一层的来源必须可追溯）：
+
+| # | 来源 | 说明 |
+|---|---|---|
+| 1 | **owner 显式配置** | 最高。用户说什么就是什么；可覆盖下面任何一层 |
+| 2 | **最新事实** | 主机 `resolveModelInfo()`（许可 effort / 模态 / context）——权威且实时；主机**不**发布的价格、速度、相对能力 ⇒ 配置时**新取**（live catalog、官方来源、联网检索），记 `source` + `observedAt` |
+| 3 | **bootstrap 种子** | 仅在 1、2 都缺席时兜底。`capability-seed.ts` 由 harness **自带目录生成**——它是可验证来源的快照，不是本项目的判断；带日期、可重生成、**永远可被第 1 层覆盖** |
+| 4 | **unknown** | 记 `unknown`。**不用代理量、不用先验猜、不静默当快或当慢** |
+
+**明确撤回**：对话中曾提议"速度轴按 `*highspeed*`/`*flash*`/`*turbo*` 命名机械标注为快档"。
+按本条原则**作废**。速度在无 owner 配置、无新取事实时一律 `unknown`；`unknown` 不参与
+排序（既不当快也不当慢），只作为"需要补齐"的信号。
+
+**时效性与再验证**：任何来自第 2/3 层的路由事实必须带 `source` + `observedAt`。目录变化
+（`llm/adapters-updated`）或超过新鲜期即视为**过期**，须重取或回到 owner 确认。
+**过期先验不得当事实使用**——这与 §1.1 记的 `source-ready ≠ installed` 是同一类诚实要求。
+
+**对首次使用引导的直接后果**：引导不是"读一遍内置表"，而是**去取最新事实或问 owner**，
+把结果连同来源与日期写进配置。内置种子只是没有网络/没有 owner 时的兜底，且其使用痕迹
+（`cost: route|model|model-case-folded|unknown`、`seed-cost@<date>`）必须出现在路由记录里，
+让"这次是靠内置快照决定的"永远可见。
+
+
+#### 核心原则：充分性阈值 vs 排序轴
+
+这是把上面几条统一起来的那条规则，也是本仓库先前两处错误的共同根因：
+
+- **充分性阈值**（过 / 不过，**从不参与排序**）：该路由的 effort 许可集、视觉
+  （`inputModalities`）、**context 是否够这个任务的真实需要**、ceiling 是否够该任务的难度。
+- **排序轴**（只在**够用**的候选之间比）：**速度**、**价格**。
+
+两条推论，各自都推翻了一个曾经写进代码的代理：
+
+- **价格 ≠ 能力**。`economy` 此前按 "smallest contextWindow ≥ floor" 排——那不是价格。
+  `zai/glm-5.3` 与 `zai/glm-5.3-flash` 同为 1M 窗口，单价差约 9×。
+- **context 窗口 ≠ 能力**。owner 事实：`k3-256k` 与 `k3` **能力相同**，只是窗口
+  256k vs 1M。所以窗口是**阈值**（任务要多少就给多少），**大不是好**；旧 `quality`
+  偏好里的 "contextWindow descending" 会把 k3-1M 排到 k3-256k 前面，是错的。
+
+#### 任务档（work_class）决定哪条轴当主导
+
+> **升档请求已交付（2026-10-11，M12）。** `autopilot_log({ stance:'escalate',
+> escalationTarget:'stronger-model', note })` 即工作模型的升档请求：引擎记下该 run 的
+> 一个未消费请求，**下一次任意角色的 auto 派发**把候选池放宽到
+> `economy + standard + reserve`（owner 写了自己的 `routing.workClasses.<class>.tiers`
+> 时以 owner 为准），该次派发在 `why` 里点名请求序号与证据，并把被替换的 pin 记为
+> `repinFrom`；消费一次后回到既有 pin 稳定性语义。**请求不放宽授权**——候选集仍是
+> 「会话策略 ∩ 活体 provider」，仍过档位成员资格、独立性与主导轴排序，策略不覆盖的
+> 路由连"被考虑"都不会出现。请求是 engine-local 的（进程重启即遗忘，登记为边界而
+> 非隐藏）；它**不是**按角色猜测的：一个 run 一个请求，由下一次 auto 派发消费。
+> 交付形态见 §8.7，落地见 `src/engine.ts` 的 `consumeEscalation` 与
+> `selectForRole` 的消费点（`takeEscalation`）**以及** `resolveRoleRoute` 中"有未消费
+> 请求就强制重选"的分支（该分支必须存在的原因：健康 pin 会被**复用**，只把消费点放在
+> selector 里则请求在它唯一有用的路径上永不被读到 —— 计划审计在 rev 1 抓到过这个缺陷；
+> 消费点最终落在**选择**处，所以无 pin 的首次派发、死 pin 重选与轮转同样会放宽，而
+> inherit/locked 这类不做选择的分派不会消耗请求）。
+>
+> **已接线（2026-10-10，governance-pragmatics-v1 承接轮）。** workClass 输入已进入
+> 选择器（角色级 `routing.roles.<role>.workClass`，缺省按角色表：executor/planner
+> simple，三审计角色 audit），零可达 work_class 以 `AP_ROUTE_NO_REACHABLE_WORK_CLASS`
+> 报出（ladder 已配置、类档位非空而候选集为空 ⇒ blocked + routingEscalation，不静默
+> 搁置）；覆盖面已升级为双度量（tier-coverage 与 work-class 可达性并存，见
+> "已记录的边界"）。仍缺：run 级 triage 的 workClass 字段（派发档位只能按角色配置，
+> 不能按单个 run 声明）与升档请求通道（子代理 → 主 agent 的 `failure_kind` 上报）
+> ——后者的缺席直接决定 `hard` 档的交付形态：DESIGN 上文要求"先试 economy；没有被请求
+> 就不升档"，因此 `hard` 的交付候选池为 **economy 单档**（`routing.workClasses.hard.tiers`
+> 可覆盖），standard/reserve 不由该类自行进入；
+> ——两者登记为非目标/已知限制，不静默缺席。
+
+不是给模型定死角色——难任务照样可以派 economy 档，先试。
+
+| 档 | 主导轴 | 入场候选 |
+|---|---|---|
+| 机械/扫描/盘点/叶子改动 | **速度** | 持有 `low` 的（`glm-5.3`/`k3`/`k3-256k`/`deepseek-v4-pro` 的 low 为 null ⇒ 无资格） |
+| 简单普通活（日常大多数） | 速度 + 价格 | economy 档，档内**轮转** |
+| 难度高 | **先试 economy**；不行才升 ceiling | 见下面的升档规则 |
+| 审计（medium+） | ceiling + 独立性 | standard，plan→execution 跨 provider |
+| 极端 | ceiling | reserve；本部署无则记无，不发明 |
+
+#### 升档是"请求"，不是"预测"
+
+**默认乐观**：计划与审计已经把重活做完，实现阶段 economy（flash 这一档）基本够用。
+所以默认派**够用 + 快 + 便宜**的那条，而不是按难度预判一个旗舰。
+
+升档只在两种证据下发生，且**由正在干活的那个模型自己提出**：
+
+- 思考档已到该路由的 **max 仍然失败**；
+- **长时间推进不下去**（停滞）。
+
+子代理把请求连同证据（`failure_kind` + 原始输出）回给主 agent，主 agent 据此派更高
+ceiling 的路由。**没有被请求就不升档**——预判难就上旗舰是浪费，预测式升档没有证据。
+
+#### 覆盖面（硬需求，不是加分项）
+
+每个在线模型必须**可达**（至少能被某个 work_class 派到），且某次派发的合格集内选择必须
+**轮转**，使任何合格模型不会永久坐板凳。零可达 work_class 的模型是配置错误，在引导/
+计划门禁处报出，不静默搁置。
+
+**已证明的现状缺口（2026-10-09）**：`RouteSelectionInput`（`src/routing/select.ts`）
+字段只有 role / risk / preference / roleRouting / policy / catalog / executorPin /
+independenceFloor——`counter`、`history`、`prior`、`rotation`、`used` **全部不存在**。
+同一 role 在相同输入下恒返回同一条，其余候选停在 `disposition: 'eligible'` 后永不派发。
+**确定性序数排序与覆盖面要求在结构上不相容。**
+
+**修法**：轮转索引从 run 自己的 `events.jsonl` 中该 role 的既往派发数**推导**
+（不引入可变计数器，replay 得到同样选择）；顺序固定为 资格 → 审计独立性 → 地板 →
+**轮转** → 主导轴偏好（速度/价格）；轮转不得凌驾独立性，plan/execution 审计仍跨 provider。
+
+**已修复（2026-10-10）**：轮转序数从 run 自身审计记录数推导（`prior.audits` 中该角色
+条数，replay 得同一序数）；选择器在审计独立性类内按序数偏移轮转（独立性永远先于轮转，
+组内 ≤1 成员时如实记 NO-OP）。引擎级重选作为 owner 显式 opt-in
+（`routing.ladder.rotation`，默认关）交付给**审计角色**：活体 pin 在下一次同角色派发
+让位整轮重选（§9 第 15 项）。**2026-10-12：executor 角色同样轮转**——序数取自 run
+自身的 `executorDispatches`（每次派发是一个新 child），偏移走排序后的存活列表；
+**运行中的 executor child 永不被改道**：只有 `startExecutor` 会调用路由解析，活体
+child 由 `resumeExecutor` 沿自己的记录路由续用。`inline` 模式下没有 executor 派发，
+因此什么都不轮转、也不声称。详见 §8.9 与 §9 第 15 项。
+
+**边界**："有活干"≠"每轮都有活"。某 run 内没有机械活时 `glm-5.3` 那一轮不上场是正确的。
+可强制的是**可达性 + 轮转**。
+
+#### 成本种子按"模型身份"键，不是按"路由"键（2026-10-09 修正）
+
+`src/routing/capability-seed.ts`（`seed-cost@2026-10-09`，153 条路由 / 136 个模型 id，
+15 家第一方 provider）只带**价格**一列。
+
+**曾经的错误**：主键用 `provider/model`。这把**打包/部署的选择当成了模型的属性**。
+harness 自己的目录就自相矛盾地否证了它：`moonshotai/kimi-k3` 与 `kimi-coding/k3`
+是**同一个模型、同一个价格**，只是两套 id。**Kimi 就是月之暗面的模型**；哪个目录文件
+给它命名是记账，不是身份。按路由作主键，恰好在"部署方自己注册了 provider 条目"时静默
+失配——本机实测四条 kimi 路由全军覆没。
+
+**现在的键序：具体 → 一般，且如实报告是哪一步答的**（`seededCost` 返回
+`{ cost, match, source }`）：
+
+| `match` | 条件 | 含义 |
+|---|---|---|
+| `route` | `provider/model` 精确命中 | 最强证据 |
+| `model` | 该模型 id 在**别的** provider 下命中 | provider 无关的价格；生成器拒绝输出"同一 id 两个价格"，故此处可信 |
+| `model-case-folded` | 折叠大小写/分隔符后命中 | **专门单独标出**：它能救回拼错的 route id，而**拼错必须可见**，不能被静默吸收 |
+| （无） | 都没命中 | `cost: unknown`，**绝不用代理量替代** |
+
+**本机实测（2026-10-09，153 路由 → 136 模型 id，跨 provider 价格冲突 0）**：
+
+| 部署里的路由 | 修正前 | 修正后 |
+|---|---|---|
+| `moonshotai/k3` | 未命中 | ✅ `model` |
+| `moonshotai/kimi-for-coding-highspeed` | 未命中 | ✅ `model` |
+| `moonshotai/kimI-for-coding`（id 含**大写 I**） | 未命中 | ⚠️ `model-case-folded` → `kimi-for-coding`（**typo 暴露出来**） |
+| `moonshotai/k3-256k` | 未命中 | 仍未命中——目录里**确实没有**该 id，真 unknown |
+| `zai/glm-5.3`、`zai/glm-5.3-flash`、`deepseek/deepseek-flash` | 命中 | ✅ `route` |
+
+`kimi-for-coding` = `$0.95/$4`，正是 owner 说的 **k2.8**；`k3` = `$3/$15`（约 3×）。
+
+
+#### owner 给出的具体模型事实（供 ladder 使用，非本文件发明）
+
+- `k3-256k`：能力**等于** `k3`，上下文小（256k vs 1M）⇒ 窗口是阈值不是排名轴。
+- `kimi-for-coding` 即 **k2.8**：能力接近 k3、更便宜 ⇒ 默认选它，k3 只在 ceiling 真需要时上。
+- `kimi-for-coding-highspeed` 即 **2.7 高速版** ⇒ 速度轴上的独立产品，不是能力降级。
+- `glm-5.3` 无视觉；`glm-5.3-flash` 有视觉且有 `low`。
+
+
+#### 已记录的边界（2026-10-09，与本节其余内容同等地位）
+
+上文写的是 owner 需求与设计意图；以下四条是**当前实现做到哪一步**的机械事实。
+它们不是"将来会做"的承诺，而是现在就不该被读成已交付的东西；与上文冲突时以本小节为准。
+
+- **阈值输入 `requirements` 有且仅有**一个**生产生产者（mechanical 档的 effort
+  许可），其余阈值仍无生产者。**自 work-class 接线起，引擎在生产派发点构造
+  `requirements: { effortIds: ['low'] }`（mechanical 档的入场门，DESIGN 上文
+  "持有 low 的" 那条），这是 fail-closed 的充分性阈值、不是排序轴；同一派发点也施加
+  ladder 档位成员资格（某档的候选集 = 其映射档位的并集），即 owner tier 阈值的已交付
+  形态。**其余不得写成"生产中强制"：模态、超出角色 `minContext` 默认的 context 地板、
+  ceiling 在派发点都没有生产者；mechanical 许可之外的努力档取自适配器自报事实。
+  生产中也真正跑到的还有：角色 `minContext` 地板（executor/planner 131072，审计角色
+  65536）与授权交集（会话策略路由 ∩ 活体 provider）。
+- **升档请求是 engine-local 的一次性意图，且只能放宽候选池、不能放宽授权。**
+  请求寄存器按 run 存一个条目（不写入 durable `Snapshot`，因此不触碰 fold 契约与
+  legacy replay）；被消费的那一次派发把它写进 `detail.routing.why` 与 `repinFrom`，
+  所以"这次为什么换了路线"是持久的，而"还有一个未消费的请求"不是。池放宽后仍必须
+  通过授权交集、档位成员资格与独立性判定；池为空时仍走
+  `AP_ROUTE_NO_REACHABLE_WORK_CLASS` 的阻塞路径（实测：owner 写了
+  `routing.workClasses.<class>.tiers` 时以 owner 映射为准，请求只提供默认下限）。
+- **持有活体 pin 的角色默认不重选；审计角色可由 owner 选择引擎级轮转。** 引擎在
+  pin 的 provider 仍活、preflight 仍接受、授权仍覆盖时复用 pin
+  （"stability over reselection"），只有 pin 死亡才带 `repinFrom` 重选。
+  `routing.ladder.rotation: true`（owner 显式 opt-in，默认关，出厂语义逐字节保留）时，
+  **审计角色**在下一次同角色派发让位整轮重选，why 行点名 rotation 是原因，序数取自
+  run 自身审计记录数，轮转偏移落在审计独立性类内（永不凌驾独立性）；**executor
+  角色同样进入该分支**（2026-10-12，§9 第 15 项），序数取自 `executorDispatches`，
+  偏移走排序后的存活列表，活体 child 不受影响。
+- **`balanced` 默认值与 owner 显式写下的 `balanced` 仍不可区分**（显式性上限：
+  schemastery 在 `apply()` 之前已填默认值，loader 与 plain 两条配置路径必须同值；
+  写成恰好等于默认值的 `balanced` 在两条路径上都如实记为 `default`）。A2 的交付
+  形态是**显式 opt-in**：`routing.orderingAxisDefault: true` 让排序轴路径
+  （价格 → owner 声明的速度）成为该部署的默认排序，引擎把有效 preference 记为
+  `axis`、来源记为 `default`（owner 选择的是"晋升"，不是 axis 本身），选择记录带
+  `preferenceSource`；未 opt-in 的部署语义逐字节不变。
+- **覆盖面是双度量：档位覆盖 + work-class 可达性。** `coverageReport`
+  （`kind: 'tier-coverage'`）保持原义五结局；`workClassReachability`
+  （`kind: 'work-class-reachability'`）回答"每个观察到的模型有没有至少一个可达的
+  tier-bound work_class"，五结局（`unobservable` / `unconfigured` / `incomplete` /
+  `unreachable-models` / `reachable`）同样遵守非空观察地板，`auditTier` 覆盖如实
+  进入报告，非档位绑定的类（mechanical，按事实许可入场）只点名不计数。报告由引擎
+  每次选择从同一缓存目录快照刷新，经 StatusView `routingReachability` 暴露
+  （缺席 = 从未观察，绝不声称可达）。
+
+另记：`routing.ladder` 已解析（tiers / auditTier / rotation / speedOrder /
+costOverrides）且已**接入派发成员资格**：tier-bound work class 的候选集即其档位成员
+（§9 第 16 项已交付）。成本种子的 provenance（`seed-cost@2026-10-09`，由 harness
+自带 provider 目录生成、按模型身份键、命中步骤带标签）由
+`skill/dsh-autopilot/references/model-routing.md` 单一 owner 记录。
+
+**前提：自主选择需要会话的 subagent model-selection policy（2026-10-10 实测）**。
+在真实 0.2.0 桌面宿主与 headless 宿主上，两个会话都没有
+`subagent/model-selection-policy` 事件，于是 auto 模式**只做继承**——引擎自己的 why 行
+逐字为 `authorization: no session model-selection policy recorded (the native default)
+— auto mode performs inheritance only; settings are never consulted as authority`，
+ladder 在该次派发上**不参与成员资格判定**（`src/routing/authorize.ts:90-98` 的
+`inheritOnly` 短路；`selectForRole` 仍会算可达性报告与轮转序数，但没有授权集合可筛）。
+策略存在时（`policy.kind === 'present'`）才有授权集合，ladder 才真正约束候选
+（`authorize.ts:109-121` → `engine.ts:3925/3936`）。宿主侧的开关是它自己的 subagent
+model selection（UI 文案 "Allow agents to choose models for Subagents"，**只对新会话
+生效**），本插件无法代设。因此"ladder 已接入派发成员资格"的诚实读法是：**接入在
+选择真正发生时生效**；无 policy 的部署上派发是继承，ladder 只影响覆盖面报告与首次
+使用引导。§9 第 12 项的引导段已如实说出这一前提（`policyState: 'absent'` /
+`'unreachable'` 各自措辞），避免引导段读起来像"路由已在派发"。
 
 ## 2. CC 机制 → dsh 原生机制映射
 
@@ -411,10 +736,20 @@ v2 新增的诚实上限：
     heredoc 体里的 `git push`、`sudo git push` 在文本上无从区分，而能区分它们的
     "命令位置"规则对 `xargs git push`、`env X=1 git push`、
     `find . -exec git push \;` 全是 fail-OPEN 的，所以没有采用。
-  - `run_code` 的 `code` 与 `terminal_send` 的 `text` **不是命令行**：前者是
-    某种语言的源码（`"git push"` 在被交给 `shell=True` 之前是惰性字符串），
-    后者是键入一个前台进程未知的 PTY 的按键（`#` 是不是注释取决于那头是 shell、node REPL
-    还是 `cat`）。这两条通道保留逐字匹配，因此保留完整的过度包含——提及即拒。
+  - `run_code` 的 `code` 与 `terminal_send` 的 `text` **不是命令行**——但
+    2026-10-09 的准确性修复（owner P1 裁决）把两者分开处理：
+    `run_code` 源码获得**代码感知**读法——标签模板（tag 是执行器）与枚举的
+    sink 调用参数（exec/execSync/spawn/system/popen/runCommand）是"表演"，逐字
+    匹配；普通字符串、注释（`//`、`/* */`、行首/空白后的 `#`）与未打标签的
+    模板是**数据**，其内部词边界被融合（`'git push'` → `git_push`），提及不再
+    被拒。实测动机：两次合法操作被拒，皆因审计 packet **引用**了裁决原文中的
+    出站词。安全核算：(a) 程序内真正发起出站的嵌套 `pwsh`/`bash`/`run_code`
+    派发在**各自派发点**仍被同一 seam 完整门禁；(b) `child_process` 继承 stdio
+    的路径对任何文本匹配器本来就可用 `'git'+' push'` 拼接绕过——逐字匹配对
+    对抗性程序从未提供真实防护，此次只是停止对诚实使用征税。新上限：不在
+    sink 名单上却执行其字符串参数的助手被放行（与解释器名单同一枚举边界）。
+    `terminal_send` 的按键**保留逐字匹配**——PTY 距执行只差一个回车，且无
+    嵌套派发论证可用。
   四点都在 `test/gate.test.ts` 有夹具（`mentions` 与 `performed` 两个方向各带
   基数下限，外加三条 `RECORDED CEILING`）。
 - `git … push` 模式的 gap **排除了** `&` / `|` / `;`，所以这三个字符出现在 `git`
@@ -2342,7 +2677,96 @@ resume 把 findings 送到同一子代理 → packet rev 2 被接受（重复提
 模型下的完整写生命周期与 closeout；冷恢复（子代理不在内存时 `sendMessage` 走 cold-resume）
 之后的 executor 重新识别；浏览器里卡片的实际渲染。
 
-## 9. 路线图
+### 8.5 Governance pragmatics v1（2026-10-09）：审计分级、计划修正、部分交付、owner 收窄
+
+七个交付物（run session-493bb9a7，独立 plan 审计 2 轮：r1 needs-replan 1×P1 阻断项
+= amend 后缺再审边界 → v2 以 delta 再审绑定修复后 pass）：
+
+1. **结构化审计发现**：`AuditFinding{severity, layer, summary}` 挂在
+   `AuditRecord.findings`（presence-gated，先例 F26 双边在场）。判决 schema 增可选
+   findings 数组；`pass` 可携带 non-blocking findings；`needs-replan` 须 ≥1
+   {blocking, plan} 发现，否则**落盘前**拒绝 `AP_AUDIT_FINDINGS_INVALID`——把
+   执行层缺陷导流回既有 needs-fix 车道（run 记录里 0/14 次真实使用的车道）。
+2. **计划修正**：新 op `amend-plan`（executing/execution-reviewing）保 gates/
+   packet/executor、revision+1、武装 `planAmendedAtRevision`；fold 派生该字段，
+   delta plan-pass（captured ≥ 修正版）解除，期间 evidence/closeout 被拒
+   (`AP_AMEND_REAUDIT_REQUIRED`)；assertAuditPhase 在武装期向执行相位开放 plan
+   角色；plan-pass commit 保留被审相位。triage 不可变兜底 WHAT 不变。
+3. **部分交付**：`Closeout.handoff{openItems, nextAuthorizedAction}` +
+   引擎推导 `outcome: complete|partial`；unproven criterion ⟺ 恰一 openItem（文本
+   匹配；openItem 必须是真 criterion）；戳 `closeoutHandoff: 1`（先例
+   evidenceKinds）。`requireHandoff` 走 evaluateCompletion options，fold 只在戳后
+   执行新臂。legacy closeout 保留旧读法。
+4. **跨 run 承继**：`Triage.carryover{fromRunId, note, inherits}`（triage 不可变
+   ⇒ 不可事后改宗）；init 写路径查 store（`AP_CARRYOVER_UNKNOWN` /
+   `AP_CARRYOVER_NOT_COMPLETED`），fold 只验形状。usage `inheritedFrom` 已有的
+   工件豁免通道承接证据承继。
+5. **owner 收窄**：>MAX_REPLAN_ROUNDS 不再强制 needs-owner-decision（m6-live 实录：
+   预算归零机械触发 owner，门禁全有效却被锁死）；改 diagnostic + status 可见；
+   升级是 agent 的显式决定。`pausedFrom`（presence-gated）记暂停来源相位，
+   `owner-resolve` 增 `resume-execution`（恢复相位，gates/packet/executor 字节级
+   不变；fold 校验）；resume-planning/block 保留原语义并清 pausedFrom。
+6. **审计收敛闸**：`governance.maxAuditRoundsPerRole`（默认关）超限拒派发
+   `AP_AUDIT_ROUND_CAP`——只停表，不发明 owner 问题。ConfigShape+CONFIG_KEY_SPEC+
+   resolveConfig 三处同步（loader/plain FIELD-FOR-FIELD 一致性由 config.test 钉住）。
+7. **文档契约**：governance-invariants.md 新增 5 个 invariant 节（Findings
+   Grading / Minimum-Sufficient Admission / Amendment and Delta Re-audit / Partial
+   Delivery and Carryover / Owner-Decision Boundaries）+ INVARIANT_HEADINGS census
+   同步；refusals.md 新 13 个拒码双向 census + 新 §16；docs/reference.md 工具序列；
+   SKILL.md 流水线。
+
+**如实记录的边界**：(a) m6-live 的 stale-snapshot→needs-replan 误分类只被 findings
+分级**部分**缓解——审计新鲜度绑定 `AP_STALE_AUDIT` 仍任其职，快照竞争问题未动；
+(a2) `pausedFrom` 推导是 either-side presence-gated：一个未打戳的当前格式暂停流
+仍能折叠通过（fail-safe：只失去 resume-execution 出口，不破坏其它不变量）；
+(b) 移除强制升级后的活性靠 status 暴露 + 纪律默认（连续 2 轮不收敛显式考虑 owner）
++ 可选 round cap 兜底，非机械保证；(c) 本 repo 是 source-ready 未安装态（§1.1），
+以上行为在已安装 0.2.0 宿主上不生效，直到下一版本发布。
+
+### 8.6 M10 桌面可靠性（2026-10-11）：plan-reviewing 楔死修复（P0）+ 无人值守 egress（P1）
+
+两个交付物，都落在 `governance-pragmatics-v1` 分支，r7 构建
+（`dsh-goal-autopilot-0.2.0-candidate-routing-m1-m9-r7.tgz`）。
+
+1. **plan-reviewing 楔死修复（P0）**：派发审计员之前先捕获 pre-dispatch 相位与两条
+   baseline 修订（runRevision / planRevision）。当判决路径拒收审计
+   （`AP_AUDIT_NO_VERDICT` / `AP_AUDIT_INVALID_VERDICT` /
+   `AP_AUDIT_FINDINGS_INVALID`）且 live state 仍等于捕获的 baseline 时，引擎提交一条
+   恢复事件（op `audit`，detail `{role, stage:'rejected', error:{code,message},
+   auditorId}`）把相位恢复到派发前；**不**追加 `audits[]`、**不**动任何 gate，拒收
+   照常 rethrow。`AP_STALE_AUDIT` 刻意**不**回滚（新鲜度绑定仍任其职）。真机楔死
+   实录：一个只带执行层 finding 的 `needs-replan` 落盘前被
+   `AP_AUDIT_FINDINGS_INVALID` 拒收，但相位已提交成 `plan-reviewing`，此后每次 plan
+   审计都被 `assertAuditPhase` 拒——run 卡死。修复后相位恢复到 `planning`、重派发
+   通过。红→绿见 `test/plan-audit-wedge.test.ts`（6 例）；真机独立启动证据见
+   `goal-runs/m10-desktop-reliability/evidence/p0-wedge-recovery.json`
+   （recoveryEventCount=1，phaseTrace rev4 plan-reviewing → rev5 planning → rev7
+   executing，wedgeRecovered=true）。
+2. **无人值守 egress（P1）**：`governance.unattended`（布尔，默认关；CONFIG_KEY_SPEC
+   同步镜像）。开启时，一份**已校验**的 egress manifest 不再中途询问 owner：门禁在
+   spawn 前**拒绝**该 egress，理由点名命令与目标、声明 manifest 仍然有效、给出恢复
+   路径（owner 执行 `autopilot_signal owner-approve` 后 agent 重试——`consumeApproval`
+   认账），并说明其它已授权的非 egress 工作继续。关闭时 ask 路径与旧行为逐字节一致。
+   每次 egress ask/deny 都记录到 run（`enforcement.egressDecisions`，outcome
+   `asked` / `denied-unattended`），让无人值守的拒绝**可见且可恢复**，而不是无限等待。
+   教义在 `src/policy.ts` 与 `skill/dsh-autopilot/SKILL.md`；测试在
+   `test/preexecute.test.ts`（含 unattended 开/关 + owner-approve 回归）与
+   `test/policy.test.ts`。
+
+**如实记录的边界（M10）**：(a) P0 修复只覆盖"判决路径在 live state 仍等于 baseline 时
+拒收"这一种楔死；若派发后又有别的 commit 改了相位/修订（baseline 不再相等），恢复
+不触发、由既有不变量兜底（宁留可诊断状态，不猜相位）。(b) P1 无人值守**只**把"已
+校验 manifest 的 egress ask"改成 deny；它**不**自动批准任何 Owner 审批、不改 ACL/
+沙箱/出站权限、不绕过安全边界——owner-approve 仍是人工显式动作。(c) 独立 headless
+验收的 (b)/(c) 两臂（unattended egress 真机拒绝、v4-pro 真机派发）被本机
+Store-PowerShell 缺陷卡住：`dsh-subprocess` 的 env-scrub 让子进程拿到默认 PATH，
+沙箱受限令牌下 Store 安装的真 pwsh ACL 不可见（candidateExists 跳过）→ 落到
+reparse-alias 桩 → spawn ENOENT；修复需持久改用户 PATH 或管理员权限，超出本轮授权
+范围。(d) 验收过程中发现并修正了一处探针配置错误：`allowedModels` 是宿主面
+`subagent-model-selection-settings` 插件的字段（MS4 叶③），**不是** autopilot 配置
+字段——把它挂在 autopilot 下会让 cordis 配置解析失败、插件不挂载。
+
+
 
 编号保持稳定（其他章节按号引用），已交付项保留条目并标注，不删号。
 
@@ -2436,3 +2860,339 @@ resume 把 findings 送到同一子代理 → packet rev 2 被接受（重复提
    `SkillSyncIo` 去掉了 `copy` 成员——它经 `src/index.ts` 再导出，对注入 io 的调用方
    是一次公开类型变更；该接口是测试缝，本包内只有 `defaultIo` 与
    `test/skill-install.test.ts` 用它。）
+
+8. **owner gate pass / withdraw + gate 来源溯源**（**已交付**，2026-10-12，见 §8.9；
+   2026-10-09 的 governance pragmatics v1 交付了相邻的
+   owner-resolve(resume-execution) 状态保留与 pausedFrom 溯源）：`autopilot_signal`
+   增加 gate 级 owner 决定（`owner-gate-pass` / `owner-gate-withdraw`），快照
+   `gateSources` 记录每条门禁的来源（`owner` / `auditor` / `self-check` /
+   `pending` / `no-source`）连同它所属的 generation（plan revision）与 owner 决定的
+   序数，并实现"同一 run/gate/plan revision 内的当前 owner pass 优先于之后的审计
+   异议、不抹除异议、也不顺带通过另一道门禁"。撤回是追加记录，之后的普通重置或 pass
+   不能复活它。**一处刻意的既有规则放宽，写在这里而不是悄悄改掉**：fold 原先要求
+   `executionGate` 翻到 `pass` 必须有一条最新的 execution 审计 pass
+   （`AP_GATE_WITHOUT_AUDIT`），现在"该 generation 内的有效 owner pass"同样成立——
+   否则 owner 对执行门禁的裁决只能永远跟在审计之后，优先级规则本身也就空了。放宽
+   保留了规则的实质：门禁不会凭空 pass，要么有审计 pass，要么有 owner 明确且带世代
+   序数的裁决，且执行门禁仍要求证据包已在场；从未记录 provenance 的旧流读法逐字节
+   不变。测试见 `test/owner-gates.test.ts`（本轮 22 例，见 §8.9 的证据文件；正文只
+   主张该文件覆盖这些规则，不主张计数会成为长期事实）。
+9. **medium+ 默认派发 executor lead**（**未交付**）：Codex GAH 把 medium/high/
+   critical 默认交给 executor lead，inline 例外需在计划里写明理由。本引擎
+   `executionMode` 在 init 固定，无法在执行期做 task-shaped 的委派决策；引入它
+   需要 `Triage` 之外的契约字段与 fold 校验。在此之前该默认标记为
+   `discipline`（§1.1），不声称强制。
+10. **阶段化收尾**（**已交付**，2026-10-09 governance pragmatics v1，见 §8.5）：
+     unproven criterion 强制结构化 handoff（openItems 双射 + 引擎推导
+     `outcome: 'partial'`），`nextAuthorizedAction` 持久化下一个已授权动作，
+     后继 run 以 `Triage.carryover` 指名承接（前驱必须 completed）。closeout 仍
+     是 run 级——"阶段"由 handoff+carryover 显式接续，而不是引入第二类终态；
+     legacy closeout（无 `closeoutHandoff: 1` 戳）保留旧读法。
+11. **模型路由：任务档 + 覆盖面**（**已交付**，2026-10-10 governance-pragmatics-v1
+    承接轮；2026-10-09 owner 需求，见 §1.2）：`routing.ladder` 解析（固定档位
+    economy/standard/reserve、`auditTier`、`rotation`、owner 声明的 `speedOrder`、
+    `costOverrides`，格式错误即拒绝）、按模型身份键的真实价格种子
+    （`seed-cost@2026-10-09`）、任务档（work_class）五档表与角色缺省映射、零可达
+    work_class 报错（`AP_ROUTE_NO_REACHABLE_WORK_CLASS`）、双度量覆盖面
+    （`coverageReport` 档位覆盖 + `workClassReachability` work-class 可达性，两者都
+    拒绝在未观察/未配置/列出不全时声称可达）。排序轴默认、引擎级轮转、ladder 成员
+    资格、首次引导分别见第 12/13/15/16 项。原文说"`routing.ladder` 声明
+    work_class→档位成员"与实现不符——ladder 没有该输入，已改正（成员资格现在由
+    work class 的 `tiers` 映射声明）。
+12. **首次使用引导**（**已交付**，2026-10-10）：`autopilot:routing-onboarding`
+    systemPrompt 段（order 61，仅 root agent）——路由开（`mode: auto`）且活体目录里
+    出现任何 tier-bound work_class 都放不下的模型时（复用引擎同一
+    `workClassReachability` 度量，单一真相），提示 agent：先在线核查各模型当前能力
+    事实或询问 owner（**禁止按名字推断**，§1.2），再写 `routing.ladder.tiers.*` 等
+    volatile 叶（无需重启）；引导文本点名不可达模型（≤5 名 + "+N more"）。全覆盖、
+    目录未观察、路由关 ⇒ **零 token**。宿主无 `ctx.configEditor` / `ctx.settings.edit`
+    时降级为"把确切 YAML 报给 owner 编辑
+    profile"路径。**未另造插件私有策略文件**。报告缓存于挂载层，挂载时与
+    `llm/adapters-updated` 刷新，渲染到时再做一次异步再校验（stale-by-one：配置修复
+    在下一次 prompt 组装时清除提示，已在代码注释声明）。config-edit 面按
+    `lookupService` 结构性探测（`ctx.get` 优先）：两个活体宿主（桌面 + headless）
+    实测**都有**该面，渲染的是"自行编辑"分支；降级分支由单测锁定，本机未实测到。
+
+    **2026-10-10 活体验收补充（M7 实测驱动）**：引导段现在还说出"ladder 何时才真正
+    参与派发"这一前提——渲染 agent 的会话读不到 model-selection policy 时（`absent` /
+    `unreachable`，与引擎 authorize 同一个 `policyReader`），文本追加 "INHERITANCE
+    ONLY：引擎派发部署默认，ladder 什么都不选"，并按成因分别措辞（无 policy ⇒ 请 owner
+    打开宿主的 subagent model selection，**只对新会话生效**；policy 投影不可达 ⇒ 本会话
+    无法打开，只能告知 owner）。策略存在时不追加。这一条由实测逼出：ladder 配全、本引导段
+    已渲染，而每一次派发仍记 `inheritance only`（见 §1.2 另记"前提"）。
+
+    **2026-10-10 M7b 修正（引导段 vs 派发读同一份 live 配置）**：前驱 run 记录过"面板显示已更新、
+    派发仍用旧策略"的分裂（引导段 1→4→1 不可达、引擎 `routingReachability` 停在
+    `k3 → ["audit","extreme"]`）。M7b 重读源码并实测后判定：两个消费者读的是**同一个**
+    `volatileRoutingAccess(config)` 闭包（`src/index.ts:1723` 建、`:1736` 给引擎、`:1796` 给引导段），
+    每次调用都重新 `resolveRouting`，因此**派发从未被冻在挂载快照上**——前驱窗口内根本没有一次为选择
+    而重读配置的派发（那次审计复用了健康 pin，走 reuse 分支，不经过 `selectForRole`）。
+    真正的缺陷是**可观测面 stale**：`reachabilityReports` 只有 `selectForRole` 一个写入点
+    （`src/engine.ts:4362`），pin 复用不会刷新它，于是配置改动后 StatusView 仍报旧梯子。
+    修正形态：引擎新增 `refreshReachability()`，在状态读取路径（`autopilot_status`）await 之后
+    再投影，报告取自**当前** routing 段落；`skill/dsh-autopilot/references/model-routing.md` 里
+    "on every selection" 的措辞随之改正，而"ladder 参与派发成员资格"这一条经核对**保留**
+    （派发确实读 live 配置）。零可达 work_class 的 fail-closed 行为在引擎层用真实形态的梯子
+    重新验证（`AP_ROUTE_NO_REACHABLE_WORK_CLASS` → routing-escalation → `needs-owner-decision`）。
+
+13. **模型路由 A2：显式 preference 来源**（**已交付**，2026-10-10，形态为显式
+    opt-in）：`routing.preferenceSource` 把"owner 显式写了非默认值"与"默认"区分开
+    （选择记录带 `preferenceSource`）；`routing.orderingAxisDefault: true` 让排序轴
+    路径（价格 → owner 声明的速度）成为该部署默认——owner 选择的是"晋升"，不是
+    axis 本身，故来源如实记为 `default`。"写成恰好等于默认值的 `balanced`"在
+    loader 与 plain 两条路径上都仍不可区分（显式性上限，§1.2 边界保留原文含义）。
+14. **模型路由 A5：真实 workClass 输入 + work-class 可达性**（**已交付**，
+    2026-10-10）：auto 角色派发从 `routing.roles.<role>.workClass`（缺省按角色表）
+    解析任务档，tier-bound 类的候选集即其档位成员（与第 16 项同一接线）；owner 未
+    启用（ladder 空且类未改）时选择**记录而不施加**（0.2.0 parity）。零可达 ⇒
+    `AP_ROUTE_NO_REACHABLE_WORK_CLASS`（blocked + routingEscalation）。覆盖面升级为
+    `workClassReachability`（`kind: 'work-class-reachability'`，经 StatusView
+    `routingReachability` 暴露）。run 级 triage 的 workClass 字段未引入（登记为
+    非目标，见 §1.2"已接线"注）。
+15. **模型路由 A4：安全的引擎级重选**（**已交付**：2026-10-10 审计角色，2026-10-12
+    executor 角色，见 §8.9）：`routing.ladder.rotation: true`（owner 显式 opt-in，
+    默认关）时，活体 pin 在下一次同角色派发让位整轮重选（`repinFrom` 指向原 pin，why
+    行点名 rotation 为原因）；**审计角色**的轮转序数取自 run 自身审计记录数，偏移落在
+    审计独立性类内，**永不凌驾独立性**；**executor 角色**的序数取自 run 自身的派发
+    计数 `executorDispatches`（计数单位是**新 child**：`startExecutor` 为一次派发写两条
+    `start-executor` 事件，starting 与 running 同 `childId`；按事件数会翻倍），偏移走
+    排序后的存活列表（executor 自身没有独立性约束）。**连续性由调用图保证，而不是
+    承诺**：`resolveRoleRoute('executor')` 只有 `startExecutor` 一个调用者，活体 child
+    由 `resumeExecutor` 按自己的记录路由续用，永远不经过轮转分支；`inline` 模式下没有
+    executor 派发，因此什么都不轮转、也不声称。escalate/blocked 结果直通，不吞。
+    测试：`test/routing-integration.test.ts`（rotation ON/OFF 两臂 + 活体 child 拒绝
+    重派发）。
+16. **模型路由：把 ladder 接入派发成员资格**（**已交付**，2026-10-10）：tier-bound
+    work class 的候选集即其 `tiers` 映射的档位成员，选择器在资格判定阶段施加
+    （engaged 判定：ladder 已配置或 owner 改过类映射；未启用时记录而不施加，
+    0.2.0 parity）；`routing.ladder.auditTier` 覆盖 audit 类档位，选择器与可达性
+    报告用同一有效映射。
+
+### 8.7 M12 模型编排实况可观测 + work-class 升档请求通道（2026-10-11）
+
+两个交付物，都在 `governance-pragmatics-v1` 分支、基线 `93ea72c`（M11，r8）。
+
+1. **路由实况投影（`src/routing/status.ts`）**。此前 `StatusView` 只有一个路由字段
+   `routingReachability`，它回答的是覆盖面问题、在健康 ladder 上什么都不说；于是
+   "这台部署路由到底生效没有"在界面上无处可查——而 DESIGN §1.2 边界 (e) 已实测：
+   没有 session policy 时 auto **只做继承**。新投影给出：有效 `mode`、`preference`
+   及其来源（显式 / 默认，含 `orderingAxisDefault` 晋升）、**policy 状态**
+   （`present` / `absent` / `unreachable` / `unobserved`，其中 `unobserved` 专指
+   "读者没有会话可问"——HTTP 服务路径不读策略，绝不把它折叠成 `absent`）、每个角色的
+   有效路由（auto / inherit / locked，locked 带路由）与其 work class（名 / 轴 / 档位 /
+   是否 engaged）、本 run 已 pin 的路由、ladder 三档成员数与 `auditTier`。
+   `mode: 'off'` 时整个字段**缺席**：关掉路由后每一派发都是继承，一屏 `inherit` 行会
+   读成"选择失败"而不是"功能关掉了"。投影是纯函数、无 I/O、不猜测；它随后经
+   allow-list 转发到 `GET /api/autopilot/run`（桌面卡片轮询的同一条路由）。
+2. **work-class 升档请求通道**见 §9 第 17 项（同一轮交付）。
+
+**执行中发现并修复的三处只有真跑才暴露的问题**（都记在这里，因为它们定义了这个交付物
+的真实边界）：
+
+- **消费点必须在 pin 复用路径上。** 健康 pin 会被复用，`resolveRoleRoute` 根本不会进入
+  `selectForRole`；只把消费点放在 selector 里，请求在它唯一有用的路径上永不被读到。
+  独立计划审计在 rev 1 抓到这一点，修复是把 escalation 分支放在 `dead === undefined`
+  之后、rotation 分支之前，并补"无请求时逐字复用"的反向对照用例。
+- **请求不能按角色猜测。** 第一版按调用者归属角色，而根 agent 记录的请求落在了
+  `executor`，它想影响的审计派发永远消费不到（实测）。`audit` 这个类名也根本说不清是
+  哪个审计角色。现在一个 run 一个请求，由下一次任意 auto 派发消费。
+- **升档必须重算派生状态。** 第一版只替换 `tiers` 字段，而 `members` 是由原映射推导的；
+  实测 why 行写着 "economy + standard + reserve" 而过滤仍只放行 standard 成员。现在
+  经同一个 `resolveWorkClassSelection` 重新推导，成员集规则仍然只有一条。
+- **消费点必须在"发生选择"的地方（规则审计第二轮指出）。** 第二版把消费点放在健康 pin
+  分支上，于是文档里"下一次 auto 派发就会放宽"比代码宽：无 pin 的首次派发、死 pin 重选
+  与轮转都不放宽也不消费。现在消费点在 `selectForRole`（`takeEscalation`），健康 pin
+  分支只负责**强制重选**；不做选择的分派不消耗请求。新增用例 (e) 钉住"首次派发也放宽"。
+- **owner 权威要在正确的类上检验。** 新增用例 (f)（owner 写了
+  `routing.workClasses.hard.tiers`）当场抓出一个真缺陷：`ownerMapped` 检的是角色自己的类
+  （审计角色 = `audit`），而请求的池是从 `hard` 读的，于是 owner 写下的 hard 映射被静默
+  忽略、请求照样放宽。现在检验 `hard`（请求提升到的那个类；角色自己的类就是 `hard` 时
+  检验它自己），并且 why 行按**实际生效的档位**措辞——owner 映射生效时说的是
+  "the owner's mapping … stands against the request's own floor"，不再无条件声称
+  "widened to economy + standard + reserve"（规则审计第三轮指出的那条过宽措辞）。
+
+**如实记录的边界（M12）**：(a) 请求寄存器是 engine-local、不写入 durable `Snapshot`：
+进程重启即遗忘未消费请求（请求者需再次提出），这是刻意的取舍（请求是活意图，不是承载
+授权的状态），登记而不隐藏；被请求**导致**的那次派发是持久的（`detail.routing` 带 why 与
+`repinFrom`）。(b) 本轮**不**改桌面卡片渲染：新增 GUI 面在运行中的会话里无法被观察
+（内存副本已冻结，新会话才加载下一构建），因此只交付经真实 HTTP 路由验证的
+`api-behavior`，卡片渲染留给下一轮。(c) 升档只放宽候选池：owner 若为某类写了
+`routing.workClasses.<class>.tiers`，请求不覆盖它；ladder 已配置但请求后的池与授权交集
+为空时，仍走 `AP_ROUTE_NO_REACHABLE_WORK_CLASS` 阻塞（不静默降级）。
+
+### 8.8 M13 路由实况进入真实 GUI + executor child 升档通道（2026-10-12）
+
+三个交付物 + 两处只有真跑才暴露的缺陷，基线 `23fdd47`（M12，r8），候选制品
+`dsh-goal-autopilot-0.2.0-candidate-routing-m1-m13-r9.tgz`（sha256
+`92570729ff15faca0422c204800183103eb44eca3a8f832f5916753f3f091f1d`）。
+
+1. **卡片渲染路由实况**。`AutopilotRunChatData` 新增 `routing` 与
+   `routingReachability` 两个折叠字段（来自会话内的 `autopilot_status` 结果，
+   白名单逐字段读取、畸形即丢弃），卡片渲染五行、**各自标注来源**：
+   `routing`（mode / preference 及其来源 / policy 状态 / dispatch 判定）、
+   `ladder`（owner 配置的三档成员**计数** + audit tier——计数而非成员表，因为那表是 owner 的）、
+   `roles`（五角色有效路由 + 其 work class）、`dispatched`（本 run 实际派发落定的路由）、
+   `candidate coverage`（`routingReachability`，行内显式写 "NOT a dispatch record"）。
+   `GET /api/autopilot/run` 增加 `routingReachability` 字段（与 `routing` **分开**服务，
+   否则卡片会把候选覆盖当成派发记录）。`mode: 'off'` 时整块不渲染，且不留替代文案。
+2. **policy 三元组的诚实性**。`{policyState, policyRouteCount, dispatch}` 作为**一个原子
+   三元组**取源：HTTP 路由没有会话可问，恒答 `unobserved`；卡片绝不让这个"读不到"覆盖
+   会话已经观察到的 `present`/`absent`/`unreachable`——行内可见 `[read in this session]`
+   的来源标注，路由的说法只在会话没有任何观察时成立。`dispatch` 由 policyState 派生，
+   所以两者必须同源（否则头部会印出 "policy present · dispatch unobserved" 这种自相矛盾）。
+3. **executor child 的升档通道**（见 §9 第 18 项）。
+
+**真跑暴露并修复的两处缺陷**（都写在 CHANGELOG 的 Fixed 段，这里记下它们为什么只有真跑
+才发现）：
+
+- **卡片在真实 0.2.0 宿主上一行数据都折不到。** `readResult` 只认 **wrapped** 信封
+  （`message.content[0].content[0].text`，`isError` 在外层包装上），而 0.2.0 交付的是
+  **flat** 形状（`message.content[0]` 就是文本块，`isError` 在 message 上）。于是每个结果
+  都折成 `payload: undefined`，卡片渲染成空壳：revision 0、没有 phase、没有 gate、没有审计
+  裁决、没有路由块，**而且任何地方都不报错**。`test/fixtures/card/` 的夹具只带 wrapped
+  形状，所以 100 多个单测全绿也照样漏掉。发现路径：隔离实例 + 真实会话 + 真实 Chromium
+  捕获 → 看到空壳 → 把真实 85 事件会话喂给**出厂**定义做回放
+  （`goal-runs/m13-routing-gui-escalation/instruments/m13-replay-fold.mjs`）→ 复现
+  revision 0（红）。修复后同一条真实会话回放得到 revision 9、两个 gate、两条已裁决审计与
+  完整的路由块（绿），两份输出都归档。
+- **路由块可能落后于卡片自身 revision。** 折叠的 revision 由**任何**结果推进（实测：closeout
+  结果把 revision 推到 10），而路由块来自更早的一次 `autopilot_status`（revision 5），于是
+  卡片只列出一个已派发的审计者、而实际跑了两个。修复分两半：`routingReconcileNeeded` 让
+  终态运行也允许**一次**对账（一次，不是心跳：任何 live 答案落地后即停），`overlayLive`
+  在"答案不比卡片新"时仍允许**只**更新路由块（它有自己的观察 revision 作基线）。
+
+**真实验收（隔离实例 + 真实 Chromium，非 HTTP 200、非单测）**：`m13-accept`
+（desktop-stack profile、独立 storeRoot、装 r9）上跑真实会话，用 CDP 直驱本机
+chromium-1217 打开该会话并展开进程折叠区，卡片 DOM 里读到五行（`routing auto ·
+preference axis (default) · policy present (8 routes) [read in this session] · dispatch
+live` / `ladder economy 4 · standard 1 · reserve 1 · audit tier none` / 五角色 / 两个实际
+派发 / `candidate coverage 6/8 … NOT a dispatch record`），22 条断言
+（`m13-gui-assert.cjs`）全部通过；`mode: off` 的第二个实例渲染出卡片但**没有**
+任何路由块，8 条断言通过，其中包括"卡片确实向宿主路由发过请求"（否则"没显示"与"没加载"
+无法区分）。截图与 DOM 文本归档在 `goal-runs/m13-routing-gui-escalation/evidence/`。
+
+**真实子代理升档（隔离实例 `m13-escalation`，`routing.ladder.rotation: false`）**：
+真实 executor child 在自己的会话里调用 `autopilot_request_escalation`
+（`m13-actor-evidence.cjs` 从两个会话流分别取证：**子会话**有该工具调用与参数、**根会话**
+没有；子会话里 `autopilot_log` 调用数为 0），引擎记下 `stance=escalate /
+escalationTarget=stronger-model` 的检查点（seq 2），随后一次真实的 execution-auditor 派发
+把它消费掉：`repinFrom` = 请求前的 `deepseek-official/deepseek-v4-pro`，why 行点名
+"escalation request: seq 2"，新 pin 为 `kimi-coding/k3`（reserve 档）——**真实结果是升档**
+（standard → reserve），所以本轮**没有**、也不需要任何排序改动；计划里那条"按档位上限
+排序"的条件修复被计划审计判定为违规（把阈值当排序轴、与 §1.2 的轴集合冲突），已在 rev 2
+整体删除，这里如实记录实测方向。
+
+**如实记录的边界（M13）**：(a) 子入口刻意窄：只接受本 run 的活体、已授权、`running` 的
+executor（否则 `AP_ESCALATION_NOT_EXECUTOR`），`stance` 固定 `escalate`、target 固定
+`stronger-model`，子代理不能写任意检查点、也不能请求 `owner`/`external-review` 这类属于
+root 的治理出口；两个入口写入同一个寄存器（`commitLogEntry` 是唯一写入点），所以是
+"一个通道两扇门"而不是两套语义。(b) 请求寄存器仍是 engine-local（M12 的既有边界）。
+(c) 真机验收的隔离实例里 rotation 必须关闭才能把"重选"归因给请求：rotation 分支每次审计
+派发都会调 `selectForRole`，而消费点就在其中——这不是产品缺陷，是验收配置的必要条件，
+已写进探针配置注释。(d) 未 push：本会话审批策略为 `never`，egress 会被自动拒绝，因此候选
+只落在本地 `plugin-artifacts/`，Draft PR #3 仍是 `23fdd470`。
+
+17. **模型路由：work-class 升档请求通道**（**已交付**，2026-10-11 M12）：DESIGN §1.2 的
+    "升档是请求，不是预测"此前只有前半句落地（`hard` 档只有 economy 池，请求通道登记为
+    non-goal）。现在 `autopilot_log({ stance:'escalate', escalationTarget:'stronger-model',
+    note })` 就是请求本身：引擎按 run 记一个未消费请求，**下一次任意角色的 auto 派发**
+    把候选池放宽到 `economy + standard + reserve`（owner 写了
+    `routing.workClasses.<class>.tiers` 时以 owner 为准），该次派发在 `why` 里点名请求
+    序号与证据并把被替换的 pin 记为 `repinFrom`；消费一次后回到既有 pin 稳定性语义。
+    请求**不放宽授权**（候选集仍是授权交集，仍过档位成员资格、独立性与主导轴排序；
+    池为空仍走 `AP_ROUTE_NO_REACHABLE_WORK_CLASS`）。寄存器是 engine-local 的
+    （进程重启遗忘，登记为边界）；被派发消费的结果是持久的。测试：
+    `test/routing-integration.test.ts`（4 例，含"未请求时逐字复用健康 pin"的反向对照）
+    与 `test/routing-status.test.ts`。
+
+18. **模型路由：executor child 的升档入口**（**已交付**，2026-10-12 M13）：M12 的请求通道
+    只有一扇门（`autopilot_log` 注册在 root 作用域，引擎路径对任何带 parent session 的
+    调用者抛 `AP_NOT_ROOT`），于是真正干活的 executor child 反而无法提出请求。现在子面注册
+    `autopilot_request_escalation({ text, note })`（与 packet 工具一样装在**子自己的层**，
+    不依赖 owner 的 toolAllowList），引擎 `requestEscalation` 只接受本 run 活体、已授权、
+    `running` 的 executor，并把条目固定为 `escalate`/`stronger-model`；两个入口都经同一个
+    `commitLogEntry` 落库，寄存器写入点唯一。请求**不放宽授权**：候选集仍是会话策略 ∩ 活体
+    目录 ∩ 档位成员，仍过一次性与独立性排序。真机：见 §8.8。测试：
+    `test/child-escalation.test.ts`（6 例，含"非本 run 子代理被拒""已完成 executor 被拒"
+    "子代理仍然不能调 `autopilot_log`"与真实 pin 复用路径上的消费）、
+    `test/child-setup.test.ts`（子面第四个工具的事务化安装与回滚）。
+
+### 8.9 Owner gates + engine-level executor rotation（2026-10-12）：关闭 §9 第 8/15 项
+
+两个交付物，分支 `governance-pragmatics-v1`，基线 `cc4276a`（M13）。
+
+1. **gate 级 owner 决定与逐门禁来源溯源（§9 第 8 项）**。`autopilot_signal` 新增
+   `owner-gate-pass` / `owner-gate-withdraw`（owner-only，工具层与 `owner-approve`
+   同一道 `requireDirectHumanTurn` 闸；参数 `gate: plan|execution`）。快照新增
+   `gateSources`，逐门禁记 `{source, planRevision, ownerDecision?, withdrawn?, note?}`：
+   - 来源词汇 `owner` / `auditor` / `self-check` / `pending` / `no-source`；
+   - **世代**就是 plan revision：新一次 plan 提交（含 amend/replan/owner-resolve
+     resume-planning）使旧世代的 owner 裁决失效；`withdraw` 保留它收回的序数，之后的
+     普通 reset 或 pass **不能**复活它；
+   - 写路径优先级：owner pass 有效期内，审计异议被**记录**（record 追加、note 保留）、
+     该门禁**不动**，另一道门禁不被顺带通过。实现放在写路径而不是留给 fold 拒绝，因为
+     被拒的提交会丢掉审计判决——那恰是优先级规则最不该做的事；
+   - 派生是双端共用的一条函数 `applyGateLedger`（与 `applyRoutingDecision` 同一写法）：
+     引擎写、fold 重算并拒绝任何不一致；**对从未记录 provenance 的旧流不做回溯填充**
+     （读作 `no-source`），因此 0.2.0 流与既有 fixture 逐字节照旧。
+   一处既有规则的**刻意放宽**写在 §9 第 8 项：`executionGate` 翻 `pass` 现在接受
+   "该世代内有效的 owner pass"作为审计 pass 之外的第二个来源（规则的实质保留：门禁不
+   凭空 pass；证据包必须在场是**写路径**性质，fold 对伪造流从来不设防——同一条流伪造
+   一条 execution `pass` 审计记录本就能翻门禁，所以这条放宽没有新增能力）。可见面：
+   `autopilot_status` 的 `gateSources`（模型侧）与卡片/`GET /api/autopilot/run`（人侧，
+   见第 4 条）。
+   测试：`test/owner-gates.test.ts`（init 起即记录、plan/execution 两个方向、
+   用量耦合、优先级对照臂、撤回后回退与不可复活、fold 的
+   `AP_OWNER_GATE_RESURRECTED` / `AP_OWNER_GATE_PRECEDENCE` /
+   `AP_OWNER_GATE_INVALID` 三条拒收）与 `test/tools.test.ts`（agent 生成回合被拒、
+   user 回合通过、`gate` 缺失即参数错误）。
+
+2. **引擎级 executor 轮转（§9 第 15 项）**。`routing.ladder.rotation` 的分支从"仅审计
+   角色"扩到 executor；新增快照计数 `executorDispatches`（fold 从自己的流派生，计数
+   单位是**新 child**：一次派发写两条 `start-executor`，starting 与 running 同
+   `childId`），它就是 executor 的轮转序数；reuse 分支的 why 行按角色分别措辞，
+   executor 那一条点名"活体 child 永不改道，因此连续性得以保留"。连续性不靠承诺而靠
+   调用图：只有 `startExecutor` 会调 `resolveRoleRoute('executor')`，活体 child 由
+   `resumeExecutor` 沿自己的记录路由续用，永不经过轮转分支；`inline` 模式下没有
+   executor 派发，因此什么都不轮转、也不声称。测试：`test/routing-integration.test.ts`
+   （ON：新边界带 `repinFrom` + `rotation: ordinal 1 into the ranked survivor list`；
+   OFF：跨边界逐字复用 pin；活体 child 重派发被 `AP_EXECUTOR_EXISTS` 拒绝）。
+
+3. **收尾校正（规则审计的 5 条 blocking 全部处理）**。真机/真流证据见
+   `goal-runs/m15-owner-gates-executor-rotation/evidence/`（机器本地、入仓被 gitignore）：
+   - **F1/B1（blocking）**：fold 的优先级守卫漏了**世代判断**（同一谓词四处实现，一处
+     失明）。`amend-plan` 抬高 plan revision 但不改 `gateSources`，于是守卫把上一世代的
+     owner pass 当作仍有效，拒掉了写侧已判定合法的门禁移动——**丢掉审计判决**，并把 run
+     留在 `plan-reviewing`（那里既不能 `submit-plan` 也不能 `replan`）。修法是把世代比较
+     补进守卫（与 `ownerPassInForce` 一致），并补回归测试；变异检验：删掉该行 → 该测试
+     恰好失败，其余全绿。
+   - **F2/B3（blocking）**：`AP_GATE_SOURCE_SHRANK` 曾经不可达（派生相等检查排在它前面
+     就会用更笼统的码先拒）。它现在排在相等检查之前，并有专门测试。
+   - **B2**：refusals §4 的规范段（`AP_GATE_WITHOUT_AUDIT`）与 Remedy 补齐 owner 分支。
+   - **B4**：DESIGN §1.2 两处、`src/config.ts` 的 schema 描述（**owner 直接读到的那个**）、
+     `src/index.ts` 的公开注释里的"executor 永不轮转/未交付"全部改正。
+   - **B5**：本节原先写了当次精确计数，落笔当天即与实测差一（DESIGN §8 自己的 Moving-Anchor
+     规则禁止这种锚）。现在改为**下限 + 证据文件**：回归基线 ≥1544 例，当次全绿输出、
+     client 声明检查、bundle 断言与真流回放分别存于 evidence/ 下的四个文件；正文不再
+     声称任何"当前计数"。基线提交也改正为 `35c8e90`（本轮 diff 的父提交；`cc4276a` 是
+     M13，即它的父）。
+   - 非阻塞项一并处理：`executorDispatches` 的口径改为"新 child 数"并说明旧流首次派发即
+     写入 1 的下限语义（N2）；审计轮转的独立性类只在约束生效时存在（N3）；世代终止只由
+     `resume-planning` 触发，`resume-execution` 原样保留（N4）；撤回的回退值/相位与"持有
+     期间不清空证据包"写进 §17（N5）；**delegated run 的 owner 执行门禁裁决现在把 executor
+     置为 `completed`**，因此它真能收尾（原先 `evaluateCompletion` 会拒，N6——这一条是改代码
+     而不是改措辞）；`status.gateSources` 改为**逐门禁**回落 `no-source`（N7）；`withdraw`
+     补上"另一道门禁不许动"的守卫（N8）；drain 失败回退不再移动 owner 已通过的门禁（N9）；
+     不变量章节补一句"owner pass 是裁决，不是机械逃生"（N10）。
+4. **可见面（N6 之外的第二处补交付）**。`gateSources` 现在真的走到用户眼前：
+   `GET /api/autopilot/run` 的 allow-list 转发它（`src/web.ts` 的 `projectRun`），客户端
+   镜像 + 合并（`definition.ts` / `live.ts`），卡片在 gate 行下方渲染 `data-autopilot-gate-source`
+   行（"plan gate: the OWNER (an explicit owner-gate-pass) (plan revision 1, owner decision 1)"）。
+   这是规则审计点名 N7 之后才补的：此前只有模型侧的 `autopilot_status` 能看到来源，卡片和
+   路由都看不到——而"谁定的门禁"正是这个功能的全部意义。
+5. **校验收口（当次实测，数字取自证据文件，正文不写死）**：`pnpm run check` 干净；
+   `pnpm run test` 全绿（回归基线 ≥1544 例）；`DSH_SRC=~/dsh-client-deps/src pnpm run check:client`
+   3 条声明路径在场、`pnpm run build` 产出 `lib/client.js`；
+   `DSH_STORE=~/dsh-client-deps/store pnpm run test:client-bundle` 19/19 断言全绿。
+   `check:client` / `test:client-bundle` 用的声明与运行时来自按精确版本取回的 npm 包
+   （`~/dsh-client-deps/`，机器本地、不入仓），因为本机没有带依赖的 0.2.0-rc.2 源树。

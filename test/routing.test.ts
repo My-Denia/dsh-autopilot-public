@@ -1181,3 +1181,279 @@ describe('select: F29 (PR #2 round 16) — a materialized default effort reaches
     expect(stubbed.calls.preflight).toEqual([{ provider: 'alpha', model: 'm-lock', reasoningEffort: 'low' }])
   })
 })
+
+
+// ── preference 'axis': sufficiency thresholds vs ranking axes (design §1.2) ──
+
+describe("select: preference 'axis' — thresholds pass/fail, then the declared axes", () => {
+  it('(a) a candidate failing a required effort id is excluded even when it is cheaper and speed-listed', async () => {
+    const decision = await selectRoute(
+      selection({
+        role: 'executor',
+        executorPin: undefined,
+        preference: 'axis',
+        policy: presentPolicy(['google', 'gemini-3.1-flash-lite'], ['mistral', 'magistral-small']),
+        catalog: catalogOf([
+          { provider: 'google', id: 'gemini-3.1-flash-lite', contextWindow: 200000, efforts: ['high'] },
+          { provider: 'mistral', id: 'magistral-small', contextWindow: 200000, efforts: ['low'] },
+        ]),
+        requirements: { effortIds: ['low'] },
+        speedOrder: ['google/gemini-3.1-flash-lite', 'mistral/magistral-small'],
+      }),
+    )
+    const route = expectRoute(decision)
+    // The seeded price of gemini is 0.25/1.5 vs magistral 0.5/1.5, and gemini
+    // is first in speedOrder — both are RANKING facts, and the threshold still
+    // excludes it.
+    expect(route.route.model).toBe('magistral-small')
+    expect(route.costMatch).toBe('route')
+    expectWhy(decision, /^requirements:/, /does not publish required reasoning effort id.s. low/)
+  })
+
+  it('(b) ranks by outputPerM first, then inputPerM', async () => {
+    const cheapest = await selectRoute(
+      selection({
+        role: 'executor',
+        executorPin: undefined,
+        preference: 'axis',
+        policy: presentPolicy(['mistral', 'devstral-small-2505'], ['mistral', 'magistral-small'], ['google', 'gemini-3.1-flash-lite']),
+        catalog: catalogOf([
+          { provider: 'mistral', id: 'magistral-small', contextWindow: 200000 },
+          { provider: 'google', id: 'gemini-3.1-flash-lite', contextWindow: 200000 },
+          { provider: 'mistral', id: 'devstral-small-2505', contextWindow: 200000 },
+        ]),
+      }),
+    )
+    expect(expectRoute(cheapest).route.model).toBe('devstral-small-2505') // output 0.3 beats 1.5
+    const tiedOutput = await selectRoute(
+      selection({
+        role: 'executor',
+        executorPin: undefined,
+        preference: 'axis',
+        policy: presentPolicy(['mistral', 'magistral-small'], ['google', 'gemini-3.1-flash-lite']),
+        catalog: catalogOf([
+          { provider: 'mistral', id: 'magistral-small', contextWindow: 200000 },
+          { provider: 'google', id: 'gemini-3.1-flash-lite', contextWindow: 200000 },
+        ]),
+      }),
+    )
+    // Equal outputPerM (1.5): the lower inputPerM (0.25 vs 0.5) decides.
+    expect(expectRoute(tiedOutput).route.model).toBe('gemini-3.1-flash-lite')
+  })
+
+  it('(c) a route with no known cost ranks after every route with one — never treated as free', async () => {
+    const decision = await selectRoute(
+      selection({
+        role: 'executor',
+        executorPin: undefined,
+        preference: 'axis',
+        policy: presentPolicy(['alpha', 'm-unseeded'], ['zai', 'glm-5.3']),
+        catalog: catalogOf([
+          { provider: 'alpha', id: 'm-unseeded', contextWindow: 200000 },
+          { provider: 'zai', id: 'glm-5.3', contextWindow: 200000 },
+        ]),
+      }),
+    )
+    const route = expectRoute(decision)
+    expect(route.route.model).toBe('glm-5.3')
+    expect(route.costMatch).toBe('route')
+    expect(route.candidatesConsidered.map((candidate) => candidate.model)).toEqual(['glm-5.3', 'm-unseeded'])
+    expectWhy(decision, /no known cost ranks after every known cost/)
+  })
+
+  it('(c2) with no price anywhere the walk still selects, and records costMatch unknown', async () => {
+    const decision = await selectRoute(
+      selection({
+        role: 'executor',
+        executorPin: undefined,
+        preference: 'axis',
+        policy: presentPolicy(['alpha', 'm-1'], ['alpha', 'm-2']),
+        catalog: catalogOf([
+          { provider: 'alpha', id: 'm-1', contextWindow: 200000 },
+          { provider: 'alpha', id: 'm-2', contextWindow: 200000 },
+        ]),
+      }),
+    )
+    const route = expectRoute(decision)
+    expect(route.route.model).toBe('m-1') // a full tie keeps adapter-preferred order
+    expect(route.costMatch).toBe('unknown')
+    expectWhy(decision, /has NO known cost — never treated as free/)
+  })
+
+  it('(d) cost outranks speed: the cheaper route wins although it is slower', async () => {
+    const decision = await selectRoute(
+      selection({
+        role: 'executor',
+        executorPin: undefined,
+        preference: 'axis',
+        policy: presentPolicy(['alpha', 'm-fast'], ['alpha', 'm-slow']),
+        catalog: catalogOf([
+          { provider: 'alpha', id: 'm-fast', contextWindow: 200000 },
+          { provider: 'alpha', id: 'm-slow', contextWindow: 200000 },
+        ]),
+        speedOrder: ['alpha/m-fast', 'alpha/m-slow'],
+        costOverrides: {
+          'alpha/m-fast': { inputPerM: 5, outputPerM: 20 },
+          'alpha/m-slow': { inputPerM: 1, outputPerM: 2 },
+        },
+      }),
+    )
+    const route = expectRoute(decision)
+    expect(route.route.model).toBe('m-slow')
+    expect(route.costMatch).toBe('owner-override')
+    expectWhy(decision, /then owner-declared speedOrder/)
+  })
+
+  it('(e) equal cost lets speedOrder decide, and its absence leaves speed unranked', async () => {
+    const speedDecided = await selectRoute(
+      selection({
+        role: 'executor',
+        executorPin: undefined,
+        preference: 'axis',
+        policy: presentPolicy(['alpha', 'm-a'], ['alpha', 'm-b']),
+        catalog: catalogOf([
+          { provider: 'alpha', id: 'm-a', contextWindow: 200000 },
+          { provider: 'alpha', id: 'm-b', contextWindow: 200000 },
+        ]),
+        costOverrides: {
+          'alpha/m-a': { inputPerM: 1, outputPerM: 2 },
+          'alpha/m-b': { inputPerM: 1, outputPerM: 2 },
+        },
+        speedOrder: ['alpha/m-b', 'alpha/m-a'],
+      }),
+    )
+    expect(expectRoute(speedDecided).route.model).toBe('m-b')
+    const noSpeed = await selectRoute(
+      selection({
+        role: 'executor',
+        executorPin: undefined,
+        preference: 'axis',
+        policy: presentPolicy(['alpha', 'm-a'], ['alpha', 'm-b']),
+        catalog: catalogOf([
+          { provider: 'alpha', id: 'm-a', contextWindow: 200000 },
+          { provider: 'alpha', id: 'm-b', contextWindow: 200000 },
+        ]),
+        costOverrides: {
+          'alpha/m-a': { inputPerM: 1, outputPerM: 2 },
+          'alpha/m-b': { inputPerM: 1, outputPerM: 2 },
+        },
+      }),
+    )
+    expect(expectRoute(noSpeed).route.model).toBe('m-a') // adapter-preferred order; speed is not an axis
+    expectWhy(noSpeed, /speedOrder is absent, so speed is NOT a ranking axis/)
+  })
+
+  it("(f) an owner costOverride changes the winner and is recorded as owner-override", async () => {
+    const common = {
+      role: 'executor' as const,
+      executorPin: undefined,
+      preference: 'axis' as const,
+      policy: presentPolicy(['google', 'gemini-3.1-flash-lite'], ['mistral', 'magistral-small']),
+      catalog: catalogOf([
+        { provider: 'google', id: 'gemini-3.1-flash-lite', contextWindow: 200000 },
+        { provider: 'mistral', id: 'magistral-small', contextWindow: 200000 },
+      ]),
+    }
+    const seedOnly = expectRoute(await selectRoute(selection(common)))
+    expect(seedOnly.route.model).toBe('gemini-3.1-flash-lite') // seed 0.25/1.5 beats 0.5/1.5
+    expect(seedOnly.costMatch).toBe('route')
+    const overridden = expectRoute(
+      await selectRoute(
+        selection({
+          ...common,
+          costOverrides: { 'mistral/magistral-small': { inputPerM: 0.01, outputPerM: 0.02 } },
+        }),
+      ),
+    )
+    expect(overridden.route.model).toBe('magistral-small')
+    expect(overridden.costMatch).toBe('owner-override') // never reported as a seed kind
+    expectWhy(overridden, /provenance owner-override/)
+  })
+
+  it('(g) an unknown context window FAILS a required minContext floor (fail closed)', async () => {
+    const decision = await selectRoute(
+      selection({
+        role: 'executor',
+        executorPin: undefined,
+        preference: 'axis',
+        policy: presentPolicy(['alpha', 'm-known'], ['alpha', 'm-unknown']),
+        catalog: catalogOf([
+          { provider: 'alpha', id: 'm-known', contextWindow: 200000 },
+          { provider: 'alpha', id: 'm-unknown' },
+        ]),
+        requirements: { minContext: 131072 },
+      }),
+    )
+    const route = expectRoute(decision)
+    expect(route.route.model).toBe('m-known')
+    expectWhy(decision, /contextWindow is unknown — it does NOT satisfy the required minimum 131072 .fail closed./)
+    const excluded = route.candidatesConsidered.find((candidate) => candidate.model === 'm-unknown')
+    expect(excluded?.disposition).toBe('excluded-below-floor')
+    expect(excluded?.note).toContain('fail closed')
+  })
+
+  it('(g2) when every eligible route fails the required floor the walk terminates to inheritance', async () => {
+    const decision = await selectRoute(
+      selection({
+        role: 'executor',
+        executorPin: undefined,
+        preference: 'axis',
+        policy: presentPolicy(['alpha', 'm-unknown'], ['alpha', 'm-unknown2']),
+        catalog: catalogOf([
+          { provider: 'alpha', id: 'm-unknown' },
+          { provider: 'alpha', id: 'm-unknown2' },
+        ]),
+        requirements: { minContext: 131072 },
+      }),
+    )
+    expect(decision.kind).toBe('inherit')
+    if (decision.kind === 'inherit') expectWhy(decision, /^requirements: every eligible route fails/)
+  })
+
+  it('(h) rotation is a NO-OP on a 1-member top independence class, and says so', async () => {
+    const decision = await selectRoute(
+      selection({
+        role: 'execution-auditor',
+        risk: 'medium',
+        preference: 'axis',
+        executorPin: { provider: 'alpha', model: 'm-exec' },
+        policy: presentPolicy(['alpha', 'm-exec'], ['beta', 'm-x']),
+        catalog: catalogOf([
+          { provider: 'alpha', id: 'm-exec', contextWindow: 200000 },
+          { provider: 'beta', id: 'm-x', contextWindow: 200000 },
+        ]),
+        rotation: 3,
+      }),
+    )
+    const route = expectRoute(decision)
+    expect(route.route.model).toBe('m-x') // the only both-axis-distinct candidate
+    expectWhy(
+      decision,
+      /rotation: ordinal 3 into the top .both-axis-distinct. independence class/,
+      /NO-OP/,
+    )
+  })
+
+  it('(h2) rotation offsets WITHIN the top independence class and never moves a candidate out of it', async () => {
+    const common = {
+      role: 'execution-auditor' as const,
+      risk: 'medium' as const,
+      preference: 'axis' as const,
+      executorPin: { provider: 'alpha', model: 'm-exec' },
+      policy: presentPolicy(['alpha', 'm-exec'], ['beta', 'm-x'], ['beta', 'm-y']),
+      catalog: catalogOf([
+        { provider: 'alpha', id: 'm-exec', contextWindow: 200000 },
+        { provider: 'beta', id: 'm-x', contextWindow: 200000 },
+        { provider: 'beta', id: 'm-y', contextWindow: 200000 },
+      ]),
+    }
+    const zero = expectRoute(await selectRoute(selection({ ...common, rotation: 0 })))
+    expect(zero.route.model).toBe('m-x')
+    const shifted = await selectRoute(selection({ ...common, rotation: 1 }))
+    expect(expectRoute(shifted).route.model).toBe('m-y')
+    // The same-family candidate is in the TAIL: rotation within the top class
+    // can never bring it into the independent group.
+    expect(expectRoute(shifted).route.model).not.toBe('m-exec')
+    expectWhy(shifted, /into the top .both-axis-distinct. independence class .2 members. — offset 1 applied within the group/)
+  })
+})

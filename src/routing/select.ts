@@ -53,6 +53,9 @@ import { independenceOf, sameRoute, toRoutePin } from './identity.js'
 import type { IndependenceRecord, RoutePin, RouteRef } from './identity.js'
 import { authorizedAutoRoutes, resolvePluginGrant } from './authorize.js'
 import type { AuthorizationSource, AutoAuthorization, SessionPolicyState } from './authorize.js'
+import { seededCost } from './capability-seed.js'
+import type { SeedMatchKind } from './capability-seed.js'
+import type { WorkClassAxis, WorkClassName, WorkClassSelection } from './work-class.js'
 
 /** The roles GAH routes (plan "Roles and routing"); auditor roles carry the independence constraint. */
 export type Role = 'executor' | 'plan-auditor' | 'execution-auditor' | 'rules-auditor' | 'planner'
@@ -60,8 +63,50 @@ export type Role = 'executor' | 'plan-auditor' | 'execution-auditor' | 'rules-au
 /** The auditor roles: the ones whose independence from the executor is recorded. */
 export type AuditorRole = 'plan-auditor' | 'execution-auditor' | 'rules-auditor'
 
-/** Ordinal route preference (plan step 3). Cost metering is out of scope — this is ordinal only. */
-export type RoutePreference = 'balanced' | 'economy' | 'quality'
+/**
+ * Ordinal route preference (plan step 3). Cost metering is out of scope —
+ * this is ordinal only.
+ *
+ * `axis` is the owner-declared ordering path: sufficiency THRESHOLDS pass or
+ * fail (never ranked), and survivors are ranked on declared AXES only —
+ * effective cost, then the owner's speed order when one is declared. It is
+ * deliberately NOT a synonym for `economy`: `economy` keeps the historical
+ * "smallest contextWindow ≥ floor" proxy, whose window-is-price conflation
+ * this preference exists to correct.
+ */
+export type RoutePreference = 'balanced' | 'economy' | 'quality' | 'axis'
+
+/**
+ * Provenance of the EFFECTIVE cost a decision ranked on. The use of the
+ * built-in seed must always be visible, and an owner price is never reported
+ * as a seed kind.
+ */
+export type CostMatchKind = SeedMatchKind | 'unknown' | 'owner-override'
+
+/**
+ * One owner cost override, US dollars per million tokens. `costOverrides` is
+ * keyed by the exact `provider/model` route, because an override is an owner
+ * statement about a route the deployment runs — unlike the seed, which is
+ * keyed by route and then by model identity.
+ */
+export interface RouteCostOverride {
+  readonly inputPerM: number
+  readonly outputPerM: number
+}
+
+/**
+ * Sufficiency thresholds for preference `axis`: pass/fail, NEVER ranked. A
+ * candidate that fails any threshold is excluded from the walk; absence of a
+ * required fact is a FAILURE, not a maybe (fail closed).
+ */
+export interface RouteRequirements {
+  /** Required reasoning-effort ids; a candidate must publish every one. */
+  readonly effortIds?: readonly string[]
+  /** Required input modality; a candidate must disclose it. */
+  readonly modality?: 'image'
+  /** Required context-window floor in tokens; unknown context does NOT satisfy it. */
+  readonly minContext?: number
+}
 
 /**
  * Per-role routing config as the engine resolved it from the `routing`
@@ -70,7 +115,17 @@ export type RoutePreference = 'balanced' | 'economy' | 'quality'
  * around.
  */
 export type RoleRouting =
-  | { readonly mode: 'auto'; readonly minContext?: number }
+  | {
+      readonly mode: 'auto'
+      readonly minContext?: number
+      /**
+       * The owner's per-role work-class override (DESIGN §1.2). Absent =
+       * the role default (`DEFAULT_ROLE_WORK_CLASS`: executor/planner
+       * `simple`, auditors `audit`). Inert for locked/inherit modes — those
+       * make no selection, so no class governs them.
+       */
+      readonly workClass?: WorkClassName
+    }
   | { readonly mode: 'inherit' }
   | { readonly mode: 'locked'; readonly provider: string; readonly model: string; readonly reasoningEffort?: string }
 
@@ -115,6 +170,36 @@ export interface RouteSelectionInput {
   readonly executorPin?: RouteRef
   /** Risk at/above which auditor independence outranks preference (`crossFamily.minRisk`; default `medium`, the shipped value). */
   readonly independenceFloor?: Risk
+  /**
+   * The owner's cost overrides, keyed by the exact `provider/model` route. An
+   * override BEATS the seeded price for that route and is reported as
+   * `owner-override` — never as a seed kind.
+   */
+  readonly costOverrides?: Readonly<Record<string, RouteCostOverride>>
+  /**
+   * Sufficiency thresholds for preference `axis`. Not a ranking input: a
+   * candidate either passes every declared threshold or is excluded.
+   */
+  readonly requirements?: RouteRequirements
+  /**
+   * Owner-declared speed order (`provider/model`, earlier = faster). Absent
+   * (or empty) means speed is NOT an axis at all — never inferred, never
+   * approximated.
+   */
+  readonly speedOrder?: readonly string[]
+  /**
+   * Rotation ordinal: an OFFSET into the already-ordered survivor list, and
+   * only within the top independence class when the auditor independence
+   * constraint is active. Purely positional — it selects nothing on its own.
+   */
+  readonly rotation?: number
+  /**
+   * The work class this dispatch draws from (DESIGN §1.2), resolved by the
+   * producer against the live ladder. Present on every auto-mode role
+   * dispatch once the producer is wired; absent keeps 0.2.0 selector
+   * semantics verbatim (legacy callers, locked/inherit roles).
+   */
+  readonly workClass?: WorkClassSelection
 }
 
 /** One candidate as the decision records it: facts, axes, and its disposition. */
@@ -163,6 +248,12 @@ export type SelectionDecision =
       readonly authorizationSource: AuthorizationSource
       /** Present iff at least one preflight rejection moved selection onward. */
       readonly fallbackFrom?: readonly FallbackRecord[]
+      /**
+       * Provenance of the effective cost the walk ranked on. Present exactly
+       * when cost was an ordering input (preference `axis`); absent
+       * otherwise, so every legacy decision record is unchanged.
+       */
+      readonly costMatch?: CostMatchKind
     }
   | { readonly kind: 'inherit'; readonly why: readonly string[]; readonly authorizationSource?: AuthorizationSource }
   | { readonly kind: 'escalate-owner'; readonly reason: string }
@@ -176,6 +267,87 @@ interface Working {
   /** Adapter-preferred position; `Infinity` for unlisted routes. */
   readonly catalogIndex: number
   readonly independence?: IndependenceRecord
+}
+
+/**
+ * The effective cost of one candidate, with the evidence step that produced
+ * it: the owner override first, then the seeded price, then `unknown` — the
+ * authority order. The provenance rides WITH the price so a record can never
+ * present an owner price as a seed kind.
+ */
+interface EffectiveCost {
+  readonly cost?: { readonly inputPerM: number; readonly outputPerM: number }
+  readonly match: CostMatchKind
+}
+
+function effectiveCostOf(input: RouteSelectionInput, candidate: Working): EffectiveCost {
+  const key = candidate.pin.provider + '/' + candidate.pin.model
+  const override = input.costOverrides?.[key]
+  if (override !== undefined) return { cost: override, match: 'owner-override' }
+  const seed = seededCost(candidate.pin.provider, candidate.pin.model)
+  if (seed !== undefined) return { cost: seed.cost, match: seed.match }
+  return { match: 'unknown' }
+}
+
+/**
+ * The owner's speed order as `provider/model` → rank (0 = fastest).
+ * `undefined` means speed is NOT an axis: an absent (or empty) declaration
+ * states nothing, and an unlisted route is unknown speed — never ranked as
+ * though it were slow or fast.
+ */
+function speedRanksOf(speedOrder: readonly string[] | undefined): ReadonlyMap<string, number> | undefined {
+  if (speedOrder === undefined || speedOrder.length === 0) return undefined
+  const ranks = new Map<string, number>()
+  for (const entry of speedOrder) {
+    const key = entry.trim()
+    if (key.length > 0 && !ranks.has(key)) ranks.set(key, ranks.size)
+  }
+  return ranks.size === 0 ? undefined : ranks
+}
+
+/**
+ * The sufficiency-threshold verdict for one candidate, under preference
+ * `axis` or an assigned work class (a class carries its own gates —
+ * mechanical's `low`-effort license — regardless of the global preference):
+ * a string naming the failed threshold, or `undefined` when every declared
+ * threshold passes. Absence of a required fact FAILS (fail closed) —
+ * "the adapter did not say" must never be read as "the route satisfies it".
+ */
+function requirementFailure(input: RouteSelectionInput, candidate: Working): string | undefined {
+  const requirements = input.requirements
+  if (
+    (input.preference !== 'axis' && (input.workClass === undefined || !input.workClass.engaged)) ||
+    requirements === undefined
+  ) return undefined
+  const label = routeLabel(candidate.pin)
+  const efforts = requirements.effortIds
+  if (efforts !== undefined && efforts.length > 0) {
+    const published = new Set((candidate.facts?.reasoning?.efforts ?? []).map((effort) => effort.id))
+    const missing = efforts.filter((effort) => !published.has(effort))
+    if (missing.length > 0) {
+      return label + ' does not publish required reasoning effort id(s) ' + missing.join(', ') + ' — excluded (sufficiency threshold)'
+    }
+  }
+  const modality = requirements.modality
+  if (modality !== undefined) {
+    const disclosed = candidate.facts?.inputModalities
+    if (disclosed === undefined || !disclosed.includes(modality)) {
+      return label + ' does not include the required input modality "' + modality + '"' +
+        (disclosed === undefined ? ' (modalities unknown — fail closed)' : '') + ' — excluded (sufficiency threshold)'
+    }
+  }
+  const minContext = requirements.minContext
+  if (minContext !== undefined) {
+    const window = contextWindowOf(candidate)
+    if (window === undefined) {
+      return label + ' contextWindow is unknown — it does NOT satisfy the required minimum ' + String(minContext) +
+        ' (fail closed) — excluded (sufficiency threshold)'
+    }
+    if (window < minContext) {
+      return label + ' contextWindow ' + String(window) + ' is below the required minimum ' + String(minContext) + ' — excluded (sufficiency threshold)'
+    }
+  }
+  return undefined
 }
 
 function contextWindowOf(candidate: Working): number | undefined {
@@ -525,8 +697,74 @@ async function selectAutoRanked(
         : 'eligibility: the authorized set is EMPTY after the live-catalog intersection — terminating to inheritance per eligibility rule 1 (an infrastructure fact, not a verdict)',
     ])
   }
-  if (authorized.routes.length === 1) {
-    const only = authorized.routes[0]
+  // WORK CLASS dispatch membership (DESIGN §1.2; §9 items 13/14): after
+  // authorization ∩ liveness, the class's mapped ladder tiers bound which
+  // routes THIS dispatch may draw from. Three honest shapes, never a silent
+  // shelving: an empty ladder restricts NOTHING (the shipped default —
+  // 0.2.0 parity); a class with no tier mapping (mechanical: entry is an
+  // effort license, applied below as a requirement) restricts nothing here;
+  // and a CONFIGURED ladder whose mapped tiers leave zero reachable routes
+  // is a configuration error — blocked and reported
+  // (AP_ROUTE_NO_REACHABLE_WORK_CLASS), so the owner sees it instead of
+  // inheriting a fallback that claims nothing happened.
+  let eligibleRoutes = authorized.routes
+  // M11: set when the work-class tier-membership filter below actually
+  // narrowed eligibility. The single-route inheritance short-circuit must NOT
+  // fire in that case: a tier mapping that collapses eligibility to exactly
+  // one route is a RESTRICTION, and inheriting the deployment default would
+  // dispatch a route outside the class mapping while the why-line claims the
+  // restriction held (M10 probe c). Inheritance stays only for the
+  // unrestricted 0.2.0-parity arm, where the deployment default and the
+  // single route are the operator's own identical choice.
+  let tierMembershipApplied = false
+  const workClass = input.workClass
+  if (workClass !== undefined && workClass.engaged) {
+    if (workClass.tiers.length === 0) {
+      why.push(
+        `work class: ${workClass.name} — entry is gated by the class's own thresholds and dominant axis (${workClass.axis}), not by ladder tier membership`,
+      )
+    } else if (!workClass.ladderConfigured) {
+      why.push(
+        `work class: ${workClass.name} maps to tier(s) ${workClass.tiers.join(' + ')}, but the ladder declares no members anywhere — an empty ladder restricts nothing; the mapping is recorded, not applied`,
+      )
+    } else {
+      const memberSet = new Set(workClass.members)
+      const kept = eligibleRoutes.filter((pin) => memberSet.has(pin.provider + '/' + pin.model))
+      if (kept.length === 0) {
+        return {
+          kind: 'blocked',
+          reason:
+            `AP_ROUTE_NO_REACHABLE_WORK_CLASS: work class "${workClass.name}" maps to ladder tier(s) ${workClass.tiers.join(' + ')}` +
+            (workClass.tierOverride !== undefined ? ` (the owner's routing.ladder.auditTier override)` : '') +
+            (workClass.members.length === 0
+              ? ', but those tiers declare no members'
+              : `, but none of the ${eligibleRoutes.length} authorized live route(s) is a member of them`) +
+            ` — a work class with zero reachable routes is a configuration error, reported rather than silently shelved (DESIGN §1.2); ` +
+            `add provider/model members to the mapped tier(s) or retarget routing.workClasses.${workClass.name}.tiers`,
+          why: [...why, `work class: ${workClass.name} — zero reachable routes after applying the tier mapping`],
+        }
+      }
+      const dropped = eligibleRoutes.length - kept.length
+      why.push(
+        `work class: ${workClass.name} restricts dispatch membership to tier(s) ${workClass.tiers.join(' + ')}` +
+          (workClass.tierOverride !== undefined ? ` (owner auditTier override: ${workClass.tierOverride})` : '') +
+          (dropped > 0
+            ? ` — ${dropped} authorized route(s) outside the mapping are not members of this dispatch`
+            : ' — every authorized route is a member'),
+      )
+      eligibleRoutes = kept
+      tierMembershipApplied = true
+    }
+  } else if (workClass !== undefined) {
+    // Not engaged: the shipped-default shape (empty ladder, no owner
+    // override). The class is RECORDED, nothing is applied — 0.2.0 parity
+    // for deployments that never configured routing.
+    why.push(
+      `work class: ${workClass.name} (axis ${workClass.axis}) recorded but NOT applied — the ladder declares no members anywhere and the owner named no override for this class or role; ranking and membership follow the preference path exactly as 0.2.0 did`,
+    )
+  }
+  if (eligibleRoutes.length === 1 && !tierMembershipApplied) {
+    const only = eligibleRoutes[0]
     if (only === undefined) throw new Error('unreachable: single-route authorized set missing its route')
     return inheritDecision([
       `eligibility: the authorized set holds a single route (${routeLabel(only)}) — with nothing to choose between, ` +
@@ -538,7 +776,7 @@ async function selectAutoRanked(
   // exact-route source; a rejection becomes an unknown-fact candidate with
   // the reason recorded, never an exclusion and never a guess.
   const working: Working[] = []
-  for (const pin of authorized.routes) {
+  for (const pin of eligibleRoutes) {
     let facts: LlmResolvedModelInfo | undefined
     let factsError: string | undefined
     try {
@@ -569,7 +807,8 @@ async function selectAutoRanked(
         ? `; excluded ${excluded.map((candidate) => `${routeLabel(candidate.pin)} (${contextWindowOf(candidate)})`).join(', ')}`
         : '') +
       (unknownFacts.length > 0
-        ? `; ${unknownFacts.map((candidate) => routeLabel(candidate.pin)).join(', ')} contextWindow unknown — eligible, ranked after known-sufficient`
+        ? `; ${unknownFacts.map((candidate) => routeLabel(candidate.pin)).join(', ')} contextWindow unknown — eligible` +
+          (input.preference === 'axis' ? ' (the window is a threshold, not a ranking axis under preference axis)' : ', ranked after known-sufficient')
         : ''),
   )
   if (sufficient.length + unknownFacts.length === 0) {
@@ -579,32 +818,137 @@ async function selectAutoRanked(
     ])
   }
 
+  // SUFFICIENCY THRESHOLDS — under preference `axis`, and whenever a work
+  // class is assigned (a class carries its own gates: mechanical's
+  // `low`-effort license): every declared requirement is pass/fail and NEVER
+  // ranked, so a failing candidate is excluded from the walk before any axis
+  // comparison happens. Absence of a required fact is a FAILURE (fail
+  // closed), named in `why`.
+  const requirementExclusions: Array<{ readonly candidate: Working; readonly note: string }> = []
+  if (input.preference === 'axis' || input.workClass !== undefined) {
+    for (const candidate of [...sufficient, ...unknownFacts]) {
+      const note = requirementFailure(input, candidate)
+      if (note !== undefined) requirementExclusions.push({ candidate, note })
+    }
+    if (requirementExclusions.length > 0) {
+      why.push(`requirements: ${requirementExclusions.map((entry) => entry.note).join('; ')}`)
+    }
+  }
+  const requirementExcluded = new Set(requirementExclusions.map((entry) => entry.candidate))
+  const survivors = [...sufficient, ...unknownFacts].filter((candidate) => !requirementExcluded.has(candidate))
+  if (survivors.length === 0) {
+    return inheritDecision([
+      'requirements: every eligible route fails a declared sufficiency threshold — no honest explicit selection exists, terminating to inheritance with the exclusions named above',
+    ])
+  }
+
   // Adapter-preferred base order (catalog position; unlisted after listed;
   // policy order for full ties) — established BEFORE the preference sort so
   // stable sorting lands equal keys in adapter-preferred order (plan step 3).
-  const byCatalog = [...sufficient, ...unknownFacts].sort((a, b) => a.catalogIndex - b.catalogIndex)
+  const byCatalog = [...survivors].sort((a, b) => a.catalogIndex - b.catalogIndex)
+  // RANKING AXES. Preference `axis`: effective cost first (outputPerM
+  // ascending, then inputPerM ascending; a route with no known cost ranks
+  // after every route with one and is NEVER treated as free), then the
+  // owner-declared speed order when one exists. An absent speedOrder means
+  // speed is not an axis at all — never inferred from a model name. A
+  // RANKING work-class axis (speed / speed-cost / economy-first) takes
+  // precedence over the global preference's order for THIS dispatch — the
+  // class is the owner's statement of which axis dominates (DESIGN §1.2 rule
+  // order: eligibility → independence → floor → rotation → dominant axis).
+  // ceiling-independence / ceiling add no ranking of their own: the tier
+  // mapping and the auditor independence rules carry them.
+  const classAxis: WorkClassAxis | undefined =
+    input.workClass !== undefined &&
+    input.workClass.engaged &&
+    (input.workClass.axis === 'speed' || input.workClass.axis === 'speed-cost' || input.workClass.axis === 'economy-first')
+      ? input.workClass.axis
+      : undefined
+  const speedRanks = input.preference === 'axis' || classAxis !== undefined ? speedRanksOf(input.speedOrder) : undefined
+  if (classAxis !== undefined && input.workClass !== undefined) {
+    why.push(
+      `work class: ${input.workClass.name} ranks on its dominant axis "${classAxis}" — ` +
+        (classAxis === 'economy-first'
+          ? 'effective cost ascending (outputPerM then inputPerM; a route with no known cost ranks after every route with one and is NEVER treated as free) — the cheapest mapped tier is tried first' +
+            (speedRanks !== undefined
+              ? '; ties by owner-declared speedOrder (earlier = faster; an unlisted route is unknown speed and ranks after listed routes)'
+              : '; speedOrder absent, so speed is NOT a tiebreak axis')
+          : 'owner-declared speedOrder first (earlier = faster; an unlisted route is unknown speed and ranks after listed routes)' +
+            (speedRanks === undefined
+              ? classAxis === 'speed-cost'
+                ? '; speedOrder is ABSENT, so every route is unknown speed and cost decides'
+                : '; speedOrder is ABSENT, so speed is unknown for every route and the adapter-preferred order stands'
+              : '') +
+            (classAxis === 'speed-cost'
+              ? '; ties and unknown-speed routes then rank by effective cost ascending (outputPerM then inputPerM; unknown cost last, never treated as free)'
+              : '; cost is NOT an axis for this class')) +
+        `; the global preference (${input.preference}) is recorded but does not order this dispatch` +
+        (outage !== undefined ? `; ${outage.tieBreak}` : '; ties in adapter-preferred catalog order'),
+    )
+  } else {
   why.push(
     `preference: ${input.preference} — ` +
-      (input.preference === 'economy'
-        ? 'smallest contextWindow ≥ floor first'
-        : input.preference === 'quality'
-          ? 'has-reasoning-efforts first, then contextWindow descending'
-          : 'efforts preferred, then contextWindow descending') +
+      (input.preference === 'axis'
+        ? 'sufficiency thresholds pass/fail (never ranked); ranking axes: effective cost ascending (outputPerM then inputPerM; no known cost ranks after every known cost)' +
+          (speedRanks !== undefined
+            ? ', then owner-declared speedOrder (earlier = faster; an unlisted route is unknown speed and ranks after listed routes)'
+            : '; speedOrder is absent, so speed is NOT a ranking axis')
+        : input.preference === 'economy'
+          ? 'smallest contextWindow ≥ floor first'
+          : input.preference === 'quality'
+            ? 'has-reasoning-efforts first, then contextWindow descending'
+            : 'efforts preferred, then contextWindow descending') +
       (outage !== undefined ? `; ${outage.tieBreak}` : '; ties in adapter-preferred catalog order'),
   )
-  const orderedSufficient = byCatalog.filter((candidate) => contextWindowOf(candidate) !== undefined)
-  if (input.preference === 'economy') {
-    orderedSufficient.sort((a, b) => (contextWindowOf(a) ?? 0) - (contextWindowOf(b) ?? 0))
+  }
+  let ordered: Working[]
+  if (classAxis !== undefined || input.preference === 'axis') {
+    // The axis walk — preference `axis`, or a ranking work-class axis. The
+    // comparators are shared; only their ORDER differs (speed-first classes
+    // rank speed before cost; economy-first and preference `axis` rank cost
+    // before speed). The sort is stable, so an equal pair keeps the
+    // adapter-preferred base order. An unknown window is NOT an ordering
+    // axis here — the window is a threshold, and the thresholds above
+    // already decided pass/fail.
+    const costs = new Map<Working, EffectiveCost>()
+    for (const candidate of byCatalog) costs.set(candidate, effectiveCostOf(input, candidate))
+    const costCompare = (a: Working, b: Working): number => {
+      const left = costs.get(a) as EffectiveCost
+      const right = costs.get(b) as EffectiveCost
+      if ((left.cost === undefined) !== (right.cost === undefined)) return left.cost === undefined ? 1 : -1
+      if (left.cost !== undefined && right.cost !== undefined) {
+        const byOutput = left.cost.outputPerM - right.cost.outputPerM
+        if (byOutput !== 0) return byOutput
+        const byInput = left.cost.inputPerM - right.cost.inputPerM
+        if (byInput !== 0) return byInput
+      }
+      return 0
+    }
+    const speedCompare = (a: Working, b: Working): number => {
+      if (speedRanks === undefined) return 0
+      const fastA = speedRanks.get(a.pin.provider + '/' + a.pin.model) ?? Number.POSITIVE_INFINITY
+      const fastB = speedRanks.get(b.pin.provider + '/' + b.pin.model) ?? Number.POSITIVE_INFINITY
+      return fastA === fastB ? 0 : fastA - fastB
+    }
+    ordered = [...byCatalog].sort((a, b) =>
+      classAxis === 'speed' || classAxis === 'speed-cost'
+        ? speedCompare(a, b) || (classAxis === 'speed-cost' ? costCompare(a, b) : 0)
+        : costCompare(a, b) || speedCompare(a, b),
+    )
   } else {
-    orderedSufficient.sort((a, b) => Number(hasEffortsOf(b)) - Number(hasEffortsOf(a)) || (contextWindowOf(b) ?? 0) - (contextWindowOf(a) ?? 0))
+    const orderedSufficient = byCatalog.filter((candidate) => contextWindowOf(candidate) !== undefined)
+    if (input.preference === 'economy') {
+      orderedSufficient.sort((a, b) => (contextWindowOf(a) ?? 0) - (contextWindowOf(b) ?? 0))
+    } else {
+      orderedSufficient.sort((a, b) => Number(hasEffortsOf(b)) - Number(hasEffortsOf(a)) || (contextWindowOf(b) ?? 0) - (contextWindowOf(a) ?? 0))
+    }
+    // Unknown-facts candidates keep adapter-preferred order; the efforts clause
+    // stays applicable where it is still observable (quality/balanced).
+    const orderedUnknown = byCatalog.filter((candidate) => contextWindowOf(candidate) === undefined)
+    if (input.preference !== 'economy') {
+      orderedUnknown.sort((a, b) => Number(hasEffortsOf(b)) - Number(hasEffortsOf(a)))
+    }
+    ordered = [...orderedSufficient, ...orderedUnknown]
   }
-  // Unknown-facts candidates keep adapter-preferred order; the efforts clause
-  // stays applicable where it is still observable (quality/balanced).
-  const orderedUnknown = byCatalog.filter((candidate) => contextWindowOf(candidate) === undefined)
-  if (input.preference !== 'economy') {
-    orderedUnknown.sort((a, b) => Number(hasEffortsOf(b)) - Number(hasEffortsOf(a)))
-  }
-  let ordered = [...orderedSufficient, ...orderedUnknown]
 
   // Step 4 — auditor independence reordering at/above the floor.
   const isAuditor = input.role === 'plan-auditor' || input.role === 'execution-auditor' || input.role === 'rules-auditor'
@@ -631,6 +975,30 @@ async function selectAutoRanked(
       }
     } else {
       why.push(`independence: risk ${input.risk} < floor ${floorRisk} — preference order unmodified (constraint not required)`)
+    }
+  }
+
+  // Step 4b — ROTATION (owner coverage requirement): applied ONLY as an
+  // OFFSET into the already-ordered survivor list, and, whenever the auditor
+  // independence constraint is ACTIVE, only WITHIN the top independence
+  // class. Rotation permutes candidates that are interchangeable on
+  // independence; it can never move a candidate out of the independent group.
+  // A group of 0 or 1 members is a no-op, and `why` says so.
+  if (input.rotation !== undefined) {
+    const ordinal = Number.isFinite(input.rotation) ? Math.max(0, Math.floor(input.rotation)) : 0
+    const independentGroup = required && isAuditor
+    const groupSize = independentGroup
+      ? ordered.filter((candidate) => candidate.independence?.modelAxis === 'distinct' && candidate.independence?.providerAxis === 'distinct').length
+      : ordered.length
+    const groupLabel = independentGroup ? 'the top (both-axis-distinct) independence class' : 'the ranked survivor list'
+    if (groupSize <= 1) {
+      why.push(`rotation: ordinal ${ordinal} into ${groupLabel} — ${groupSize} eligible member(s), so rotation is a NO-OP (nothing to rotate through)`)
+    } else {
+      const shift = ordinal % groupSize
+      const head = ordered.slice(0, groupSize)
+      const tail = ordered.slice(groupSize)
+      ordered = [...head.slice(shift), ...head.slice(0, shift), ...tail]
+      why.push(`rotation: ordinal ${ordinal} into ${groupLabel} (${groupSize} members) — offset ${shift} applied within the group; a candidate can never be rotated out of the independent group`)
     }
   }
 
@@ -690,12 +1058,17 @@ async function selectAutoRanked(
     if (candidate.factsError !== undefined) {
       notes.push(`facts: resolveModelInfo rejected this route (${candidate.factsError}) — contextWindow unknown`)
     } else if (contextWindowOf(candidate) === undefined) {
-      notes.push('contextWindow unknown — eligible, ranked after known-sufficient')
+      notes.push(input.preference === 'axis'
+        ? 'contextWindow unknown — eligible (the window is a threshold, not a ranking axis under preference axis)'
+        : 'contextWindow unknown — eligible, ranked after known-sufficient')
     }
     return candidateRecord(candidate, isSelected ? 'selected' : rejected ? 'preflight-rejected' : 'eligible', notes.length > 0 ? notes.join('; ') : undefined)
   })
   for (const candidate of excluded) {
     considered.push(candidateRecord(candidate, 'excluded-below-floor', `contextWindow ${contextWindowOf(candidate)} < floor ${floor}`))
+  }
+  for (const entry of requirementExclusions) {
+    considered.push(candidateRecord(entry.candidate, 'excluded-below-floor', entry.note))
   }
 
   const retained = retainedRouteFields(chosen.pin, effortFor(chosen), resolved)
@@ -716,6 +1089,19 @@ async function selectAutoRanked(
       ? `preflight: ${fallbackFrom.map((record) => `${record.provider}/${record.model} rejected (${record.reason})`).join('; ')} — fell back to ${routeLabel(chosen.pin)}`
       : `preflight: resolveCallConfig accepted ${routeLabel(chosen.pin)}`,
   )
+  // Cost provenance: recorded exactly when cost was an ordering input
+  // (preference `axis`). An owner override is NEVER reported as a seed kind;
+  // an absent price is `unknown`, never a proxy.
+  let costMatch: CostMatchKind | undefined
+  if (input.preference === 'axis') {
+    const effective = effectiveCostOf(input, chosen)
+    costMatch = effective.match
+    why.push(
+      effective.cost === undefined
+        ? `cost: ${routeLabel(chosen.pin)} has NO known cost — never treated as free, and it ranked after every route with a known cost`
+        : `cost: ${routeLabel(chosen.pin)} effective ${String(effective.cost.outputPerM)}/M output, ${String(effective.cost.inputPerM)}/M input — provenance ${effective.match}`,
+    )
+  }
   return {
     kind: 'route',
     route: {
@@ -728,5 +1114,6 @@ async function selectAutoRanked(
     candidatesConsidered: considered,
     authorizationSource: authorized.authorizationSource ?? 'session-policy',
     ...(fallbackFrom.length > 0 ? { fallbackFrom } : {}),
+    ...(costMatch === undefined ? {} : { costMatch }),
   }
 }

@@ -10,7 +10,7 @@
  */
 
 import { randomUUID } from 'node:crypto'
-import { applyEvent } from './domain/fold.js'
+import { applyEvent, applyGateLedger, AUDIT_ROLE_OF_ROUTING_ROLE, withdrawnGateValue } from './domain/fold.js'
 import {
   AutopilotError,
   MAX_REPLAN_ROUNDS,
@@ -26,8 +26,10 @@ import {
   validateTriage,
   validateExternalReview,
   compareDeclaredTree,
+  handoffProblems,
 } from './domain/types.js'
 import type {
+  AuditFinding,
   AuditRecord,
   AuditRole,
   CrossFamilyOutcome,
@@ -35,8 +37,11 @@ import type {
   Risk,
   Closeout,
   EgressChannel,
+  EgressDecision,
   Enforcement,
   ExecutorRecord,
+  GateName,
+  GateSources,
   LogEntry,
   Operation,
   OwnerApproval,
@@ -62,9 +67,15 @@ import type { Role, RoleRouting, RoutePreference, SelectedRoute, SelectionDecisi
 import { resolvePluginGrant } from './routing/authorize.js'
 import type { GrantSource, SessionPolicyState } from './routing/authorize.js'
 import { RouteCatalog, providerIsLive } from './routing/catalog.js'
+import type { CatalogSnapshot } from './routing/catalog.js'
+import { workClassReachability, type WorkClassReachabilityReport } from './routing/coverage.js'
 import type { LlmCallConfig } from './routing/catalog.js'
 import { independenceOf, sameRoute, toRoutePin } from './routing/identity.js'
 import type { RoutePin } from './routing/identity.js'
+import { DEFAULT_ROLE_WORK_CLASS, DEFAULT_WORK_CLASSES, ESCALATION_TIERS, resolveWorkClassSelection } from './routing/work-class.js'
+import type { ResolvedWorkClass, WorkClassName } from './routing/work-class.js'
+import { routingStatusOf } from './routing/status.js'
+import type { RoutingStatusView } from './routing/status.js'
 
 // ── Structural platform types (subset of dsh surfaces the engine touches) ──
 
@@ -136,9 +147,33 @@ export interface SubagentRunRef {
   dispose(): Promise<void>
 }
 
-/** Structural subset of ctx.subagents. */
+/**
+ * One managed child on dsh 0.2.1 (`SubagentRuntime.startActivation`).
+ * `result` settles when the activation does. Disposal addresses this activation.
+ */
+export interface SubagentActivationRef {
+  readonly childId: string
+  readonly result: Promise<{
+    readonly stopReason: string
+    readonly structured?: unknown
+    readonly diagnostic?: string
+  }>
+  dispose(): Promise<void>
+}
+
+/**
+ * Structural subset of ctx.subagents.
+ *
+ * Two host generations share this mirror. dsh 0.2.0 and the 0.1.x lines expose
+ * `start` / `startContinuable` / `drainContinuableChildren`, and those calls
+ * carry `toolFilter`. dsh 0.2.1-rc.2 replaced that trio with `startActivation`
+ * / `drainChildren`. `startActivation` does not accept a tool filter; the
+ * plugin applies the allow-list itself on `agent/created`. `sendMessage` and
+ * `interrupt` kept their shapes across both. A host is used through whichever
+ * pair it actually has, never by pretending the missing methods exist.
+ */
 export interface SubagentsRef {
-  start(provider: string, request: {
+  start?(provider: string, request: {
     prompt: Array<{ type: 'text'; text: string }>
     parent: unknown
     outputSchema: object
@@ -147,7 +182,7 @@ export interface SubagentsRef {
     signal: AbortSignal
     agentOptions?: AgentOptionsLike
   }): Promise<SubagentRunRef>
-  startContinuable(spec: {
+  startContinuable?(spec: {
     childId: string
     provider: string
     label: string
@@ -160,19 +195,34 @@ export interface SubagentsRef {
     }
     signal: AbortSignal
   }): Promise<unknown>
+  startActivation?(spec: {
+    provider: string
+    label: string
+    childId?: string
+    request: {
+      prompt: Array<{ type: 'text'; text: string }>
+      parent: unknown
+      outputSchema?: object
+      maxDepth?: number
+      agentOptions?: AgentOptionsLike
+    }
+    signal: AbortSignal
+    delivery: 'parent' | 'caller'
+  }): Promise<SubagentActivationRef>
   /**
    * Deliver one message to a direct continuable child (`SubagentManager.sendMessage`).
    * The host derives sender attribution from the exact live `sender`. This is
    * the resume transport: the manager has had no `followup` since at least
    * dsh 0.1.2-rc.1 (checked against the published 0.1.2-rc.1, 0.1.5-rc.1,
    * 0.1.7-rc.2 and 0.2.0-rc.2 packages), so the earlier call threw
-   * `followup is not a function` on every real host.
+   * `followup is not a function` on every real host. 0.2.1-rc.2 still has it.
    */
   sendMessage(sender: unknown, targetId: string, content: Array<{ type: 'text'; text: string }>, options: {
     signal: AbortSignal
   }): Promise<unknown>
   interrupt(childId: string, authority: { kind: 'ancestor'; agent: unknown }): void
-  drainContinuableChildren(parent: unknown, childIds: readonly string[]): Promise<unknown>
+  drainContinuableChildren?(parent: unknown, childIds: readonly string[]): Promise<unknown>
+  drainChildren?(parent: unknown, childIds: readonly string[]): Promise<unknown>
 }
 
 /** Explicit LLM route for a dispatched child; omitted fields inherit the deployment default. */
@@ -201,11 +251,77 @@ export interface AgentOptionsLike {
  * session model-selection policy — while the per-role table still resolves,
  * so locks stay visible (and enforced as plugin-config grants) in every mode.
  */
+/** One owner-authored cost override, parsed from `provider/model=input/output`. */
+export interface ResolvedCostOverride {
+  readonly provider: string
+  readonly model: string
+  readonly inputPerM: number
+  readonly outputPerM: number
+}
+
+/**
+ * The owner's routing ladder, resolved.
+ *
+ * TIER NAMES ARE FIXED (economy/standard/reserve) and every field is a fixed
+ * path, because Schemastery forbids a volatile field under a transform or a
+ * keyed dict and `containsVolatileRef` caps the depth it will follow. An
+ * owner-authored map of arbitrary tier names is therefore not expressible;
+ * fixed names are, and they are what this type carries.
+ *
+ * ABSENT IS NOT DERIVED. Every default here is a declared literal. Nothing is
+ * inferred from a model name or id: a name is not evidence about speed, cost
+ * or tier, so the ladder states nothing it was not told.
+ */
+export interface ResolvedLadder {
+  readonly tiers: Readonly<Record<'economy' | 'standard' | 'reserve', readonly string[]>>
+  readonly auditTier: 'economy' | 'standard' | 'reserve' | 'none'
+  /**
+   * A4 (DESIGN §9 item 15): owner opt-in to engine-level re-selection at a
+   * role's next dispatch. Default off — the shipped pin-stability semantics are
+   * unchanged, and a healthy pin is re-selected only when the owner wrote
+   * `true`. AUDITOR roles offset within their independence class; the EXECUTOR
+   * offsets within the ranked survivor list by its own dispatch count, and a
+   * LIVE child is never re-routed (only `startExecutor` reaches the resolver).
+   */
+  readonly rotation: boolean
+  /** Owner-declared speed order, earliest = faster. Empty means speed is UNKNOWN. */
+  readonly speedOrder: readonly string[]
+  readonly costOverrides: readonly ResolvedCostOverride[]
+}
+
 export interface ResolvedRouting {
   readonly mode: 'auto' | 'off'
+  /** The EFFECTIVE preference (see `preferenceSource`): what selections actually rank by. */
   readonly preference: RoutePreference
+  /**
+   * Whether the effective preference came from an explicit owner write or the
+   * shipped default. A2 (DESIGN section 9 item 13): the explicitness ceiling of
+   * the config loader applies — schemastery fills the declared default before
+   * `apply()` sees the value, so a preference WRITTEN as exactly the default
+   * ('balanced') is indistinguishable from an absent one and deliberately
+   * counts as 'default' on BOTH config paths (the same doctrine
+   * `modeIsExplicit` follows for role modes; the loader/plain deep-equality
+   * fixture requires one answer). Only a non-'balanced' value proves a write.
+   * 'default' is also the source when `routing.orderingAxisDefault` promoted
+   * the effective preference to 'axis' — the owner opted into the promotion,
+   * not into 'axis' itself.
+   */
+  readonly preferenceSource: 'explicit' | 'default'
   /** Every role is always present, resolved to its effective routing. */
   readonly roles: Readonly<Record<Role, RoleRouting>>
+  /**
+   * The owner's ladder. Present on every resolved routing (empty by default)
+   * so a consumer never has to distinguish "no ladder" from "an empty one".
+   */
+  readonly ladder: ResolvedLadder
+  /**
+   * The five work classes (DESIGN §1.2; §9 items 13/14), resolved. Fixed
+   * names for the same schemastery reason as the ladder tier names; the
+   * owner-table mapping/axis are the declared defaults, overridable per
+   * class through `routing.workClasses.<name>`. Present on every resolved
+   * routing — an owner who never wrote a class gets the owner table verbatim.
+   */
+  readonly workClasses: Readonly<Record<WorkClassName, ResolvedWorkClass>>
 }
 
 /** Resolved plugin configuration. */
@@ -231,6 +347,21 @@ export interface ResolvedConfig {
   }
   /** Copy bundled SKILL.md into the skill-scan root (`auto`) or leave it (`off`). */
   readonly skillInstall: 'auto' | 'off'
+  /**
+   * Governance pragmatics knobs (all optional, all OFF by default).
+   * `maxAuditRoundsPerRole` brakes audit storms: beyond the cap, further
+   * dispatches for that role are refused (AP_AUDIT_ROUND_CAP) instead of
+   * silently escalating to the owner.
+   */
+  readonly governance?: {
+    readonly maxAuditRoundsPerRole?: number
+    /**
+     * Unattended approval policy (default off). When on, a validated egress
+     * returns an immediate, visible, recoverable DENY instead of an owner ask
+     * (which pends forever with nobody to answer). Never auto-approves.
+     */
+    readonly unattended?: boolean
+  }
 }
 
 /**
@@ -604,12 +735,47 @@ function packetRevisionHint(executionRevision: number): string {
   return `[autopilot] executionRevision=${String(executionRevision)}. Pass this integer as autopilot_submit_packet.executionRevision; a stale or missing value is refused.`
 }
 
+/**
+ * Dispatch text that tells the child WHICH ROUTE it runs on (shared doctrine
+ * 2026-10-09: a dispatch packet must state the child's model+effort — a child
+ * that cannot see its own tier cannot judge when escalation is the honest
+ * answer). `pin` is the dispatch decision's pin: present on explicit routes,
+ * absent on inheritance. An absent reasoningEffort on an explicit route means
+ * the adapter publishes no adjustable effort (or no default) — the doctrine's
+ * 2026-10-10 ceiling rule: a fixed-reasoning route's fixed setting IS the
+ * ceiling, so the line must say so instead of implying a higher effort exists.
+ */
+function dispatchRoutingLine(pin: RoutingPin | undefined): string {
+  if (pin === undefined) {
+    return '[autopilot] routing: inherited — no explicit route was pinned for this dispatch; your provider/model is the parent session\'s route, unobserved from here.'
+  }
+  const effort = pin.reasoningEffort === undefined
+    ? 'reasoning effort: none pinned — this route publishes no adjustable effort; its fixed/default setting IS the ceiling, so do not request a higher effort that does not exist'
+    : `reasoning effort: ${pin.reasoningEffort}`
+  return `[autopilot] routing: dispatched as ${pin.provider}/${pin.model} (${effort}). Escalation, if needed, is a NEW dispatch from a wider pool — never a mid-run model swap of this context.`
+}
+
 function withToolDiagnostic(route: RouteRecord, note: string | undefined): RouteRecord {
   if (note === undefined) return route
   return {
     ...route,
     routeDiagnostic: route.routeDiagnostic === undefined ? note : `${route.routeDiagnostic}; ${note}`,
   }
+}
+
+/** The graded-findings channel both verdict schemas share (governance pragmatics v1). */
+const FINDINGS_SCHEMA = {
+  type: 'array' as const,
+  items: {
+    type: 'object' as const,
+    additionalProperties: false,
+    required: ['severity', 'layer', 'summary'],
+    properties: {
+      severity: { type: 'string' as const, enum: ['blocking', 'non-blocking'] },
+      layer: { type: 'string' as const, enum: ['plan', 'execution', 'rules'] },
+      summary: { type: 'string' as const },
+    },
+  },
 }
 
 /** Structured verdict schema for plan auditors (no needs-fix on the plan gate). */
@@ -620,6 +786,7 @@ export const PLAN_VERDICT_SCHEMA = {
   properties: {
     verdict: { type: 'string' as const, enum: ['pass', 'needs-replan', 'blocked', 'needs-owner-decision'] },
     note: { type: 'string' as const },
+    findings: FINDINGS_SCHEMA,
   },
 }
 
@@ -631,6 +798,7 @@ export const EXECUTION_VERDICT_SCHEMA = {
   properties: {
     verdict: { type: 'string' as const, enum: ['pass', 'needs-fix', 'needs-replan', 'blocked', 'needs-owner-decision'] },
     note: { type: 'string' as const },
+    findings: FINDINGS_SCHEMA,
   },
 }
 
@@ -683,9 +851,53 @@ function routingActive(routing: ResolvedRouting, role: Role): boolean {
  * anything. It exists so the gates have a total function to read even when
  * the real section cannot be resolved at all.
  */
+/** The ladder of a routing that can never select: every tier empty, no axes declared. */
+const EMPTY_LADDER: ResolvedLadder = {
+  tiers: { economy: [], standard: [], reserve: [] },
+  auditTier: 'none',
+  rotation: false,
+  speedOrder: [],
+  costOverrides: [],
+}
+
+/**
+ * The owner's cost overrides as the selector's `provider/model` index. An
+ * override is an owner statement about a ROUTE the deployment runs, so the
+ * key is that exact route — unlike the seed, which resolves route and then
+ * model identity. Absent when the owner declared none, so the selector input
+ * carries nothing a legacy decision ever carried.
+ */
+function costOverrideIndex(ladder: ResolvedLadder): Readonly<Record<string, { readonly inputPerM: number; readonly outputPerM: number }>> | undefined {
+  if (ladder.costOverrides.length === 0) return undefined
+  const index: Record<string, { readonly inputPerM: number; readonly outputPerM: number }> = {}
+  for (const override of ladder.costOverrides) {
+    index[override.provider + '/' + override.model] = { inputPerM: override.inputPerM, outputPerM: override.outputPerM }
+  }
+  return index
+}
+
+/**
+ * The owner-declared AXES the selector consumes. The ladder is resolved and
+ * passed to every selection; nothing here derives an axis the owner did not
+ * declare, and a field is present only when the owner wrote one.
+ */
+function routingAxisInput(ladder: ResolvedLadder): {
+  readonly costOverrides?: Readonly<Record<string, { readonly inputPerM: number; readonly outputPerM: number }>>
+  readonly speedOrder?: readonly string[]
+} {
+  const costOverrides = costOverrideIndex(ladder)
+  return {
+    ...(costOverrides === undefined ? {} : { costOverrides }),
+    ...(ladder.speedOrder.length === 0 ? {} : { speedOrder: ladder.speedOrder }),
+  }
+}
+
 const REFUSED_ROUTING: ResolvedRouting = {
   mode: 'off',
   preference: 'balanced',
+  preferenceSource: 'default',
+  ladder: EMPTY_LADDER,
+  workClasses: DEFAULT_WORK_CLASSES,
   roles: {
     executor: { mode: 'inherit' },
     planner: { mode: 'inherit' },
@@ -1040,12 +1252,77 @@ function withPlannerDetail(detail: unknown, record: PlannerRoutingRecord): unkno
 }
 
 /** Model-facing status projection. */
+/**
+ * One required role's latest audit record, VERBATIM — the audit-packet rule's
+ * input.
+ *
+ * The rule (see skill/dsh-autopilot/references/governance-invariants.md) is
+ * that an audit packet embeds every required role's latest verdict read
+ * directly from the run state, with non-passes shown explicitly, and that the
+ * dispatcher does not summarise or characterise them. `latestVerdicts` is a
+ * verdict WORD; it cannot carry provenance, freshness or a non-pass's reason,
+ * so a dispatcher working from it is retyping a conclusion. This record keeps
+ * the fields the decision actually needs.
+ */
+export interface AuditStatusRecord {
+  readonly role: AuditRole
+  /** 0-based append-only sequence: two records are comparable without a clock. */
+  readonly seq: number
+  readonly verdict: Verdict
+  readonly note: string
+  /** The auditor child session id, or `self-check`. */
+  readonly auditorId: string
+  /** Run revision captured when the audit STARTED — a later revision makes it stale. */
+  readonly runRevision: number
+  readonly planRevision: number
+  readonly executionRevision: number
+  /** `self-check`, or the subagent transport provider that ran the auditor. */
+  readonly provider: string
+  /** Present only on an owner-countersigned external review. */
+  readonly external?: ExternalReview
+  /** Whether the current triage requires this role. */
+  readonly required: boolean
+}
+
+/** The verbatim latest audit record per role. See {@link AuditStatusRecord}. */
+export function auditStatusRecords(snapshot: Snapshot): Partial<Record<AuditRole, AuditStatusRecord>> {
+  const required = new Set(requiredRoles(snapshot.triage))
+  const out: Partial<Record<AuditRole, AuditStatusRecord>> = {}
+  for (const [role, record] of Object.entries(latestVerdicts(snapshot.audits)) as Array<[AuditRole, AuditRecord]>) {
+    out[role] = {
+      role: record.role,
+      seq: record.seq,
+      verdict: record.verdict,
+      note: record.note,
+      auditorId: record.auditorId,
+      runRevision: record.runRevision,
+      planRevision: record.planRevision,
+      executionRevision: record.executionRevision,
+      provider: record.route.provider,
+      ...(record.external === undefined ? {} : { external: record.external }),
+      required: required.has(role),
+    }
+  }
+  return out
+}
+
 export interface StatusView {
   readonly runId: RunId
+  /**
+   * Every run this session has started, oldest first. Present only once a
+   * second run exists, so a single-run status stays the shape it had before.
+   */
+  readonly sessionRunIds?: readonly string[]
   readonly revision: number
   readonly phase: Snapshot['phase']
   readonly planGate: Snapshot['planGate']
   readonly executionGate: Snapshot['executionGate']
+  /**
+   * Which authority last set each gate, and for which plan revision (DESIGN §9
+   * item 8). A stream that recorded no provenance projects `no-source` — the
+   * honest reading, never inferred from the gate value.
+   */
+  readonly gateSources: GateSources
   readonly planRevision: number
   readonly objective: string
   readonly size: Snapshot['triage']['size']
@@ -1054,6 +1331,12 @@ export interface StatusView {
   readonly auditMode: Snapshot['triage']['auditMode']
   readonly requiredRoles: readonly AuditRole[]
   readonly latestVerdicts: Partial<Record<AuditRole, Verdict>>
+  /**
+   * The latest audit record per role, verbatim. Build an audit packet from
+   * THIS, not from `latestVerdicts`: a packet must carry the record, and a
+   * non-pass must be visible as itself rather than summarised away.
+   */
+  readonly latestAuditRecords: Partial<Record<AuditRole, AuditStatusRecord>>
   readonly replanBudgetRemaining: number
   readonly auditCount: number
   readonly logCount: number
@@ -1070,7 +1353,32 @@ export interface StatusView {
    * here.)
    */
   readonly plannerRouting?: PlannerRoutingRecord
+  /**
+   * M3 (DESIGN §9-14/16): work-class reachability over the live catalog —
+   * per observed model, whether at least one tier-bound work class's member
+   * set includes it. Present exactly after THIS run read a catalog snapshot
+   * for a routing decision (the report is computed from that same read);
+   * absent before, and never fabricated. `'reachable'` is the only outcome
+   * that claims anything.
+   */
+  readonly routingReachability?: WorkClassReachabilityReport
+  /**
+   * M12 (DESIGN §1.2 boundary (e)): the routing status a READER can act on —
+   * the effective mode/preference and its source, the session policy state as
+   * the engine read it for the dispatching session, each role's effective
+   * routing (auto/inherit/locked) and work class, the run's own pins, and the
+   * owner's ladder shape. This is the surface that answers "is routing live
+   * here", which `routingReachability` does not (it answers a coverage
+   * question and is silent on a healthy ladder). ABSENT when `routing.mode` is
+   * off — with routing off every dispatch inherits, and a block of `inherit`
+   * rows would read like a failed selection rather than a switched-off feature.
+   */
+  readonly routing?: RoutingStatusView
   readonly diagnostic?: string
+  /** Owner-verbatim requirements declared at init (traceability surface); absent when none were declared. */
+  readonly ownerRequirements?: readonly string[]
+  /** The recorded inline-at-medium+ reason; absent when the run delegates or is low-risk. */
+  readonly inlineReason?: string
 }
 
 /**
@@ -1331,6 +1639,37 @@ export class AutopilotEngine {
    * cleared whenever the planning window closes without one.
    */
   private readonly plannerReloadStamps = new Set<RunId>()
+  /**
+   * M3 (DESIGN §9-14/16): the last work-class reachability report THIS run
+   * actually produced, computed from the SAME cached catalog snapshot the
+   * run's routing decisions read. Engine-local on purpose: the report is a
+   * live-facts view, not durable run state — a restart simply has no report
+   * until the next routed dispatch recomputes one, and StatusView projects
+   * NOTHING while the map has no entry (the absent field is the honest
+   * record of "never observed").
+   */
+  private readonly reachabilityReports = new Map<RunId, WorkClassReachabilityReport>()
+
+  /**
+   * M2 (DESIGN §1.2 "升档是请求，不是预测"): the run's OPEN work-class
+   * escalation requests, engine-local by deliberate choice.
+   *
+   * WHY ENGINE-LOCAL AND NOT DURABLE RUN STATE. The request is a LIVE intent
+   * ("the model that was working asked for more ceiling"), not
+   * authorization-bearing state: it widens which ladder tiers the NEXT
+   * auto dispatch of that role may draw from, and it is consumed by exactly one
+   * dispatch. Nothing about a dispatch's authority depends on it — the policy
+   * intersection, the tier membership and the independence rules all run before
+   * and after it identically — so recording it in the durable Snapshot would
+   * buy replay determinism for a value no replayable decision reads, at the
+   * cost of a new fold-validated shape. The honest boundary is therefore
+   * stated rather than hidden: a process restart forgets open requests, and the
+   * requester simply asks again (the log checkpoint that carried the request
+   * stays in `log.md`). The selection the request CAUSED is durable like any
+   * other: it rides `detail.routing` with its own `why` line and its
+   * `repinFrom`.
+   */
+  private readonly pendingEscalations = new Map<RunId, { readonly seq: number; readonly note: string }>()
 
   constructor(
     private readonly agents: AgentsRef,
@@ -1366,7 +1705,17 @@ export class AutopilotEngine {
      * live routing, byte-identical to the previous behavior.
      */
     private readonly routingSource: (() => ResolvedRouting) | undefined = undefined,
-  ) {}
+  ) {
+    // M7b: keep the catalog port where the engine can ALSO read it on the
+    // status path (`refreshReachability`), not just inside `selectForRole`.
+    this.catalog = routingPorts.catalog
+  }
+
+  /**
+   * M7b: the catalog port, kept for `refreshReachability`. Same value the
+   * routing core receives through `routingPorts.catalog`.
+   */
+  private readonly catalog: RouteCatalog | undefined
 
   /**
    * Dispose: abort new work, then WAIT (bounded) for in-flight transactions to
@@ -1423,21 +1772,48 @@ export class AutopilotEngine {
         throw new AutopilotError(`usage seed rejected: ${seedProblems.join('; ')}`, 'AP_USAGE_INVALID')
       }
     }
+    // Governance pragmatics v2 (shared doctrine §9): a medium+ risk run that
+    // implements INLINE must record WHY it does not delegate. The reason is
+    // recorded and surfaced, never gated on approval — but its absence is a
+    // hard refusal, because an unrecorded inline choice at real risk is the
+    // quiet path around the executor/auditor separation.
+    if (triage.executionMode === 'inline' && triage.risk !== 'low'
+      && (triage.inlineReason === undefined || triage.inlineReason.trim().length === 0)) {
+      throw new AutopilotError(
+        'inline execution at medium+ risk requires inlineReason — the recorded reason this run does not delegate (a reason, not an approval)',
+        'AP_INLINE_REASON_REQUIRED',
+      )
+    }
     return this.transact(root.id, async () => {
-      const prior = this.current(root.id)
+      const prior = this.current(this.activeRunId(root.id))
       if (prior !== undefined && !TERMINAL_PHASES.includes(prior.phase)) {
         throw new AutopilotError('an autopilot run is already active on this session', 'AP_ALREADY_ACTIVE')
       }
-      if (prior !== undefined) {
-        throw new AutopilotError(
-          'this session already carries a finished run; start a new session for a new run',
-          'AP_RUN_EXHAUSTED',
-        )
-      }
+      const runId = prior === undefined ? root.id : this.successorRunId(root.id)
 
+      // CARRYOVER (governance pragmatics v1): the write path settles the
+      // filesystem question once, here — the predecessor must exist and have
+      // completed. The fold re-checks only the shape, so replay never depends
+      // on another run's directory surviving.
+      if (triage.carryover !== undefined) {
+        const predecessor = this.current(triage.carryover.fromRunId)
+        if (predecessor === undefined) {
+          throw new AutopilotError(
+            `carryover predecessor run not found: ${triage.carryover.fromRunId}`,
+            'AP_CARRYOVER_UNKNOWN',
+          )
+        }
+        if (predecessor.phase !== 'completed') {
+          throw new AutopilotError(
+            `carryover predecessor has not completed (phase ${predecessor.phase}); only a completed run's work may be carried forward`,
+            'AP_CARRYOVER_NOT_COMPLETED',
+          )
+        }
+      }
       const enforcement = this.applyInitEnforcement(root, triage)
       const snapshot: Snapshot = {
-        runId: root.id,
+        runId,
+        ...(runId === root.id ? {} : { sessionId: root.id }),
         revision: 1,
         triage,
         plan: { revision: 0, text: '' },
@@ -1452,22 +1828,86 @@ export class AutopilotEngine {
         bearerBase: resolveBearerBase(root.session.header.cwd),
         enforcement,
       }
-      return await this.commit(undefined, 'init', snapshot)
+      const committed = await this.commit(undefined, 'init', snapshot)
+      if (prior !== undefined) {
+        const existing = this.store.readSessionIndex(root.id)
+        const runIds = existing?.runIds ?? [prior.runId]
+        this.store.writeSessionIndex({
+          v: 1,
+          sessionId: root.id,
+          currentRunId: runId,
+          runIds: runIds.includes(runId) ? runIds : [...runIds, runId],
+        })
+      }
+      return committed
     })
   }
 
   status(caller: AgentRef): StatusView | undefined {
     const root = this.resolveRoot(caller)
-    const snapshot = this.current(root.id)
+    const snapshot = this.current(this.activeRunId(root.id))
     if (snapshot === undefined) return undefined
-    return this.projectStatus(snapshot)
+    // M12: the policy state is read for the CALLER's session — the same reader
+    // the dispatch sites use, so the status cannot disagree with a dispatch
+    // about whether selection is possible. A reader with no live session (the
+    // HTTP/service path) passes nothing and gets `unobserved`.
+    const view = this.projectStatus(snapshot, this.readPolicy(root))
+    const index = this.store.readSessionIndex(root.id)
+    if (index === undefined || index.runIds.length < 2) return view
+    return { ...view, sessionRunIds: index.runIds }
+  }
+
+  /**
+   * M7b: refresh every materialized run's work-class reachability report from
+   * the CURRENT routing config and a current catalog snapshot, then return.
+   *
+   * `status()` stays synchronous and pure; the status READER awaits this first
+   * (see `autopilot_status` in `./tools.ts`), so the report a reader projects
+   * describes the routing section in force NOW rather than the ladder some
+   * earlier FRESH selection happened to run under. That distribution was the
+   * predecessor M7 defect: `reachabilityReports` had exactly one writer, inside
+   * `selectForRole`, and a healthy-pin REUSE never reaches that method, so after
+   * a config edit the StatusView served the pre-edit value while the onboarding
+   * section — reading the same shared `volatileRoutingAccess` closure — already
+   * reported the new ladder.
+   *
+   * Never throws. An absent catalog is the documented 0.2.0-parity path; a
+   * catalog read that fails leaves the last observed report standing (a failed
+   * read is not evidence of reachability); a live routing section that no longer
+   * resolves leaves the report absent rather than fabricating one.
+   */
+  async refreshReachability(): Promise<void> {
+    const catalog = this.catalog
+    if (catalog === undefined) return
+    let snapshot: CatalogSnapshot
+    try {
+      snapshot = await catalog.snapshot()
+    } catch {
+      return
+    }
+    const live = this.routingConfig()
+    // A live section that no longer resolves is the refusal path; the report is
+    // left as it was rather than replaced by a claim about an invalid config.
+    if (live.refused !== undefined) return
+    for (const runId of [...this.cache.keys()]) {
+      this.reachabilityReports.set(runId, workClassReachability(
+        {
+          catalogStatus: snapshot.catalogStatus,
+          models: snapshot.listedModels,
+          failedProviders: [...snapshot.providerErrors.keys()],
+        },
+        { tiers: live.routing.ladder.tiers },
+        live.routing.workClasses,
+        live.routing.ladder.auditTier,
+      ))
+    }
   }
 
   async submitPlan(caller: AgentRef, text: string): Promise<Snapshot> {
     const root = this.resolveRoot(caller)
     if (text.trim().length === 0) throw new AutopilotError('plan text is empty', 'AP_INVALID_ARGUMENT')
     return this.transact(root.id, async () => {
-      const prior = this.require(root.id)
+      const prior = this.require(this.activeRunId(root.id))
       if (prior.phase !== 'planning' && prior.phase !== 'replanning') {
         throw new AutopilotError(`cannot submit plan in phase ${prior.phase}`, 'AP_WRONG_PHASE')
       }
@@ -1488,16 +1928,79 @@ export class AutopilotEngine {
     })
   }
 
+  /**
+   * Amend the passed plan mid-execution WITHOUT destroying execution state
+   * (governance pragmatics v1).
+   *
+   * The fold mechanically wipes evidence on submit-plan (AP_STALE_EVIDENCE),
+   * which made every mid-execution plan refinement a full replan — the
+   * model-orchestration record shows what that costs. An amendment bumps the
+   * plan revision, keeps gates/packet/executor untouched, and ARMS the delta
+   * re-audit binding: further submit-evidence/submit-closeout are refused
+   * until a plan-role pass captured at or after the amended revision lands
+   * (a delta audit, not a from-scratch one). Material changes that fail the
+   * delta audit still take the full replan path.
+   *
+   * The objective/scope/acceptance criteria cannot change here at all —
+   * triage is immutable after init (the fold enforces it), so an amendment
+   * can only re-plan HOW, never WHAT or WHETHER it counts.
+   */
+  async amendPlan(caller: AgentRef, request: { text: string; note: string }): Promise<Snapshot> {
+    const root = this.resolveRoot(caller)
+    if (request.text.trim().length === 0) {
+      throw new AutopilotError('amendment text is empty', 'AP_INVALID_ARGUMENT')
+    }
+    if (request.note.trim().length === 0) {
+      throw new AutopilotError('amendment note is empty — an amendment must say what changed and why', 'AP_INVALID_ARGUMENT')
+    }
+    return this.transact(root.id, async () => {
+      const prior = this.require(this.activeRunId(root.id))
+      if (prior.phase !== 'executing' && prior.phase !== 'execution-reviewing') {
+        throw new AutopilotError(
+          `amend-plan requires phase executing|execution-reviewing, got ${prior.phase}`,
+          'AP_WRONG_PHASE',
+        )
+      }
+      if (prior.planGate !== 'pass') {
+        throw new AutopilotError(`amend-plan requires planGate pass, got ${prior.planGate}`, 'AP_INVALID_ARGUMENT')
+      }
+      return await this.commit(prior, 'amend-plan', {
+        ...prior,
+        revision: prior.revision + 1,
+        plan: { revision: prior.plan.revision + 1, text: request.text },
+        planAmendedAtRevision: prior.plan.revision + 1,
+        diagnostic: `plan amended: ${request.note}`,
+      }, { note: request.note })
+    })
+  }
+
   /** Dispatch one independent auditor (auditMode independent only). */
   async audit(caller: AgentRef, request: { role: AuditRole; prompt: string; provider?: string }): Promise<AuditOutcome> {
     const root = this.resolveRoot(caller)
     return this.transact(root.id, async () => {
-      const prior = this.require(root.id)
+      const prior = this.require(this.activeRunId(root.id))
       if (prior.triage.auditMode !== 'independent') {
         throw new AutopilotError(`audit dispatch requires auditMode independent (run is ${prior.triage.auditMode}); use autopilot_self_check`, 'AP_WRONG_AUDIT_MODE')
       }
       this.assertAuditPhase(prior, request.role)
       if (request.prompt.trim().length === 0) throw new AutopilotError('audit prompt is empty', 'AP_INVALID_ARGUMENT')
+      // AUDIT ROUND CAP (governance pragmatics v1): a mechanical brake on
+      // audit storms, OFF by default. When configured, dispatching the same
+      // role beyond the cap is refused — the run must resolve with the
+      // findings it has, escalate deliberately, or raise the cap. This is the
+      // convergence backstop that replacing the forced replan escalation
+      // left open, and unlike that mechanism it never invents an owner
+      // question; it just stops the meter.
+      const roundCap = this.config.governance?.maxAuditRoundsPerRole
+      if (roundCap !== undefined && Number.isFinite(roundCap)) {
+        const dispatched = prior.audits.filter(record => record.role === request.role).length
+        if (dispatched >= roundCap) {
+          throw new AutopilotError(
+            `audit round cap reached for role ${request.role} (${dispatched}/${roundCap}); re-audits beyond the cap are refused — resolve with the findings recorded, or raise governance.maxAuditRoundsPerRole`,
+            'AP_AUDIT_ROUND_CAP',
+          )
+        }
+      }
 
       const provider = request.provider ?? this.config.auditors[request.role]?.provider ?? this.config.auditProvider
       const roleKey = routeRoleOf(request.role)
@@ -1603,20 +2106,19 @@ export class AutopilotEngine {
       try {
         const dispatched = await this.dispatchWithToolAllow(
           { requested: AUDITOR_TOOL_ALLOW, required: AUDITOR_TOOL_REQUIRED, label: `${request.role} auditor` },
-          allow => this.subagents.start(provider, {
-            prompt: [{ type: 'text', text: request.prompt }],
-            parent: root,
-            outputSchema: schema,
-            maxDepth: 1,
-            toolFilter: { allow },
-            signal: this.lifecycle.signal,
-            ...(agentOptions === undefined ? {} : { agentOptions }),
-          }),
+          allow => this.startOneShot(root, provider, request.prompt, schema, agentOptions, allow, `${request.role} auditor`),
         )
         run = dispatched.value
         toolDiagnostic = dispatched.resolution.diagnostic
 
         // Plan audits transition to plan-reviewing before awaiting the verdict.
+        // The pre-dispatch phase is captured HERE because the verdict path below
+        // can refuse the audit AFTER this transition lands (no structured
+        // verdict, an illegal verdict string, or the findings contract) — and
+        // without a recovery those refusals left the run in plan-reviewing,
+        // where assertAuditPhase refuses every further plan audit (the
+        // plan-reviewing wedge, reproduced twice on the real host).
+        const preDispatchPhase = prior.phase
         let baseline = prior
         if (request.role === 'plan') {
           baseline = await this.commit(prior, 'audit', {
@@ -1631,55 +2133,94 @@ export class AutopilotEngine {
           executionRevision: baseline.executor?.executionRevision ?? 0,
         }
 
-        const result = await run.result
-        if (result.stopReason !== 'completed' || result.structured === undefined) {
-          throw new AutopilotError(
-            `${request.role} audit returned no structured verdict (stopReason ${result.stopReason}): ${result.diagnostic ?? 'missing structured output'}`,
-            'AP_AUDIT_NO_VERDICT',
+        try {
+          const result = await run.result
+          if (result.stopReason !== 'completed' || result.structured === undefined) {
+            throw new AutopilotError(
+              `${request.role} audit returned no structured verdict (stopReason ${result.stopReason}): ${result.diagnostic ?? 'missing structured output'}`,
+              'AP_AUDIT_NO_VERDICT',
+            )
+          }
+          const structured = result.structured as { verdict?: string; note?: string }
+          const legal = request.role === 'plan' ? PLAN_VERDICTS : EXECUTION_VERDICTS
+          if (structured.verdict === undefined || !legal.includes(structured.verdict)) {
+            throw new AutopilotError(`${request.role} audit returned invalid verdict: ${String(structured.verdict)}`, 'AP_AUDIT_INVALID_VERDICT')
+          }
+
+          // Staleness CAS: reject a verdict whose baseline moved. Execution-class
+          // audits additionally CAS on the executor's execution revision so a
+          // verdict about revision N can never gate revision N+1.
+          const live = this.require(this.activeRunId(root.id))
+          if (live.revision !== captured.runRevision || live.plan.revision !== captured.planRevision) {
+            throw new AutopilotError('stale audit result: run/plan revision advanced since the audit started', 'AP_STALE_AUDIT')
+          }
+          if (request.role !== 'plan'
+            && (live.executor?.executionRevision ?? 0) !== captured.executionRevision) {
+            throw new AutopilotError('stale execution audit result: execution revision advanced since the audit started', 'AP_STALE_AUDIT')
+          }
+
+          // The narrowing rides on the audit's own route record, so a reader of
+          // the durable stream can see that THIS verdict came from an auditor
+          // whose surface was reduced, and by what. `run.result` has settled by
+          // this point, so the observed leg (`request/header`) is read from the
+          // child session HERE — the latest header is the only proof of the
+          // request route (plan v3 M4; `Agent.options` prove creation only).
+          // Route status never gates the verdict below: it is provenance for the
+          // auditor's reader, including when it records a mismatch.
+          const route = withCrossFamily(
+            withToolDiagnostic(
+              captureRoute(run.id, provider, run.localAgent?.options, run.localAgent?.session, routingDetail),
+              toolDiagnostic,
+            ),
+            familyChoice,
           )
+          return await this.applyVerdict(root, live, {
+            role: request.role,
+            verdict: structured.verdict as Verdict,
+            note: structured.note ?? '',
+            auditorId: run.id,
+            route,
+            captured,
+            ...(routingDetail === undefined ? {} : { routing: routingDetail }),
+            ...(Array.isArray((structured as { findings?: unknown }).findings)
+              ? { findings: (structured as { findings: AuditFinding[] }).findings }
+              : {}),
+          })
+        } catch (error: unknown) {
+          // PLAN-AUDIT RECOVERY (the plan-reviewing wedge). A plan audit refused
+          // by the verdict path AFTER the plan-reviewing transition landed used
+          // to leave the run in plan-reviewing forever: assertAuditPhase admits
+          // plan audits only from planning/replanning, so the dispatcher could
+          // never re-issue. When the live state still equals the captured
+          // baseline (nothing moved while the auditor ran), commit a recovery
+          // event restoring the pre-dispatch phase so the plan can be
+          // re-audited. AP_STALE_AUDIT is deliberately EXCLUDED: the baseline
+          // moved, so restoring the old phase would rewind a revision the rest
+          // of the stream already built on — that refusal stays a plain error.
+          if (request.role === 'plan'
+            && error instanceof AutopilotError
+            && (error.code === 'AP_AUDIT_NO_VERDICT'
+              || error.code === 'AP_AUDIT_INVALID_VERDICT'
+              || error.code === 'AP_AUDIT_FINDINGS_INVALID')) {
+            const live = this.current(this.activeRunId(root.id))
+            if (live !== undefined
+              && live.revision === captured.runRevision
+              && live.plan.revision === captured.planRevision) {
+              await this.commit(live, 'audit', {
+                ...live,
+                revision: live.revision + 1,
+                phase: preDispatchPhase,
+                diagnostic: `plan audit rejected (${error.code}): ${error.message}`,
+              }, {
+                role: request.role,
+                auditorId: run.id,
+                stage: 'rejected',
+                error: { code: error.code, message: error.message },
+              })
+            }
+          }
+          throw error
         }
-        const structured = result.structured as { verdict?: string; note?: string }
-        const legal = request.role === 'plan' ? PLAN_VERDICTS : EXECUTION_VERDICTS
-        if (structured.verdict === undefined || !legal.includes(structured.verdict)) {
-          throw new AutopilotError(`${request.role} audit returned invalid verdict: ${String(structured.verdict)}`, 'AP_AUDIT_INVALID_VERDICT')
-        }
-
-        // Staleness CAS: reject a verdict whose baseline moved. Execution-class
-        // audits additionally CAS on the executor's execution revision so a
-        // verdict about revision N can never gate revision N+1.
-        const live = this.require(root.id)
-        if (live.revision !== captured.runRevision || live.plan.revision !== captured.planRevision) {
-          throw new AutopilotError('stale audit result: run/plan revision advanced since the audit started', 'AP_STALE_AUDIT')
-        }
-        if (request.role !== 'plan'
-          && (live.executor?.executionRevision ?? 0) !== captured.executionRevision) {
-          throw new AutopilotError('stale execution audit result: execution revision advanced since the audit started', 'AP_STALE_AUDIT')
-        }
-
-        // The narrowing rides on the audit's own route record, so a reader of
-        // the durable stream can see that THIS verdict came from an auditor
-        // whose surface was reduced, and by what. `run.result` has settled by
-        // this point, so the observed leg (`request/header`) is read from the
-        // child session HERE — the latest header is the only proof of the
-        // request route (plan v3 M4; `Agent.options` prove creation only).
-        // Route status never gates the verdict below: it is provenance for the
-        // auditor's reader, including when it records a mismatch.
-        const route = withCrossFamily(
-          withToolDiagnostic(
-            captureRoute(run.id, provider, run.localAgent?.options, run.localAgent?.session, routingDetail),
-            toolDiagnostic,
-          ),
-          familyChoice,
-        )
-        return await this.applyVerdict(root, live, {
-          role: request.role,
-          verdict: structured.verdict as Verdict,
-          note: structured.note ?? '',
-          auditorId: run.id,
-          route,
-          captured,
-          ...(routingDetail === undefined ? {} : { routing: routingDetail }),
-        })
       } finally {
         if (run !== undefined) await run.dispose()
       }
@@ -1690,7 +2231,7 @@ export class AutopilotEngine {
   async selfCheck(caller: AgentRef, request: { role: AuditRole; verdict: Verdict; note: string }): Promise<AuditOutcome> {
     const root = this.resolveRoot(caller)
     return this.transact(root.id, async () => {
-      const prior = this.require(root.id)
+      const prior = this.require(this.activeRunId(root.id))
       if (prior.triage.auditMode !== 'self-check') {
         throw new AutopilotError('self-check verdicts are only legal on auditMode self-check runs', 'AP_WRONG_AUDIT_MODE')
       }
@@ -1742,7 +2283,7 @@ export class AutopilotEngine {
   }): Promise<AuditOutcome> {
     const root = this.resolveRoot(caller)
     return this.transact(root.id, async () => {
-      const prior = this.require(root.id)
+      const prior = this.require(this.activeRunId(root.id))
       if (prior.triage.auditMode !== 'external') {
         throw new AutopilotError(
           `external countersigns are only legal on auditMode external runs (run is ${prior.triage.auditMode})`,
@@ -1807,7 +2348,7 @@ export class AutopilotEngine {
     const root = this.resolveRoot(caller)
     const childId = randomUUID()
     return this.transact(root.id, async () => {
-      const prior = this.require(root.id)
+      const prior = this.require(this.activeRunId(root.id))
       if (prior.triage.executionMode !== 'delegated') {
         throw new AutopilotError('executor children are only legal on delegated runs; inline runs implement directly', 'AP_WRONG_EXECUTION_MODE')
       }
@@ -1927,19 +2468,16 @@ export class AutopilotEngine {
           // ask for. The family rule below still refuses to hand back a child
           // that lost an entire capability class the config DID ask for.
           { requested: this.config.executor.toolAllowList, required: [], label: 'executor child' },
-          allow => this.subagents.startContinuable({
-            childId,
+          allow => this.startContinuableChild(
+            root,
             provider,
-            label: 'autopilot-executor',
-            request: {
-              prompt: [{ type: 'text', text: `${request.prompt}\n\n${packetRevisionHint(executor.executionRevision)}` }],
-              parent: root,
-              persona: request.persona ?? this.config.executor.persona,
-              toolFilter: { allow },
-              ...(agentOptions === undefined ? {} : { agentOptions }),
-            },
-            signal: request.signal,
-          }),
+            childId,
+            `${request.prompt}\n\n${dispatchRoutingLine(routingDetail?.pin)}\n\n${packetRevisionHint(executor.executionRevision)}`,
+            request.persona ?? this.config.executor.persona,
+            agentOptions,
+            allow,
+            request.signal,
+          ),
         )
         // A continuable child's first turn starts only AFTER `startContinuable`
         // resolves (upstream: the promise settles at inbox acceptance), so on a
@@ -1985,7 +2523,7 @@ export class AutopilotEngine {
   async resumeExecutor(caller: AgentRef, request: { findings: string; nextPrompt: string; signal: AbortSignal }): Promise<Snapshot> {
     const root = this.resolveRoot(caller)
     return this.transact(root.id, async () => {
-      const prior = this.require(root.id)
+      const prior = this.require(this.activeRunId(root.id))
       if (prior.executor === undefined) throw new AutopilotError('no executor to resume', 'AP_NO_EXECUTOR')
       if (prior.executor.state !== 'running') {
         throw new AutopilotError(`executor is ${prior.executor.state}, cannot resume`, 'AP_EXECUTOR_NOT_RUNNING')
@@ -2015,7 +2553,7 @@ export class AutopilotEngine {
       await this.subagents.sendMessage(
         root,
         prior.executor.childId,
-        [{ type: 'text', text: `[audit findings]\n${request.findings}\n\n[next dispatch]\n${request.nextPrompt}\n\n${packetRevisionHint(nextRevision)}` }],
+        [{ type: 'text', text: `[audit findings]\n${request.findings}\n\n[next dispatch]\n${request.nextPrompt}\n\n${dispatchRoutingLine(prior.executor.route.selected)}\n\n${packetRevisionHint(nextRevision)}` }],
         { signal: request.signal },
       )
       return await this.commit(prior, 'resume-executor', {
@@ -2035,7 +2573,7 @@ export class AutopilotEngine {
   }): Promise<Snapshot> {
     const root = this.resolveChildRoot(child)
     return this.transact(root.id, async () => {
-      const prior = this.require(root.id)
+      const prior = this.require(this.activeRunId(root.id))
       if (prior.executor === undefined) throw new AutopilotError('no executor authorized', 'AP_NO_EXECUTOR')
       if (prior.executor.childId !== child.id) {
         throw new AutopilotError(`child ${child.id} is not the authorized executor`, 'AP_EXECUTOR_MISMATCH')
@@ -2091,7 +2629,7 @@ export class AutopilotEngine {
   async submitExecutionEvidence(caller: AgentRef, request: { report: string; residualRisks: readonly string[] }): Promise<Snapshot> {
     const root = this.resolveRoot(caller)
     return this.transact(root.id, async () => {
-      const prior = this.require(root.id)
+      const prior = this.require(this.activeRunId(root.id))
       if (prior.triage.executionMode !== 'inline') {
         throw new AutopilotError('inline evidence submission is illegal on delegated runs; the executor child submits the packet', 'AP_WRONG_EXECUTION_MODE')
       }
@@ -2115,12 +2653,100 @@ export class AutopilotEngine {
     blockingScope?: LogEntry['blockingScope']
   }): Promise<Snapshot> {
     const root = this.resolveRoot(caller)
+    return this.commitLogEntry(root, entry)
+  }
+
+  /**
+   * M13: the EXECUTOR CHILD's escalation request — the second entry point into
+   * the ONE request channel.
+   *
+   * WHY THIS EXISTS. M12 delivered the channel (an `escalate` checkpoint naming
+   * `stronger-model` widens the pool of the next auto selection), but its only
+   * producer was `log`, which is registered into the ROOT agent's scope and
+   * resolves its caller through `resolveRoot` — a method that throws
+   * `AP_NOT_ROOT` for ANY caller whose session has a `parentSession`. The
+   * executor child's own surface carried exactly one tool
+   * (`autopilot_submit_packet`). So the delegated executor — the agent that
+   * actually does the work, and the one DESIGN §1.2's "the working model asks"
+   * is about — could not ask for anything.
+   *
+   * WHAT IT IS ALLOWED TO BE, exactly, and nothing more:
+   *  - the caller must be the LIVE registered child of a top-level run
+   *    ({@link resolveChildRoot}) AND that run's AUTHORIZED executor, still
+   *    `running`: a stranger child, a stale child id, or an executor that has
+   *    been revoked/completed is refused with `AP_ESCALATION_NOT_EXECUTOR`;
+   *  - the entry is FIXED to `stance: 'escalate'` with
+   *    `escalationTarget: 'stronger-model'`. A child may not write arbitrary
+   *    checkpoints into the run's record, and may not request the governance
+   *    exits (`owner`, `external-review`) that belong to the root — those are
+   *    decisions about the RUN, not requests for capability;
+   *  - it lands through {@link commitLogEntry}, so the request register is
+   *    written at the SAME single site as the root path. There is one channel
+   *    with two entry points, never two escalation semantics.
+   *
+   * WHAT IT CANNOT DO is widen an authorization: the request only widens the
+   * candidate POOL, which is still `session policy ∩ live catalog`, still
+   * filtered by the class's tier membership and still ordered by the
+   * independence rules. A child cannot switch its own model, gain a route the
+   * policy does not cover, or write policy.
+   *
+   * @param caller - the calling agent; only the authorized executor child is accepted.
+   * @param request - the checkpoint text plus the required note (the evidence the request carries).
+   * @returns the committed snapshot.
+   */
+  async requestEscalation(caller: AgentRef, request: { text: string; note: string }): Promise<Snapshot> {
+    const root = this.resolveChildRoot(caller)
+    const prior = this.require(this.activeRunId(root.id))
+    if (prior.executor === undefined || prior.executor.childId !== caller.id) {
+      throw new AutopilotError(
+        `Agent ${caller.id} is not the authorized executor of run ${root.id}; only the executor child may request an escalation`,
+        'AP_ESCALATION_NOT_EXECUTOR',
+      )
+    }
+    if (prior.executor.state !== 'running') {
+      throw new AutopilotError(
+        `the executor of run ${root.id} is ${prior.executor.state}, not running; a finished executor cannot request an escalation`,
+        'AP_ESCALATION_NOT_EXECUTOR',
+      )
+    }
+    if (TERMINAL_PHASES.includes(prior.phase) || prior.phase === 'needs-owner-decision') {
+      throw new AutopilotError(`cannot request an escalation in phase ${prior.phase}`, 'AP_WRONG_PHASE')
+    }
+    return this.commitLogEntry(root, {
+      text: request.text,
+      stance: 'escalate',
+      escalationTarget: 'stronger-model',
+      note: request.note,
+    })
+  }
+
+  /**
+   * The ONE site where a log entry lands — shared by the root-only `log` and by
+   * the executor child's {@link requestEscalation}.
+   *
+   * The request register is written HERE and nowhere else
+   * (`pendingEscalations.set` below), which is what makes "one channel with two
+   * entry points" a structural fact rather than a convention: a second entry
+   * point cannot invent its own escalation semantics, because there is no other
+   * place that records one.
+   *
+   * @param root - the resolved top-level root agent (the authority for the run).
+   * @param entry - the checkpoint to append.
+   * @returns the committed snapshot.
+   */
+  private async commitLogEntry(root: AgentRef, entry: {
+    text: string
+    stance: Stance
+    note?: string
+    escalationTarget?: LogEntry['escalationTarget']
+    blockingScope?: LogEntry['blockingScope']
+  }): Promise<Snapshot> {
     if (entry.text.trim().length === 0) throw new AutopilotError('log text is empty', 'AP_INVALID_ARGUMENT')
     if (entry.stance === 'escalate' && (entry.note === undefined || entry.note.trim().length === 0)) {
       throw new AutopilotError('escalate checkpoints require a note (CC checkpoint contract)', 'AP_INVALID_ARGUMENT')
     }
     return this.transact(root.id, async () => {
-      const prior = this.require(root.id)
+      const prior = this.require(this.activeRunId(root.id))
       // Stance coupling, the converse of the rule above. `escalate` REQUIRES a
       // note; every other stance must not carry escalation fields at all.
       // Measured on the real host 2026-08-25: the driving model filled every
@@ -2144,14 +2770,63 @@ export class AutopilotEngine {
         logCount: prior.logCount + 1,
       }, logEntry)
       await this.store.appendLog(root.id, logEntry)
+      // M2: an `escalate` checkpoint naming `stronger-model` IS the work-class
+      // escalation request (DESIGN §1.2: the working model asks, the root
+      // dispatches a higher ceiling). Recorded only after the checkpoint is
+      // durable, so the request can never outlive its evidence. A later
+      // request for the same role REPLACES the earlier one (last-wins): the
+      // newest evidence is the one the next dispatch should act on.
+      if (escalating && entry.escalationTarget === 'stronger-model') {
+        this.pendingEscalations.set(root.id, { seq: logEntry.seq, note: logEntry.note ?? logEntry.text })
+      }
       return next
     })
+  }
+
+  /**
+   * M2: the run's OPEN escalation request, if any. One per run, deliberately —
+   * and this is the DESIGN's own shape rather than a simplification.
+   *
+   * WHAT THE REQUEST MEANS. It is the working model reporting that the RUN
+   * could not make progress ("thinking effort maxed and it still failed", or a
+   * stall), so a later auto dispatch may draw a wider pool. It is not a
+   * statement about one role, and an engine that GUESSED a role here would
+   * widen the wrong pool: the first cut of this milestone did exactly that —
+   * a root-logged request landed on `executor` while the auditor dispatch it
+   * was meant for could never consume it, and an `audit` class name cannot
+   * even name which auditor was meant. Measured in this milestone's own test
+   * run, which is why the register holds ONE request per run and nothing about
+   * the caller is inferred.
+   *
+   * WHERE IT IS CONSUMED: inside `selectForRole`, i.e. by the next AUTO
+   * dispatch that actually runs a selection — whatever brought it there (no
+   * pin yet, a dead pin, rotation, or a healthy-pin branch forcing a
+   * re-selection). A dispatch that never selects (inherit/locked, or a
+   * degraded routing config) leaves the request OPEN for the next one, which
+   * is why this is a read-with-delete at the selection site rather than a hook
+   * on the dispatch path.
+   *
+   * WHY THAT IS SAFE. Widening a pool is not widening an authorization: the
+   * candidate set is still `policy ∩ live`, still filtered by the class's tier
+   * membership, and the auditor independence ordering still runs. A role that
+   * has nothing to gain from the widening simply ranks its (unchanged)
+   * authorized set. The one thing a request can never do is dispatch a route
+   * the session policy does not cover.
+   *
+   * Engine-local: a restart forgets an open request, and the requester asks
+   * again.
+   */
+  private takeEscalation(runId: RunId): { readonly seq: number; readonly note: string } | undefined {
+    const open = this.pendingEscalations.get(runId)
+    if (open === undefined) return undefined
+    this.pendingEscalations.delete(runId)
+    return open
   }
 
   async replan(caller: AgentRef, note: string): Promise<Snapshot> {
     const root = this.resolveRoot(caller)
     return this.transact(root.id, async () => {
-      const prior = this.require(root.id)
+      const prior = this.require(this.activeRunId(root.id))
       if (TERMINAL_PHASES.includes(prior.phase) || prior.phase === 'needs-owner-decision') {
         throw new AutopilotError(`cannot replan in phase ${prior.phase}`, 'AP_WRONG_PHASE')
       }
@@ -2173,7 +2848,7 @@ export class AutopilotEngine {
   async setBlocked(caller: AgentRef, reason: string): Promise<Snapshot> {
     const root = this.resolveRoot(caller)
     return this.transact(root.id, async () => {
-      const prior = this.require(root.id)
+      const prior = this.require(this.activeRunId(root.id))
       return await this.commit(prior, 'set-blocked', {
         ...prior,
         revision: prior.revision + 1,
@@ -2186,11 +2861,15 @@ export class AutopilotEngine {
   async setOwnerDecision(caller: AgentRef, reason: string): Promise<Snapshot> {
     const root = this.resolveRoot(caller)
     return this.transact(root.id, async () => {
-      const prior = this.require(root.id)
+      const prior = this.require(this.activeRunId(root.id))
       return await this.commit(prior, 'set-owner-decision', {
         ...prior,
         revision: prior.revision + 1,
         phase: 'needs-owner-decision',
+        // Pause tracking (governance pragmatics v1): remember where the run
+        // was paused FROM so owner-resolve(resume-execution) can restore it
+        // without destroying still-valid state.
+        pausedFrom: prior.phase,
         diagnostic: reason,
       })
     })
@@ -2201,7 +2880,7 @@ export class AutopilotEngine {
     const root = this.resolveRoot(caller)
     if (target.trim().length === 0) throw new AutopilotError('approval target is empty', 'AP_INVALID_ARGUMENT')
     return this.transact(root.id, async () => {
-      const prior = this.require(root.id)
+      const prior = this.require(this.activeRunId(root.id))
       const approval: OwnerApproval = {
         seq: prior.enforcement.ownerApprovals.length,
         target,
@@ -2215,11 +2894,166 @@ export class AutopilotEngine {
     })
   }
 
-  /** Owner-authority: resolve a needs-owner-decision pause. */
-  async ownerResolve(caller: AgentRef, request: { decision: 'resume-planning' | 'block'; note: string }): Promise<Snapshot> {
+  /**
+   * Owner-authority: pass a gate directly (DESIGN §9 item 8). The tool layer
+   * verifies the direct-human turn, exactly as it does for owner-approve and
+   * owner-resolve.
+   *
+   * WHAT THIS BUYS: the owner's own ruling that a gate is met, recorded as
+   * `owner` provenance together with the plan revision (the GENERATION) it was
+   * taken in and a monotonic ordinal. An audit objection that arrives
+   * afterwards is RECORDED and does not move that gate, and the other gate is
+   * never carried along — one owner decision, one gate. Ending the pass is an
+   * explicit `owner-gate-withdraw`.
+   *
+   * TWO COUPLINGS ARE KEPT DELIBERATELY:
+   * - the usage question: a plan gate that passed while the usage question was
+   *   unanswered would break the invariant the engine states everywhere else
+   *   ('at the revision where planGate becomes pass, the question was
+   *   answered'), so this path refuses with the same `AP_USAGE_UNDECLARED`
+   *   rather than routing around it;
+   * - evidence: the execution gate is only passable from
+   *   `execution-reviewing`, i.e. after the evidence report exists.
+   */
+  async ownerGatePass(caller: AgentRef, request: { gate: GateName; note: string }): Promise<Snapshot> {
     const root = this.resolveRoot(caller)
     return this.transact(root.id, async () => {
-      const prior = this.require(root.id)
+      const prior = this.require(this.activeRunId(root.id))
+      if (TERMINAL_PHASES.includes(prior.phase) || prior.phase === 'needs-owner-decision') {
+        throw new AutopilotError(`owner-gate-pass requires a live run, got phase ${prior.phase}`, 'AP_WRONG_PHASE')
+      }
+      const detail = { gate: request.gate, note: request.note }
+      if (request.gate === 'plan') {
+        if (prior.phase !== 'planning' && prior.phase !== 'plan-reviewing' && prior.phase !== 'replanning') {
+          throw new AutopilotError(
+            `owner-gate-pass plan requires phase planning|plan-reviewing|replanning, got ${prior.phase}`,
+            'AP_OWNER_GATE_INVALID',
+          )
+        }
+        if (prior.plan.text.trim().length === 0) {
+          throw new AutopilotError('owner-gate-pass plan requires a submitted plan', 'AP_OWNER_GATE_INVALID')
+        }
+        const usageProblems = usageDeclarationProblems(prior.usage)
+        if (usageProblems.length > 0) {
+          throw new AutopilotError(
+            `plan gate refused: usage evidence must be declared before the plan gate can pass: ${usageProblems.join('; ')}`,
+            'AP_USAGE_UNDECLARED',
+          )
+        }
+        return await this.commit(prior, 'owner-gate-pass', {
+          ...prior,
+          revision: prior.revision + 1,
+          phase: 'executing',
+          planGate: 'pass',
+          consecutiveReplans: 0,
+          ...(prior.planGatePassedAt === undefined ? { planGatePassedAt: new Date().toISOString() } : {}),
+          diagnostic: `owner gate pass (plan): ${request.note}`,
+        }, detail)
+      }
+      if (prior.phase !== 'execution-reviewing') {
+        throw new AutopilotError(
+          `owner-gate-pass execution requires phase execution-reviewing, got ${prior.phase}`,
+          'AP_OWNER_GATE_INVALID',
+        )
+      }
+      if (prior.executionPacket === undefined) {
+        throw new AutopilotError('owner-gate-pass execution requires submitted execution evidence', 'AP_OWNER_GATE_INVALID')
+      }
+      return await this.commit(prior, 'owner-gate-pass', {
+        ...prior,
+        revision: prior.revision + 1,
+        phase: 'closing',
+        executionGate: 'pass',
+        // THE EXECUTOR IS TERMINATED HERE, exactly as the execution-audit pass
+        // arm does it. Without this an owner-passed delegated run had
+        // `executor.state === 'running'` while the gate said pass, and
+        // `evaluateCompletion` refuses to complete a delegated run whose
+        // executor is not `completed` — so the owner's own ruling could not
+        // close the run it was about, and the only exits were a passing review
+        // or a withdrawal. The decision is the same kind of decision either
+        // way, so the state transition is the same.
+        executor: keepOrSetExecutorState(prior.executor, 'completed'),
+        diagnostic: `owner gate pass (execution): ${request.note}`,
+      }, detail)
+    })
+  }
+
+  /**
+   * Owner-authority: take back a gate pass the owner gave (DESIGN §9 item 8).
+   *
+   * The withdrawal is an APPENDED record carrying the ordinal it takes back, so
+   * that decision can never be resurrected: the gate falls back to what the
+   * run's own audit stream says at the current plan revision (or `pending` when
+   * this generation was never reviewed) — precisely the state the owner's pass
+   * had been standing in front of. Only the owner can do this, only for a gate
+   * they passed, and only once per decision.
+   */
+  async ownerGateWithdraw(caller: AgentRef, request: { gate: GateName; note: string }): Promise<Snapshot> {
+    const root = this.resolveRoot(caller)
+    return this.transact(root.id, async () => {
+      const prior = this.require(this.activeRunId(root.id))
+      if (TERMINAL_PHASES.includes(prior.phase) || prior.phase === 'needs-owner-decision') {
+        throw new AutopilotError(`owner-gate-withdraw requires a live run, got phase ${prior.phase}`, 'AP_WRONG_PHASE')
+      }
+      const history = prior.gateSources?.[request.gate]
+      if (history === undefined || history.source !== 'owner' || history.withdrawn === true) {
+        throw new AutopilotError(
+          `owner-gate-withdraw ${request.gate}: no owner pass is in force for this gate — an audit-derived gate is not the owner's to withdraw, and a decision already withdrawn has nothing left to take back`,
+          'AP_OWNER_GATE_NOT_PASSED',
+        )
+      }
+      if (history.planRevision !== prior.plan.revision) {
+        // A pass taken in an EARLIER generation is already superseded: a new plan
+        // submission, a replan or `owner-resolve(resume-planning)` ended it, so
+        // there is nothing left to take back and writing a withdrawal here would
+        // record a retraction of a ruling that no longer exists.
+        throw new AutopilotError(
+          `owner-gate-withdraw ${request.gate}: the owner's pass belongs to plan revision ${String(history.planRevision ?? 0)} and plan revision ${prior.plan.revision} is current — a superseded pass is already out of force, nothing to withdraw`,
+          'AP_OWNER_GATE_NOT_PASSED',
+        )
+      }
+      const detail = { gate: request.gate, note: request.note }
+      if (request.gate === 'plan') {
+        const value = withdrawnGateValue(prior, 'plan')
+        return await this.commit(prior, 'owner-gate-withdraw', {
+          ...prior,
+          revision: prior.revision + 1,
+          // The plan gate is no longer passed by the owner; when this
+          // generation was never reviewed the run returns to planning rather
+          // than pretending a plan it no longer approves is under execution.
+          phase: value === 'pass' ? prior.phase : 'planning',
+          planGate: value,
+          diagnostic: `owner gate withdraw (plan): ${request.note}`,
+        }, detail)
+      }
+      const value = withdrawnGateValue(prior, 'execution')
+      return await this.commit(prior, 'owner-gate-withdraw', {
+        ...prior,
+        revision: prior.revision + 1,
+        phase: value === 'pass' ? prior.phase : 'execution-reviewing',
+        executionGate: value,
+        diagnostic: `owner gate withdraw (execution): ${request.note}`,
+      }, detail)
+    })
+  }
+
+  /**
+   * Owner-authority: resolve a needs-owner-decision pause.
+   *
+   * Three rulings (governance pragmatics v1 adds resume-execution):
+   * - resume-execution: restore the paused-from phase with gates, packet,
+   *   executor and amendment binding byte-identical. The pause asked the
+   *   owner a question; the answer must not destroy still-valid state. Only
+   *   legal when the pause stamped pausedFrom (executing|execution-reviewing)
+   *   — a stream that predates pause tracking keeps resume-planning only.
+   * - resume-planning: the full reset (both gates pending, packet cleared) —
+   *   the original reading, kept for rulings that actually invalidate the plan.
+   * - block: terminal.
+   */
+  async ownerResolve(caller: AgentRef, request: { decision: 'resume-planning' | 'resume-execution' | 'block'; note: string }): Promise<Snapshot> {
+    const root = this.resolveRoot(caller)
+    return this.transact(root.id, async () => {
+      const prior = this.require(this.activeRunId(root.id))
       if (prior.phase !== 'needs-owner-decision') {
         throw new AutopilotError(`ownerResolve requires phase needs-owner-decision, got ${prior.phase}`, 'AP_WRONG_PHASE')
       }
@@ -2228,8 +3062,25 @@ export class AutopilotEngine {
           ...prior,
           revision: prior.revision + 1,
           phase: 'blocked',
+          pausedFrom: undefined,
           diagnostic: `owner ruling: ${request.note}`,
-        })
+        }, { decision: 'block' })
+      }
+      if (request.decision === 'resume-execution') {
+        if (prior.pausedFrom === undefined
+          || (prior.pausedFrom !== 'executing' && prior.pausedFrom !== 'execution-reviewing')) {
+          throw new AutopilotError(
+            'resume-execution requires a pause stamped pausedFrom=executing|execution-reviewing; this stream predates pause tracking — use resume-planning',
+            'AP_OWNER_RESUME_INVALID',
+          )
+        }
+        return await this.commit(prior, 'owner-resolve', {
+          ...prior,
+          revision: prior.revision + 1,
+          phase: prior.pausedFrom,
+          pausedFrom: undefined,
+          diagnostic: `owner ruling: ${request.note}`,
+        }, { decision: 'resume-execution' })
       }
       return await this.commit(prior, 'owner-resolve', {
         ...prior,
@@ -2239,8 +3090,10 @@ export class AutopilotEngine {
         executionGate: 'pending',
         consecutiveReplans: 0,
         executionPacket: undefined,
+        pausedFrom: undefined,
+        planAmendedAtRevision: undefined,
         diagnostic: `owner ruling: ${request.note}`,
-      })
+      }, { decision: 'resume-planning' })
     })
   }
 
@@ -2261,7 +3114,7 @@ export class AutopilotEngine {
       throw new AutopilotError(`usage declaration rejected: ${problems.join('; ')}`, 'AP_USAGE_INVALID')
     }
     return this.transact(root.id, async () => {
-      const prior = this.require(root.id)
+      const prior = this.require(this.activeRunId(root.id))
       const existing = prior.usage?.entries ?? []
       const replaced = existing.some(item => item.id === entry.id)
       const entries = replaced
@@ -2279,7 +3132,7 @@ export class AutopilotEngine {
   async submitCloseout(caller: AgentRef, closeout: Closeout): Promise<Snapshot> {
     const root = this.resolveRoot(caller)
     return this.transact(root.id, async () => {
-      const prior = this.require(root.id)
+      const prior = this.require(this.activeRunId(root.id))
       if (prior.phase !== 'closing') {
         throw new AutopilotError(`closeout requires phase closing, got ${prior.phase}`, 'AP_WRONG_PHASE')
       }
@@ -2295,11 +3148,40 @@ export class AutopilotEngine {
           firstKindProblem.code,
         )
       }
+      // Structured command records (governance pragmatics v2): optional, but
+      // when carried every record must state the command and its exit fact.
+      if (closeout.commandRecords !== undefined) {
+        for (const record of closeout.commandRecords) {
+          if (record.command.trim().length === 0 || record.exitStatus.trim().length === 0) {
+            throw new AutopilotError(
+              'closeout refused: every commandRecord needs a non-empty command and exitStatus',
+              'AP_INVALID_ARGUMENT',
+            )
+          }
+        }
+      }
+      // PARTIAL DELIVERY (governance pragmatics v1): the outcome label is
+      // DERIVED here and never trusted from the caller — 'partial' iff any
+      // criterion is unproven — and an unproven criterion requires a handoff
+      // whose openItems map the gaps one-to-one. The stamp below puts this
+      // stream on the new arm; unstamped (legacy) closeouts keep the old
+      // reading on replay.
+      const derivedOutcome: 'complete' | 'partial' = closeout.evidence.some(entry => entry.status === 'unproven')
+        ? 'partial'
+        : 'complete'
+      const enriched: Closeout = { ...closeout, outcome: derivedOutcome }
+      const handoffProblemsList = handoffProblems(enriched, prior.triage.acceptanceCriteria)
+      if (handoffProblemsList.length > 0) {
+        throw new AutopilotError(
+          `closeout refused: ${handoffProblemsList.join('; ')}`,
+          'AP_HANDOFF_INVALID',
+        )
+      }
       const candidate: Snapshot = {
         ...prior,
         revision: prior.revision + 1,
         phase: 'completed',
-        closeout,
+        closeout: enriched,
       }
       // Settlement runs HERE and not in the fold: it reads the filesystem, and
       // replay of an old stream must not depend on artifacts still being on
@@ -2320,6 +3202,7 @@ export class AutopilotEngine {
         // carries no information (DESIGN.md §5).
         settledAt: new Date().toISOString(),
         requireKind: true,
+        requireHandoff: true,
       })
       if (!check.ok) {
         throw new AutopilotError(`completion refused: ${check.problems.join('; ')}`, 'AP_COMPLETION_REFUSED')
@@ -2327,15 +3210,27 @@ export class AutopilotEngine {
       // The format stamp. It says what THIS writer guaranteed, so a later
       // replay can hold this event to the current rule without holding older
       // events to a rule that did not exist when they were written.
-      return await this.commit(prior, 'submit-closeout', candidate, { evidenceKinds: 1 })
+      return await this.commit(prior, 'submit-closeout', candidate, { evidenceKinds: 1, closeoutHandoff: 1 })
     })
   }
 
   // ── Read surfaces for gate/policy/tools (no root-authority requirement) ──
 
-  /** Peek the run rooted at one session id (undefined when none). */
-  peek(rootSessionId: string): Snapshot | undefined {
-    return this.current(rootSessionId)
+  /**
+   * Peek one run by its own id. A historical run stays readable after the
+   * session has moved on; this does not follow the session's current pointer.
+   */
+  peek(runId: string): Snapshot | undefined {
+    return this.current(runId)
+  }
+
+  /**
+   * The run the session is on now. The first run's id is the session id, so
+   * a store with no index answers that run. After a successor starts, this
+   * follows the index rather than the finished first run.
+   */
+  peekActive(sessionId: string): Snapshot | undefined {
+    return this.current(this.activeRunId(sessionId))
   }
 
   /**
@@ -2393,7 +3288,7 @@ export class AutopilotEngine {
 
   executorStatus(caller: AgentRef): { generation: number; executionRevision: number } | undefined {
     const root = this.resolveRoot(caller)
-    const snapshot = this.current(root.id)
+    const snapshot = this.current(this.activeRunId(root.id))
     if (snapshot?.executor === undefined) return undefined
     return { generation: snapshot.executor.generation, executionRevision: snapshot.executor.executionRevision }
   }
@@ -2420,7 +3315,7 @@ export class AutopilotEngine {
    */
   async consumeApproval(rootSessionId: string, command: string): Promise<number | undefined> {
     return this.transact(rootSessionId, async () => {
-      const prior = this.current(rootSessionId)
+      const prior = this.current(this.activeRunId(rootSessionId))
       if (prior === undefined) return undefined
       const open = prior.enforcement.ownerApprovals.find(entry =>
         entry.consumedBy === undefined && approvalAuthorizes(entry.target, command))
@@ -2433,6 +3328,49 @@ export class AutopilotEngine {
         enforcement: { ...prior.enforcement, ownerApprovals: approvals },
       }, { seq: open.seq, command: command.slice(0, 500) })
       return open.seq
+    })
+  }
+
+  /**
+   * Record one egress ask/deny decision on the run (unattended-approval
+   * visibility, P1). The pre-execute seam calls this so the outcome is durable
+   * and readable from autopilot_status (`enforcement.egressDecisions`) and the
+   * event stream — an unattended run never sits on a silent pending ask, and a
+   * refused egress names its recovery path. Append-only; never gates anything.
+   * @returns the recorded decision's seq, or undefined when no run is bound.
+   */
+  async recordEgressOutcome(rootSessionId: string, decision: {
+    readonly outcome: 'asked' | 'denied-unattended'
+    readonly target: string
+    readonly commands: readonly string[]
+    readonly command: string
+    readonly manifestPath: string
+    readonly at: string
+    readonly recovery?: string
+  }): Promise<number | undefined> {
+    return this.transact(rootSessionId, async () => {
+      const prior = this.current(this.activeRunId(rootSessionId))
+      if (prior === undefined) return undefined
+      const entry: EgressDecision = {
+        seq: prior.enforcement.egressDecisions?.length ?? 0,
+        outcome: decision.outcome,
+        target: decision.target,
+        commands: [...decision.commands],
+        command: decision.command.slice(0, 500),
+        manifestPath: decision.manifestPath,
+        at: decision.at,
+        ...(decision.recovery === undefined ? {} : { recovery: decision.recovery }),
+      }
+      await this.commit(prior, 'log', {
+        ...prior,
+        revision: prior.revision + 1,
+        logCount: prior.logCount + 1,
+        enforcement: {
+          ...prior.enforcement,
+          egressDecisions: [...(prior.enforcement.egressDecisions ?? []), entry],
+        },
+      }, entry)
+      return entry.seq
     })
   }
 
@@ -2453,7 +3391,7 @@ export class AutopilotEngine {
     readonly target: string
   }): Promise<number | undefined> {
     return this.transact(rootSessionId, async () => {
-      const prior = this.current(rootSessionId)
+      const prior = this.current(this.activeRunId(rootSessionId))
       if (prior === undefined) return undefined
       const consumed = (prior.enforcement.outboundConsumed ?? 0) + 1
       const next = await this.commit(prior, 'consume-manifest', {
@@ -2468,7 +3406,7 @@ export class AutopilotEngine {
   /** Bump the turn-stop reminder counter; returns the new count, or undefined when the budget is spent. */
   async bumpReminder(rootSessionId: string): Promise<number | undefined> {
     return this.transact(rootSessionId, async () => {
-      const prior = this.current(rootSessionId)
+      const prior = this.current(this.activeRunId(rootSessionId))
       if (prior === undefined) return undefined
       if (prior.enforcement.reminders >= MAX_STOP_REMINDERS) return undefined
       const next = await this.commit(prior, 'reminder', {
@@ -2481,6 +3419,204 @@ export class AutopilotEngine {
   }
 
   // ── Internals ─────────────────────────────────────────────────────────────
+
+  /** The run id the session is working on. No index means the first run, whose id is the session id. */
+  private activeRunId(sessionId: string): RunId {
+    const index = this.store.readSessionIndex(sessionId)
+    return index === undefined ? sessionId : index.currentRunId
+  }
+
+  /**
+   * Id for the next run in a session that already finished one.
+   * `.r2`, `.r3`, … stay inside the store's filename alphabet, so the path
+   * sanitizer does not merge two runs into one directory.
+   */
+  private successorRunId(sessionId: string): RunId {
+    const count = this.store.readSessionIndex(sessionId)?.runIds.length ?? 1
+    return `${sessionId}.r${count + 1}`
+  }
+
+  /** The live root agent for a run. A successor run's id is not an agent id. */
+  private sessionAgent(snapshot: Snapshot): AgentRef | undefined {
+    return this.agents.get(snapshot.sessionId ?? snapshot.runId)
+  }
+
+  private usesActivationApi(): boolean {
+    return typeof this.subagents.startActivation === 'function'
+  }
+
+  /**
+   * Allow-list waiting for the child `agent/created` listener. dsh 0.2.1's
+   * `startActivation` does not take `toolFilter`, so the listener applies it
+   * before the child's first prompt. Absent on the 0.2.0 surface, which still
+   * passes the filter into `start` / `startContinuable`.
+   */
+  private readonly armedAllows = new Map<string, {
+    allow: readonly string[]
+    required: readonly string[]
+    label: string
+    applied: boolean
+  }>()
+
+  /**
+   * Apply the allow-list armed for this parent, if one is armed and not yet
+   * applied. The mount listener calls this from `agent/created`. A second
+   * call is a no-op so a remount sweep does not restrict twice.
+   */
+  restrictArmedChild(parentId: string, restrict: (allow: readonly string[]) => void): void {
+    const armed = this.armedAllows.get(parentId)
+    if (armed === undefined || armed.applied) return
+    try {
+      restrict(armed.allow)
+    } catch (error) {
+      // One child id is reserved for the whole start. A restrict rejection
+      // must be repaired here: dispatchWithToolAllow's second attempt would
+      // reuse that id and the host answers "already exists".
+      const parsed = parseRestrictRejection(errorMessage(error))
+      if (parsed === undefined) throw error
+      this.learnedToolNames = parsed.known
+      const repaired = resolveToolAllow(armed.allow, parsed.known, armed.required, armed.label)
+      restrict(repaired.allow)
+      armed.allow = repaired.allow
+    }
+    armed.applied = true
+  }
+
+  private armChildAllow(parentId: string, allow: readonly string[], required: readonly string[], label: string): void {
+    this.armedAllows.set(parentId, { allow, required, label, applied: false })
+  }
+
+  private disarmChildAllow(parentId: string): void {
+    this.armedAllows.delete(parentId)
+  }
+
+  private assertChildAllowApplied(parentId: string): void {
+    const armed = this.armedAllows.get(parentId)
+    if (armed !== undefined && !armed.applied) {
+      throw new AutopilotError(
+        'the host started a child without applying the autopilot tool allow-list',
+        'AP_TOOL_ALLOW_UNAPPLIED',
+      )
+    }
+  }
+
+  private async startOneShot(
+    root: AgentRef,
+    provider: string,
+    prompt: string,
+    outputSchema: object,
+    agentOptions: AgentOptionsLike | undefined,
+    allow: readonly string[],
+    label: string,
+  ): Promise<SubagentRunRef> {
+    if (this.usesActivationApi()) {
+      this.armChildAllow(root.id, allow, AUDITOR_TOOL_REQUIRED, label)
+      try {
+        const activation = await this.subagents.startActivation!({
+          provider,
+          label,
+          request: {
+            prompt: [{ type: 'text', text: prompt }],
+            parent: root,
+            outputSchema,
+            maxDepth: 1,
+            ...(agentOptions === undefined ? {} : { agentOptions }),
+          },
+          signal: this.lifecycle.signal,
+          delivery: 'caller',
+        })
+        this.assertChildAllowApplied(root.id)
+        return {
+          id: activation.childId,
+          result: activation.result,
+          dispose: () => activation.dispose(),
+        }
+      } catch (error) {
+        if (error instanceof AutopilotError) throw error
+        const err = error instanceof Error ? error : new Error(String(error))
+        const stack = (err.stack ?? '').split('\n').slice(0, 8).join('\n')
+        throw new AutopilotError(`${err.message}\n${stack}`, 'AP_SUBAGENT_SURFACE')
+      } finally {
+        this.disarmChildAllow(root.id)
+      }
+    }
+    const start = this.subagents.start
+    if (start === undefined) {
+      throw new AutopilotError('the host subagent service has neither start nor startActivation', 'AP_SUBAGENT_SURFACE')
+    }
+    return start(provider, {
+      prompt: [{ type: 'text', text: prompt }],
+      parent: root,
+      outputSchema,
+      maxDepth: 1,
+      toolFilter: { allow },
+      signal: this.lifecycle.signal,
+      ...(agentOptions === undefined ? {} : { agentOptions }),
+    })
+  }
+
+  private async startContinuableChild(
+    root: AgentRef,
+    provider: string,
+    childId: string,
+    prompt: string,
+    persona: string | undefined,
+    agentOptions: AgentOptionsLike | undefined,
+    allow: readonly string[],
+    signal: AbortSignal,
+  ): Promise<void> {
+    if (this.usesActivationApi()) {
+      this.armChildAllow(root.id, allow, [], 'executor child')
+      try {
+        await this.subagents.startActivation!({
+          provider,
+          label: 'autopilot-executor',
+          childId,
+          request: {
+            prompt: [{ type: 'text', text: prompt }],
+            parent: root,
+            maxDepth: 1,
+            ...(agentOptions === undefined ? {} : { agentOptions }),
+          },
+          signal,
+          delivery: 'caller',
+        })
+        this.assertChildAllowApplied(root.id)
+        return
+      } finally {
+        this.disarmChildAllow(root.id)
+      }
+    }
+    const startContinuable = this.subagents.startContinuable
+    if (startContinuable === undefined) {
+      throw new AutopilotError('the host subagent service has neither startContinuable nor startActivation', 'AP_SUBAGENT_SURFACE')
+    }
+    await startContinuable({
+      childId,
+      provider,
+      label: 'autopilot-executor',
+      request: {
+        prompt: [{ type: 'text', text: prompt }],
+        parent: root,
+        ...(persona === undefined ? {} : { persona }),
+        toolFilter: { allow },
+        ...(agentOptions === undefined ? {} : { agentOptions }),
+      },
+      signal,
+    })
+  }
+
+  private async releaseChild(root: AgentRef, childId: string): Promise<void> {
+    if (typeof this.subagents.drainChildren === 'function') {
+      await this.subagents.drainChildren(root, [childId])
+      return
+    }
+    const drain = this.subagents.drainContinuableChildren
+    if (drain === undefined) {
+      throw new AutopilotError('the host subagent service has neither drainChildren nor drainContinuableChildren', 'AP_SUBAGENT_SURFACE')
+    }
+    await drain(root, [childId])
+  }
 
   private resolveRoot(caller: AgentRef): AgentRef {
     const live = this.agents.get(caller.id)
@@ -2568,8 +3704,9 @@ export class AutopilotEngine {
     if (!this.plannerRoutingActive()) return
     this.plannerReloadStamps.add(runId)
     if (this.plannerInstalls.has(runId)) return
-    if (this.agents.get(runId) === undefined) return
-    void this.transact(runId, async () => {
+    const sessionId = loaded.sessionId ?? runId
+    if (this.agents.get(sessionId) === undefined) return
+    void this.transact(sessionId, async () => {
       if (this.lifecycle.signal.aborted) return
       if (this.plannerInstalls.has(runId)) return
       const snapshot = this.current(runId)
@@ -2729,27 +3866,46 @@ export class AutopilotEngine {
         }
       }
     }
+    // ── GATE LEDGER + EXECUTOR-DISPATCH LEDGER (DESIGN §9 items 8 and 15) ──
+    //
+    // Both fields are DERIVED here by the same shared function the fold
+    // re-derives with, so the committed snapshot carries no author-chosen
+    // provenance: an owner gate pass records its generation (plan revision)
+    // and ordinal, a withdrawal keeps the ordinal it took back, and the
+    // executor rotation ordinal comes from this run's own dispatch count. A
+    // legacy stream (field absent, never written) keeps folding exactly as it
+    // did, and the fold refuses the moment the two derivations disagree.
+    const ledger = applyGateLedger(
+      prior,
+      { op, ...(stampedDetail === undefined ? {} : { detail: stampedDetail }) },
+      scoped,
+    )
+    const committed: Snapshot = {
+      ...scoped,
+      ...(ledger.gateSources === undefined ? {} : { gateSources: ledger.gateSources }),
+      ...(ledger.executorDispatches === undefined ? {} : { executorDispatches: ledger.executorDispatches }),
+    }
     const candidate: RunEvent = {
       v: 1,
       op,
-      revision: scoped.revision,
+      revision: committed.revision,
       time: new Date().toISOString(),
-      snapshot: scoped,
+      snapshot: committed,
       ...(stampedDetail === undefined ? {} : { detail: stampedDetail }),
     }
     try {
       applyEvent(prior, candidate)
-      await this.store.commit(scoped.runId, op, scoped, stampedDetail)
+      await this.store.commit(committed.runId, op, committed, stampedDetail)
     } catch (error: unknown) {
       // The transition did not happen; whatever arm state this call created
       // must not survive it (disposed AND deleted — a retried transition
       // re-resolves from current facts instead of trusting a stale arm).
-      if (armedHere) this.disposePlanner(scoped.runId)
+      if (armedHere) this.disposePlanner(committed.runId)
       throw error
     }
-    this.cache.set(scoped.runId, scoped)
-    if (wasPlanning && !isPlanning) this.disposePlanner(scoped.runId)
-    return scoped
+    this.cache.set(committed.runId, committed)
+    if (wasPlanning && !isPlanning) this.disposePlanner(committed.runId)
+    return committed
   }
 
   private transact<T>(runId: RunId, operation: () => Promise<T>): Promise<T> {
@@ -3322,7 +4478,7 @@ export class AutopilotEngine {
     const routing = live.routing
     const roleRouting = routing.roles[role]
     const policy = this.readPolicy(root)
-    const catalog = this.routingPorts.catalog
+    const catalog = this.catalog
 
     if (role === 'planner') {
       // The planner IS the root agent (plan "Roles and routing"); it is routed
@@ -3454,6 +4610,75 @@ export class AutopilotEngine {
         if (dead === undefined) {
           dead = this.pinStillAuthorized(role, pinRoute, policy)
         }
+        // M4 + DESIGN §9 item 15 (closed here): owner-opted engine-level
+        // rotation. A HEALTHY pin yields to a full re-selection when
+        // `routing.ladder.rotation` is on — the SAME selectForRole path a
+        // first dispatch walks (authorization, preflight and audit
+        // independence all re-run; a rotation that blocks, e.g.
+        // AP_ROUTE_NO_REACHABLE_WORK_CLASS, escalates instead of keeping the
+        // pin). The rotation ordinal is derived from the run's own stream
+        // inside selectForRole (replay-safe, no mutable counter), and the
+        // selector applies the offset only WITHIN the group it may permute:
+        // for an auditor that is the top independence class (§1.2: rotation
+        // does not override independence), for the executor there is no
+        // independence constraint of its own, so the offset walks the ranked
+        // survivor list.
+        //
+        // WHY EXECUTOR ROTATION IS SAFE HERE, stated as a property of the call
+        // graph rather than a promise: `resolveRoleRoute('executor')` is called
+        // by `startExecutor` ONLY, i.e. at a NEW dispatch boundary. A live child
+        // is continued by `resumeExecutor`, which re-uses the child's own
+        // recorded route and never reaches this method — so continuity inside a
+        // running executor is preserved by construction. Under
+        // `executionMode: 'inline'` there is no executor dispatch at all, so
+        // nothing is rotated and nothing is claimed.
+        // Default off leaves the reuse semantics below untouched.
+        if (dead === undefined && routing.ladder.rotation
+          && (AUDITOR_ROLE_SET.includes(role) || role === 'executor')) {
+          const rotated = await this.selectForRole(role, routing.preference, routing.preferenceSource, roleRouting, prior, policy, catalog, routing.ladder, routing.workClasses)
+          return this.decorateRepinned(
+            this.resolutionOfDecision(role, roleRouting, rotated, undefined),
+            {
+              provider: pin.provider,
+              model: pin.model,
+              ...(pin.reasoningEffort === undefined ? {} : { reasoningEffort: pin.reasoningEffort }),
+            },
+            role === 'executor'
+              ? 'rotation: routing.ladder.rotation is on — this executor dispatch re-selects instead of reusing its healthy pin (the pin was live, preflighted and authorized when this decision started); a LIVE executor child is never re-routed, so continuity is preserved'
+              : 'rotation: routing.ladder.rotation is on — this auditor role re-selects instead of reusing its healthy pin (the pin was live, preflighted and authorized when this decision started)',
+          )
+        }
+        // M2 (DESIGN §1.2 "升档是请求，不是预测"): an OPEN escalation request
+        // for this role forces a re-selection even though the pin is healthy.
+        //
+        // WHY THIS BRANCH MUST EXIST — measured, not assumed: a healthy auto
+        // pin is REUSED and the selection path is never entered (the whole
+        // point of the reuse branch above), so consuming a request only inside
+        // `selectForRole` left the request unreadable on the one path the
+        // request exists for. `先试 economy` pins economy on the first
+        // dispatch; without this branch the resume reuses that pin forever and
+        // the request is a no-op. Rotation is not a substitute: it is a
+        // whole-list offset the owner opted into, and it can fire for an
+        // auditor or for the executor (DESIGN §9 item 15).
+        //
+        // PLACEMENT IS LOAD-BEARING. It sits AFTER both the dead-pin re-select
+        // above and the rotation branch: a DEAD pin already re-selects (and
+        // must keep recording its own `repinFrom` reason), and rotation is an
+        // owner-level policy that this request must not pre-empt.
+        // The request is consumed HERE, in the branch that acts on it, so a
+        // dispatch that never reaches this point cannot eat it.
+        if (dead === undefined && this.pendingEscalations.has(prior.runId)) {
+          const escalated = await this.selectForRole(role, routing.preference, routing.preferenceSource, roleRouting, prior, policy, catalog, routing.ladder, routing.workClasses)
+          return this.decorateRepinned(
+            this.resolutionOfDecision(role, roleRouting, escalated, undefined),
+            {
+              provider: pin.provider,
+              model: pin.model,
+              ...(pin.reasoningEffort === undefined ? {} : { reasoningEffort: pin.reasoningEffort }),
+            },
+            'escalation request: an OPEN work-class escalation request is recorded for this run — this role re-selects instead of reusing its healthy pin, and the selection consumes the request and widens the pool it may draw from; the widened pool still passes the session-policy intersection, the tier membership and the independence rules',
+          )
+        }
         if (dead === undefined) {
           // F9 (PR #2 Codex round 4): the reuse label's pool inference is
           // auditor-only, mirroring pinStillAuthorized. Persist/recover
@@ -3540,7 +4765,7 @@ export class AutopilotEngine {
             },
           }
         }
-        const reselected = await this.selectForRole(role, routing.preference, roleRouting, prior, policy, catalog)
+        const reselected = await this.selectForRole(role, routing.preference, routing.preferenceSource, roleRouting, prior, policy, catalog, routing.ladder, routing.workClasses)
         core = this.decorateRepinned(
           this.resolutionOfDecision(role, roleRouting, reselected, undefined),
           {
@@ -3551,10 +4776,10 @@ export class AutopilotEngine {
           dead,
         )
       } else {
-        core = this.resolutionOfDecision(role, roleRouting, await this.selectForRole(role, routing.preference, roleRouting, prior, policy, catalog), undefined)
+        core = this.resolutionOfDecision(role, roleRouting, await this.selectForRole(role, routing.preference, routing.preferenceSource, roleRouting, prior, policy, catalog, routing.ladder, routing.workClasses), undefined)
       }
     } else {
-      core = this.resolutionOfDecision(role, roleRouting, await this.selectForRole(role, routing.preference, roleRouting, prior, policy, catalog), undefined)
+      core = this.resolutionOfDecision(role, roleRouting, await this.selectForRole(role, routing.preference, routing.preferenceSource, roleRouting, prior, policy, catalog, routing.ladder, routing.workClasses), undefined)
       // F16 (PR #2 Codex round 7): a locked dispatch is COMPOSED here
       // (lock route + riding legacy tuning — `lockedAgentOptions`), and the
       // composed object — not just the bare lock the selector validated — is
@@ -3930,13 +5155,129 @@ export class AutopilotEngine {
   private async selectForRole(
     role: Role,
     preference: RoutePreference,
+    preferenceSource: 'explicit' | 'default',
     roleRouting: RoleRouting,
     prior: Snapshot,
     policy: SessionPolicyState,
     catalog: RouteCatalog,
+    ladder: ResolvedLadder,
+    workClasses: Readonly<Record<WorkClassName, ResolvedWorkClass>>,
   ): Promise<SelectionDecision> {
     const executorPin = AUDITOR_ROLE_SET.includes(role) ? this.executorPinOf(prior) : undefined
-    return await selectRoute({
+    // M2: an OPEN escalation request is consumed HERE — at the selection, not on
+    // the dispatch path — so every auto selection widens (a first selection, a
+    // dead-pin re-selection, a rotation, and the healthy-pin branch that forces
+    // one), and a dispatch that never selects leaves the request open for the
+    // next one.
+    const escalation = roleRouting.mode === 'auto' ? this.takeEscalation(prior.runId) : undefined
+    // WORK CLASS (DESIGN §1.2; §9 items 13/14): the class this auto-role
+    // dispatch draws from — the owner's per-role override, else the role
+    // default — resolved against the live ladder. `ladder.auditTier`, when
+    // set, is the owner's explicit override of the AUDIT class's tier
+    // mapping (auditor roles only; owner-explicit beats the seeded mapping,
+    // and the selector's why names it). Locked/inherit roles make no
+    // selection, so no class is computed for them.
+    // M2 (DESIGN §1.2 "升档是请求，不是预测"): a REQUESTED escalation widens
+    // the pool to ESCALATION_TIERS and makes the class APPLY (engaged), and
+    // nothing else about the resolution changes — every threshold, the
+    // authorization intersection, the tier membership and the independence
+    // ordering run exactly as they do without a request. Two boundaries are
+    // deliberate and stated rather than implied:
+    //
+    //  - The owner's OWN mapping for the class beats the request's floor
+    //    (owner-explicit is the highest authority in the routing order), so a
+    //    deployment that wrote `routing.workClasses.hard.tiers` keeps it.
+    //  - The class NAME is unchanged: a request does not silently reclassify a
+    //    role, it widens the class that role already draws from. The class axis
+    //    (cost-first for `hard`) comes with that class, which is why the
+    //    widened pool is ranked by the requester's own economics rather than by
+    //    an invented one.
+    const workClass =
+      roleRouting.mode === 'auto'
+        ? (() => {
+            const className = roleRouting.workClass ?? DEFAULT_ROLE_WORK_CLASS[role]
+            // WHICH CLASS A REQUESTED WIDENING RESOLVES THROUGH: `hard` — the
+            // class a request raises to — unless the role's OWN class IS `hard`,
+            // in which case that same class. `hard` is also the class whose
+            // mapping the owner's authority is tested on, because the pool a
+            // request opens IS that class's pool whether or not the owner wrote
+            // its tiers. (Measured: testing the ROLE's class here — `audit` for
+            // every auditor — silently ignored an owner-written
+            // `routing.workClasses.hard.tiers` and widened anyway.)
+            const escalationClass = 'hard' as WorkClassName
+            const mappedClass =
+              escalation === undefined || className === escalationClass ? className : escalationClass
+            const resolved = workClasses[mappedClass]
+            const seeded = DEFAULT_WORK_CLASSES[mappedClass]
+            // The owner's mapping differs from the owner table ⇒ they wrote it.
+            // ONE definition of "the owner wrote a mapping", used by both arms.
+            const classOwnerMapped =
+              resolved.axis !== seeded.axis ||
+              resolved.tiers.length !== seeded.tiers.length ||
+              resolved.tiers.some((tier, index) => tier !== seeded.tiers[index])
+            // The effective mapping: a REQUEST's own floor (ESCALATION_TIERS)
+            // unless the owner wrote the escalation class's tiers, which stand
+            // (owner-explicit is the highest authority in the routing order).
+            const effectiveClasses =
+              escalation !== undefined && !classOwnerMapped
+                ? { ...workClasses, [mappedClass]: { ...workClasses[mappedClass], tiers: ESCALATION_TIERS } }
+                : workClasses
+            // The plain arm keeps its engagement rule verbatim: a per-role
+            // assignment or a written class engages the machinery; with neither
+            // and an empty ladder the selection is recorded, not applied
+            // (0.2.0 parity — DESIGN §1.2). A REQUEST engages it by definition
+            // — that is the whole content of "被请求".
+            const ownerOverridden =
+              escalation !== undefined
+                ? true
+                : roleRouting.workClass !== undefined || classOwnerMapped
+            // ONE resolution for both arms, so the member set is always derived
+            // from the mapping that actually applies. (Measured twice: replacing
+            // `tiers` alone left `members` as the un-escalated union, so the
+            // why-line announced the widened tiers while the filter still admitted
+            // only the old members.)
+            return resolveWorkClassSelection(
+              effectiveClasses,
+              ladder.tiers,
+              mappedClass,
+              AUDITOR_ROLE_SET.includes(role) ? ladder.auditTier : undefined,
+              ownerOverridden,
+            )
+          })()
+        : undefined
+    // M3 (DESIGN §9-14/16): refresh the run's work-class reachability report
+    // from the SAME cached catalog snapshot this decision is about to read
+    // (RouteCatalog caches per commit, so this is one read, not two). The
+    // auditTier override reaches the report exactly as it reaches the
+    // selector — the report must answer with the effective audit mapping,
+    // never the superseded seeded one.
+    const catalogSnapshot = await catalog.snapshot()
+    this.reachabilityReports.set(
+      prior.runId,
+      workClassReachability(
+        {
+          catalogStatus: catalogSnapshot.catalogStatus,
+          models: catalogSnapshot.listedModels,
+          failedProviders: [...catalogSnapshot.providerErrors.keys()],
+        },
+        { tiers: ladder.tiers },
+        workClasses,
+        ladder.auditTier,
+      ),
+    )
+    // The rotation ordinal (owner coverage requirement): for an auditor, how
+    // many audit records this role's mapped audit role already holds in the
+    // run's OWN durable stream; for the EXECUTOR (DESIGN §9 item 15), how many
+    // executor dispatches this run has already started. Both are DERIVED from
+    // the stream, never a mutable counter, so replay recomputes the same
+    // ordinal. The mapping is fold.ts's AUDIT_ROLE_OF_ROUTING_ROLE (routing
+    // role -> audit role); the engine's own `routeRoleOf` is the INVERSE and is
+    // deliberately NOT used here.
+    const auditRole = AUDIT_ROLE_OF_ROUTING_ROLE[role]
+    const rotation = role === 'executor'
+      ? (prior.executorDispatches ?? 0)
+      : auditRole === undefined ? undefined : prior.audits.filter((record) => record.role === auditRole).length
+    const decision = await selectRoute({
       role,
       risk: prior.triage.risk,
       // F2: the preference as read at THIS decision's start, passed down so a
@@ -3950,7 +5291,61 @@ export class AutopilotEngine {
       // dispatch ([R2-P2-2b] — pins stabilize routes, not judgments).
       ...(executorPin === undefined ? {} : { executorPin }),
       independenceFloor: this.config.crossFamily.minRisk,
+      // The owner's ladder: cost overrides and the declared speed order reach
+      // the selector, so an owner override changes the selected route.
+      ...routingAxisInput(ladder),
+      ...(rotation === undefined ? {} : { rotation }),
+      ...(workClass === undefined ? {} : { workClass }),
+      // Mechanical entry is an EFFORT LICENSE (owner table: holders of a
+      // real `low` effort; `low` absent ⇒ disqualified) — a fail-closed
+      // sufficiency threshold, never a ranking axis.
+      ...(workClass?.name === 'mechanical' ? { requirements: { effortIds: ['low'] } } : {}),
     })
+    // A2 (DESIGN section 9 item 13): the one preference transition a record
+    // must never hide — the owner wrote no explicit preference and the
+    // `routing.orderingAxisDefault` opt-in promoted the effective preference
+    // to axis. Explicit preferences and the plain shipped default say what
+    // they are in the selector's own preference line; the promotion does not.
+    // M2: a requested widening is never silent — the reader of `detail.routing`
+    // must be able to see that the pool grew because something ASKED, and what
+    // evidence the request carried.
+    if (escalation !== undefined && 'why' in decision) {
+      // NAME THE TIERS THAT ACTUALLY APPLIED. The owner's own mapping wins over
+      // the request's floor, so an unconditional "widened to economy + standard
+      // + reserve" would be FALSE on a deployment that wrote
+      // `routing.workClasses.<class>.tiers` — the request was consumed, and the
+      // pool followed the owner's mapping instead. The record says which of the
+      // two happened, because the reader's next question is exactly that.
+      const applied = workClass?.tiers ?? []
+      const widened = applied.length > 0 && applied.join(' + ') === ESCALATION_TIERS.join(' + ')
+      // NAME THE CLASS WHOSE MAPPING STANDs — the ESCALATION class a request
+      // resolves through (`hard`), not necessarily `workClass.name`: a request
+      // raises the pool to `hard` even for a role whose own class is `audit`, so
+      // naming `audit` there would point the reader at a mapping that had nothing
+      // to do with the pool.
+      const mappingClass = workClass?.name === 'hard' ? workClass.name : 'hard'
+      return {
+        ...decision,
+        why: [
+          ...decision.why,
+          `escalation request: seq ${String(escalation.seq)} — ${escalation.note} (the working model asked for a higher ceiling; ` +
+            (widened
+              ? `the pool widened to ${applied.join(' + ')} for this dispatch only`
+              : `the owner's mapping for routing.workClasses.${mappingClass}.tiers ${applied.length > 0 ? applied.join(' + ') : '(no tiers)'} stands against the request's own floor of ${ESCALATION_TIERS.join(' + ')} — owner-explicit is the higher authority`) +
+            ', and every threshold, the authorization intersection and the independence rules still applied)',
+        ],
+      }
+    }
+    if (preferenceSource === 'default' && preference === 'axis' && 'why' in decision) {
+      return {
+        ...decision,
+        why: [
+          ...decision.why,
+          'preference source: default — no explicit routing.preference is detectable; routing.orderingAxisDefault promoted the effective preference to axis (an explicit preference would have been used verbatim)',
+        ],
+      }
+    }
+    return decision
   }
 
   /** Which config surface named a locked route, for the grant's `source` field. */
@@ -4037,6 +5432,7 @@ export class AutopilotEngine {
         pin: routePin,
         why,
         authorizationSource: decision.authorizationSource,
+        ...(decision.costMatch === undefined ? {} : { costMatch: decision.costMatch }),
         ...(decision.fallbackFrom === undefined ? {} : { fallbackFrom: decision.fallbackFrom }),
         ...(decision.candidatesConsidered === undefined ? {} : { candidates: [...decision.candidatesConsidered] }),
         ...(repinFrom === undefined ? {} : { repinFrom }),
@@ -4069,6 +5465,7 @@ export class AutopilotEngine {
       ...prior,
       revision: prior.revision + 1,
       phase: 'needs-owner-decision',
+      pausedFrom: prior.phase,
       diagnostic: `routing-escalation: ${reason}`,
     })
     throw new AutopilotError(
@@ -4162,6 +5559,7 @@ export class AutopilotEngine {
         roleRouting,
         policy,
         catalog,
+        ...routingAxisInput(routing.ladder),
       })
       if (decision.kind === 'route') return { kind: 'route', route: decision.route, why: decision.why }
       if (decision.kind === 'inherit') return { kind: 'inherit' }
@@ -4181,6 +5579,7 @@ export class AutopilotEngine {
       roleRouting,
       policy,
       catalog,
+      ...routingAxisInput(routing.ladder),
     })
     if (decision.kind === 'route') return { kind: 'route', route: decision.route, why: decision.why }
     if (decision.kind === 'inherit') return { kind: 'inherit' }
@@ -4195,7 +5594,7 @@ export class AutopilotEngine {
    * decision, which records NOTHING.
    */
   private async armPlannerSelection(runId: RunId, next: Snapshot): Promise<PlannerRoutingRecord | undefined> {
-    const decision = await this.resolvePlannerRoute(this.agents.get(runId), next)
+    const decision = await this.resolvePlannerRoute(this.sessionAgent(next), next)
     return await this.armPlannerDecision(runId, decision)
   }
 
@@ -4208,7 +5607,8 @@ export class AutopilotEngine {
    * planning-phase commit's change detection compares against.
    */
   private async armPlannerDecision(runId: RunId, decision: PlannerRouteDecision): Promise<PlannerRoutingRecord | undefined> {
-    const root = this.agents.get(runId)
+    const rooted = this.current(runId)
+    const root = rooted === undefined ? this.agents.get(runId) : this.sessionAgent(rooted)
     const decisionKey = plannerDecisionKeyOf(decision)
     // F25 (PR #2 Codex round 13): the arm may land here AFTER dispose()
     // swept — the caller awaited planner route resolution (catalog/policy
@@ -4302,7 +5702,7 @@ export class AutopilotEngine {
     const state = this.plannerInstalls.get(runId)
     if (state === undefined) return undefined
     const previousDecision: PlannerDecisionKey = state.kind === 'inherit' ? { kind: 'inherit' } : state.decision
-    const decision = await this.resolvePlannerRoute(this.agents.get(runId), next)
+    const decision = await this.resolvePlannerRoute(this.sessionAgent(next), next)
     if (samePlannerDecision(previousDecision, plannerDecisionKeyOf(decision))) return undefined
     // F25: the re-resolution awaited catalog/policy facts, and the engine may
     // have been disposed under it — the old install was already taken by
@@ -4400,6 +5800,17 @@ export class AutopilotEngine {
 
   private assertAuditPhase(snapshot: Snapshot, role: AuditRole): void {
     if (role === 'plan') {
+      // DELTA RE-AUDIT (governance pragmatics v1): an armed amendment
+      // (planAmendedAtRevision) opens the plan role to the execution phases,
+      // because that is exactly when an amendment happens and exactly what
+      // must be re-audited before further evidence can land.
+      if (snapshot.planAmendedAtRevision !== undefined
+        && (snapshot.phase === 'executing' || snapshot.phase === 'execution-reviewing' || snapshot.phase === 'closing')) {
+        if (snapshot.plan.revision < 1) {
+          throw new AutopilotError('no plan submitted yet', 'AP_NO_PLAN')
+        }
+        return
+      }
       if (snapshot.phase !== 'planning' && snapshot.phase !== 'replanning') {
         throw new AutopilotError(`plan audits run from planning/replanning, not ${snapshot.phase}`, 'AP_WRONG_PHASE')
       }
@@ -4512,15 +5923,22 @@ export class AutopilotEngine {
     if (prior.executor === undefined || prior.executor.state !== 'running') return undefined
     try {
       this.subagents.interrupt(prior.executor.childId, { kind: 'ancestor', agent: root })
-      await this.subagents.drainContinuableChildren(root, [prior.executor.childId])
+      await this.releaseChild(root, prior.executor.childId)
       return undefined
     } catch (error: unknown) {
+      // AN OWNER PASS OUTLIVES A DRAIN FAILURE. This fallback runs on the
+      // failure path, so it must not move a gate the owner passed — the fold
+      // would refuse the commit and turn a recoverable drain failure into a
+      // thrown transition. The run still parks for the owner; the gate it
+      // passed is simply left where the owner put it.
+      const held = this.ownerPassInForce(prior, 'execution')
       return await this.commit(prior, 'set-owner-decision', {
         ...prior,
         revision: prior.revision + 1,
         phase: 'needs-owner-decision',
-        executionGate: 'needs-owner-decision',
-        diagnostic: `executor drain failed: ${errorMessage(error)}`,
+        executionGate: held ? prior.executionGate : 'needs-owner-decision',
+        pausedFrom: prior.phase,
+        diagnostic: `executor drain failed: ${errorMessage(error)}${held ? ' — the execution gate was not moved: the owner\'s pass stands' : ''}`,
       })
     }
   }
@@ -4536,7 +5954,43 @@ export class AutopilotEngine {
     captured: { runRevision: number; planRevision: number; executionRevision: number }
     /** The dispatch's routing decision; its pin rides THIS commit (M3b). */
     routing?: RoutingDecisionDetail
+    /** Graded findings from the auditor's structured return, when it graded any. */
+    findings?: readonly AuditFinding[]
   }): Promise<AuditOutcome> {
+    // FINDINGS CONTRACT, PRE-COMMIT (governance pragmatics v1). This is the
+    // divert point: a needs-replan that cannot name a blocking plan-layer
+    // finding is refused BEFORE any record lands, so the dispatcher re-issues
+    // the dispatch with the verdict the findings actually support (needs-fix
+    // for execution/rules-layer defects). No partial state, no burned round,
+    // no new gate value — the error IS the remediation instruction.
+    if (outcome.findings !== undefined) {
+      const findings = outcome.findings
+      const label = `${outcome.role} audit`
+      if (!Array.isArray(findings) || findings.length === 0) {
+        throw new AutopilotError(`${label} carried an empty findings array; omit the field instead`, 'AP_AUDIT_FINDINGS_INVALID')
+      }
+      for (const finding of findings) {
+        if (typeof finding?.summary !== 'string' || finding.summary.trim().length === 0) {
+          throw new AutopilotError(`${label} carried a finding with an empty summary`, 'AP_AUDIT_FINDINGS_INVALID')
+        }
+        if (finding?.severity !== 'blocking' && finding?.severity !== 'non-blocking') {
+          throw new AutopilotError(`${label} carried a finding whose severity is not blocking|non-blocking ("${String(finding?.severity)}")`, 'AP_AUDIT_FINDINGS_INVALID')
+        }
+        if (finding?.layer !== 'plan' && finding?.layer !== 'execution' && finding?.layer !== 'rules') {
+          throw new AutopilotError(`${label} carried a finding whose layer is not plan|execution|rules ("${String(finding?.layer)}")`, 'AP_AUDIT_FINDINGS_INVALID')
+        }
+      }
+      const blockingPlan = findings.some(finding => finding?.severity === 'blocking' && finding?.layer === 'plan')
+      if (outcome.verdict === 'needs-replan' && !blockingPlan) {
+        throw new AutopilotError(
+          `${label} returned needs-replan without a blocking plan-layer finding. An execution- or rules-layer defect is executor-fixable: re-dispatch with verdict needs-fix and carry the findings`,
+          'AP_AUDIT_FINDINGS_INVALID',
+        )
+      }
+      if (outcome.verdict === 'blocked' && !findings.some(finding => finding?.severity === 'blocking')) {
+        throw new AutopilotError(`${label} returned blocked without a blocking finding`, 'AP_AUDIT_FINDINGS_INVALID')
+      }
+    }
     // The routing pin derives onto exactly the commit that records this
     // dispatch's verdict, with the SAME shared rule the fold re-derives — every
     // `{...live}` below inherits it, and `routingDetail` stamps the event.
@@ -4553,6 +6007,7 @@ export class AutopilotEngine {
       verdict: outcome.verdict,
       note: outcome.note,
       route: outcome.route,
+      ...(outcome.findings === undefined ? {} : { findings: outcome.findings }),
     }
     const audits = [...live.audits, record]
     // The op distinguishes the three verdict PROVENANCES in the event stream
@@ -4568,35 +6023,65 @@ export class AutopilotEngine {
       route: outcome.route,
     }
 
-    // needs-replan from any role: bounded escalation (CC: 2 rounds, the 3rd escalates).
+    // OWNER-PASS PRECEDENCE ON THE WRITE PATH (DESIGN §9 item 8). When the
+    // owner's pass is in force for a gate, the verdict is RECORDED and that
+    // gate does not move. Implemented here rather than left to the fold's
+    // refusal for one reason: a refused commit loses the auditor's verdict, and
+    // erasing the objection is the single thing the precedence rule must never
+    // do. The PHASE still moves (a blocked auditor parks the run; a needs-fix
+    // sends it back to work) — what the owner set stays set, so the gate the
+    // owner passed is still the gate it reads as when the run resumes.
+    const heldPlan = this.ownerPassInForce(live, 'plan')
+    const heldExecution = this.ownerPassInForce(live, 'execution')
+    const heldInThisArm = outcome.role === 'plan' ? heldPlan : heldExecution
+    const heldGate: GateName = outcome.role === 'plan' ? 'plan' : 'execution'
+    const heldNote = (gate: GateName): string =>
+      `verdict ${outcome.verdict} was RECORDED but did not move the ${gate} gate: the owner's pass (plan revision ${String(live.gateSources?.[gate]?.planRevision ?? 0)}) takes precedence over a later audit objection — withdraw it (autopilot_signal owner-gate-withdraw) to let the run's own reviews decide again`
+
+    // needs-replan from any role (governance pragmatics v1): the replan
+    // budget is OBSERVED, never auto-escalated. Budget exhaustion used to
+    // force needs-owner-decision on the 3rd consecutive round — a mechanical
+    // trigger for a channel reserved for questions only the owner can answer
+    // (the m6-live incident: "Replan budget is 0, so execution is mechanically
+    // blocked. Owner decision is required."). Now the run stays in its
+    // replanning lane with the exhaustion visible in status, and escalating
+    // to the owner is a DELIBERATE choice via autopilot_signal owner-decision.
+    // Liveness backstops: replanBudgetRemaining in status, the discipline
+    // default in the skill layer, and governance.maxAuditRoundsPerRole.
     if (outcome.verdict === 'needs-replan') {
       const rounds = live.consecutiveReplans + 1
-      if (rounds > MAX_REPLAN_ROUNDS) {
-        await this.commit(live, op, {
-          ...live,
-          revision: live.revision + 1,
-          phase: 'needs-owner-decision',
-          planGate: outcome.role === 'plan' ? 'needs-owner-decision' : live.planGate,
-          executionGate: outcome.role === 'plan' ? live.executionGate : 'needs-owner-decision',
-          audits,
-          consecutiveReplans: rounds,
-          diagnostic: `bounded escalation: ${rounds} consecutive needs-replan rounds (max ${MAX_REPLAN_ROUNDS}); owner decision required`,
-        }, routingDetail)
-        return result
-      }
-      const prior = this.current(root.id) ?? live
+      const exhausted = rounds > MAX_REPLAN_ROUNDS
+      const prior = this.current(this.activeRunId(root.id)) ?? live
       const drained = outcome.role !== 'plan' ? await this.drainExecutorIfRunning(root, prior) : undefined
       if (drained !== undefined) return result
+      const heldHere: GateName[] = [
+        ...(heldPlan ? (['plan'] as GateName[]) : []),
+        ...(outcome.role !== 'plan' && heldExecution ? (['execution'] as GateName[]) : []),
+      ]
       await this.commit(live, op, {
         ...live,
         revision: live.revision + 1,
         phase: 'replanning',
-        planGate: 'needs-replan',
-        executionGate: outcome.role === 'plan' ? live.executionGate : 'needs-replan',
+        planGate: heldPlan ? live.planGate : 'needs-replan',
+        executionGate: outcome.role === 'plan' || heldExecution ? live.executionGate : 'needs-replan',
         audits,
         consecutiveReplans: rounds,
         executor: keepOrSetExecutorState(live.executor, 'revoked'),
-        executionPacket: undefined,
+        executionPacket: heldExecution ? live.executionPacket : undefined,
+        ...(exhausted || heldHere.length > 0
+          ? {
+              diagnostic: [
+                exhausted
+                  ? `replan budget exhausted: ${rounds} consecutive needs-replan rounds (max ${MAX_REPLAN_ROUNDS}); escalation to the owner is a deliberate choice (autopilot_signal owner-decision), not automatic`
+                  : undefined,
+                // THIS ARM attempts BOTH gates (the plan gate whatever the
+                // role, the execution gate for every non-plan role), so every
+                // held gate it would have moved is named — not just the one the
+                // auditing role happens to own.
+                ...heldHere.map(gate => heldNote(gate)),
+              ].filter((part): part is string => part !== undefined).join('; '),
+            }
+          : {}),
       }, routingDetail)
       return result
     }
@@ -4642,14 +6127,32 @@ export class AutopilotEngine {
             )
           }
           const enforcement = this.restoreSandbox(root, live)
+          // DELTA RE-AUDIT (governance pragmatics v1): when the plan gate is
+          // ALREADY pass, this pass is the delta re-audit an amendment
+          // demanded — it must not yank the run out of the phase it audited
+          // from (execution-reviewing/closing), and it disarms the binding by
+          // construction (the fold derives the clear from this record's
+          // planRevision).
+          const planPassTargetPhase = live.planGate === 'pass'
+            && live.phase !== 'planning' && live.phase !== 'plan-reviewing' && live.phase !== 'replanning'
+            ? live.phase
+            : 'executing'
+          // The same record disarms the amendment binding when it was
+          // captured at or after the amended revision — the writer half of
+          // the fold's derivation (the fold re-derives and would refuse a
+          // stream where the two disagree).
+          const amendedRevision = live.planAmendedAtRevision
+          const disarmAmendment = amendedRevision !== undefined
+            && outcome.captured.planRevision >= amendedRevision
           await this.commit(live, op, {
             ...live,
             revision: live.revision + 1,
-            phase: 'executing',
+            phase: planPassTargetPhase,
             planGate: 'pass',
             audits,
             consecutiveReplans: 0,
             enforcement,
+            ...(disarmAmendment ? { planAmendedAtRevision: undefined } : {}),
             // Freshness anchor for usage artifacts, stamped on the FIRST pass
             // only. The fold refuses any restamp: re-anchoring would silently
             // re-admit artifacts captured before the gate.
@@ -4682,9 +6185,10 @@ export class AutopilotEngine {
           ...live,
           revision: live.revision + 1,
           phase: 'executing',
-          executionGate: 'needs-fix',
+          executionGate: heldExecution ? live.executionGate : 'needs-fix',
           audits,
-          executionPacket: undefined,
+          executionPacket: heldExecution ? live.executionPacket : undefined,
+          ...(heldExecution ? { diagnostic: heldNote('execution') } : {}),
         }, routingDetail)
         return result
       }
@@ -4693,10 +6197,10 @@ export class AutopilotEngine {
           ...live,
           revision: live.revision + 1,
           phase: 'blocked',
-          planGate: outcome.role === 'plan' ? 'blocked' : live.planGate,
-          executionGate: outcome.role === 'plan' ? live.executionGate : 'blocked',
+          planGate: outcome.role === 'plan' && !heldPlan ? 'blocked' : live.planGate,
+          executionGate: outcome.role === 'plan' || heldExecution ? live.executionGate : 'blocked',
           audits,
-          diagnostic: outcome.note,
+          diagnostic: heldInThisArm ? `${outcome.note} — ${heldNote(heldGate)}` : outcome.note,
         }, routingDetail)
         return result
       }
@@ -4705,10 +6209,11 @@ export class AutopilotEngine {
           ...live,
           revision: live.revision + 1,
           phase: 'needs-owner-decision',
-          planGate: outcome.role === 'plan' ? 'needs-owner-decision' : live.planGate,
-          executionGate: outcome.role === 'plan' ? live.executionGate : 'needs-owner-decision',
+          planGate: outcome.role === 'plan' && !heldPlan ? 'needs-owner-decision' : live.planGate,
+          executionGate: outcome.role === 'plan' || heldExecution ? live.executionGate : 'needs-owner-decision',
           audits,
-          diagnostic: outcome.note,
+          pausedFrom: live.phase,
+          diagnostic: heldInThisArm ? `${outcome.note} — ${heldNote(heldGate)}` : outcome.note,
         }, routingDetail)
         return result
       }
@@ -4726,7 +6231,19 @@ export class AutopilotEngine {
    * obtained by run id, where no calling Agent exists to authorize against —
    * and projection is a pure read, so it needs none.
    */
-  projectStatus(snapshot: Snapshot): StatusView {
+  /**
+   * Whether an owner pass is in force for this gate at the run's CURRENT plan
+   * revision (DESIGN §9 item 8). A pass recorded under an older plan revision
+   * is superseded by the new generation, and a withdrawn one is spent: only a
+   * fresh owner decision can put the gate back in the owner's name.
+   */
+  private ownerPassInForce(snapshot: Snapshot, gate: GateName): boolean {
+    const history = snapshot.gateSources?.[gate]
+    return history?.source === 'owner' && history.withdrawn !== true
+      && history.planRevision === snapshot.plan.revision
+  }
+
+  projectStatus(snapshot: Snapshot, policy?: SessionPolicyState): StatusView {
     const latest = latestVerdicts(snapshot.audits)
     const verdicts: Partial<Record<AuditRole, Verdict>> = {}
     for (const [role, record] of Object.entries(latest)) {
@@ -4738,14 +6255,30 @@ export class AutopilotEngine {
       phase: snapshot.phase,
       planGate: snapshot.planGate,
       executionGate: snapshot.executionGate,
+      // Absent provenance (a legacy stream, or one that recorded none) is the
+      // explicit `no-source` reading: the reader is told the stream cannot
+      // say, rather than being handed an inference.
+      // PER GATE, not per field: a legacy stream whose FIRST owner decision was
+      // taken on one gate records provenance for that gate alone, so the other
+      // reads `no-source` — a statement about the stream, made about the gate it
+      // is true of.
+      gateSources: {
+        plan: snapshot.gateSources?.plan ?? { source: 'no-source' },
+        execution: snapshot.gateSources?.execution ?? { source: 'no-source' },
+      },
       planRevision: snapshot.plan.revision,
       objective: snapshot.triage.objective,
       size: snapshot.triage.size,
       risk: snapshot.triage.risk,
       executionMode: snapshot.triage.executionMode,
       auditMode: snapshot.triage.auditMode,
+      ...(snapshot.triage.ownerRequirements === undefined
+        ? {}
+        : { ownerRequirements: snapshot.triage.ownerRequirements }),
+      ...(snapshot.triage.inlineReason === undefined ? {} : { inlineReason: snapshot.triage.inlineReason }),
       requiredRoles: requiredRoles(snapshot.triage),
       latestVerdicts: verdicts,
+      latestAuditRecords: auditStatusRecords(snapshot),
       replanBudgetRemaining: Math.max(0, MAX_REPLAN_ROUNDS - snapshot.consecutiveReplans),
       auditCount: snapshot.audits.length,
       logCount: snapshot.logCount,
@@ -4759,6 +6292,14 @@ export class AutopilotEngine {
         return planner?.kind === 'armed' ? { plannerRouting: planner.record } : {}
       })(),
       ...(snapshot.diagnostic === undefined ? {} : { diagnostic: snapshot.diagnostic }),
+      ...((): { routingReachability?: WorkClassReachabilityReport } => {
+        const report = this.reachabilityReports.get(snapshot.runId)
+        return report === undefined ? {} : { routingReachability: report }
+      })(),
+      ...((): { routing?: RoutingStatusView } => {
+        const view = routingStatusOf(snapshot, this.routingConfig().routing, policy)
+        return view === undefined ? {} : { routing: view }
+      })(),
     }
   }
 }
