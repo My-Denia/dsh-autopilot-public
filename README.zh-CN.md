@@ -56,7 +56,7 @@ Use dsh-autopilot to implement <goal> and verify the result.
 | --- | --- |
 | 已测试 | WSL2 + dsh 0.2.0-rc.2，本地 mock 模型：安装、挂载、技能注册、计划审计、委派执行、needs-fix 续跑 |
 | 客户端包 | 2026-10-18 按当前 `src/client` 重新构建。同一会话里的后一个目标会留在卡片的历史里。包检查 20 项通过。还没有在浏览器或桌面里打开过 |
-| 尚未测试 | 真实模型完整运行、macOS/Windows 桌面版、原生 Windows、浏览器卡片渲染 |
+| 尚未测试 | 真实模型完整运行。2026-10-18 在 dsh 0.2.1-rc.2 的 headless 会话里，请求已经到达配置的模型线路，对方返回 HTTP 503，还没调用任何 autopilot 工具。桌面版、原生 Windows、浏览器里的卡片也还没测 |
 | 宿主范围 | dsh 0.2.0 系列、0.1.5-rc.1、0.1.2-rc.1（0.1.7 与 0.2.1 不在 peer 范围内） |
 | 分发 | npm；GitHub Releases 只有说明，不附包 |
 
