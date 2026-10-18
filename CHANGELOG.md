@@ -27,8 +27,10 @@ that exact host, plus the previously supported `0.1.2-rc.1`, `0.1.5-rc.1`, and
   does not seed a price for it.
 - A finished run no longer blocks the session. The next `autopilot_init`
   starts a new run, leaves the finished run in the store, and does not copy
-  its gates, approvals, executor, or auditors. After a restart the session
-  index still points at the current run.
+  its gates or executor. The measured second goal had no owner approvals and
+  used a self-check, so approvals and auditors were not part of that
+  measurement. After a restart the session index still points at the current
+  run.
 
 ### Known limits
 
