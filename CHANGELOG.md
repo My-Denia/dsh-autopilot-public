@@ -15,6 +15,10 @@ two desktop fixes: the tool probe for `scout` and `reviewer` is scoped to those
 roles, and the delegate card is shown at turn level. Both were verified on the
 owner's Windows desktop (see Verification).
 
+The packaged bundle layer (`cordis.patch.yml`) no longer writes the retired `storeKind: file`, so a fresh install
+no longer shows a "retired settings: storeKind" notice the user cannot delete, and the onboarding YAML for the owner no
+longer asks to repeat it.
+
 The session card follows the host UI language (Chinese or English) and leads with plain
 wording in the main body; technical fields (ids, routes, sources) sit under collapsed
 details. Warnings appear only for a route mismatch or when auto-continue is unavailable,

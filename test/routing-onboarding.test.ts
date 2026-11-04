@@ -51,7 +51,7 @@ describe('renderRoutingOnboarding', () => {
     // The promise is now kept: a fenced YAML block carrying the OBSERVED ids.
     expect(text).toContain('```yaml')
     expect(text).toContain('- id: autopilot')
-    expect(text).toContain('storeKind: file')
+    expect(text).not.toContain('storeKind')
     expect(text).toContain('      ladder:')
     expect(text).toContain('            - zai/glm-5.3-flash')
     // Never a name-based tier verdict: the tier is the owner's/facts' call.

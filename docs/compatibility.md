@@ -308,7 +308,7 @@ packages and the Windows Desktop app (2026-10-10/12):
 | Token cost / usage metering | **absent** | the price seed in `references/model-routing.md` is a dated, provenance-labelled tie-break seed, never a live fact |
 | Host-native goal-autopilot surface | **absent** in 0.2.0-rc.2 | 0.2.x stance. 0.3.0 targets a host that has native goal tools and a goal round driver, and uses them; what was observed is in the verified list above, and what was not is in the not-verified list |
 | Skill registry | present | **used** — the adapter ships as a skill installed through the host's own registry |
-| Run storage backends | `file` / `storageDomain` | both supported; Desktop needs the shipped `storeKind: file` pin (see the profile-patch hazard above) |
+| Run storage backends | `file` / `storageDomain` | 0.3.0 ignores `storeKind`: the ledger is one file per session and legacy domain runs are only read (the 0.2.x pin is history, see the profile-patch hazard above) |
 
 The rule behind the table: a host capability that EXISTS is ridden, not
 rebuilt; one that is absent is named absent, not wished into the docs.
