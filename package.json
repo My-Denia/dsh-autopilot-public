@@ -1,7 +1,7 @@
 {
   "name": "dsh-goal-autopilot",
-  "version": "0.2.1-rc.1",
-  "description": "Native Goal Autopilot Harness for DeepSeek Harness (dsh): plan-execute-audit gates, mechanical enforcement, and evidence-bound closeout as an out-of-tree plugin bundle.",
+  "version": "0.3.0-rc.1",
+  "description": "Goal-workflow adapter for DeepSeek Harness (dsh): role delegation with explicit model and effort, an independent cross-family review, and a small delegation ledger shown on a session card, as an out-of-tree plugin bundle.",
   "type": "module",
   "main": "lib/index.js",
   "types": "lib/index.d.ts",
@@ -20,8 +20,8 @@
     "dsh-plugin",
     "goal",
     "autopilot",
-    "plan-execute-audit",
-    "agent-governance"
+    "goal-workflow",
+    "subagent-delegation"
   ],
   "files": [
     "lib",
@@ -29,12 +29,11 @@
     "skill",
     "DESIGN.md",
     "CHANGELOG.md",
-    "docs",
-    "evidence"
+    "docs"
   ],
   "engines": {
     "node": ">=22",
-    "dsh": "0.1.2-rc.1 || >=0.1.5-rc.1 <0.1.6 || >=0.2.0-rc.1 <0.2.1-0 || 0.2.1-rc.2"
+    "dsh": ">=0.2.1-rc.5 <0.3.0-0"
   },
   "packageManager": "pnpm@11.17.0",
   "scripts": {
@@ -61,12 +60,12 @@
   },
   "devDependencies": {
     "@deepseek-ai/cordis": "4.0.5",
-    "@deepseek-ai/dsh-agent": "0.2.1-rc.2",
-    "@deepseek-ai/dsh-llm": "0.2.1-rc.2",
-    "@deepseek-ai/dsh-session": "0.2.1-rc.2",
-    "@deepseek-ai/dsh-subagent": "0.2.1-rc.2",
-    "@deepseek-ai/dsh-tools": "0.2.1-rc.2",
-    "@deepseek-ai/dsh-util-values": "0.2.1-rc.2",
+    "@deepseek-ai/dsh-agent": "0.2.1-rc.5",
+    "@deepseek-ai/dsh-llm": "0.2.1-rc.5",
+    "@deepseek-ai/dsh-session": "0.2.1-rc.5",
+    "@deepseek-ai/dsh-subagent": "0.2.1-rc.5",
+    "@deepseek-ai/dsh-tools": "0.2.1-rc.5",
+    "@deepseek-ai/dsh-util-values": "0.2.1-rc.5",
     "@deepseek-ai/schemastery": "3.18.5",
     "@stryker-mutator/core": "^10.0.0",
     "@stryker-mutator/vitest-runner": "^10.0.0",
@@ -75,8 +74,8 @@
     "vitest": "^3.0.0"
   },
   "peerDependencies": {
-    "@deepseek-ai/dsh-tools": "0.1.2-rc.1 || >=0.1.5-rc.1 <0.1.6 || >=0.2.0-rc.1 <0.2.1-0 || 0.2.1-rc.2",
-    "@deepseek-ai/schemastery": "^3.18.2"
+    "@deepseek-ai/dsh-tools": ">=0.2.1-rc.5 <0.3.0-0",
+    "@deepseek-ai/schemastery": "^3.18.5"
   },
   "exports": {
     ".": {

@@ -24,7 +24,7 @@ function runtimePrototype(): Record<string, unknown> {
   return candidates[0]!.prototype
 }
 
-describe('installed subagent service surface (dsh-subagent 0.2.1-rc.2)', () => {
+describe('installed subagent service surface (dsh-subagent 0.2.1-rc.5)', () => {
   it('has the activation methods the engine calls, and not the 0.2.0 trio', () => {
     const proto = runtimePrototype()
     for (const name of ['startActivation', 'sendMessage', 'interrupt', 'drainChildren']) {

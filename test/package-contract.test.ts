@@ -19,10 +19,10 @@ const pkg = JSON.parse(readFileSync(pkgPath, 'utf8')) as {
 
 const TOOLS = '@deepseek-ai/dsh-tools'
 // dsh 0.2.1 prefers `engines.dsh` and otherwise keeps the peer check.
-// `<0.2.1-0` still excludes every 0.2.1 prerelease except the one exact
-// version named at the end, which is the host this package was run on.
-const RANGE = '0.1.2-rc.1 || >=0.1.5-rc.1 <0.1.6 || >=0.2.0-rc.1 <0.2.1-0 || 0.2.1-rc.2'
-const DEV_PIN = '0.2.1-rc.2'
+// 0.3.0 targets dsh 0.2.1-rc.5 and later 0.2.x builds; `<0.3.0-0` keeps every
+// 0.3.0 prerelease of the host out until it has been tried.
+const RANGE = '>=0.2.1-rc.5 <0.3.0-0'
+const DEV_PIN = '0.2.1-rc.5'
 
 describe('package contract: dsh-tools is host-provided', () => {
   it('does not list @deepseek-ai/dsh-tools in runtime dependencies', () => {
@@ -32,7 +32,8 @@ describe('package contract: dsh-tools is host-provided', () => {
 
   it('declares the bounded peer range that was live-tested', () => {
     expect(pkg.peerDependencies?.[TOOLS]).toBe(RANGE)
-    expect(pkg.peerDependencies?.[TOOLS]?.startsWith('>=')).toBe(false)
+    // Bounded above: an open-ended `>=` would admit a host this was never run on.
+    expect(pkg.peerDependencies?.[TOOLS]).toMatch(/ <0\.3\.0-0$/)
   })
 
   it('declares the same range as engines.dsh, which dsh 0.2.1 checks first', () => {
