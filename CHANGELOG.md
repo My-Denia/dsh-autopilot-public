@@ -9,8 +9,8 @@ The plugin becomes the dsh adapter of the goal-workflow. It is **not**
 published: npm `latest` is still `dsh-goal-autopilot@0.2.0`. Target host is dsh
 `0.2.1-rc.5` only. See Verification below for what was observed on a real host.
 
-`0.3.0-rc.1` and `0.3.0-rc.3` are on npm `next` (`latest` is `0.2.0`). The
-registry integrity of rc.3 matched the audited tarball. `0.3.0-rc.2` contains
+`0.3.0-rc.1`, `0.3.0-rc.3` and `0.3.0-rc.4` are on npm `next` (`latest` is `0.2.0`). The
+registry integrity of rc.3 and rc.4 matched the audited tarballs. `0.3.0-rc.2` contains
 two desktop fixes: the tool probe for `scout` and `reviewer` is scoped to those
 roles, and the delegate card is shown at turn level. Both were verified on the
 owner's Windows desktop (see Verification).

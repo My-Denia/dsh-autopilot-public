@@ -13,7 +13,7 @@
 
 ## 安装
 
-这份源码是 `0.3.0`（`0.3.0-rc.1` 和 `0.3.0-rc.3` 已发布到 npm，`next` 指向 `0.3.0-rc.3`，正式版未发布）。只面向 dsh `0.2.1-rc.5`，没有在其他宿主上测试过。需要 Node 22+。Windows 桌面版和 WSL CLI 各自按原生环境处理，不互相代替。
+这份源码是 `0.3.0`（`0.3.0-rc.1`、`0.3.0-rc.3` 和 `0.3.0-rc.4` 已发布到 npm，`next` 指向 `0.3.0-rc.4`，正式版未发布）。只面向 dsh `0.2.1-rc.5`，没有在其他宿主上测试过。需要 Node 22+。Windows 桌面版和 WSL CLI 各自按原生环境处理，不互相代替。
 
 早于 `0.2.1-rc.5` 的宿主（`0.1.x`、`0.2.0`）请继续用 `dsh-goal-autopilot@0.2.0`，这是它们的最后一个版本。目前 npm `latest` 仍是 `0.2.0`，正式版 `0.3.0` 没有发布，可安装 `next` 预发布版，或用这份源码打出的 tarball。
 
@@ -45,7 +45,7 @@ WSL CLI 的 profile 需要退回旧宿主时，先备份 profile，再执行 `np
 
 ## 状态
 
-开发者预览版，`0.3.0-rc.3` 在 npm 的 `next` 标签上，`latest` 仍是 `0.2.0`。[已在真实宿主上验证](./docs/compatibility.md#verified-on-a-real-host)一节是在 Windows、dsh `0.2.1-rc.5`、单一模型厂商下观察到的行为，覆盖 headless profile、owner 的日常桌面应用（提示由 agent 经界面粘贴）和隔离的 Web Session 宿主（提示由 agent 经 API 发送）；[未验证](./docs/compatibility.md#not-verified-on-a-real-host)一节是没有观察到的（跨厂商 reviewer，需要第二个模型厂商；WSL 上的模型任务；DSH 侧 Linear；clerk 的连接器工具尚未接入）。测试通过、mock 运行和状态读取都不算观察。[docs/compatibility.md](./docs/compatibility.md) 里更早的测量针对插件 `0.2.x`。
+开发者预览版，`0.3.0-rc.4` 在 npm 的 `next` 标签上，`latest` 仍是 `0.2.0`。[已在真实宿主上验证](./docs/compatibility.md#verified-on-a-real-host)一节是在 Windows、dsh `0.2.1-rc.5`、单一模型厂商下观察到的行为，覆盖 headless profile、owner 的日常桌面应用（提示由 agent 经界面粘贴）和隔离的 Web Session 宿主（提示由 agent 经 API 发送）；[未验证](./docs/compatibility.md#not-verified-on-a-real-host)一节是没有观察到的（跨厂商 reviewer，需要第二个模型厂商；WSL 上的模型任务；DSH 侧 Linear；clerk 的连接器工具尚未接入）。测试通过、mock 运行和状态读取都不算观察。[docs/compatibility.md](./docs/compatibility.md) 里更早的测量针对插件 `0.2.x`。
 
 ## 文档
 
