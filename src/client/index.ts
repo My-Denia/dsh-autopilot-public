@@ -1,5 +1,12 @@
 /**
- * dsh-autopilot browser half — the autopilot run card.
+ * dsh-autopilot browser half — the goal autopilot card.
+ *
+ * v3: the card shows the session's goal ledger (served at
+ * `/api/autopilot/ledger`): the goal's last-seen phase, auto-continue status,
+ * delegations with selected vs observed routing, reviews with their
+ * independence, and issue/PR links. The retired v1 run view stays as an
+ * archived, read-only section, and only when the session log still holds v1
+ * traffic. The card has no buttons.
  *
  * Registers one `ConversationNodeDefinition` (`./definition.ts`, a pure fold
  * over the root session's `autopilot_*` tool traffic) and seats its renderer
@@ -34,6 +41,9 @@ export type {
 } from './definition.js'
 export { AUTOPILOT_RUN_KIND, createAutopilotRunDefinition } from './definition.js'
 export { AutopilotRunCard } from './AutopilotRunCard.js'
+export type { AutopilotRunCardProps } from './AutopilotRunCard.js'
+export { GoalLedgerView } from './GoalLedgerView.js'
+export type { GoalLedgerViewProps } from './GoalLedgerView.js'
 
 /**
  * Required client services.

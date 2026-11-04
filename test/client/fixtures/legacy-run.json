@@ -1,0 +1,52 @@
+{
+ "ok": true,
+ "run": {
+  "runId": "session-legacy-amend-01",
+  "revision": 14,
+  "phase": "executing",
+  "planGate": "pass",
+  "executionGate": "pending",
+  "planRevision": 3,
+  "objective": "Old v1 run with an amended plan",
+  "size": "medium",
+  "risk": "high",
+  "executionMode": "delegated",
+  "auditMode": "dual",
+  "requiredRoles": [
+   "plan-auditor",
+   "closeout-auditor"
+  ],
+  "latestVerdicts": {
+   "plan-auditor": "pass"
+  },
+  "replanBudgetRemaining": 1,
+  "auditCount": 4,
+  "logCount": 9,
+  "closeoutSubmitted": false,
+  "executor": {
+   "generation": 2,
+   "state": "running"
+  },
+  "enforcement": {},
+  "gateSources": {
+   "plan": {
+    "source": "owner",
+    "planRevision": 3,
+    "ownerDecision": 1
+   }
+  },
+  "ownerResolutions": [
+   {
+    "at": "2026-10-20T08:00:00Z",
+    "text": "owner passed the plan gate after amendment"
+   }
+  ],
+  "planAmendments": 2,
+  "archived": true,
+  "sandboxRestore": {
+   "state": "restored",
+   "mode": "workspace-write",
+   "at": "2026-11-04T09:00:00Z"
+  }
+ }
+}

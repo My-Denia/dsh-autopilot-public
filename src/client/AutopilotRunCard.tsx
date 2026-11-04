@@ -1,7 +1,13 @@
 /**
- * The autopilot run card renderer.
+ * The goal autopilot card renderer.
  *
- * Presentation only: every value it shows was FOLDED FROM THE SESSION LOG by
+ * v3 shape: the card leads with the session's goal ledger (`./GoalLedgerView.tsx`,
+ * read from the host route by `useLedger` below). The retired v1 "run" view is
+ * kept as an ARCHIVED, read-only section, shown only when the session log still
+ * holds v1 traffic. Nothing here has a button: the goal belongs to the host's
+ * native goal tool.
+ *
+ * The archived v1 half is presentation only: every value it shows was FOLDED FROM THE SESSION LOG by
  * `./definition.ts`, and the card's whole editorial stance is that it says so.
  * Each gate is labelled with the revision it was OBSERVED at, never derived;
  * a value the run never reported is rendered as an em-dash rather than a
@@ -19,12 +25,18 @@
 
 import { useEffect, useRef, useState } from 'react'
 import type { CSSProperties } from 'react'
+import type { LedgerProjection, LegacyRunProjection } from '../domain/ledger-types.js'
 import type {
   AutopilotAuditRow, AutopilotRunChatData, GateSourcesMirror, Observed, ReachabilityMirror, RoutingMirror,
 } from './definition.js'
 import { gateSourceLines, routeStatusView, routingLines } from './definition.js'
 import { fetchLiveRun, overlayLive, pollDelayMs, pollKey, shouldPoll } from './live.js'
 import type { LiveFetch, LiveRun } from './live.js'
+import { GoalLedgerView } from './GoalLedgerView.js'
+import { fetchLedger, fetchLegacyRun, ledgerPollDelayMs } from './ledger.js'
+import { badge, muted, shell } from './styles.js'
+
+export { GoalLedgerView }
 
 /** The slot passes the whole chat node; the card reads only its data. */
 export interface AutopilotRunCardProps {
@@ -52,6 +64,98 @@ export interface AutopilotRunCardProps {
    * base URL and no credentials to configure.
    */
   readonly fetchJson?: LiveFetch
+  /**
+   * Initial ledger. Production leaves it absent and the hook fetches it; tests
+   * and the bundle harness pass one because `renderToStaticMarkup` runs no
+   * effects.
+   */
+  readonly ledger?: LedgerProjection
+  /** Initial archived-run details (same reason as `ledger`). */
+  readonly legacyRuns?: readonly LegacyRunProjection[]
+}
+
+/** True when the session log holds v1 traffic worth an archived section. */
+function holdsV1(data: AutopilotRunChatData): boolean {
+  return data.triage !== undefined
+    || data.phase !== undefined
+    || data.planGate !== undefined
+    || data.calls.some(c => c.name === 'autopilot_init')
+}
+
+/** The injected fetch, else the browser's; undefined where there is neither. */
+function pickFetch(fetchJson: LiveFetch | undefined): LiveFetch | undefined {
+  return fetchJson ?? (typeof fetch === 'function' ? ((url: string) => fetch(url)) : undefined)
+}
+
+/**
+ * Poll the ledger route for this session.
+ *
+ * Same shape as {@link useLiveRun}: a `setTimeout` chain (no overlap), a mounted
+ * flag checked after the await, and the delay recomputed from the newest answer
+ * by `ledgerPollDelayMs`. A new autopilot call in the session log restarts the
+ * chain, so a delegation that just started shows up without waiting out the
+ * quiet interval. A failed poll leaves the last answer in place.
+ */
+function useLedger(
+  sessionId: string | undefined,
+  fetchJson: LiveFetch | undefined,
+  callCount: number,
+  initial: LedgerProjection | undefined,
+): LedgerProjection | undefined {
+  const [ledger, setLedger] = useState<LedgerProjection | undefined>(initial)
+  const latest = useRef(ledger)
+  latest.current = ledger
+  useEffect(() => {
+    if (sessionId === undefined || sessionId.trim() === '') return
+    const request = pickFetch(fetchJson)
+    if (request === undefined) return
+    let mounted = true
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const tick = async (): Promise<void> => {
+      const answer = await fetchLedger(sessionId, request)
+      if (!mounted) return
+      if (answer !== undefined) {
+        latest.current = answer
+        setLedger(answer)
+      }
+      timer = setTimeout(() => { void tick() }, ledgerPollDelayMs(latest.current))
+    }
+    void tick()
+    return () => {
+      mounted = false
+      if (timer !== undefined) clearTimeout(timer)
+    }
+  }, [sessionId, fetchJson, callCount])
+  return ledger
+}
+
+/**
+ * Fetch each archived run's detail ONCE. Archived runs never change, so there
+ * is no polling; a run whose request failed is not retried within this mount.
+ */
+function useLegacyRuns(
+  ledger: LedgerProjection | undefined,
+  fetchJson: LiveFetch | undefined,
+  initial: readonly LegacyRunProjection[] | undefined,
+): readonly LegacyRunProjection[] {
+  const [runs, setRuns] = useState<readonly LegacyRunProjection[]>(initial ?? [])
+  const requested = useRef(new Set<string>((initial ?? []).map(r => r.runId)))
+  const mounted = useRef(true)
+  useEffect(() => () => { mounted.current = false }, [])
+  useEffect(() => {
+    if (ledger === undefined) return
+    const request = pickFetch(fetchJson)
+    if (request === undefined) return
+    for (const summary of ledger.legacyRuns) {
+      if (summary.fold !== 'ok' || requested.current.has(summary.runId)) continue
+      requested.current.add(summary.runId)
+      void fetchLegacyRun(summary.runId, request).then((run) => {
+        if (run === undefined || !mounted.current) return
+        setRuns(prev => (prev.some(r => r.runId === run.runId) ? prev : [...prev, run]))
+      })
+    }
+  }, [ledger, fetchJson])
+  return runs
 }
 
 /**
@@ -106,7 +210,7 @@ function useLiveRun(
     // A host without `fetch` (server-side render, an exotic embedder) simply
     // never polls: the card keeps showing the session-log reconstruction, which
     // is exactly its behaviour before this existed.
-    const request = fetchJson ?? (typeof fetch === 'function' ? ((url: string) => fetch(url)) : undefined)
+    const request = pickFetch(fetchJson)
     if (request === undefined) return
 
     let mounted = true
@@ -137,16 +241,6 @@ function useLiveRun(
   return live
 }
 
-const shell: CSSProperties = {
-  border: '1px solid var(--dsw-alias-border-l2)',
-  borderRadius: 8,
-  background: 'var(--dsw-alias-bg-layer-2)',
-  padding: '10px 12px',
-  fontSize: 12,
-  lineHeight: 1.6,
-  color: 'var(--dsw-alias-label-primary)',
-}
-
 const headRow: CSSProperties = {
   display: 'flex',
   alignItems: 'baseline',
@@ -155,21 +249,11 @@ const headRow: CSSProperties = {
   marginBottom: 6,
 }
 
-const title: CSSProperties = { fontWeight: 600 }
-const muted: CSSProperties = { color: 'var(--dsw-alias-label-tertiary)' }
 const grid: CSSProperties = {
   display: 'grid',
   gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))',
   gap: '2px 12px',
 }
-
-const badge = (color: string): CSSProperties => ({
-  border: `1px solid ${color}`,
-  color,
-  borderRadius: 4,
-  padding: '0 5px',
-  fontSize: 11,
-})
 
 /** Verdict/gate colouring; anything unrecognised stays neutral rather than guessing a mood. */
 function toneOf(value: string | undefined): string {
@@ -258,7 +342,7 @@ function GateSourceRow({ gates }: { readonly gates: Observed<GateSourcesMirror> 
   return (
     <div style={{ marginTop: 6 }} data-autopilot-gate-sources="">
       {gateSourceLines(gates.value).map(line => (
-        <div key={line.gate} style={muted} title={line.title} data-autopilot-gate-source={line.gate}>
+        <div key={line.gate} style={muted} title={`archived: ${line.title}`} data-autopilot-gate-source={line.gate}>
           {line.text}
         </div>
       ))}
@@ -326,12 +410,11 @@ function RoutingBlock({ routing, reachability }: {
 }
 
 /**
- * Render one autopilot run card.
- *
- * @param props - the chat node carrying the folded run data.
- * @returns the card element.
+ * The archived v1 rendering: everything folded from the session's autopilot_*
+ * traffic, exactly as the retired run card showed it, now inside the archived
+ * section. Only mounted when the fold holds v1 data.
  */
-export function AutopilotRunCard({ node, sessionId, fetchJson }: AutopilotRunCardProps): JSX.Element {
+function ArchivedRunFold({ node, sessionId, fetchJson }: AutopilotRunCardProps): JSX.Element {
   const live = useLiveRun(node.data, fetchJson, sessionId)
   // The overlay returns the SAME object when the live answer adds nothing, so a
   // poll that confirms what the card already knew costs no re-render below.
@@ -339,9 +422,8 @@ export function AutopilotRunCard({ node, sessionId, fetchJson }: AutopilotRunCar
   const isLive = data !== node.data
   const triage = data.triage
   return (
-    <div style={shell} data-autopilot-run-card="">
+    <div data-autopilot-run-fold="">
       <div style={headRow}>
-        <span style={title}>Autopilot run</span>
         <span style={badge(toneOf(data.phase?.value))}>{data.phase?.value ?? 'phase unknown'}</span>
         <span style={muted}>revision {data.revision}</span>
         {isLive
@@ -452,6 +534,29 @@ export function AutopilotRunCard({ node, sessionId, fetchJson }: AutopilotRunCar
           ? ' · gates read live from the host route; audits and triage reconstructed from this session’s tool traffic'
           : ' · reconstructed from this session’s tool traffic'}
       </div>
+    </div>
+  )
+}
+
+/**
+ * Render the goal autopilot card.
+ *
+ * @param props - the chat node (v1 fold), the session id, and optional initial
+ * ledger and archived-run details.
+ * @returns the card element.
+ */
+export function AutopilotRunCard(props: AutopilotRunCardProps): JSX.Element {
+  const { node, sessionId, fetchJson } = props
+  const ledger = useLedger(sessionId, fetchJson, node.data.calls.length, props.ledger)
+  const legacyRuns = useLegacyRuns(ledger, fetchJson, props.legacyRuns)
+  const v1 = holdsV1(node.data)
+  return (
+    <div style={shell} data-autopilot-run-card="">
+      <GoalLedgerView
+        ledger={ledger}
+        legacyRuns={legacyRuns}
+        legacyFold={v1 ? <ArchivedRunFold {...props} /> : undefined}
+      />
     </div>
   )
 }

@@ -1,0 +1,49 @@
+{
+ "ok": true,
+ "ledger": {
+  "v": 3,
+  "sessionId": "session-synthetic-0001",
+  "revision": 7,
+  "previousGoals": [],
+  "delegations": [],
+  "reviews": [],
+  "links": [],
+  "autoContinue": {
+   "available": true,
+   "reason": "goal round driver present"
+  },
+  "depth": {
+   "executorLead": 2,
+   "source": "plugin-default"
+  },
+  "legacyRuns": [
+   {
+    "runId": "session-legacy-amend-01",
+    "sessionId": "session-synthetic-0001",
+    "backend": "file",
+    "fold": "ok",
+    "phase": "executing",
+    "objective": "Old v1 run with an amended plan",
+    "revision": 14,
+    "eventCount": 38,
+    "sandboxRestore": {
+     "state": "restored",
+     "mode": "workspace-write",
+     "at": "2026-11-04T09:00:00Z"
+    }
+   },
+   {
+    "runId": "session-legacy-bad-02",
+    "backend": "domain",
+    "fold": "rejected",
+    "foldError": "unknown event type",
+    "eventCount": 5,
+    "sandboxRestore": {
+     "state": "pending"
+    }
+   }
+  ],
+  "notes": [],
+  "updatedAt": "2026-11-04T10:00:00Z"
+ }
+}

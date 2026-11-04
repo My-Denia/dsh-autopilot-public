@@ -1,0 +1,78 @@
+{
+ "ok": true,
+ "ledger": {
+  "v": 3,
+  "sessionId": "session-synthetic-0001",
+  "revision": 7,
+  "previousGoals": [],
+  "delegations": [
+   {
+    "childId": "worker-99999999-7777",
+    "role": "worker",
+    "parentId": "session-synthetic-0001",
+    "depth": 1,
+    "generation": 2,
+    "title": "Fix effort drop",
+    "state": "completed",
+    "modelSource": "pin",
+    "effortSource": "arg",
+    "routeMatch": "mismatch",
+    "tools": "inherit",
+    "maxDepth": 0,
+    "startedAt": "2026-11-04T09:20:00Z",
+    "selected": {
+     "provider": "kimi",
+     "model": "kimi-k2",
+     "reasoningEffort": "high"
+    },
+    "observed": {
+     "provider": "kimi",
+     "model": "kimi-k2",
+     "reasoningEffort": "medium"
+    },
+    "replaces": "worker-88888888-0000"
+   },
+   {
+    "childId": "scout-77777777-8888",
+    "role": "scout",
+    "parentId": "session-synthetic-0001",
+    "depth": 1,
+    "generation": 1,
+    "title": "Pending observation",
+    "state": "starting",
+    "modelSource": "ladder",
+    "effortSource": "host-default",
+    "routeMatch": "pending",
+    "tools": "inherit",
+    "maxDepth": 0,
+    "startedAt": "2026-11-04T09:21:00Z",
+    "selected": {
+     "provider": "zai",
+     "model": "glm-4.6",
+     "reasoningEffort": "medium"
+    }
+   }
+  ],
+  "reviews": [],
+  "links": [],
+  "autoContinue": {
+   "available": true,
+   "reason": "goal round driver present"
+  },
+  "depth": {
+   "executorLead": 2,
+   "source": "plugin-default"
+  },
+  "legacyRuns": [],
+  "notes": [],
+  "updatedAt": "2026-11-04T10:00:00Z",
+  "goal": {
+   "goalId": "goal-synth-a",
+   "revision": 3,
+   "status": "active",
+   "objective": "Ship the synthetic card fixture goal",
+   "firstSeenAt": "2026-11-04T09:00:00Z",
+   "lastSeenAt": "2026-11-04T10:00:00Z"
+  }
+ }
+}
