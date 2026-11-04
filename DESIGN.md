@@ -1174,6 +1174,8 @@ v2 新增的诚实上限：
     storeRoot: ''               # 缺省 $DSH_HOME/storages/dsh-autopilot
 ```
 
+> 0.3.0 注：`storeKind` 已退役并被忽略，账本恒为每会话一个文件；打包的 bundle 层已不再写 `storeKind: file`，下文是 0.2.x 的历史决定。
+
 本包自己的 `cordis.patch.yml`（bundle 层）从 2026-08-27 起把 `storeKind: file`
 **钉死**在插入行上：
 

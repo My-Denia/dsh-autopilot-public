@@ -9,11 +9,15 @@ The plugin becomes the dsh adapter of the goal-workflow. It is **not**
 published: npm `latest` is still `dsh-goal-autopilot@0.2.0`. Target host is dsh
 `0.2.1-rc.5` only. See Verification below for what was observed on a real host.
 
-`0.3.0-rc.1`, `0.3.0-rc.3` and `0.3.0-rc.4` are on npm `next` (`latest` is `0.2.0`). The
-registry integrity of rc.3 and rc.4 matched the audited tarballs. `0.3.0-rc.2` contains
+`0.3.0-rc.1`, `0.3.0-rc.3`, `0.3.0-rc.4` and `0.3.0-rc.5` are on npm `next` (`latest` is `0.2.0`). The
+registry integrity of rc.3, rc.4 and rc.5 matched the audited tarballs. `0.3.0-rc.2` contains
 two desktop fixes: the tool probe for `scout` and `reviewer` is scoped to those
 roles, and the delegate card is shown at turn level. Both were verified on the
 owner's Windows desktop (see Verification).
+
+The packaged bundle layer (`cordis.patch.yml`) no longer writes the retired `storeKind: file`, so a fresh install
+no longer shows a "retired settings: storeKind" notice the user cannot delete, and the onboarding YAML for the owner no
+longer asks to repeat it.
 
 The session card follows the host UI language (Chinese or English) and leads with plain
 wording in the main body; technical fields (ids, routes, sources) sit under collapsed

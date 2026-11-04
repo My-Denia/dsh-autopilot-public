@@ -101,13 +101,12 @@ function editBlock(configEditorAvailable: boolean, unreachable: readonly string[
   if (configEditorAvailable || unreachable.length === 0) return []
   return [
     '',
-    'YAML for the owner (profile `cordis.patch.yml`; repeat `storeKind: file` beside `routing` — a patch entry replaces, never merges, the packaged config):',
+    'YAML for the owner (profile `cordis.patch.yml`):',
     '',
     '```yaml',
     '- id: autopilot',
     '  name: dsh-goal-autopilot',
     '  config:',
-    '    storeKind: file',
     '    routing:',
     '      ladder:',
     '        tiers:',
