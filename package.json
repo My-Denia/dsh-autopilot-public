@@ -1,6 +1,6 @@
 {
   "name": "dsh-goal-autopilot",
-  "version": "0.3.0-rc.1",
+  "version": "0.3.0-rc.2",
   "description": "Goal-workflow adapter for DeepSeek Harness (dsh): role delegation with explicit model and effort, an independent cross-family review, and a small delegation ledger shown on a session card, as an out-of-tree plugin bundle.",
   "type": "module",
   "main": "lib/index.js",
