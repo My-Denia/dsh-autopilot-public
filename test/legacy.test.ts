@@ -34,12 +34,10 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { describe, expect, it } from 'vitest'
-import { foldRun } from '../src/domain/fold.js'
-import { decideTool } from '../src/gate/decide.js'
-import type { GateConfig } from '../src/gate/decide.js'
-import { evaluateCompletion } from '../src/domain/types.js'
-import type { RunEvent, Snapshot } from '../src/domain/types.js'
-import { RunStore } from '../src/store/file.js'
+import { foldRun } from '../src/legacy/fold.js'
+import { readLegacyRun } from '../src/legacy/index.js'
+import { evaluateCompletion } from '../src/legacy/types.js'
+import type { RunEvent, Snapshot } from '../src/legacy/types.js'
 
 const RUN_ID = 'legacy-session-0001'
 
@@ -221,33 +219,20 @@ describe('v1 stream compatibility', () => {
     expect(check.ok).toBe(true)
   })
 
-  it('loads and folds off disk through the v2 file store', () => {
+  it('loads and folds off disk through the frozen reader', async () => {
     const root = mkdtempSync(join(tmpdir(), 'dsh-autopilot-legacy-'))
     const dir = join(root, 'runs', RUN_ID)
     mkdirSync(dir, { recursive: true })
     writeFileSync(join(dir, 'events.jsonl'), stream.map(event => JSON.stringify(event)).join('\n') + '\n', 'utf8')
 
-    const store = new RunStore(root)
-    const snapshot = store.load(RUN_ID)
-    expect(snapshot?.phase).toBe('completed')
+    const read = await readLegacyRun({ fileRoot: root }, RUN_ID)
+    expect(read?.snapshot?.phase).toBe('completed')
     // Derived from the fixture rather than hardcoded: `8` was the synthetic
     // stream's own length restated as a constant, i.e. an anchor that moves
     // with whatever the fixture becomes.
-    expect(snapshot?.revision).toBe(stream.length)
-    expect(snapshot?.usage).toBeUndefined()
-    // The store still records its own kind even for a stream that predates the field.
-    expect(store.kind).toBe('file')
-  })
-
-  it('the v2 gates leave a legacy run alone: no usage clamp, terminal phase ungated', () => {
-    const config: GateConfig = { toolDeny: true, egressDeny: true, strictShell: false, egressSeam: 'native-ask' }
-    const midRun = stream[5]?.snapshot as Snapshot // revision 6, execution-reviewing, standard size
-    expect(midRun.triage.size).toBe('standard')
-    expect(midRun.usage).toBeUndefined()
-    expect(decideTool(midRun, 'write', {}, config).kind).toBe('allow')
-
-    const finished = foldRun(stream).snapshot as Snapshot
-    expect(decideTool(finished, 'write', {}, config).kind).toBe('allow')
+    expect(read?.snapshot?.revision).toBe(stream.length)
+    expect(read?.snapshot?.usage).toBeUndefined()
+    expect(read?.summary.backend).toBe('file')
   })
 })
 
@@ -306,16 +291,16 @@ describe('a REAL v1 events.jsonl, read as bytes', () => {
     expect(check.ok).toBe(true)
   })
 
-  it('loads off disk through the v2 file store, from the original bytes', () => {
+  it('loads off disk through the frozen reader, from the original bytes', async () => {
     const root = mkdtempSync(join(tmpdir(), 'dsh-autopilot-legacy-real-'))
     const runId = (real[0]?.snapshot as Snapshot).runId
     const dir = join(root, 'runs', runId)
     mkdirSync(dir, { recursive: true })
     writeFileSync(join(dir, 'events.jsonl'), rawStream, 'utf8')
-    const snapshot = new RunStore(root).load(runId)
-    expect(snapshot?.phase).toBe('completed')
-    expect(snapshot?.revision).toBe(real.length)
-    expect(snapshot?.usage).toBeUndefined()
+    const read = await readLegacyRun({ fileRoot: root }, runId)
+    expect(read?.snapshot?.phase).toBe('completed')
+    expect(read?.snapshot?.revision).toBe(real.length)
+    expect(read?.snapshot?.usage).toBeUndefined()
   })
 
   it('accepts a v2-only op appended onto a TRUNCATED real prefix', () => {

@@ -12,8 +12,8 @@
  */
 
 import { describe, expect, it } from 'vitest'
-import { Config, DEFAULT_EXECUTOR_TOOLS } from '../src/config.js'
-import { SHELL_TOOLS, isEgressCommand } from '../src/gate/decide.js'
+import { Config, DEFAULT_EXECUTOR_TOOLS, RETIRED_CONFIG_KEYS, retiredConfigNote, retiredKeysIn } from '../src/config.js'
+import { SHELL_TOOLS } from '../src/roles/tools.js'
 import { resolveConfig, volatileRoutingAccess } from '../src/index.js'
 import type { ConfigInput, ResolvedRouting } from '../src/index.js'
 import { DEFAULT_ROLE_MIN_CONTEXT } from '../src/routing/select.js'
@@ -549,10 +549,9 @@ describe('DEFAULT_EXECUTOR_TOOLS is pinned by value, in both directions', () => 
     for (const tool of ['terminal_open', 'terminal_send', 'terminal_read', 'terminal_signal', 'terminal_close']) {
       expect(DEFAULT_EXECUTOR_TOOLS).not.toContain(tool)
     }
-    // The GATE went the other way: it scans the terminal channel it cannot allow.
+    // The shell-name list names the terminal channel the allow-list does not grant.
     expect(SHELL_TOOLS).toContain('terminal_send')
-    expect(isEgressCommand('git push origin main')).toBe(true)
-    // The shell the executor DOES get is still the shell the gate scans.
+    // The shell the executor DOES get is still one of the shell names.
     expect(DEFAULT_EXECUTOR_TOOLS.filter(tool => SHELL_TOOLS.includes(tool))).toEqual(['bash', 'pwsh'])
   })
 })
@@ -695,5 +694,75 @@ describe("resolveConfig — routing.preference 'axis'", () => {
     expect(['balanced', 'economy', 'quality', 'axis']).not.toContain(bogus)
     const preference = loaded({ routing: { preference: bogus } })
     expect(preference.issues?.some(issue => issue.message.includes('routing.preference'))).toBe(true)
+  })
+})
+
+describe('retired 0.2.x settings', () => {
+  /** A 0.2.x profile with every retired key written. */
+  const oldProfile = {
+    gate: {
+      sandboxCoupling: false,
+      toolDeny: false,
+      egressDeny: false,
+      stopReminder: false,
+      strictShell: true,
+      restoreMode: 'read-only',
+    },
+    governance: { maxAuditRoundsPerRole: 2, unattended: true },
+    storeKind: 'file',
+    auditProvider: 'spawn',
+    crossFamily: { enabled: true, minRisk: 'high' },
+  }
+
+  it('an old profile with every retired key set loads with no issue, through the schema and the plain path', () => {
+    const result = loaded(oldProfile)
+    expect(result.issues).toBeUndefined()
+    expect(result.value).toBeDefined()
+    expect(() => resolveConfig(result.value)).not.toThrow()
+    expect(() => resolveConfig(oldProfile as never)).not.toThrow()
+  })
+
+  it('a profile that writes NO retired key reads as having written none, AFTER the loader has filled its defaults', () => {
+    // The loader fills declared defaults before apply() sees the config. A default on a retired leaf
+    // would make every real mount report "ignores retired settings", a false status note.
+    const result = loaded({})
+    expect(result.issues).toBeUndefined()
+    expect(retiredKeysIn(result.value)).toEqual([])
+    expect(retiredKeysIn(loaded({ routing: { mode: 'off' }, storeRoot: '/tmp/x' }).value)).toEqual([])
+  })
+
+  it('through the loader, a retired key that IS written still reads as written (the check can fail)', () => {
+    expect(retiredKeysIn(loaded({ gate: { toolDeny: false }, storeKind: 'file' }).value)).toEqual(['gate.toolDeny', 'storeKind'])
+  })
+
+  it('retiredKeysIn returns exactly the retired keys written, in table order', () => {
+    expect(retiredKeysIn(oldProfile)).toEqual([...RETIRED_CONFIG_KEYS])
+    expect(retiredKeysIn({ gate: { toolDeny: true }, governance: { unattended: false }, routing: { mode: 'off' } }))
+      .toEqual(['gate.toolDeny', 'governance.unattended'])
+    // A key whose value is false is still written.
+    expect(retiredKeysIn({ gate: { egressDeny: false } })).toEqual(['gate.egressDeny'])
+  })
+
+  it('live settings are not reported, and a malformed input does not throw', () => {
+    expect(retiredKeysIn({ routing: { mode: 'off' }, crossFamily: { enabled: true }, storeRoot: '/x', skillInstall: 'off' })).toEqual([])
+    expect(retiredKeysIn(undefined)).toEqual([])
+    expect(retiredKeysIn(null)).toEqual([])
+    expect(retiredKeysIn('gate')).toEqual([])
+    expect(retiredKeysIn({ gate: 'x', governance: [] })).toEqual([])
+  })
+
+  it('an empty config gives no note; a written one gives one plain note naming the keys', () => {
+    expect(retiredConfigNote(retiredKeysIn({}))).toBeUndefined()
+    expect(retiredConfigNote(retiredKeysIn(undefined))).toBeUndefined()
+    const note = retiredConfigNote(['gate.toolDeny', 'governance.unattended'])
+    expect(note).toBe('dsh-autopilot 0.3.0 ignores retired settings: gate.toolDeny, governance.unattended; they no longer have an effect.')
+  })
+
+  it('every retired key is still declared by the schema (it must keep loading)', () => {
+    for (const path of RETIRED_CONFIG_KEYS) {
+      const [head, tail] = path.split('.')
+      const raw = tail === undefined ? { [head!]: 'file' } : { [head!]: { [tail]: tail === 'restoreMode' ? 'read-only' : tail === 'maxAuditRoundsPerRole' ? 2 : true } }
+      expect(loaded(raw).issues, path).toBeUndefined()
+    }
   })
 })

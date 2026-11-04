@@ -373,7 +373,7 @@ describe('apply() wiring', () => {
     await withSkillHome(async home => {
       const { registry, providers } = stubRegistry()
       const host = mountHost(registry)
-      const dispose = await apply(host.ctx, { storeRoot: tempRoot('dsh-autopilot-apply-skill-'), storeKind: 'file' })
+      const dispose = await apply(host.ctx, { storeRoot: tempRoot('dsh-autopilot-apply-skill-') })
       try {
         expect(providers).toHaveLength(1)
         expect(providers[0]?.name).toBe(BUNDLED_SKILL_PROVIDER_NAME)
@@ -395,7 +395,7 @@ describe('apply() wiring', () => {
   it('ctx.skills present: the registered provider serves the real bundled skill', async () => {
     const { registry, providers } = stubRegistry()
     const host = mountHost(registry)
-    const dispose = await apply(host.ctx, { storeRoot: tempRoot('dsh-autopilot-apply-skill-serve-'), storeKind: 'file' })
+    const dispose = await apply(host.ctx, { storeRoot: tempRoot('dsh-autopilot-apply-skill-serve-') })
     try {
       const provider = providers[0]
       if (provider === undefined) throw new Error('expected the registered provider')
@@ -413,7 +413,7 @@ describe('apply() wiring', () => {
     await withSkillHome(async home => {
       const { registry } = stubRegistry({ registerProviderError: new Error('registry refused: duplicate name') })
       const host = mountHost(registry)
-      const dispose = await apply(host.ctx, { storeRoot: tempRoot('dsh-autopilot-apply-skill-fallback-'), storeKind: 'file' })
+      const dispose = await apply(host.ctx, { storeRoot: tempRoot('dsh-autopilot-apply-skill-fallback-') })
       try {
         const dest = join(home, 'skills', 'dsh-autopilot', 'SKILL.md')
         expect(existsSync(dest)).toBe(true)
@@ -431,7 +431,7 @@ describe('apply() wiring', () => {
   it('ctx.skills absent: the file path is taken, unchanged', async () => {
     await withSkillHome(async home => {
       const host = mountHost(undefined)
-      const dispose = await apply(host.ctx, { storeRoot: tempRoot('dsh-autopilot-apply-skill-file-'), storeKind: 'file' })
+      const dispose = await apply(host.ctx, { storeRoot: tempRoot('dsh-autopilot-apply-skill-file-') })
       try {
         expect(existsSync(join(home, 'skills', 'dsh-autopilot', 'SKILL.md'))).toBe(true)
         expect(host.warnings).toEqual([])
@@ -448,7 +448,6 @@ describe('apply() wiring', () => {
       const host = mountHost(registry)
       const dispose = await apply(host.ctx, {
         storeRoot: tempRoot('dsh-autopilot-apply-skill-off-'),
-        storeKind: 'file',
         skillInstall: 'off',
       })
       try {

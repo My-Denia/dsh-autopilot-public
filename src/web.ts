@@ -1,46 +1,34 @@
 /**
- * The host half of roadmap §9.3: a same-origin read-only HTTP surface over
- * `ctx.autopilot`, so the browser can show CURRENT run state instead of the
- * card's reconstruction of past tool traffic.
+ * The host half of the card: a same-origin read-only HTTP surface over
+ * `ctx.autopilot`, so the browser shows CURRENT ledger state.
  *
- * WHY THE PROJECTION IS NOT `Snapshot`, AND WHY THAT IS THE POINT.
- * `AutopilotReadOnly` exposes two readers. `peek()` returns the whole
- * {@link Snapshot}: the full plan text, the executor's returned packet or the
- * root's evidence report, every auditor's free-text note, the closeout body,
- * the residual-risk list, the usage artifacts and the baseline branch/commit.
- * That is the run's private working material, and none of it is needed to say
- * "what phase is this run in and which gates have passed". So:
+ * ROUTES (constants live in `domain/ledger-types.ts`, shared with the card):
+ *  - `GET LEDGER_ROUTE?session=<id>`  one session's ledger plus its legacy runs.
+ *  - `GET LEGACY_RUNS_ROUTE`          every pre-0.3.0 run, both backends.
+ *  - `GET LEGACY_RUN_ROUTE?id=<id>`   one pre-0.3.0 run in full.
  *
- *   **this module never calls `peek()`.**
+ * Error bodies carry a stable code and never text from the store: a stored
+ * path or exception message must not cross the HTTP boundary. Routes read
+ * through the read-only service, never the engine.
  *
- * Everything it serves is derived from `status()`, the projection the engine
- * already hands the MODEL — which means nothing crosses the HTTP boundary that
- * the session log did not already carry. Two fields are dropped even from
- * that:
- *
- *  - `diagnostic`, because `engine.ts` aliases it onto an auditor's `note`
- *    (`applyVerdict`) and onto an owner's ruling text (`autopilot_signal`).
- *    Both are unbounded free text about the workspace, and a gate-status view
- *    has no use for either.
- *  - `enforcement.ownerApprovals[]`, because each entry's `target` is a "human
- *    description of the approved egress" and `consumedBy` names what consumed
- *    it — i.e. the one place in `StatusView` that names an external
- *    destination. The count and the grant revisions carry the enforcement fact
- *    without the destination.
- *
- * DEGRADATION. The route is mounted through `ctx.inject(['webServer'], …)`,
+ * DEGRADATION. The routes are mounted through `ctx.inject(['webServer'], ...)`,
  * cordis's lazy inject: on a profile with no api-gateway (the headless
  * bundles), `webServer` never appears, the callback never runs, and the plugin
- * behaves exactly as it did before this module existed. There is no probe to
- * get wrong and no branch to test — absence is the default.
+ * behaves exactly as it did before this module existed.
  *
  * @module dsh-autopilot/web
  */
 
-import type { Enforcement } from './domain/types.js'
-import type { StatusView } from './engine.js'
-import type { WorkClassReachabilityReport } from './routing/coverage.js'
-import type { RoutingStatusView } from './routing/status.js'
+import { LEDGER_ROUTE, LEGACY_RUN_ROUTE, LEGACY_RUNS_ROUTE } from './domain/ledger-types.js'
+import type {
+  ErrorBody,
+  LedgerBody,
+  LedgerProjection,
+  Ledger,
+  LegacyRunBody,
+  LegacyRunsBody,
+  LegacyRunSummary,
+} from './domain/ledger-types.js'
 import type { AutopilotReadOnly } from './service.js'
 
 /** Same-origin API prefix. One namespace, matching the plugin's package name. */
@@ -138,190 +126,59 @@ export function fenceRoute(route: AutopilotWebRoute, lookup: ((name: string) => 
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// The projection — a pure function, which is the whole reason it is testable
+// The projection: a pure function, which is the whole reason it is testable
 // ─────────────────────────────────────────────────────────────────────────────
 
-/** Enforcement, with the free-text approval descriptions replaced by counts. */
-export interface EnforcementProjection {
-  readonly sandbox?: string
-  readonly modeAppended?: boolean
-  readonly priorSandboxMode?: string
-  readonly reminders?: number
-  readonly store?: string
-  readonly approval?: string
-  readonly egress?: string
-  readonly service?: string
-  readonly outboundConsumed?: number
-  /** How many owner approvals were granted. The `target` strings are NOT served. */
-  readonly ownerApprovalsGranted: number
-  /** How many of those an egress consumed. */
-  readonly ownerApprovalsConsumed: number
-}
-
-/** One run, as served. Strictly narrower than `StatusView`. */
-export interface RunProjection {
-  readonly runId: string
-  readonly revision: number
-  readonly phase: string
-  readonly planGate: string
-  readonly executionGate: string
-  readonly planRevision: number
-  readonly objective: string
-  readonly size: string
-  readonly risk: string
-  readonly executionMode: string
-  readonly auditMode: string
-  readonly requiredRoles: readonly string[]
-  readonly latestVerdicts: Readonly<Record<string, string>>
-  readonly replanBudgetRemaining: number
-  readonly auditCount: number
-  readonly logCount: number
-  readonly closeoutSubmitted: boolean
-  readonly executor?: { readonly generation: number; readonly state: string }
-  readonly enforcement: EnforcementProjection
-  /**
-   * M12: the engine's routing-status projection, forwarded verbatim when the
-   * run's routing mode is `auto`. The web PARSER has no agent to read a
-   * session policy for, so `policyState` here is `unobserved` whenever the
-   * mount cannot ask — the projection never guesses on its behalf.
-   */
-  readonly routing?: RoutingStatusView
-  /**
-   * M13: the candidate-coverage report, served as its OWN field.
-   *
-   * It answers a different question from `routing` — "can every observed model
-   * be reached by some tier-bound work class" is a statement about the ladder
-   * and the live catalog, NOT about what ran — so it does not ride inside the
-   * routing block, where a reader would take it for a dispatch record.
-   */
-  readonly routingReachability?: WorkClassReachabilityReport
-  /**
-   * DESIGN §9 item 8: which authority last set each gate, for which plan
-   * revision. Forwarded verbatim — the card renders it so a reader can tell a
-   * gate a review passed from one the owner passed, which the precedence rule
-   * turns into different futures.
-   */
-  readonly gateSources: StatusView['gateSources']
-}
-
-/** The `/runs` body. */
-export interface RunsBody {
-  readonly ok: true
-  /** Which backend holds the canonical stream, as observed at mount. */
-  readonly storeKind: string
-  readonly runs: readonly RunProjection[]
-}
-
-/** The error body shape; `error` is a stable machine code, never an exception message. */
-export interface ErrorBody {
-  readonly ok: false
-  readonly error: string
-}
-
-/** The keys of `Enforcement` that are safe to forward verbatim. */
-const ENFORCEMENT_KEYS = [
-  'sandbox', 'modeAppended', 'priorSandboxMode', 'reminders',
-  'store', 'approval', 'egress', 'service', 'outboundConsumed',
-] as const
-
 /**
- * Project one enforcement record.
+ * Project one ledger for the card.
  *
- * @param enforcement - the run's enforcement block.
- * @returns the forwarded keys plus approval COUNTS; never an approval's target text.
+ * Attaches the legacy runs that belong to this session (matched by the run's
+ * session id, or by the id list the ledger recorded) and overlays each run's
+ * `sandboxRestore` with what the ledger recorded for it: the ledger is the only
+ * place the one-time restore outcome is kept, so it wins over the reader's
+ * summary.
+ *
+ * @param ledger - the session's ledger.
+ * @param legacyRuns - every legacy run summary; the others are ignored.
+ * @param notes - one-time notes to show.
  */
-export function projectEnforcement(enforcement: Enforcement): EnforcementProjection {
-  const out: Record<string, unknown> = {}
-  for (const key of ENFORCEMENT_KEYS) {
-    const value = enforcement[key]
-    if (value !== undefined) out[key] = value
-  }
-  const approvals = enforcement.ownerApprovals
-  const list = Array.isArray(approvals) ? approvals : []
-  out.ownerApprovalsGranted = list.length
-  out.ownerApprovalsConsumed = list.filter(
-    entry => typeof entry === 'object' && entry !== null && (entry as { consumedBy?: unknown }).consumedBy !== undefined,
-  ).length
-  return out as unknown as EnforcementProjection
-}
-
-/**
- * Project one `StatusView` into the served shape.
- *
- * Deliberately an ALLOW-LIST over the status projection rather than a
- * deny-list over the snapshot: a field added to `Snapshot` later cannot leak
- * through here by omission, because nothing arrives unless it is named.
- *
- * @param status - the engine's model-facing status projection.
- * @returns the run as served, without `diagnostic` and without approval targets.
- */
-export function projectRun(status: StatusView): RunProjection {
-  const verdicts: Record<string, string> = {}
-  for (const [role, verdict] of Object.entries(status.latestVerdicts)) {
-    if (typeof verdict === 'string') verdicts[role] = verdict
-  }
+export function projectLedger(
+  ledger: Ledger,
+  legacyRuns: readonly LegacyRunSummary[],
+  notes: readonly string[],
+): LedgerProjection {
+  const recorded = new Set(ledger.legacyRunIds)
+  const runs = legacyRuns
+    .filter(run => run.sessionId === ledger.sessionId || recorded.has(run.runId))
+    .map(run => {
+      const restore = ledger.legacyRestores?.[run.runId]
+      return restore === undefined ? run : { ...run, sandboxRestore: restore }
+    })
   return {
-    runId: status.runId,
-    revision: status.revision,
-    phase: status.phase,
-    planGate: status.planGate,
-    executionGate: status.executionGate,
-    planRevision: status.planRevision,
-    objective: status.objective,
-    size: status.size,
-    risk: status.risk,
-    executionMode: status.executionMode,
-    auditMode: status.auditMode,
-    requiredRoles: [...status.requiredRoles],
-    latestVerdicts: verdicts,
-    replanBudgetRemaining: status.replanBudgetRemaining,
-    auditCount: status.auditCount,
-    logCount: status.logCount,
-    closeoutSubmitted: status.closeoutSubmitted,
-    ...(status.executor === undefined
-      ? {}
-      : { executor: { generation: status.executor.generation, state: status.executor.state } }),
-    enforcement: projectEnforcement(status.enforcement),
-    // ALLOW-LIST discipline: `routing` rides only because it is named here.
-    ...(status.routing === undefined ? {} : { routing: status.routing }),
-    // M13: the CANDIDATE-COVERAGE report rides SEPARATELY from `routing`, and
-    // the card labels it as coverage rather than as a dispatch record. It says
-    // which observed models a tier-bound work class can reach — a statement
-    // about the ladder and the live catalog, never about what ran.
-    ...(status.routingReachability === undefined ? {} : { routingReachability: status.routingReachability }),
-    // ALLOW-LIST discipline again: gate provenance rides because it is NAMED
-    // here, exactly like every other field. It is never absent (the engine
-    // projects `no-source` for a stream that recorded none).
-    gateSources: status.gateSources,
+    v: ledger.v,
+    sessionId: ledger.sessionId,
+    revision: ledger.revision,
+    ...(ledger.goal === undefined ? {} : { goal: ledger.goal }),
+    previousGoals: ledger.previousGoals,
+    delegations: ledger.delegations,
+    reviews: ledger.reviews,
+    links: ledger.links,
+    ...(ledger.hostRestart === undefined ? {} : { hostRestart: ledger.hostRestart }),
+    autoContinue: ledger.autoContinue,
+    depth: ledger.depth,
+    legacyRuns: runs,
+    notes: [...notes],
+    updatedAt: ledger.updatedAt,
   }
-}
-
-/**
- * Project every run this mount has materialized.
- *
- * The no-run case is NOT an error: a mount with no run is the normal state of
- * every session before `autopilot_init`, and an empty list says exactly that.
- * A run id that `list()` reports but `status()` cannot project (a stream folded
- * to nothing) is SKIPPED rather than served as a half-filled row.
- *
- * @param service - the read-only `ctx.autopilot` surface.
- * @returns the served body.
- */
-export function projectRuns(service: AutopilotReadOnly): RunsBody {
-  const runs: RunProjection[] = []
-  for (const runId of service.list()) {
-    const status = service.status(runId)
-    if (status === undefined) continue
-    runs.push(projectRun(status))
-  }
-  return { ok: true, storeKind: service.storeKind ?? 'file', runs }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Routes
 // ─────────────────────────────────────────────────────────────────────────────
 
-function json(res: RouteResponse, status: number, body: RunsBody | ErrorBody | { ok: true; run: RunProjection }): void {
+type Body = LedgerBody | LegacyRunsBody | LegacyRunBody | ErrorBody | { readonly ok: false; readonly error: 'method-not-allowed' | 'no-connection-service' }
+
+function json(res: RouteResponse, status: number, body: Body): void {
   res.writeHead(status, { 'content-type': 'application/json; charset=utf-8' })
   res.end(JSON.stringify(body))
 }
@@ -342,50 +199,41 @@ export function queryParam(url: string, key: string): string | undefined {
 }
 
 /**
- * Build the route table.
- *
- * `GET /api/autopilot/runs` — every materialized run, projected.
- * `GET /api/autopilot/run?id=<rootSessionId>` — one run, 404 when absent.
- *
- * Both are GET-only; a non-GET method answers 405 rather than being treated as
- * a read, because this surface is read-only by construction and a POST landing
- * here is a caller bug worth reporting.
+ * Build the route table. All routes are GET-only: a non-GET method answers 405
+ * rather than being treated as a read, because a POST landing here is a caller
+ * bug worth reporting.
  *
  * @param service - the read-only `ctx.autopilot` surface.
  * @returns the routes, ready for `webServer.register`.
  */
 export function makeAutopilotRoutes(service: AutopilotReadOnly): readonly AutopilotWebRoute[] {
+  const route = (path: string, read: (req: RouteRequest, res: RouteResponse) => Promise<void>): AutopilotWebRoute => ({
+    kind: 'exact',
+    path,
+    handler: (req, res) => {
+      if (req.method !== 'GET') return json(res, 405, { ok: false, error: 'method-not-allowed' })
+      // The failure detail is deliberately NOT forwarded: it can carry a store path.
+      read(req, res).catch(() => json(res, 500, { ok: false, error: 'internal' }))
+    },
+  })
   return [
-    {
-      kind: 'exact',
-      path: `${AUTOPILOT_API_PREFIX}/runs`,
-      handler: (req, res) => {
-        if (req.method !== 'GET') return json(res, 405, { ok: false, error: 'method-not-allowed' })
-        try {
-          return json(res, 200, projectRuns(service))
-        } catch {
-          // The message is deliberately NOT forwarded: an engine failure can
-          // carry a store path, and this route serves no free text.
-          return json(res, 500, { ok: false, error: 'projection-failed' })
-        }
-      },
-    },
-    {
-      kind: 'exact',
-      path: `${AUTOPILOT_API_PREFIX}/run`,
-      handler: (req, res) => {
-        if (req.method !== 'GET') return json(res, 405, { ok: false, error: 'method-not-allowed' })
-        const id = queryParam(req.url ?? '', 'id')
-        if (id === undefined || id === '') return json(res, 400, { ok: false, error: 'missing-id' })
-        try {
-          const status = service.status(id)
-          if (status === undefined) return json(res, 404, { ok: false, error: 'no-run' })
-          return json(res, 200, { ok: true, run: projectRun(status) })
-        } catch {
-          return json(res, 500, { ok: false, error: 'projection-failed' })
-        }
-      },
-    },
+    route(LEDGER_ROUTE, async (req, res) => {
+      const session = queryParam(req.url ?? '', 'session')
+      if (session === undefined || session === '') return json(res, 400, { ok: false, error: 'missing-session' })
+      const ledger = await service.ledger(session)
+      if (ledger === undefined) return json(res, 404, { ok: false, error: 'no-ledger' })
+      return json(res, 200, { ok: true, ledger })
+    }),
+    route(LEGACY_RUNS_ROUTE, async (_req, res) => {
+      return json(res, 200, { ok: true, runs: await service.legacyRuns() })
+    }),
+    route(LEGACY_RUN_ROUTE, async (req, res) => {
+      const id = queryParam(req.url ?? '', 'id')
+      if (id === undefined || id === '') return json(res, 400, { ok: false, error: 'missing-id' })
+      const run = await service.legacyRun(id)
+      if (run === undefined) return json(res, 404, { ok: false, error: 'no-run' })
+      return json(res, 200, { ok: true, run })
+    }),
   ]
 }
 

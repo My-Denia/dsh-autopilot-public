@@ -25,7 +25,7 @@
  * Pure domain module: no dsh imports, no I/O, no state.
  */
 
-import type { Snapshot } from '../domain/types.js'
+import type { RoutingPin } from '../domain/types.js'
 import type { ResolvedRouting } from '../engine.js'
 import type { SessionPolicyState } from './authorize.js'
 import type { WorkClassAxis, WorkClassName, WorkClassTier } from './work-class.js'
@@ -140,7 +140,7 @@ export interface RoutingStatusView {
  * the owner turned off. The absent field is the honest record, exactly as the
  * other absent-means-unobserved fields on the status view are.
  *
- * @param snapshot - the run's durable state (read for its own pins only).
+ * @param snapshot - anything carrying the roles' pinned routes (read for those pins only).
  * @param routing - the LIVE resolved routing section (the same value the
  *   dispatch sites resolve), so a volatile config edit is visible here without
  *   a restart.
@@ -150,7 +150,7 @@ export interface RoutingStatusView {
  *   into `absent`.
  */
 export function routingStatusOf(
-  snapshot: Snapshot,
+  snapshot: { readonly routingPins?: Partial<Record<RoutingStatusRole, RoutingPin>> },
   routing: ResolvedRouting,
   policy?: SessionPolicyState,
 ): RoutingStatusView | undefined {

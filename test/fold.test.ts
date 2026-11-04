@@ -1,10 +1,50 @@
 /** Fold invariant matrix: legal transitions accepted, illegal streams rejected loudly. */
 
 import { describe, expect, it } from 'vitest'
-import { applyEvent, foldRun } from '../src/domain/fold.js'
-import { AutopilotError, canonicalBearer, evaluateCompletion, validateTriage } from '../src/domain/types.js'
-import type { AuditRecord, EvidenceKind, ExecutorRecord, RunEvent, Snapshot, UsageEntry } from '../src/domain/types.js'
-import { makeSnapshot, makeTriage } from './helpers.js'
+import { applyEvent, foldRun } from '../src/legacy/fold.js'
+import { AutopilotError, canonicalBearer, evaluateCompletion, validateTriage } from '../src/legacy/types.js'
+import type { AuditRecord, EvidenceKind, ExecutorRecord, RunEvent, Snapshot, Triage, UsageEntry } from '../src/legacy/types.js'
+
+// Local copies of the two fixture builders. test/helpers.ts builds a live engine and is being
+// retired with it; the frozen reader must not depend on it.
+function makeTriage(overrides: Partial<Triage> = {}): Triage {
+  const merged: Triage = {
+    objective: 'test objective',
+    scope: ['src/'],
+    nonGoals: ['docs/'],
+    acceptanceCriteria: ['tests pass'],
+    risk: 'low',
+    size: 'lightweight',
+    executionMode: 'inline',
+    auditMode: 'self-check',
+    touchesOperatingLayer: false,
+    baseline: {},
+    ...overrides,
+  }
+  // LEGACY_INLINE_REASON_REQUIRED: a fixture that asks for an inline medium+ run records its reason.
+  if (merged.executionMode === 'inline' && merged.risk !== 'low' && merged.inlineReason === undefined) {
+    return { ...merged, inlineReason: 'fixture: the test exercises an inline medium+ run' }
+  }
+  return merged
+}
+
+function makeSnapshot(overrides: Partial<Snapshot> = {}, triage: Partial<Triage> = {}): Snapshot {
+  return {
+    runId: 'run-1',
+    revision: 1,
+    triage: makeTriage(triage),
+    plan: { revision: 0, text: '' },
+    phase: 'planning',
+    planGate: 'pending',
+    executionGate: 'pending',
+    audits: [],
+    residualRisks: [],
+    logCount: 0,
+    consecutiveReplans: 0,
+    enforcement: { sandbox: 'off', reminders: 0, ownerApprovals: [] },
+    ...overrides,
+  }
+}
 
 function event(op: RunEvent['op'], snapshot: Snapshot, revision = snapshot.revision, detail?: unknown): RunEvent {
   return {
@@ -1699,7 +1739,7 @@ describe('submit-closeout evidence-kind stamp', () => {
 
   it('refuses a kind-less proven entry on a stamped event', () => {
     expect(codeOf(() => applyEvent(closing(), event('submit-closeout', completed(), 10, { evidenceKinds: 1 }))))
-      .toBe('AP_EVIDENCE_KIND_REQUIRED')
+      .toBe('LEGACY_EVIDENCE_KIND_REQUIRED')
   })
 
   it('accepts the same stamped event once the entry declares its kind', () => {
@@ -1722,7 +1762,7 @@ describe('submit-closeout evidence-kind stamp', () => {
       expect(codeOf(() => applyEvent(
         closing(),
         event('submit-closeout', completed('path'), 10, { evidenceKinds: stamped }),
-      ))).toBe('AP_EVIDENCE_KIND_STAMP_INVALID')
+      ))).toBe('LEGACY_EVIDENCE_KIND_STAMP_INVALID')
     }
   })
 
@@ -1742,7 +1782,7 @@ describe('submit-closeout evidence-kind stamp', () => {
       },
     })
     expect(codeOf(() => applyEvent(closing(), event('submit-closeout', snapshot, 10, { evidenceKinds: 1 }))))
-      .toBe('AP_EVIDENCE_KIND_INVALID')
+      .toBe('LEGACY_EVIDENCE_KIND_INVALID')
   })
 })
 
@@ -2531,7 +2571,7 @@ describe('routing detail costMatch: five kinds, optional, fold-validated', () =>
     expect(next.routingPins).toEqual({ 'plan-auditor': PIN })
   })
 
-  it('refuses an invalid costMatch value with an AP_ROUTING_DETAIL-shaped problem', () => {
+  it('refuses an invalid costMatch value with an LEGACY_ROUTING_DETAIL-shaped problem', () => {
     const prior = makeSnapshot({ phase: 'plan-reviewing' }, STANDARD_TRIAGE)
     expect(() => applyEvent(prior, auditWithRouting(
       prior,
@@ -2706,7 +2746,7 @@ describe('governance pragmatics v1 (fold)', () => {
     expect(() => applyEvent(prior, event('amend-plan', next, 2))).toThrowError(/illegal in phase planning/)
     // Defense-in-depth arm: a foreign snapshot that claims phase executing
     // with planGate NOT pass must hit the gate rule itself (the write path
-    // refuses this earlier with AP_INVALID_ARGUMENT; §16 documents the fold
+    // refuses this earlier with LEGACY_INVALID_ARGUMENT; §16 documents the fold
     // arm as the replay-side re-check).
     const foreign = executing({ planGate: 'pending' })
     const foreignNext: Snapshot = {

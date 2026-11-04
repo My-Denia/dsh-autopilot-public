@@ -18,10 +18,8 @@
  */
 
 import { describe, expect, it } from 'vitest'
-import { familyOf, selectCrossFamily } from '../src/engine.js'
-import type { CrossFamilyPolicy } from '../src/engine.js'
-import { resolveConfig } from '../src/index.js'
-import { makeHarness, makeTriage, stubSubagents } from './helpers.js'
+import { familyOf, selectCrossFamily } from '../src/roles/cross-family.js'
+import type { CrossFamilyPolicy } from '../src/roles/cross-family.js'
 
 const ALPHA = { provider: 'alpha', model: 'a-1' }
 const ALPHA_OTHER_MODEL = { provider: 'alpha', model: 'a-2' }
@@ -132,44 +130,5 @@ describe('selectCrossFamily: when it does happen', () => {
       risk: 'medium', configured: ALPHA, executor: ALPHA, policy: policy({ pool: [{ model: 'nameless' }] }),
     })
     expect(choice.outcome).toBe('same-family')
-  })
-})
-
-describe('the audit dispatch records the outcome on its route', () => {
-  const STANDARD = { size: 'standard', risk: 'medium', executionMode: 'inline', auditMode: 'independent' } as const
-  const SEED = { id: 'm1', usageClass: 'internal', boundaryStates: [], artifacts: [], attempted: [] } as const
-
-  async function auditWith(config: Parameters<typeof resolveConfig>[0]) {
-    const subagents = stubSubagents({ verdicts: [{ verdict: 'pass', note: 'ok' }] })
-    const h = makeHarness({ subagents, config })
-    await h.engine.init(h.root, makeTriage(STANDARD), [SEED])
-    await h.engine.submitPlan(h.root, 'plan')
-    const outcome = await h.engine.audit(h.root, { role: 'plan', prompt: 'packet' })
-    return { outcome, snapshot: h.engine.peek(h.root.id) }
-  }
-
-  it('stamps achieved when the auditor is drawn out of family', async () => {
-    const { outcome, snapshot } = await auditWith({
-      executor: { agentOptions: ALPHA },
-      crossFamily: { enabled: true, minRisk: 'medium', pool: [BETA] },
-    })
-    expect(outcome.route.crossFamily).toBe('achieved')
-    expect(snapshot?.audits[0]?.route.crossFamily).toBe('achieved')
-  })
-
-  it('stamps same-family, and the diagnostic survives onto the durable record', async () => {
-    const { snapshot } = await auditWith({
-      executor: { agentOptions: ALPHA },
-      auditors: { plan: { agentOptions: ALPHA } },
-      crossFamily: { enabled: true, minRisk: 'medium', pool: [] },
-    })
-    expect(snapshot?.audits[0]?.route.crossFamily).toBe('same-family')
-    expect(snapshot?.audits[0]?.route.routeDiagnostic).toMatch(/cross-family: /)
-  })
-
-  it('stamps unknown-family on a deployment that configured no routes at all', async () => {
-    // The default shape of a fresh install. It must not read as `achieved`.
-    const { snapshot } = await auditWith({})
-    expect(snapshot?.audits[0]?.route.crossFamily).toBe('unknown-family')
   })
 })

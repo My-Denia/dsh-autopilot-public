@@ -60,7 +60,7 @@ import type { WorkClassName } from './routing/work-class.js'
  * `terminal_send` / `terminal_read` / `terminal_signal` / `terminal_close`,
  * and substituting those here would GRANT a delegated child a capability it
  * never had. The rename went the other way instead: the gate's `SHELL_TOOLS`
- * scan (`./gate/decide.ts`) gained the terminal names, because widening what
+ * scan (`SHELL_TOOLS` in `./roles/tools.ts`, formerly the egress gate) gained the terminal names, because widening what
  * is SCANNED is the fail-closed direction and widening what is ALLOWED is not.
  * Nothing egress-capable belongs in this list, and `test/config.test.ts`
  * asserts both the exact array and that property — in BOTH directions, because
@@ -298,7 +298,7 @@ export const StoreKindSchema = Schema.union([
   Schema.const('auto').description('Prefer the storageDomain backend when it is observable, else files.'),
   Schema.const('file').description('Always the file store under $DSH_HOME/storages/dsh-autopilot.'),
   Schema.const('domain').description('Require ctx.storageDomain; refuse to mount without it.'),
-]).default('auto').description('Which backend holds the canonical event stream.')
+]).description('RETIRED in 0.3.0 and ignored: the ledger goes to the domain when the host mounts one, else to files. No default is declared, so only a written key reads as retired.')
 
 /** Declared plugin configuration shape; mirrors `ConfigInput` in `./index.ts`. */
 const ConfigShape = Schema.object({
@@ -327,22 +327,25 @@ const ConfigShape = Schema.object({
   routing: RoutingShape.description(
     'Role-true model routing over the live catalog. Every GAH-config-sourced explicit route (a lock, legacy role config, a legacy pool pick) is a plugin-config grant under one rule in every mode; a grant outside an existing session model-selection policy escalates to the owner instead of dispatching. In auto mode the routing core subsumes the legacy pool fallback: pool entries stay consultable as grants, never widen the session-authorized set, and never override a role lock.',
   ),
+  // RETIRED in 0.3.0 and ignored. NO defaults are declared on these leaves on purpose: the loader fills
+  // declared defaults before `apply()` sees the config, and a default here would make every mount read
+  // as having written a retired key (`retiredKeysIn`). `resolveConfig` supplies its own defaults.
   gate: Schema.object({
-    sandboxCoupling: Schema.boolean().default(true).description('Clamp standard runs read-only until the plan gate passes.'),
-    toolDeny: Schema.boolean().default(true).description('Deny write/edit/str_replace_editor pre-plan-gate and while usage is undeclared.'),
-    egressDeny: Schema.boolean().default(true).description('Enforce the owner-only egress boundary.'),
-    stopReminder: Schema.boolean().default(true).description('Emit the bounded turn-stop execution reminder.'),
-    strictShell: Schema.boolean().default(false).description('Deny shell pre-plan-gate when the sandbox is not active.'),
-    restoreMode: Schema.string().default('workspace-write').description('Sandbox mode restored on plan-gate pass when none was recorded.'),
+    sandboxCoupling: Schema.boolean().description('Retired, ignored: the plan-gate sandbox clamp is gone.'),
+    toolDeny: Schema.boolean().description('Retired, ignored: the pre-plan-gate tool deny is gone.'),
+    egressDeny: Schema.boolean().description('Retired, ignored: the egress boundary is gone.'),
+    stopReminder: Schema.boolean().description('Retired, ignored: the turn-stop reminder is gone.'),
+    strictShell: Schema.boolean().description('Retired, ignored: the shell gate is gone.'),
+    restoreMode: Schema.string().description('Retired, ignored: a clamped session is restored to the mode its run recorded.'),
   }),
   storeKind: StoreKindSchema,
   storeRoot: Schema.string().default('').description('Run store directory; empty means $DSH_HOME/storages/dsh-autopilot.'),
   governance: Schema.object({
     maxAuditRoundsPerRole: Schema.number().min(1).description(
-      'Brake on audit storms: refuse further same-role audit dispatches beyond this many rounds (AP_AUDIT_ROUND_CAP). Off when unset; escalation to the owner is never automatic.',
+      'Brake on audit storms: refuse further same-role audit dispatches beyond this many rounds. Retired in 0.3.0 and ignored. Off when unset; escalation to the owner is never automatic.',
     ),
     unattended: Schema.boolean().description(
-      'Unattended approval policy: when on, a validated egress returns an immediate, visible, recoverable DENY instead of an owner ask (which would wait forever with nobody to answer). The manifest stands; the owner later grants autopilot_signal owner-approve and the call is retried. Off by default preserves the ask arm.',
+      'Retired in 0.3.0 and ignored: the egress policy it tuned no longer exists.',
     ),
   }).description('Governance pragmatics knobs (all optional, all off by default).'),
   skillInstall: Schema.union([
@@ -506,4 +509,49 @@ export const Config: Schema<ConfigInput, ConfigInput> = ((raw: unknown, options?
   version: 1,
   vendor: 'dsh-autopilot',
   validate: (value: unknown) => validateConfig(value),
+}
+
+/**
+ * Settings whose mechanism 0.3.0 removed. The schema still ACCEPTS them, so a
+ * profile written for 0.2.x loads without error, but they have no effect.
+ *
+ * - `gate.*`: the sandbox clamp, tool deny, egress deny, stop reminder, strict
+ *   shell and restore mode belonged to the retired run state machine.
+ * - `governance.*`: audit-round cap and unattended egress policy likewise.
+ * - `storeKind`: history now reads both backends; the ledger follows what the
+ *   host offers.
+ *
+ * Still live (not listed): `routing.*` (child routing), `crossFamily.*`
+ * (reviewer independence), `storeRoot`, `skillInstall`. `auditors.*`,
+ * `auditProvider`, `executorProvider` and `executor.*` are accepted but are not
+ * yet listed here; whether 0.3.0 still reads them is the engine's call.
+ */
+export const RETIRED_CONFIG_KEYS: readonly string[] = [
+  'gate.sandboxCoupling',
+  'gate.toolDeny',
+  'gate.egressDeny',
+  'gate.stopReminder',
+  'gate.strictShell',
+  'gate.restoreMode',
+  'governance.maxAuditRoundsPerRole',
+  'governance.unattended',
+  'storeKind',
+]
+
+/** The retired keys the user actually wrote in `input`, in {@link RETIRED_CONFIG_KEYS} order. */
+export function retiredKeysIn(input: unknown): readonly string[] {
+  return RETIRED_CONFIG_KEYS.filter(path => {
+    let node: unknown = input
+    for (const part of path.split('.')) {
+      if (typeof node !== 'object' || node === null || Array.isArray(node)) return false
+      node = (node as Record<string, unknown>)[part]
+    }
+    return node !== undefined
+  })
+}
+
+/** One plain status note naming the ignored keys, or `undefined` when there are none. */
+export function retiredConfigNote(keys: readonly string[]): string | undefined {
+  if (keys.length === 0) return undefined
+  return `dsh-autopilot 0.3.0 ignores retired settings: ${keys.join(', ')}; they no longer have an effect.`
 }

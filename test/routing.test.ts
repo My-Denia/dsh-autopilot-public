@@ -1167,6 +1167,25 @@ describe('select: F29 (PR #2 round 16) — a materialized default effort reaches
     expectWhy(decision, /effort: "low" named by the role lock/)
   })
 
+  it('MY-25 #1: a preflight that carries a DIFFERENT effort never replaces the lock-named one; it is recorded as an observation', async () => {
+    const base = stubLlm([{ provider: 'alpha', id: 'm-lock', contextWindow: 131072 }])
+    const carrying: LlmRuntimeSubset = {
+      ...base,
+      resolveCallConfig: async (config: LlmCallConfig) => ({ ...config, reasoningEffort: 'high' }),
+    }
+    const decision = await selectRoute(
+      selection({
+        roleRouting: { mode: 'locked', provider: 'alpha', model: 'm-lock', reasoningEffort: 'low' },
+        policy: ABSENT_POLICY,
+        catalog: new RouteCatalog(carrying),
+      }),
+    )
+    const route = expectRoute(decision)
+    expect(route.route.reasoningEffort).toBe('low')
+    expectWhy(decision, /preflight carried "high" but the role lock named "low"/)
+    expect(route.why.some((entry) => /materialized by the adapter/.test(entry))).toBe(false)
+  })
+
   it('locked path: echo with a lock-named effort ⇒ byte-identical (the preflight validated exactly what is recorded)', async () => {
     const stubbed = stubLlm([{ provider: 'alpha', id: 'm-lock', contextWindow: 131072 }])
     const decision = await selectRoute(
