@@ -15,6 +15,7 @@ import { readFileSync, readdirSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { describe, expect, it } from 'vitest'
+import { REFUSALS } from '../src/domain/refusals.js'
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..')
 const refusalsPath = join(root, 'skill', 'dsh-autopilot', 'references', 'refusals.md')
@@ -33,6 +34,14 @@ function sourceFiles(): readonly string[] {
   return out
 }
 
+/**
+ * Drop comments before counting: a comment that mentions a code (a note about
+ * a refusal that no longer exists) raises nothing.
+ */
+function withoutComments(text: string): string {
+  return text.replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|\s)\/\/.*$/gm, '$1')
+}
+
 function codesIn(text: string): ReadonlySet<string> {
   return new Set([...text.matchAll(/AP_[A-Z0-9_]+/g)].map(match => match[0]))
 }
@@ -49,7 +58,7 @@ function splitRefusals(text: string): { readonly inForce: ReadonlySet<string>, r
 
 const files = sourceFiles()
 const fromSource = new Set<string>()
-for (const file of files) for (const code of codesIn(readFileSync(join(root, 'src', file), 'utf8'))) fromSource.add(code)
+for (const file of files) for (const code of codesIn(withoutComments(readFileSync(join(root, 'src', file), 'utf8')))) fromSource.add(code)
 
 describe('refusal contract', () => {
   it('has an enforcing source to census', () => {
@@ -57,6 +66,14 @@ describe('refusal contract', () => {
     // would pass on two empty sets and report a calm green.
     expect(files.length).toBeGreaterThan(20)
     expect(fromSource.size).toBeGreaterThanOrEqual(10)
+  })
+
+  it('documents exactly the codes of the registry in src/domain/refusals.ts', () => {
+    const { inForce } = splitRefusals(readFileSync(refusalsPath, 'utf8'))
+    const registry = Object.keys(REFUSALS).sort()
+    // The registry is the one list a code can be thrown from, so it must not be empty.
+    expect(registry.length).toBeGreaterThanOrEqual(20)
+    expect([...inForce].sort()).toEqual(registry)
   })
 
   it('states every code the source can raise, and invents none', () => {

@@ -3279,12 +3279,18 @@ root 的治理出口；两个入口写入同一个寄存器（`commitLogEntry` �
 - `requireDirectHumanTurn` 收窄：只用于账本里 owner 显式动作（如清除遗留归档）。目标的创建、
   编辑、恢复由 dsh-tool-goal 原生的直接人类回合校验负责，不再由插件重复一道。
 - 同会话目标 A→B、skill 的安装与复制机制：保留。
-- 角色的 `escalate` 动作保留为子代理向主线程提议升档的通道（§1.2 "升档是请求"）。
+- 升档请求保留为独立工具 `autopilot_escalate {reason}`：除 reviewer 外的被委派子代理用它向父级提议升档，只记录请求并返回，由父级决定并重新派发（§1.2 "升档是请求"）。它不再是 `autopilot_agents` 的动作。
 
 #### 配置键
 
-`gate.*`、`governance.*`、`storeKind`、`crossFamily` 仍被接受但不再生效；status 提示一次。
-`routing.*` 照常。
+退役键（`src/config.ts` 的 `RETIRED_CONFIG_KEYS`）仍被接受但不再生效；status 提示一次：`gate.*`、
+`governance.maxAuditRoundsPerRole`、`governance.unattended`、`storeKind`、`auditProvider`、
+`executorProvider`、`executor.persona`、`executor.toolAllowList`、`crossFamily.*`、各
+`*.agentOptions.maxTokens` 以及 `auditors.<role>.provider`。仍被读取的旧键
+（`LEGACY_KEYS_STILL_READ`）：`executor.agentOptions.{provider,model,reasoningEffort}` 成为
+`routing.roles.executor` 的锁，钉住 worker 与 executor-lead 的路由；
+`auditors.<role>.agentOptions.{provider,model,reasoningEffort}` 成为对应审计员的锁，钉住
+reviewer 的路由。`routing.*`、`skillInstall`、`storeRoot` 照常。
 
 #### 未覆盖 / 承担得更弱的部分
 
@@ -3297,8 +3303,10 @@ root 的治理出口；两个入口写入同一个寄存器（`commitLogEntry` �
   所耗轮数的界限（不超过 ceil(等待分钟/10)+2）是**待验证**的目标，不是已测结果。
   跨重启的继续需要 owner 说"continue"；`schedule_create` 的提醒会在重启后送达会话，但
   不会重新武装目标。
-- 事实表未确认插件运行时启动的子代理是否会收到宿主原生的结算通知、能否用原生
-  `send_message` / `list_agents` 驱动；这决定 `autopilot_agents` 的最终动作集，**可能变化**。
+- 插件工具面已定为：`autopilot_status`、`autopilot_delegate`、`autopilot_agents`（只有 `wait` 一个动作）、
+  `autopilot_escalate`；列出、发消息、中断由宿主原生的 `list_agents` / `send_message` /
+  `interrupt_agent` 承担（代码注释称它们已能看见并控制经 `startActivation` 启动的子代理）。
+  这一点在真机上**尚未验证**。
 
 #### 兼容与回滚
 
@@ -3312,5 +3320,8 @@ root 的治理出口；两个入口写入同一个寄存器（`commitLogEntry` �
 autopilot_init（不再是必需的第一步）、autopilot_submit_plan、autopilot_audit、
 autopilot_self_check、autopilot_usage、autopilot_submit_evidence、autopilot_submit_closeout、
 autopilot_submit_packet、autopilot_external_audit、autopilot_amend_plan、autopilot_signal、
-autopilot_executor。现行工具面见 `autopilot_status` 与宿主显示的工具列表；
-`autopilot_delegate` 和 `autopilot_agents` 的最终形态由引擎部分决定，写作时未定稿。
+autopilot_executor、autopilot_log、autopilot_request_escalation（后者被 `autopilot_escalate` 取代）。
+现行工具面：`autopilot_status {link?}`；`autopilot_delegate {role, task, writePaths?, provider?, model?,
+effort?, workClass?, replaces?, reviewedChildIds?}`（仅根代理与 executor-lead）；
+`autopilot_agents {action: 'wait', childIds?, timeoutSeconds}`（默认 300，上限 600，仅根代理与
+executor-lead）；`autopilot_escalate {reason}`（除 reviewer 外的被委派子代理）。

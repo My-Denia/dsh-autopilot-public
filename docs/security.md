@@ -20,11 +20,19 @@ Deeper design and measurements: [DESIGN.md](../DESIGN.md).
   filter is applied to the child when the host announces it. The reviewer's
   verdict is returned in-band by the reviewer itself; the main agent cannot
   write one.
-- **Delegated children** have a tool filter per role (scout, clerk, planner and
-  reviewer are read-only; a worker writes only inside its `writePaths`).
-  Workers with intersecting `writePaths` are refused before they start.
-  *Mechanical*: the filter and the overlap check. *Not mechanical*: whether a
-  worker's task text keeps to its brief.
+- **Delegated children** have a tool allow-list per role: scout, planner and
+  reviewer get only `read`, `glob`, `grep` and `read_image` (scout also
+  `web_fetch` and `web_search`); a clerk gets the scout set plus the connector
+  tools present in the session, so it can write to external systems. A worker
+  and an executor-lead have no allow-list. `writePaths` is a conflict guard,
+  not a permission system: a worker is not stopped from writing outside its
+  declared paths, but a dispatch whose `writePaths` intersect those of an
+  active writer under the same root is refused before it starts, and a worker
+  dispatch without `writePaths` is refused. Only an executor-lead gets the
+  delegation tools, and it may start only scout, clerk and worker.
+  *Mechanical*: the allow-lists, the dispatch rule and the overlap check.
+  *Not mechanical*: whether a worker's task text keeps to its brief and its
+  declared paths.
 - **Ledger owner actions.** Actions that change the ledger on the owner's behalf,
   such as clearing a legacy archive, require the owner's direct human turn.
   An agent-generated turn is refused. Goal creation, editing and resuming are
@@ -59,8 +67,8 @@ host (see [compatibility.md](compatibility.md#not-yet-verified-on-a-real-host)).
 ## Enforcement labels (do not over-read)
 
 - *Mechanical* means the plugin code refuses or filters the action: the role
-  tool filter, the `writePaths` overlap refusal, the direct-human-turn check on
-  ledger owner actions, the read-only tool set of the reviewer.
+  tool allow-lists, the `writePaths` overlap refusal, the direct-human-turn
+  check on ledger owner actions, the read-only tool set of the reviewer.
 - *Discipline* means the skill asks and a reviewer may catch it: redaction
   before outbound, completing a goal only when Done holds, recording "reduced
   independence", keeping to a brief.
@@ -71,11 +79,24 @@ host (see [compatibility.md](compatibility.md#not-yet-verified-on-a-real-host)).
 
 ## Web routes
 
-`GET /api/autopilot/runs` and `/run` are fenced by the host's `connection`
-service. A host with a web server but no `connection` service gets
-`503 no-connection-service`, never an open route. The fence is the host's; the
-plugin only applies it. The projection these routes return may change with the
-0.3.0 ledger.
+When the host has a web server, the plugin mounts three same-origin, GET-only
+routes under `/api/autopilot`:
+
+| route | answers |
+| --- | --- |
+| `GET /api/autopilot/ledger?session=<id>` | `200 {ok:true, ledger}`; `400 {ok:false, error:'missing-session'}` without `session`; `404 {ok:false, error:'no-ledger'}` when that session has no ledger |
+| `GET /api/autopilot/runs` | `200 {ok:true, runs}`: every legacy 0.2.x run, from both backends |
+| `GET /api/autopilot/run?id=<id>` | `200 {ok:true, run}`; `400 {ok:false, error:'missing-id'}` without `id`; `404 {ok:false, error:'no-run'}`. `id` is a run id, or a session id: then the last legacy run listed for that session is served |
+
+Any other method answers `405 {ok:false, error:'method-not-allowed'}`; an
+unexpected failure answers `500 {ok:false, error:'internal'}` with no store
+path or exception text. Every route is fenced by the host's `connection`
+service on each request (browser authentication and Host/Origin checks, `401`
+or `403` when rejected). A host with a web server but no `connection` service
+gets `503 {ok:false, error:'no-connection-service'}`, never an open route. The
+fence is the host's; the plugin only applies it. A host with no web server
+mounts nothing. The routes read through the read-only service and cannot
+change the ledger.
 
 ## Explicit non-goals
 

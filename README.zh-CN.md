@@ -33,7 +33,7 @@ WSL CLI 的 profile 需要退回旧宿主时，先备份 profile，再执行 `np
 ## 目标怎么运行
 
 - 开始：读项目规则和 issue，把 Outcome、Done、Not in scope 写在 issue 或 PR 上，在 worktree 里工作。
-- 角色：主代理负责判断、整合和同 owner 沟通。`autopilot_delegate` 启动 `scout`（只读检索）、`clerk`（通过现有连接器做外部读写）、`worker`（带独立 `writePaths` 的有界实现）、`executor-lead`（负责一个工作块的完整交付，可再启动 scout、clerk、worker）、`planner`（只读规划或诊断）和 `reviewer`。
+- 角色：主代理负责判断、整合和同 owner 沟通。`autopilot_delegate` 启动 `scout`（只读检索）、`clerk`（通过现有连接器做外部读写）、`worker`（带独立 `writePaths` 的有界实现）、`executor-lead`（负责一个工作块的完整交付，可再启动 scout、clerk、worker）、`planner`（只读规划或诊断）和 `reviewer`。跟踪子代理用 `autopilot_agents`（只有 `wait` 一个动作）以及宿主自带的 `list_agents`、`send_message`、`interrupt_agent`；卡住的子代理调用 `autopilot_escalate`。
 - 并行委派：互相独立的子代理在同一轮一起启动。`writePaths` 有重叠的 worker 会在启动前被拒绝。
 - 独立评审：`reviewer` 一次性、只读、全新上下文，只看 diff 和结论。能找到不同模型家族时用不同家族；找不到则允许同家族，并记录为「降低独立性」。
 - 模型与 effort：每次派发都写明模型和 effort。调用里的显式值或 profile 里的固定值优先于插件的选择。账本和卡片同时显示选定路线和实际观察到的路线。

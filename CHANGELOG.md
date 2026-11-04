@@ -15,9 +15,16 @@ in [docs/compatibility.md](docs/compatibility.md#not-yet-verified-on-a-real-host
 - Removed tools: `autopilot_submit_plan`, `autopilot_audit`,
   `autopilot_self_check`, `autopilot_usage`, `autopilot_submit_evidence`,
   `autopilot_submit_closeout`, `autopilot_submit_packet`,
-  `autopilot_external_audit`, `autopilot_amend_plan`, `autopilot_signal` and
-  `autopilot_executor`. `autopilot_init` is no longer a required first step;
-  there is no init step.
+  `autopilot_external_audit`, `autopilot_amend_plan`, `autopilot_signal`,
+  `autopilot_executor`, `autopilot_log` and `autopilot_request_escalation`
+  (replaced by `autopilot_escalate`). `autopilot_init` is removed too; there
+  is no init step.
+- Retired config keys are accepted and ignored (`gate.*`, `governance.*`,
+  `storeKind`, `auditProvider`, `executorProvider`, `executor.persona`,
+  `executor.toolAllowList`, `crossFamily.*`, every `maxTokens` under
+  `executor` and `auditors`, `auditors.<role>.provider`). The
+  `executor.agentOptions` and `auditors.<role>.agentOptions` route keys are
+  still read as route locks; see [docs/reference.md](docs/reference.md#configuration).
 - Removed mechanisms: run phases and gates (plan gate, execution gate, closing,
   replan budget); triage (size, risk, executionMode, auditMode); usage ids;
   the read-only sandbox clamp and tool deny; the closeout packet, handoff,
@@ -26,7 +33,7 @@ in [docs/compatibility.md](docs/compatibility.md#not-yet-verified-on-a-real-host
   with `gateSources`; the turn-stopping reminder.
 - Plan, execution and rules auditors are replaced by one one-shot read-only
   `reviewer`.
-- `engines.dsh` narrows to `>=0.2.1-rc.5 <0.3.0-0` (set at integration). Hosts
+- `engines.dsh` narrows to `>=0.2.1-rc.5 <0.3.0-0`. Hosts
   on `0.1.x` and `0.2.0` stay on `dsh-goal-autopilot@0.2.0`, the last version
   for them.
 - The skill and its reference files are replaced.
@@ -35,8 +42,14 @@ in [docs/compatibility.md](docs/compatibility.md#not-yet-verified-on-a-real-host
 
 - `autopilot_delegate`: start a `scout`, `clerk`, `worker`, `executor-lead`,
   `planner` or `reviewer` child with an explicit model and effort.
-- `autopilot_agents`: list, wait for, message, stop or escalate children. The
-  final action set depends on a real-host probe.
+- `autopilot_agents`: wait for children (`action: wait`, default 300 s, at most
+  600 s). Listing, messaging and stopping children use the host's own
+  `list_agents`, `send_message` and `interrupt_agent`; whether they reach
+  children started by the plugin on a real host is not yet verified.
+- `autopilot_escalate`: a delegated child other than the reviewer records a
+  request for a stronger model, more effort or a different split; the parent
+  decides and re-dispatches with `replaces`.
+- `autopilot_status` takes an optional `link` to record an issue or PR link.
 - Parallel delegation in one turn, with a pre-dispatch refusal of workers whose
   `writePaths` intersect. `executor-lead` children may start children (depth 2).
 - Native goal use: `get_goal`, `create_goal`, `update_goal`, continued by the

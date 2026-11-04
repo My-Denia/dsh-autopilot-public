@@ -10,9 +10,9 @@ Source version `0.3.0`, the goal-workflow adapter. It is not published: npm
 
 - **Target host:** dsh `0.2.1-rc.5` only (npm `@deepseek-ai/dsh` `latest` was
   `0.2.1-rc.5` on 2026-10-29; that is the Windows desktop build). The plugin is
-  tested on no other host. The `engines` range will be `>=0.2.1-rc.5 <0.3.0-0`
-  once the integration step sets it in `package.json`; until then the manifest
-  still carries the 0.2.x range.
+  tested on no other host. The `engines.dsh` range in `package.json` is
+  `>=0.2.1-rc.5 <0.3.0-0`, and the `@deepseek-ai/dsh-tools` peer range is the
+  same. A host outside it refuses the install.
 - **Environments:** the Windows desktop app (profile `desktop`) and the WSL CLI
   (profile `autopilot-rc`) are each treated as a native environment. The WSL CLI
   has no run history; the Windows desktop profile has 45 legacy run streams.
@@ -27,7 +27,7 @@ been observed is below.
 ## Not yet verified on a real host
 
 Plugin 0.3.0 on dsh 0.2.1-rc.5. None of these has been observed on a real host.
-The integration step will trim this list as items are observed. Passing tests,
+The list is trimmed as items are observed. Passing tests,
 mock runs and status reads do not count as observation.
 
 - Upgrade keeps the legacy run cards: the same count before and after (45 file
@@ -57,8 +57,10 @@ mock runs and status reads do not count as observation.
 - WSL CLI `0.2.1-rc.5` install of 0.3.0 from npm or a tarball; a headless run
   passes the simple-work check and a reduced goal-work check.
 - Whether children started by the plugin's runtime get native settlement notices
-  and can be driven by the host's `send_message` and `list_agents`. This decides
-  how large the `autopilot_agents` tool stays.
+  and can be driven by the host's `send_message`, `list_agents` and
+  `interrupt_agent`. The plugin ships no list, message or stop tool
+  (`autopilot_agents` has only `wait`), so these native tools are the only way
+  to do that.
 - Anything that needs the real model API: earlier attempts returned HTTP
   503/502. Such items are "unverified (API 503)", never replaced by a mock run.
 
@@ -77,12 +79,12 @@ Source version of that line: **0.2.1-rc.1**, a pre-release adapted to dsh
 
 | Host `dsh` | How it was established | Install / mount | Lifecycle |
 | --- | --- | --- | --- |
-| `0.2.1-rc.2` CLI | WSL2, 2026-10-17, isolated `DSH_HOME`, local Anthropic-messages mock on 127.0.0.1, no credentials | The installed client matches the 2026-10-17 tarball. A saved install log with the exit code was not kept. `engines.dsh` is what this host checks first. `pnpm peers check` inside a profile directory lists `@deepseek-ai/dsh-tools` and `schemastery` as missing; those are host-provided | **verified with the mock, on the 2026-10-17 tarball:** plugin tools loaded; plan audit; delegated executor; packet rev 1; execution audit needs-fix; resume; packet rev 2; closeout of goal A; `autopilot_init` of goal B in the same session; B completed; A's run stayed `completed` with its own executor; B had no executor and a different objective. Restart with `--session-id` then `autopilot_status` returned B (`…r2`, phase `completed`). That tarball's `lib/index.js` matches the 2026-10-18 package. Its `lib/client.js` does not contain `priorRuns`. |
+| `0.2.1-rc.2` CLI | WSL2, 2026-10-17, isolated `DSH_HOME`, local Anthropic-messages mock on 127.0.0.1, no credentials | The installed client matches the 2026-10-17 tarball. A saved install log with the exit code was not kept. `engines.dsh` is what this host checks first. `pnpm peers check` inside a profile directory lists `@deepseek-ai/dsh-tools` and `schemastery` as missing; those are host-provided | **verified with the mock, on the 2026-10-17 tarball:** plugin tools loaded; plan audit; delegated executor; packet rev 1; execution audit needs-fix; resume; packet rev 2; closeout of goal A; the 0.2.x init call of goal B in the same session; B completed; A's run stayed `completed` with its own executor; B had no executor and a different objective. Restart with `--session-id` then `autopilot_status` returned B (`…r2`, phase `completed`). That tarball's `lib/index.js` matches the 2026-10-18 package. Its `lib/client.js` does not contain `priorRuns`. |
 | `0.2.1-rc.2` CLI, tarball `b967e627…` | WSL2, 2026-10-18, a different isolated home, local mock on 127.0.0.1. sha256 `b967e62729f9b492415a9238c8f3a3f035f156bbd5d4014564cbd86c310f3e62`, packed from `567b7a7`. Later doc commits are not inside that file | The installed client matches this tarball | Mock lifecycle through a second goal; restart status stayed on that goal. This does not replace the 2026-10-17 tarball. Extracted `lib/client.js` keeps the earlier run id in `priorRuns` and the live id on the later run. The 20 bundle assertions do not cover that fold. A web page on this home rendered the card for the live goal only; the card does not list `priorRuns`. **Not verified:** Desktop, and a real model. Headless calls stopped with HTTP 503 before any autopilot tool. |
 | `0.2.0-rc.2` CLI | WSL2, 2026-10-07, isolated `DSH_HOME` + local mock model, no credentials | **verified:** `dsh plugin add` without exemption, mount, 12 `autopilot_*` tools, skill install; web profile serves the client bundle | **verified with a scripted mock model:** plan audit → delegated executor → packet → execution audit needs-fix → resume of the same executor → packet rev 2. **Not verified:** a real model, closeout |
 | `0.2.0-rc.1`, `0.2.0` | in the declared range; host's own compatibility check says compatible | not re-run for 0.2.1-rc.1 | not re-run |
 | `0.1.7-x`, other `0.2.1` prereleases | **outside** the declared range; dsh refuses the install | — | — |
-| `0.1.5-rc.1` | WSL2 live CLI, 2026-09-13 (0.1.1) | **0.1.1 peer-layout:** compose/mount + skill load + `autopilot_init` | **not verified:** write lifecycle. 0.2.0's code changes were checked against the published 0.1.5 packages, not re-run on a 0.1.5 host |
+| `0.1.5-rc.1` | WSL2 live CLI, 2026-09-13 (0.1.1) | **0.1.1 peer-layout:** compose/mount + skill load + the 0.2.x init call | **not verified:** write lifecycle. 0.2.0's code changes were checked against the published 0.1.5 packages, not re-run on a 0.1.5 host |
 | `0.1.2-rc.1` | Original package pin / earlier real-host work | claimed by this snapshot's design notes | earlier host traces in [DESIGN.md §8](../DESIGN.md) (not re-run) |
 | Windows Desktop 0.2.0-rc.2 (app, real account) | **run 2026-10-10**, profile `desktop`, candidate tarball | **verified:** plugin mount; the shipped system-prompt section renders against the LIVE catalog (`m7/desktop-onboarding-section.md` in the run store); the routing config on the profile patch is what the host mounts, and the session's own run stayed visible (`enforcement.store=file`) after a restart | **partially verified:** run persistence across a host restart (needs the packaged `storeKind: file` pin repeated in the profile patch — see below); the composed-config dump is a HEADLESS artifact (the managed `desktop` profile refuses `--dump-config`), so the desktop side is backed by the on-disk patch plus the restarted session's own run state; **not verified:** full write lifecycle / closeout on Desktop, macOS |
 | Windows | out of scope | **not verified** | **not verified** |
@@ -218,7 +220,7 @@ workspace-write calls. That host/model mismatch is outside this plugin's
 0.1.1 scope. Residual: the model sends redundant
 `sandbox_permissions=workspace-write`.
 
-The domain store backend has been driven to `autopilot_init` and no further
+The domain store backend has been driven to the 0.2.x init call and no further
 on that path; artifact settlement and some store-error arms are file-backend
 evidence only. See [DESIGN.md §6](../DESIGN.md).
 

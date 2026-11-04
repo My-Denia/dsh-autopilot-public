@@ -3,8 +3,7 @@
 First-time users should start from the [README](../README.md). This page is for
 operators: the tools the plugin registers, the ledger it keeps, the DSH tools
 the workflow relies on, and configuration. The tool list the host shows in a
-session is authoritative; the plugin's tool surface may still change while the
-engine work lands, so check it before scripting against a name or parameter.
+session is authoritative if it ever differs from this page.
 
 Who owns what:
 
@@ -24,65 +23,110 @@ children.
 
 ## Plugin tools
 
+Four tools, registered per agent scope. The root agent gets `autopilot_status`,
+`autopilot_delegate` and `autopilot_agents`; a delegated `executor-lead` gets
+`autopilot_delegate`, `autopilot_agents` and `autopilot_escalate`; every other
+delegated child except `reviewer` gets `autopilot_escalate` only; a `reviewer`
+gets none. There is no list, message or stop tool: the host's own `list_agents`,
+`send_message` and `interrupt_agent` do that.
+
 ### `autopilot_delegate`
 
-Starts one role child. Parameters:
+Starts one role child. Callable by the root agent and by an `executor-lead`.
+Parameters:
 
 | parameter | meaning |
 | --- | --- |
 | `role` | `scout`, `clerk`, `worker`, `executor-lead`, `planner` or `reviewer` |
 | `task` | the brief: outcome, files, what the child may not touch, a checkable result |
-| `writePaths` | paths the child may write; read-only roles get none |
-| `model`, `effort` | optional explicit route. Beats a profile pin and the plugin's choice |
+| `writePaths` | files or prefixes (`src/parser/**`) the child may write. Required for `worker`; ignored for read-only roles |
+| `provider`, `model` | optional explicit route; give both or neither. Beats a profile pin and the ladder |
+| `effort` | optional explicit reasoning effort |
+| `workClass` | optional override of the role's default work class (`mechanical`, `simple`, `hard`, `audit`, `extreme`) |
+| `replaces` | child id this dispatch replaces (escalation): same role, generation + 1 |
+| `reviewedChildIds` | reviewer only: the delegations under review (default: every settled write delegation) |
 
-Roles:
+Give no `provider`, `model` or `effort` to let routing choose.
 
-| role | what it is | tools |
-| --- | --- | --- |
-| `scout` | search, inventory, log reading; returns compressed findings | read-only, depth 1 |
-| `clerk` | external reads and writes through connector tools present in the session; says so when none are | read-only plus the connector tools that exist |
-| `worker` | one bounded piece with explicit `writePaths` | write access limited to its `writePaths`, depth 1 |
-| `executor-lead` | owns one chunk end to end; may start scout, clerk and worker children; integrates and validates | depth 2 |
-| `planner` | read-only plan or diagnosis | read-only |
-| `reviewer` | independent one-shot review, fresh context, structured verdict | read-only, one-shot |
+Which allowed-route list wins: the durable per-session model-selection policy
+(the `subagent/model-selection-policy` the host records when a top-level session
+is composed) remains the only authority for automatic route choice. The host's
+`subagentModelSelection` user setting is read on every dispatch and only
+restricts, never grants. When it is enabled with a non-empty list, an explicit
+route (dispatch arguments or an owner pin) outside the list is refused with
+`AP_ROLE_ROUTE_NOT_ALLOWED`, and automatic selection draws only from the session
+policy's routes that are also in the list. A session with no recorded policy
+gets no selection authority from the setting: the child inherits the host
+default unless a route is named explicitly. A route must satisfy both. When the
+setting is off, absent, unreadable or malformed, routing behaves as if it did
+not exist.
 
-Children started in the same turn run in parallel. A `worker` whose
-`writePaths` intersect those of a running worker is refused before anything
-starts; this is a check, not an approval step. A child started by an
-`executor-lead` is a child of that lead (depth 2). A lower explicit user
-`maxDepth` is respected.
+Roles (from `src/roles`):
 
-The reviewer returns its verdict in-band. The main agent cannot write a
-verdict into the ledger. The reviewer is given a model family different from
-the change when one is reachable; otherwise the record says "reduced
-independence".
+| role | what it is | tools | default work class |
+| --- | --- | --- | --- |
+| `scout` | search, inventory, log reading; returns compressed findings | `read`, `glob`, `grep`, `read_image`, `web_fetch`, `web_search` | `mechanical` |
+| `clerk` | external reads and writes through connector tools present in the session; says so when none are | the scout set plus the connector tools that exist | `mechanical` |
+| `worker` | one bounded piece; `writePaths` required | no allow-list (inherits the profile's tools) | `simple` |
+| `executor-lead` | owns one chunk end to end; may start `scout`, `clerk` and `worker` only | no allow-list, plus `autopilot_delegate` and `autopilot_agents` | `hard` |
+| `planner` | read-only plan or diagnosis | `read`, `glob`, `grep`, `read_image` | `hard` |
+| `reviewer` | independent one-shot review, fresh context, structured verdict | `read`, `glob`, `grep`, `read_image` | `audit` |
 
-Every dispatch carries an explicit model and effort. The result reports the
-selected route and the observed one; trust the observed one.
+A read-only role whose `read` tool is not registered is refused
+(`AP_TOOL_SURFACE_INCOMPLETE`) rather than started blind. Other requested names
+the deployment does not register are dropped, and the dispatch result says so.
+
+Depth: a child of the root is depth 1 and gets `maxDepth` 1; an `executor-lead`
+gets 2, so its own children are depth 2 and cannot start children. A
+`maxDepth` of 2 is what the plugin sends; the host enforces its own limit, and
+the ledger records whether the host setting was readable.
+
+Delegation is refused (not queued) when the caller may not dispatch the role
+(`AP_ROLE_NOT_DISPATCHABLE`), a `worker` has no `writePaths`
+(`AP_WRITE_PATHS_REQUIRED`), or the `writePaths` intersect those of an active
+writer under the same root (`AP_WRITE_PATHS_CONFLICT`). The overlap check is a
+conflict guard between concurrent writers, not a permission system: a worker has
+no tool filter, so staying inside its `writePaths` is up to the brief.
+
+Every call returns at once with the child id, the route chosen and where it
+came from; the child reports through the host's settlement notice. The
+reviewer is the exception: the call waits and returns the verdict in-band.
+The main agent cannot write a verdict into the ledger. The reviewer is given a
+model family different from the change when one is reachable; otherwise the
+record says "reduced independence".
 
 ### `autopilot_agents`
 
-Follows and steers the children the plugin started:
-`action: list | wait | message | stop | escalate`. `wait` blocks for children
-inside the turn (host-clamped, at most 10 minutes per wait). `escalate` is how a
-child proposes a new dispatch on a higher route; the new child gets the same
-contract and the role's eligibility is never widened.
+One action: `wait`. Parameters: `action: 'wait'`, optional `childIds`, optional
+`timeoutSeconds` (default 300, at most 600). It blocks until the listed children
+(default: all your active ones) settle or the timeout fires, and returns
+`timedOut` and the delegation records. It is not a gate. Callable by the root
+agent and by an `executor-lead`.
 
-The exact action set depends on whether the host's own `list_agents` and
-`send_message` cover children started by the plugin runtime. That is not yet
-verified (see [compatibility.md](compatibility.md#not-yet-verified-on-a-real-host)),
-so this tool may shrink.
+### `autopilot_escalate`
+
+`reason` (required). A delegated child other than the reviewer asks its parent
+for a stronger model, more effort or a different split. The call records the
+request on the child's delegation and returns; the parent decides and
+re-dispatches with `autopilot_delegate` and `replaces`. It never widens what the
+role may do.
 
 ### `autopilot_status`
 
 Shows the ledger for the current session: delegations, routes, reviewer
-verdicts, links, legacy runs, and a one-time note when a removed config key was
-supplied.
+verdicts, links, whether auto-continue is available, legacy runs of this
+session, and one-time notes (such as a retired config key that was written).
+Read-only, except for the optional `link` parameter `{kind: 'issue' | 'pr',
+ref, url?}`, which records an issue or PR link on the ledger (idempotent on
+`kind` and `ref`). A session with no ledger answers `ledger: null`.
 
-### Other plugin tools
+### Removed tools
 
-`autopilot_log` and `autopilot_request_escalation` may still be registered;
-check the tool list the host shows. They are not part of the contract above.
+0.3.0 removed every tool of the 0.2.x run state machine (init, plan, audit,
+evidence, closeout, usage, log and the executor and escalation-proposal tools).
+A script or prompt that still calls one of them fails, and there is no
+replacement for the run state machine they wrote. The names are listed in the
+[CHANGELOG](../CHANGELOG.md) and in [DESIGN.md §8.10](../DESIGN.md).
 
 ## Ledger
 
@@ -97,8 +141,10 @@ judgement. Each delegation record holds:
 | generation | the child's generation; a replacement child gets the next one |
 | selected route, source | the model and effort the plugin or the call chose, and why: pin, ladder, call argument or adapter default |
 | observed route | the model and effort the host reports the child actually ran on |
-| `state` | where the child is now, including `lost` for a child that was running when the host restarted |
-| `writePaths` | the paths a worker may write |
+| `state` | `starting`, `running`, `idle` (settled a turn, can be messaged), `completed`, `failed` (the host refused the start, or the child failed), `cancelled`, or `lost` (it was `starting` or `running` when the plugin reloaded after a host restart; never restarted automatically) |
+| parent, depth | the dispatching agent (the root session or an `executor-lead`) and the depth below the root |
+| `writePaths` | the paths declared at dispatch |
+| escalation | the reason and time of an `autopilot_escalate` request, when the child made one |
 | reviewer verdict | the verdict text and the model family, as evidence of independence |
 | links | the issue and PR the goal belongs to |
 
@@ -133,14 +179,33 @@ code `round-limit`.
 `routing.*` keeps working: mode, preference, roles, ladder and work classes.
 See
 [model-routing.md](../skill/dsh-autopilot/references/model-routing.md) for the
-shape and how roles map to work classes. `skillInstall` (`auto` or `off`) and `storeRoot` are kept.
+shape and how roles map to work classes. `skillInstall` (`auto` or `off`) and
+`storeRoot` are kept; `DSH_AUTOPILOT_HOME` overrides the store root and accepts
+a leading `~`.
 
-Removed keys are accepted and ignored: `gate.*`, `governance.*`, `storeKind` and
-`crossFamily`. A profile that still sets
-them loads without error, and `autopilot_status` notes this once. Legacy
-`storeKind` file and domain backends stay readable for history. The root can
-still be set with `storeRoot` or `DSH_AUTOPILOT_HOME` (both accept a leading
-`~`).
+Retired keys are accepted and ignored, so a profile written for 0.2.x loads
+without error; `autopilot_status` names the ones actually written, once. They
+are exactly `RETIRED_CONFIG_KEYS` in `src/config.ts`:
+
+- `gate.sandboxCoupling`, `gate.toolDeny`, `gate.egressDeny`,
+  `gate.stopReminder`, `gate.strictShell`, `gate.restoreMode`
+- `governance.maxAuditRoundsPerRole`, `governance.unattended`
+- `storeKind`, `auditProvider`, `executorProvider`
+- `executor.persona`, `executor.toolAllowList`, `executor.agentOptions.maxTokens`
+- `auditors.<plan|execution|rules>.provider` and
+  `auditors.<plan|execution|rules>.agentOptions.maxTokens`
+- `crossFamily.enabled`, `crossFamily.minRisk`, `crossFamily.pool`
+
+Some 0.2.x keys are still read (`LEGACY_KEYS_STILL_READ`):
+
+- `executor.agentOptions.{provider,model,reasoningEffort}` becomes the
+  `routing.roles.executor` lock, so it pins the route of `worker` and
+  `executor-lead`.
+- `auditors.<plan|execution|rules>.agentOptions.{provider,model,reasoningEffort}`
+  becomes the matching auditor lock, so it pins the `reviewer` route.
+
+Legacy `storeKind` file and domain backends stay readable for history: the
+ledger goes to the domain when the host mounts one, else to files.
 
 For a web profile, include the web app bundle and the npm package name:
 
@@ -151,11 +216,6 @@ For a web profile, include the web app bundle and the npm package name:
   "dsh-goal-autopilot"
 ] } }
 ```
-
-Runs stranded in domain tables can be exported on demand with
-`node lib/tools/migrate-domain-runs.js` (dry run by default; `--apply`
-writes). It never deletes a domain record and never overwrites a file-backed
-run.
 
 ## Skill copy fallback
 

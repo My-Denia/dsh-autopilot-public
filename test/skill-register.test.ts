@@ -50,7 +50,7 @@ describe('createBundledSkillProvider against the shipped SKILL.md', () => {
     expect(candidate.name).toBe('dsh-autopilot')
     // The shipped description is a `>-` folded scalar; the file provider's
     // YAML delivers it as ONE line, and so must the mirror.
-    expect(candidate.description).toMatch(/^Run goal-driven engineering work/)
+    expect(candidate.description).toMatch(/^DSH adapter of the goal workflow/)
     expect(candidate.description).not.toContain('\n')
     expect(candidate.invocation).toEqual({ modelInvocable: true, userInvocable: true })
     // Honest source: the provider itself — no file-origin bucket is borrowed.
@@ -76,7 +76,9 @@ describe('createBundledSkillProvider against the shipped SKILL.md', () => {
     expect(definition.name).toBe('dsh-autopilot')
     expect(definition.description).toBe(candidate.description)
     expect(definition.content.startsWith('# dsh-autopilot')).toBe(true)
-    expect(definition.content).toContain('autopilot_init')
+    expect(definition.content).toContain('autopilot_delegate')
+    // The adapter binds the 0.3.0 tools; the retired init step is gone from the body.
+    expect(definition.content).not.toContain('autopilot_init')
     // The fence block is metadata, never body.
     expect(definition.content).not.toContain('name: dsh-autopilot')
     expect(definition.path).toBe(bundledSkillPath())

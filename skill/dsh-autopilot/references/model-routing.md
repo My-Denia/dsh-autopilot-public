@@ -131,7 +131,7 @@ which ladder tiers it draws from. Five fixed classes:
 | --- | --- | --- | --- |
 | `mechanical` | speed (a real permitted `low` effort) | none — fact permit | — (no auto role defaults here) |
 | `simple` | price + speed | `economy` | scout, clerk, worker |
-| `hard` | try economy first, widened only when something ASKS (see "The escalation request" below) | `economy` | worker (when the task is hard) |
+| `hard` | try economy first; a stronger route is asked for explicitly (see "The escalation request" below) | `economy` | worker (when the task is hard) |
 | `audit` | ceiling + independence | `standard` | reviewer |
 | `extreme` | ceiling | `reserve` | — |
 
@@ -172,27 +172,32 @@ route.
 
 DESIGN §1.2 makes an upgrade a REQUEST, not a prediction: the pool stays economy
 until the model that is *working* reports that it could not proceed. A child
-proposes, the main agent decides:
+proposes, the parent decides:
 
-- A child (for example a worker or executor-lead) records the request with the
-  `escalate` action of `autopilot_agents`, saying what stalled and the raw
-  evidence. The main agent may also escalate on its own observation (repeated
-  failure on one layer, a stalled child) without waiting for the child.
-- **What it does.** The next AUTO dispatch that runs a selection widens its
-  candidate pool to `economy + standard + reserve`, unless the owner wrote their
-  own `routing.workClasses.<class>.tiers`, which wins. That dispatch says so in
-  its `why` trace and records the pin it replaced as `repinFrom`.
+- A delegated child other than the reviewer calls `autopilot_escalate` with a
+  `reason`: what stalled and the raw evidence. The call records the request on
+  that child's delegation (reason and time) and returns at once; the child then
+  reports and stops, it does not wait for an answer. A reviewer has no such tool.
+  The main agent may also escalate on its own observation (repeated failure on
+  one layer, a stalled child) without waiting for a child.
+- **How the parent answers.** It starts a replacement with `autopilot_delegate`,
+  passing `replaces` (the stalled child's id; same role, generation + 1) and,
+  as needed, a stronger `model` or more `effort`, or a harder `workClass`. An
+  explicit value in that call beats every pin and the ladder.
 - **What it does NOT do.** It never widens an AUTHORIZATION or the role's
   eligibility. The candidate set is still `session policy ∩ live providers`,
   still filtered by the class's tier membership, ordered by the reviewer
   independence rule, and ranked by the class's dominant axis. A pool that widens
   to nothing blocks with `AP_ROUTE_NO_REACHABLE_WORK_CLASS`.
-- **Escalation is a new-context handoff, never a mid-run swap.** The wider pool
-  answers at the NEXT dispatch: a fresh child on the same contract. A message
-  to a live child that keeps its route is continuity, not escalation.
-- **Consumed once, engine-local.** The request covers one dispatch and is not
-  durable state; a process restart forgets an open request and the requester
-  asks again. What it caused is recorded with the dispatch.
+- **Escalation is a new-context handoff, never a mid-run swap.** The wider choice
+  applies to a fresh child on the same contract. A message to a live child that
+  keeps its route is continuity, not escalation.
+- **Not verified in code.** `src/routing/work-class.ts` defines the wider pool a
+  requested escalation resolves to (`economy + standard + reserve`, unless the
+  owner wrote `routing.workClasses.<class>.tiers`), but the dispatch path in
+  `src/delegate.ts` only records the request; whether a recorded request widens
+  the next automatic selection was not confirmed. Do not rely on it: name the
+  stronger route in the replacement call.
 
 Coverage is two metrics. `coverageReport` (`kind: 'tier-coverage'`) answers "is
 every observed model claimed by some configured tier". The work-class

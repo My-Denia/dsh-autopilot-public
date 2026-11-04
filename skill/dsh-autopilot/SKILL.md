@@ -52,7 +52,8 @@ second todo list and not a completion judgement.
 
 The main agent owns the goal: it decides, integrates, reviews results and
 talks to the owner. Start every other role with `autopilot_delegate`
-(`role`, `task`, `writePaths`, optional `model` and `effort`):
+(`role`, `task`, `writePaths`, optional `model` and `effort`; only you and an
+`executor-lead` may call it):
 
 - `scout`: read-only search, inventory, log reading. Returns compressed findings.
 - `clerk`: external reads and writes through the connector tools that exist in
@@ -70,8 +71,13 @@ Launch independent delegations together in one turn, not one after another.
 Parallel workers need disjoint `writePaths`; an overlap is refused before
 anything starts. Hand implementation, test runs and fixes to a worker and
 searches to a scout; do a step yourself only when it is a few short calls whose
-result you need at once. Use `autopilot_agents` (`list`, `wait`, `message`,
-`stop`, `escalate`) to follow, steer or stop children.
+result you need at once.
+
+`autopilot_agents` has one action, `wait`. To list children, message them or
+stop them, use the host's own `list_agents`, `send_message` and
+`interrupt_agent`. A delegated child that stalls calls `autopilot_escalate`
+(`reason`); that only records the request, and you decide and re-dispatch. A
+reviewer cannot escalate.
 
 ### Model and effort
 
@@ -99,7 +105,7 @@ the blockers and verify them yourself.
 ## Waiting
 
 - With children or background jobs pending inside a goal round, do not end the
-  turn. Block in it: `autopilot_agents` `wait` for children, `job_output` with
+  turn. Block in it: `autopilot_agents` with `action: wait` for children, `job_output` with
   `wait: true` for a background command or CI watcher, at most 10 minutes per
   wait (the host clamps longer waits). Ending the turn early only spends goal
   rounds, and the round cap ends in a blocker.
