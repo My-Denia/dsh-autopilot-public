@@ -159,6 +159,12 @@ export interface GoalRef {
   /** Last status the plugin read from the host (mirror, display only). */
   readonly status?: string
   readonly objective?: string
+  /** Native dsh-goal blocked reason, mirrored (e.g. round-limit, queue-failed, model-reported). */
+  readonly blockedReason?: { readonly code: string; readonly message: string }
+  /** Whether the host's goal continuation is armed for this session (mirror). */
+  readonly activation?: 'armed' | 'disarmed'
+  readonly roundsStarted?: number
+  readonly maxGoalRounds?: number
   readonly firstSeenAt: string
   readonly lastSeenAt: string
 }
@@ -180,6 +186,8 @@ export interface HostRestartMarker {
 export interface AutoContinueStatus {
   /** Whether the host composition has a goal round driver for this session. */
   readonly available: boolean
+  /** Machine-readable reason; `reason` keeps the plain text. Absent on ledgers written before this field. */
+  readonly code?: 'driver-present' | 'no-driver-in-composition' | 'released-after-restart' | 'not-yet-observed' | 'unknown'
   /** Plain reason, e.g. `goal round driver present`, `released after host restart`, `no goal round driver in this composition`. */
   readonly reason: string
 }

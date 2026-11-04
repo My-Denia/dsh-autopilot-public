@@ -599,7 +599,7 @@ export class AutopilotEngine {
           ? {}
           : {
               hostRestart: { at, lostChildIds: [...(ledger.hostRestart?.lostChildIds ?? []), ...gone.map(d => d.childId)] },
-              autoContinue: { available: false, reason: 'released after host restart' },
+              autoContinue: { available: false, code: 'released-after-restart', reason: 'released after host restart' },
             }),
         legacyRunIds,
         legacyRestores,
