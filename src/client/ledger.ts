@@ -372,12 +372,12 @@ export function goalView(p: LedgerProjection): GoalView {
         ...base, phase: 'active', label: 'active', tone: 'success',
         next: p.autoContinue.available
           ? 'rounds continue automatically while the session is idle'
-          : 'auto-continue is not running; it resumes when you say "continue"',
+          : `auto-continue is not running: ${p.autoContinue.reason}`,
       }
     case 'paused':
       return { ...base, phase: 'paused', label: 'paused', tone: 'warn', next: 'paused; only you can resume it (say "continue")' }
     case 'blocked':
-      return { ...base, phase: 'blocked', label: 'blocked', tone: 'error', next: 'blocked; you can resume it (say "continue") once the cause is dealt with' }
+      return { ...base, phase: 'blocked', label: 'blocked', tone: 'error', next: 'blocked; the block reason is not recorded in the ledger — check the goal before resuming (a round-limit block needs a higher round cap first)' }
     default:
       return { ...base, phase: 'complete', label: 'complete', tone: 'success', next: 'complete; a new goal can be created in this session' }
   }

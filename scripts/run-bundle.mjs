@@ -402,7 +402,7 @@ try {
 }
 assert('A27 no ledger and no v1 data: only the placeholder line, no archived section',
   emptyMarkup.includes('Goal autopilot')
-  && emptyMarkup.includes('no goal ledger for this session yet')
+  && emptyMarkup.includes('no goal ledger recorded for this session')
   && !emptyMarkup.includes('data-autopilot-legacy=""'))
 
 const rendered = [parallel, lost, mismatch, reduced, paused, legacyMarkup, emptyMarkup, markup, delegatedMarkup]
@@ -415,6 +415,27 @@ assert('A29 v1 fold lives in the archived section only when the fold holds v1 da
   && gateMarkup.includes('title="archived: ')
   && !emptyMarkup.includes('data-autopilot-run-fold=""'))
 
-const TOTAL = 30
+// A30 — a pre-upgrade v1 session the ledger route does not know: the card
+// still shows the archived run detail it fetched once by the fold's poll key,
+// including the sandbox-restore line and the amendment/owner history.
+let noLedgerV1 = ''
+try {
+  const archived = JSON.parse(readFileSync(resolve(root, 'test/client/fixtures/legacy-run.json'), 'utf8')).run
+  noLedgerV1 = renderToStaticMarkup(React.createElement(exports.AutopilotRunCard, {
+    node: fold('inline').node, legacyRuns: [archived],
+  }))
+} catch (error) {
+  noLedgerV1 = `render threw: ${error.message}`
+}
+assert('A30 no ledger, real v1 fold: archived detail still renders with sandbox and history',
+  noLedgerV1.includes('no goal ledger recorded for this session')
+  && noLedgerV1.includes('data-autopilot-legacy-detail="session-legacy-amend-01"')
+  && noLedgerV1.includes('sandbox restored to workspace-write')
+  && noLedgerV1.includes('2 amendments')
+  && noLedgerV1.includes('owner passed the plan gate after amendment')
+  && noLedgerV1.includes('data-autopilot-run-fold=""'),
+  noLedgerV1.slice(0, 160))
+
+const TOTAL = 31
 console.log(`\n${failures === 0 ? `ALL GREEN (${TOTAL} assertions)` : `${failures} RED of ${TOTAL}`}`)
 process.exitCode = failures === 0 ? 0 : 1

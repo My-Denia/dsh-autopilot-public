@@ -87,6 +87,20 @@ function ReviewItem({ row }: { readonly row: ReviewRow }): JSX.Element {
   )
 }
 
+/** One archived run's detail lines (final phase, gates, history, sandbox restore). */
+function LegacyDetail({ run }: { readonly run: LegacyRunProjection }): JSX.Element {
+  return (
+    <div style={{ ...muted, paddingLeft: 12 }} data-autopilot-legacy-detail={run.runId}>
+      {legacyRunLines(run).map((line, i) => (
+        <div key={`${line.label}:${i}`}>
+          <span>{line.label === '' ? ' ' : `${line.label} `}</span>
+          <span style={{ color: 'var(--dsw-alias-label-primary)' }}>{line.text}</span>
+        </div>
+      ))}
+    </div>
+  )
+}
+
 /** The archived-run section: summaries, fetched details, and any v1 fold content. */
 function LegacySection({ ledger, legacyRuns, legacyFold }: GoalLedgerViewProps): JSX.Element | null {
   const summaries = ledger === undefined ? [] : legacySummaryRows(ledger.legacyRuns)
@@ -103,16 +117,13 @@ function LegacySection({ ledger, legacyRuns, legacyFold }: GoalLedgerViewProps):
             <span style={s.rejected ? undefined : muted}>{s.text}</span>
           </div>
           <div style={muted}>{s.sandbox}</div>
-          {(legacyRuns ?? []).filter(r => r.runId === s.runId).map(run => (
-            <div key={run.runId} style={{ ...muted, paddingLeft: 12 }} data-autopilot-legacy-detail={run.runId}>
-              {legacyRunLines(run).map((line, i) => (
-                <div key={`${line.label}:${i}`}>
-                  <span>{line.label === '' ? ' ' : `${line.label} `}</span>
-                  <span style={{ color: 'var(--dsw-alias-label-primary)' }}>{line.text}</span>
-                </div>
-              ))}
-            </div>
-          ))}
+          {(legacyRuns ?? []).filter(r => r.runId === s.runId).map(run => <LegacyDetail key={run.runId} run={run} />)}
+        </div>
+      ))}
+      {(legacyRuns ?? []).filter(r => !summaries.some(s => s.runId === r.runId)).map(run => (
+        <div key={run.runId} style={rowBox} data-autopilot-legacy-run={run.runId}>
+          <div style={muted}>run {run.runId.length > 8 ? `${run.runId.slice(0, 8)}…` : run.runId} · {run.objective}</div>
+          <LegacyDetail run={run} />
         </div>
       ))}
       {legacyFold !== undefined ? <div style={{ marginTop: 6 }}>{legacyFold}</div> : null}
@@ -133,7 +144,7 @@ export function GoalLedgerView(props: GoalLedgerViewProps): JSX.Element {
     return (
       <div data-autopilot-ledger="">
         <div style={headRow}><span style={{ fontWeight: 600 }}>Goal autopilot</span></div>
-        <div style={muted}>no goal ledger for this session yet</div>
+        <div style={muted}>no goal ledger recorded for this session</div>
         <LegacySection {...props} />
       </div>
     )

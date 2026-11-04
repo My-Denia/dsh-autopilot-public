@@ -137,24 +137,31 @@ function useLegacyRuns(
   ledger: LedgerProjection | undefined,
   fetchJson: LiveFetch | undefined,
   initial: readonly LegacyRunProjection[] | undefined,
+  fallbackRunId: string | undefined,
 ): readonly LegacyRunProjection[] {
   const [runs, setRuns] = useState<readonly LegacyRunProjection[]>(initial ?? [])
   const requested = useRef(new Set<string>((initial ?? []).map(r => r.runId)))
   const mounted = useRef(true)
   useEffect(() => () => { mounted.current = false }, [])
   useEffect(() => {
-    if (ledger === undefined) return
     const request = pickFetch(fetchJson)
     if (request === undefined) return
-    for (const summary of ledger.legacyRuns) {
-      if (summary.fold !== 'ok' || requested.current.has(summary.runId)) continue
-      requested.current.add(summary.runId)
-      void fetchLegacyRun(summary.runId, request).then((run) => {
+    // The ledger's summaries name the archived runs. A pre-upgrade session the
+    // ledger route does not know (no ledger, or no summary for this session's
+    // own v1 run) still gets its one archived detail, so the sandbox-restore
+    // line and the owner/amendment history stay visible.
+    const ids = (ledger?.legacyRuns ?? []).filter(s => s.fold === 'ok').map(s => s.runId)
+    const covered = (ledger?.legacyRuns ?? []).some(s => s.runId === fallbackRunId)
+    if (fallbackRunId !== undefined && !covered) ids.push(fallbackRunId)
+    for (const runId of ids) {
+      if (requested.current.has(runId)) continue
+      requested.current.add(runId)
+      void fetchLegacyRun(runId, request).then((run) => {
         if (run === undefined || !mounted.current) return
         setRuns(prev => (prev.some(r => r.runId === run.runId) ? prev : [...prev, run]))
       })
     }
-  }, [ledger, fetchJson])
+  }, [ledger, fetchJson, fallbackRunId])
   return runs
 }
 
@@ -548,8 +555,8 @@ function ArchivedRunFold({ node, sessionId, fetchJson }: AutopilotRunCardProps):
 export function AutopilotRunCard(props: AutopilotRunCardProps): JSX.Element {
   const { node, sessionId, fetchJson } = props
   const ledger = useLedger(sessionId, fetchJson, node.data.calls.length, props.ledger)
-  const legacyRuns = useLegacyRuns(ledger, fetchJson, props.legacyRuns)
   const v1 = holdsV1(node.data)
+  const legacyRuns = useLegacyRuns(ledger, fetchJson, props.legacyRuns, v1 ? pollKey(node.data, sessionId) : undefined)
   return (
     <div style={shell} data-autopilot-run-card="">
       <GoalLedgerView

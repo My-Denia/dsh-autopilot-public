@@ -263,7 +263,10 @@ describe('goal phases', () => {
     const g = goalView(withStatus('blocked'))
     expect(g.phase).toBe('blocked')
     expect(g.tone).toBe('error')
-    expect(g.next).toContain('you can resume it')
+    // The ledger carries no blockedReason, and a round-limit block re-blocks on
+    // resume until the cap is raised, so the card must not promise resume works.
+    expect(g.next).toContain('block reason is not recorded')
+    expect(g.next).not.toContain('you can resume it')
   })
 
   it('unrecognised status is shown verbatim', () => {
@@ -290,7 +293,8 @@ describe('goal phases', () => {
   it('active without a driver says it resumes on "continue"', () => {
     const g = goalView(withStatus('active'))
     expect(g.phase).toBe('active')
-    expect(g.next).toContain('auto-continue is not running')
+    expect(g.next).toBe(`auto-continue is not running: ${withStatus('active').autoContinue.reason}`)
+    expect(g.next).not.toContain('resumes when you say')
     expect(autoContinueView(withStatus('active')).restartNote).toBe(RESTART_NOTE)
   })
 })
