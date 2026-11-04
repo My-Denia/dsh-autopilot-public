@@ -370,7 +370,7 @@ describe('authorize: the session policy is the authority, never the settings', (
         expect(verdict.reason).toContain(source)
         expect(verdict.reason).toContain('alpha/m-lock')
         expect(verdict.reason).toContain('alpha/m-a')
-        expect(verdict.reason).toContain('needs-owner-decision')
+        expect(verdict.reason).toContain('re-deciding the lock needs the owner')
       }
     }
   })
@@ -599,7 +599,7 @@ describe('select: fixture (f) — a locked route outside the policy escalates to
     expect(decision.kind).toBe('escalate-owner')
     if (decision.kind === 'escalate-owner') {
       expect(decision.reason).toContain('outside the session model-selection policy')
-      expect(decision.reason).toContain('needs-owner-decision')
+      expect(decision.reason).toContain('re-deciding the lock needs the owner')
     }
   })
 
@@ -699,7 +699,6 @@ describe('select: F14 (PR #2 round 6) — a catalog outage is not "provider gone
     if (decision.kind === 'escalate-owner') {
       expect(decision.reason).toContain('no live provider in the catalog')
       expect(decision.reason).toContain('needs the owner')
-      expect(decision.reason).not.toContain('needs-owner-decision')
     }
   })
 })

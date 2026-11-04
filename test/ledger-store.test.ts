@@ -7,10 +7,10 @@
  * `ledgers` table is migrated without that table ever being written.
  */
 
-import { execFile } from 'node:child_process'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, utimesSync, writeFileSync } from 'node:fs'
+import { execFile, spawnSync } from 'node:child_process'
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, utimesSync, writeFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
-import { tmpdir } from 'node:os'
+import { hostname, tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { promisify } from 'node:util'
@@ -313,6 +313,52 @@ describe('file ledger store across processes', () => {
     utimesSync(`${path}.lock`, old, old)
     expect((await store.write(emptyLedger('s1', T0), 0)).revision).toBe(1)
     expect(readdirSync(join(root, 'ledgers'))).toEqual([ledgerFileName('s1')]) // no lock or temp file left
+  })
+
+  it('a lock naming a dead pid on this host is taken over at once, without waiting', async () => {
+    const root = tempRoot()
+    const store = FileLedgerStore.open(root, { lockWaitMs: 50 })
+    const path = join(root, 'ledgers', ledgerFileName('s1'))
+    mkdirSync(join(root, 'ledgers'), { recursive: true })
+    const dead = spawnSync(process.execPath, ['-e', ''])
+    writeFileSync(`${path}.lock`, `${dead.pid}\n${hostname()}\n`)
+    expect((await store.write(emptyLedger('s1', T0), 0)).revision).toBe(1)
+    expect(readdirSync(join(root, 'ledgers'))).toEqual([ledgerFileName('s1')])
+  })
+
+  it('a lock naming a live pid is not taken over', async () => {
+    const root = tempRoot()
+    const store = FileLedgerStore.open(root, { lockWaitMs: 50 })
+    const path = join(root, 'ledgers', ledgerFileName('s1'))
+    mkdirSync(join(root, 'ledgers'), { recursive: true })
+    writeFileSync(`${path}.lock`, `${process.pid}\n${hostname()}\n`)
+    await expectConflict(store.write(emptyLedger('s1', T0), 0))
+  })
+
+  it.skipIf(process.platform === 'win32' || process.getuid?.() === 0)('a refused lock create (EACCES) is a busy lock: AP_LEDGER_CONFLICT, not a dispatch failure', async () => {
+    const root = tempRoot()
+    const store = FileLedgerStore.open(root, { lockWaitMs: 50 })
+    const dir = join(root, 'ledgers')
+    mkdirSync(dir, { recursive: true })
+    chmodSync(dir, 0o555)
+    try {
+      await expectConflict(store.write(emptyLedger('s1', T0), 0))
+    } finally {
+      chmodSync(dir, 0o755)
+    }
+  })
+
+  it.each(['not json {', JSON.stringify({ v: 99, sessionId: 's1' })])('a write over an unusable stored file raises AP_STORE_CORRUPT and leaves it byte-unchanged', async (content) => {
+    const root = tempRoot()
+    const store = FileLedgerStore.open(root)
+    mkdirSync(join(root, 'ledgers'), { recursive: true })
+    const path = join(root, 'ledgers', ledgerFileName('s1'))
+    writeFileSync(path, content)
+    const err = await store.write(emptyLedger('s1', T0), 0).catch((e: unknown) => e)
+    expect(err).toBeInstanceOf(AutopilotError)
+    expect((err as AutopilotError).code).toBe('AP_STORE_CORRUPT')
+    expect(readFileSync(path, 'utf8')).toBe(content)
+    expect(readdirSync(join(root, 'ledgers'))).toEqual([ledgerFileName('s1')])
   })
 
   // A real two-process race on one session. Without the lock both processes can pass the

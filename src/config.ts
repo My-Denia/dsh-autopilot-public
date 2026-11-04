@@ -298,7 +298,7 @@ export const StoreKindSchema = Schema.union([
   Schema.const('auto').description('Prefer the storageDomain backend when it is observable, else files.'),
   Schema.const('file').description('Always the file store under $DSH_HOME/storages/dsh-autopilot.'),
   Schema.const('domain').description('Require ctx.storageDomain; refuse to mount without it.'),
-]).description('RETIRED in 0.3.0 and ignored: the ledger goes to the domain when the host mounts one, else to files. No default is declared, so only a written key reads as retired.')
+]).description('RETIRED in 0.3.0 and ignored: the ledger is always one file per session under the store root; legacy domain runs are only read. No default is declared, so only a written key reads as retired.')
 
 /** Declared plugin configuration shape; mirrors `ConfigInput` in `./index.ts`. */
 const ConfigShape = Schema.object({

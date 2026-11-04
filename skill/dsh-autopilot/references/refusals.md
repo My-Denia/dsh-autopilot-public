@@ -19,7 +19,7 @@ corrupt store.
 
 ## Refusals in force
 
-Exactly the 20 codes of the registry in `src/domain/refusals.ts`, in registry order.
+Every code of the registry in `src/domain/refusals.ts`, in registry order.
 
 | Code | Requires |
 | --- | --- |

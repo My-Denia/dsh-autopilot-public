@@ -41,12 +41,13 @@
  * left in place, untouched.
  */
 
-import { closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
+import { hostname } from 'node:os'
+import { closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync, writeSync } from 'node:fs'
 import { randomUUID } from 'node:crypto'
 import { join } from 'node:path'
 import { LEDGER_VERSION } from '../domain/ledger-types.js'
 import type { Ledger } from '../domain/ledger-types.js'
-import { AP_LEDGER_CONFLICT } from '../domain/refusals.js'
+import { AP_LEDGER_CONFLICT, AP_STORE_CORRUPT } from '../domain/refusals.js'
 import { AutopilotError } from '../domain/types.js'
 import type { LegacyDomainReader, LegacySources } from '../legacy/index.js'
 
@@ -157,6 +158,21 @@ export function ledgerFileName(sessionId: string): string {
   return `${out}.json`
 }
 
+/** True when the lock names a pid on this host that no longer exists. Unreadable or foreign locks are not dead. */
+function lockOwnerIsDead(lock: string): boolean {
+  let text: string
+  try { text = readFileSync(lock, 'utf8') } catch { return false }
+  const [pidText, host] = text.split('\n')
+  const pid = Number(pidText)
+  if (!Number.isInteger(pid) || pid <= 0 || host !== hostname()) return false
+  try {
+    process.kill(pid, 0)
+    return false
+  } catch (error: unknown) {
+    return (error as NodeJS.ErrnoException).code === 'ESRCH'
+  }
+}
+
 const sleep = (ms: number): Promise<void> => new Promise(resolve => setTimeout(resolve, ms))
 
 /** Windows can refuse a rename for a moment while another process has the target open. */
@@ -211,12 +227,14 @@ export class FileLedgerStore implements LedgerStoreLike {
 
   /** One ledger file, read now. `name` must be the file name of the id it claims. */
   private readFile(name: string): Read {
-    let text: string
-    try {
-      text = readFileSync(join(this.dir, name), 'utf8')
-    } catch (error: unknown) {
-      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { kind: 'absent' }
-      return { kind: 'skipped', reason: 'unparseable' }
+    let text: string | undefined
+    for (let attempt = 0; text === undefined; attempt += 1) {
+      try {
+        text = readFileSync(join(this.dir, name), 'utf8')
+      } catch (error: unknown) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { kind: 'absent' }
+        if (attempt >= 1) return { kind: 'skipped', reason: 'unparseable' } // a read error twice running: not usable
+      }
     }
     let parsed: unknown
     try {
@@ -305,16 +323,25 @@ export class FileLedgerStore implements LedgerStoreLike {
     const lock = `${this.pathOf(sessionId)}.lock`
     for (let attempt = 0; attempt < 2; attempt += 1) {
       try {
-        closeSync(openSync(lock, 'wx'))
+        const fd = openSync(lock, 'wx')
+        try { writeSync(fd, `${process.pid}\n${hostname()}\n`) } catch { /* an empty lock falls back to the age rule */ }
+        closeSync(fd)
         return () => {
           try { unlinkSync(lock) } catch { /* already gone */ }
         }
       } catch (error: unknown) {
-        if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error
+        const code = (error as NodeJS.ErrnoException).code
+        // Windows refuses a create for a moment while another process holds or is deleting the file: busy.
+        if (code === 'EPERM' || code === 'EACCES' || code === 'EBUSY') return undefined
+        if (code !== 'EEXIST') throw error
         let age: number
         try { age = Date.now() - statSync(lock).mtimeMs } catch { continue } // released meanwhile: try again
-        if (age < STALE_LOCK_MS) return undefined
-        try { unlinkSync(lock) } catch { /* someone else took it over first */ }
+        if (age < STALE_LOCK_MS && !lockOwnerIsDead(lock)) return undefined
+        // Rename away first: only one taker wins the rename, and a lock someone re-created meanwhile is not unlinked by name.
+        const aside = `${lock}.${process.pid}.${randomUUID()}.stale`
+        try { renameSync(lock, aside) } catch { continue } // someone else took it over first
+        try { unlinkSync(aside) } catch { /* nothing to clean */ }
+        // Fall through to our own exclusive create on the next attempt.
       }
     }
     return undefined
@@ -350,10 +377,16 @@ export class FileLedgerStore implements LedgerStoreLike {
     try {
       // Inside the lock and synchronous: the revision read here is the one the rename replaces.
       const read = this.readFile(ledgerFileName(sessionId))
+      if (read.kind === 'skipped') {
+        // Unusable on disk (unparseable, newer version, unreadable): never publish over it.
+        throw new AutopilotError(
+          `ledger ${JSON.stringify(sessionId)}: the stored file cannot be used (${read.reason}); left untouched`,
+          AP_STORE_CORRUPT,
+        )
+      }
       const actual =
         read.kind === 'ledger' ? read.ledger.revision
-          : read.kind === 'absent' ? (this.legacyRow(sessionId)?.revision ?? 0)
-            : 0
+          : (this.legacyRow(sessionId)?.revision ?? 0)
       if (actual !== expectedRevision) throw conflict(sessionId, expectedRevision, actual)
       const stored: Ledger = { ...next, v: LEDGER_VERSION, revision: expectedRevision + 1, updatedAt: this.now() }
       this.publish(stored)

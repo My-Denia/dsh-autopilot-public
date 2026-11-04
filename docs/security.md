@@ -95,7 +95,7 @@ service on each request (browser authentication and Host/Origin checks, `401`
 or `403` when rejected). A host with a web server but no `connection` service
 gets `503 {ok:false, error:'no-connection-service'}`, never an open route. The
 fence is the host's; the plugin only applies it. A host with no web server
-mounts nothing. The routes read through the read-only service and cannot
+mounts nothing. Reading a ledger for a session found only in the legacy domain table copies it to its own file; the domain file is never written. The routes read through the read-only service and cannot
 change the ledger.
 
 ## Explicit non-goals
