@@ -59,16 +59,33 @@ not counted here; these were observed in real model sessions.
 - WSL: the plugin installs and loads on dsh `0.2.1-rc.5`. No model task ran
   there, because the WSL environment had no credentials.
 
+Isolated Web Session host, agent-sent API prompts (dsh `0.2.1-rc.5`, web
+composition, not a person typing in a client):
+
+- A `schedule_create` reminder was delivered after a host restart; `deliveredAt`
+  was 2.3 s after boot.
+- After the restart no goal round ran until the agent explicitly called
+  `update_goal` with `action: resume`. An owner-style "continue" message alone
+  did not lead the agent to resume in one of two runs, so the goal stayed disarmed.
+- When the agent called resume and then ended its turn, a goal round started
+  immediately.
+- When the agent called `schedule_create` and ended its turn with the goal
+  active and armed, the driver queued about one no-op round per second (48 rounds
+  in about 57 s), heading for the 256-round cap. The skill now says to wait
+  inside the turn.
+- The ledger route returned 200.
+
+Owner's daily Windows desktop app, plugin `0.3.0-rc.1`: the native goal round
+started stage 2 by itself. The prompt was pasted into the desktop GUI by an
+agent, not typed by the owner.
+
 ## Not verified on a real host
 
 None of the following has been observed on dsh `0.2.1-rc.5`.
 
-- The desktop app's rendering of the card (a person has to look at it), and
+- The desktop app's rendering of the card (a person has to look at it; on rc.1
+  no card rendered, fixed in rc.2, re-check pending), and
   installing the plugin from the desktop Plugins page.
-- The next goal round executing after a stage ends. The headless runner exits
-  before the queued round runs, so this needs a desktop or web host.
-- A `schedule_create` reminder delivered across a restart. The schedule tool is
-  only in the web and desktop compositions.
 - A cross-family reviewer. The test machine had only one provider family
   configured.
 - A session whose sandbox mode the user changed after the old clamp stays

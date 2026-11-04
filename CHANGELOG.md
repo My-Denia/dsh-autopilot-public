@@ -14,6 +14,13 @@ two desktop fixes: the tool probe for `scout` and `reviewer` is scoped to those
 roles, and the delegate card is shown at turn level. Neither fix has been
 verified on a real host yet.
 
+`0.3.0-rc.3` changes the skill text after two web-host findings. Inside an
+armed goal the agent waits inside the turn (`job_output` / `autopilot_agents`)
+instead of ending the turn for a `schedule_create` reminder, which made the
+driver queue about one no-op round per second. After the owner says "continue"
+following a restart or pause, the agent calls `get_goal` and then `update_goal`
+resume before proceeding.
+
 ### Verification
 
 Observed on Windows with dsh `0.2.1-rc.5`, headless profile, one provider
@@ -22,9 +29,9 @@ family: plugin load and tool list, simple work with no `autopilot_*` or
 verdict (independence "reduced"), observed route equal to selected route for
 every delegation, own-repo push and draft PR with no refusal, a goal kept active
 through a CI wait, restart recovery and "continue", goal A then B, two
-concurrent processes, and 47 legacy runs folded with 0 rejected. Not verified:
-desktop card rendering, the next goal round after a stage, schedule reminders
-across a restart, a cross-family reviewer, a user-changed sandbox mode after the
+concurrent processes, and 47 legacy runs folded with 0 rejected. Later observations on an
+isolated web host and the desktop app are in the compatibility doc. Not verified:
+desktop card rendering, a cross-family reviewer, a user-changed sandbox mode after the
 old clamp, and any model task on WSL. Details:
 [docs/compatibility.md](docs/compatibility.md#verified-on-a-real-host).
 

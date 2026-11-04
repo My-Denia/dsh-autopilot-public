@@ -181,15 +181,21 @@ These belong to the host, not the plugin.
 | --- | --- |
 | `get_goal` | read the current goal with its `goal_id` and `revision` |
 | `create_goal` | create the goal with the Outcome as its objective. Needs the owner's direct top-level turn |
-| `update_goal` | `complete` or `blocked` (also allowed in an autonomous goal round), `resume`, edit, pause. Needs the exact `goal_id` and `revision` from `get_goal`; all but `complete`/`blocked` need the owner's direct turn |
+| `update_goal` | `complete` or `blocked` (also allowed in an autonomous goal round), `resume` (not on a paused goal), edit, pause. Needs the exact `goal_id` and `revision` from `get_goal`; all but `complete`/`blocked` need the owner's direct turn |
 | `job_output` | `job_id`, optional `wait` and `timeout_ms` (default wait 30 s, cap 10 minutes) for a background command or CI watcher |
 | `list_agents`, `send_message` | the host's own view of and channel to agents |
 | `schedule_create` | set a delayed reminder (`after_seconds` and related). Only the main agent may call it; a child is refused (`subagent_session`) |
 
 A goal stays disarmed after a session resume, fork or host restart until the
-owner says "continue" (`update_goal` with `action: resume`). A reminder from
-`schedule_create` is delivered into the session after a restart but does not
-re-arm the goal. The goal round cap defaults to 256 and ends in the blocker
+owner says "continue" (`update_goal` with `action: resume`; the agent must
+call `get_goal` first and then resume, a text reply does not re-arm it). This
+applies to an active but disarmed goal only. A paused goal must be resumed by
+the owner in the client: the model's resume is refused (`GOAL_TOOL_RESUME_PAUSED`),
+so tell the owner instead of calling it. A
+reminder from `schedule_create` is delivered into the session after a restart
+but does not re-arm the goal, and it is not pending work for the goal driver:
+ending a turn to wait for one while the goal is armed queues a round immediately
+each time the main agent goes idle. Inside an active goal, wait with `job_output` / `autopilot_agents`. The goal round cap defaults to 256 and ends in the blocker
 code `round-limit`.
 
 ## Configuration
