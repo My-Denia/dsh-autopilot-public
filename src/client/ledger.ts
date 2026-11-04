@@ -557,7 +557,7 @@ export function reviewRows(p: LedgerProjection): readonly ReviewRow[] {
       reviewer: `${shortId(r.reviewerChildId)} · ${routeText(r.reviewerRoute, 'observed')}`,
       reduced: r.independence === 'reduced',
       independence: r.independence === 'reduced'
-        ? `REDUCED INDEPENDENCE: same provider family as the reviewed work${r.independenceNote === undefined ? '' : ` — ${r.independenceNote}`}`
+        ? `REDUCED INDEPENDENCE${r.independenceNote === undefined ? '' : `: ${r.independenceNote}`}${excluded}`
         : `cross-family review${excluded}`,
       findings: counts.length === 0 ? 'no findings' : counts.join(', '),
       at: r.at,

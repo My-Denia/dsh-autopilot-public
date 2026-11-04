@@ -107,8 +107,6 @@ interface Armed {
   readonly allow: readonly string[] | 'inherit'
 }
 
-const WRITE_ROLES: ReadonlySet<string> = new Set(ROLE_NAMES.filter(name => ROLES[name].write))
-
 const fail = (message: string, code: RefusalCode): never => { throw new AutopilotError(message, code) }
 
 /** Same route on every comparable axis? Effort is compared only when it was actually sent. */
@@ -303,6 +301,9 @@ export class Delegator {
     why: readonly string[],
     extra: { readonly outputSchema?: object; readonly delivery?: 'parent' | 'caller' } = {},
   ): Promise<DelegateResult & { activation?: { result: Promise<{ stopReason: string; structured?: unknown; diagnostic?: string }> } }> {
+    // Mirror the goal first: its firstSeenAt must not be later than this dispatch's startedAt, or the
+    // reviewer's default window (since the goal's first sighting) would miss this dispatch.
+    await this.engine.syncGoal(this.engine.agents.get(caller.rootId) ?? caller.agent)
     const spec = ROLES[role]
     const depth = caller.depth + 1
     const cap = depth + spec.maxDepth - 1
@@ -542,7 +543,12 @@ export class Delegator {
       }
       reviewedIds = args.reviewedChildIds
     } else {
-      reviewedIds = snapshot.delegations.filter(d => WRITE_ROLES.has(d.role) && (d.state === 'completed' || d.state === 'idle')).map(d => d.childId)
+      // Default: every settled non-reviewer delegation of the current goal. Delegation records carry no
+      // goal id, so the goal's window starts at its first sighting; without goal info, the root's history.
+      const since = snapshot.goal?.firstSeenAt
+      reviewedIds = snapshot.delegations
+        .filter(d => d.role !== 'reviewer' && (d.state === 'completed' || d.state === 'idle') && (since === undefined || d.startedAt >= since))
+        .map(d => d.childId)
     }
     const families = new Set<string>()
     for (const d of snapshot.delegations) {
