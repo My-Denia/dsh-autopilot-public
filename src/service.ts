@@ -63,8 +63,7 @@ export interface ProvideHost {
  * live root Agent's authority. A service handle has no agent, so a mutator here
  * would be a second write path with no authority check.
  *
- * Ledger reads come from the store's in-memory cache (filled at open and
- * advanced by this process's own writes); legacy reads go to the frozen 0.2.x
+ * Ledger reads go to disk on every call (see store/ledger.ts); legacy reads go to the frozen 0.2.x
  * reader and are asynchronous because they fold event streams.
  */
 export interface AutopilotReadOnly {

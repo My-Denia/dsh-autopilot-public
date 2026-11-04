@@ -21,6 +21,10 @@ driver queue about one no-op round per second. After the owner says "continue"
 following a restart or pause, the agent calls `get_goal` and then `update_goal`
 resume before proceeding.
 
+Docs correction: `clerk` is read-only today (same tools as `scout`); connector
+tools are not wired into delegation yet, and earlier text that said otherwise
+is fixed.
+
 ### Verification
 
 Observed on Windows with dsh `0.2.1-rc.5`, headless profile, one provider
