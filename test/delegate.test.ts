@@ -111,6 +111,35 @@ describe('autopilot_delegate: the flow', () => {
   })
 })
 
+describe('the registry probe is asked for the right agent', () => {
+  // On a preset composition (the desktop app) `read` lives in the scope layer the
+  // root and its children share, not in the global layer; only the agent's view
+  // lists it. See boundary.test.ts §4 for the same fact against the real registry.
+  const scoped = (h: { root: unknown }) => (scope: unknown) => (scope === h.root ? REG : ['ask_user_question'])
+
+  it('a scout dispatched by the root resolves against the root\'s view', async () => {
+    const asked: unknown[] = []
+    const holder: { root?: unknown } = {}
+    const h = delegationHost({ registeredFor: (scope) => { asked.push(scope); return scoped(holder as { root: unknown })(scope) } })
+    holder.root = h.root
+    const scout = await h.engine.delegate(h.root, { role: 'scout', task: 't' })
+    expect(scout.tools).toEqual(allowListFor('scout', REG))
+    expect(asked.length).toBeGreaterThan(0)
+    expect(asked.every(scope => scope === h.root)).toBe(true)
+  })
+
+  it('the cold-resume path reads the CHILD\'s own view', async () => {
+    const asked: unknown[] = []
+    const h = delegationHost({ registeredFor: (scope) => { asked.push(scope); return REG } })
+    const { childId } = await h.engine.delegate(h.root, { role: 'scout', task: 't' })
+    const child = h.agents.get(childId)!
+    asked.length = 0
+    // A restart lost the armed entry: the restriction is rebuilt from the ledger record.
+    h.engine.onChildCreated(child)
+    expect(asked).toEqual([child])
+  })
+})
+
 describe('tool restriction is keyed by the child id', () => {
   it('a scout and a worker started from one root in the same tick each get their OWN list', async () => {
     const h = delegationHost({ registered: REG })

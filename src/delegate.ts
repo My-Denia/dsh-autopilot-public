@@ -185,8 +185,12 @@ export class Delegator {
     }
   }
 
-  private registeredNames(): readonly string[] | undefined {
-    return this.engine.ports.environment?.registeredToolNames?.() ?? this.learnedToolNames
+  /**
+   * The tool names `scope` can be restricted to: the caller at dispatch (a child
+   * inherits its parent's preset generation), the child itself on a cold resume.
+   */
+  private registeredNames(scope: AgentRef): readonly string[] | undefined {
+    return this.engine.ports.environment?.registeredToolNames?.(scope) ?? this.learnedToolNames
   }
 
   private depthStatus(): DepthStatus {
@@ -258,7 +262,7 @@ export class Delegator {
     if (role === 'reviewer') return await this.review(caller, args)
 
     const decision = await this.route(role, args, caller)
-    const registered = this.registeredNames()
+    const registered = this.registeredNames(caller.agent)
     const allow = allowListFor(role, registered)
     const narrowed = allowListDiagnostic(role, registered)
     const why = [...decision.why, ...(narrowed === undefined ? [] : [narrowed])]
@@ -547,7 +551,7 @@ export class Delegator {
       if (family !== undefined) families.add(family)
     }
     const decision = await this.route('reviewer', args, caller, [...families])
-    const registered = this.registeredNames()
+    const registered = this.registeredNames(caller.agent)
     const allow = allowListFor('reviewer', registered)
     const started = await this.start(caller, 'reviewer', args, decision, allow, [], new Set(), undefined, decision.why, { outputSchema: REVIEW_VERDICT_SCHEMA, delivery: 'caller' })
     const { activation, ...base } = started
@@ -625,7 +629,7 @@ export class Delegator {
     if (armed === undefined) {
       const record = this.engine.peekLedger(rootId)?.delegations.find(d => d.childId === agent.id)
       if (record === undefined) return
-      armed = { role: record.role, allow: allowListFor(record.role, this.registeredNames()) }
+      armed = { role: record.role, allow: allowListFor(record.role, this.registeredNames(agent)) }
     }
     this.armed.delete(agent.id)
     // Retain the session itself, not a snapshot: no request/header exists before the first prompt.

@@ -80,6 +80,12 @@ export interface CardViewNode {
   readonly anchorSeq: number
   readonly location: unknown
   readonly visibility: 'visible' | 'hidden'
+  /**
+   * Where the Chat view's group tree places the node (`dsh-client-ui-chat`,
+   * `ChatNode.groupTree`: exchange < input < turn < process). Always `'turn'`:
+   * see {@link AUTOPILOT_GROUP_TREE}.
+   */
+  readonly groupTree: typeof AUTOPILOT_GROUP_TREE
   readonly data: AutopilotRunChatData
 }
 
@@ -720,6 +726,23 @@ export function isGoalToolName(name: string): boolean {
 
 /** The card's kind — the chat renderer dispatch key and the slot registration key. */
 export const AUTOPILOT_RUN_KIND = 'autopilot-run'
+
+/**
+ * The card stands at TURN level in the Chat group tree, like the host's own
+ * turn notices (`turn-error`, `turn-tail`).
+ *
+ * dsh 0.2.1-rc.5's Chat view puts every turn node whose `groupTree` is not at
+ * or outside "process" into a collapsed activity group, and folds a completed
+ * turn's whole process under its "done" line (`dsh-client-ui-chat`
+ * `TurnGroups.rebuild` and `ChatNodeSeat`). The card anchors at the first
+ * autopilot or goal call, a tool call in the middle of a turn, so without this
+ * it rendered inside the first collapsed tool group of a real desktop goal
+ * session and was never on screen. The in-tree `workflow-run` card leaves
+ * `groupTree` unset and is folded with its turn; this card summarizes the whole
+ * session's goal ledger, so hiding it with one step's tool rows hides the only
+ * place the ledger is shown.
+ */
+export const AUTOPILOT_GROUP_TREE = 'turn' as const
 
 /**
  * The context id, a CONSTANT.
@@ -1553,6 +1576,7 @@ export function createAutopilotRunDefinition(deps: CardDeps): AutopilotRunDefini
         anchorSeq: state.firstSeq,
         location: location ?? { kind: 'unresolved' },
         visibility: 'visible',
+        groupTree: AUTOPILOT_GROUP_TREE,
         data: state.data,
       }
       built.set(context.key, { state, location, node })

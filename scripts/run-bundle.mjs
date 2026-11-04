@@ -482,6 +482,15 @@ assert('A32 a goal-only session (get_goal, no autopilot_*) anchors one card, req
   && goalLedger === undefined && goalMarkup === '',
   JSON.stringify({ anchor: goalOnly.node?.anchorSeq ?? null, requested, goalLedger: String(goalLedger), goalMarkup }))
 
-const TOTAL = 32
+// A33 — the shipped node stands at turn level in the Chat group tree. On dsh
+// 0.2.1-rc.5 a turn node without it is a member of a collapsed tool group and,
+// on a completed turn, of the folded process (dsh-client-ui-chat
+// TurnGroups.rebuild / ChatNodeSeat): the desktop goal session that found this
+// had its card inside the first collapsed group, never on screen.
+assert('A33 the shipped card node declares groupTree "turn" (outside the collapsed process groups)',
+  goalOnly.node?.groupTree === 'turn' && mixed.node?.groupTree === 'turn',
+  JSON.stringify({ goalOnly: goalOnly.node?.groupTree ?? null, mixed: mixed.node?.groupTree ?? null }))
+
+const TOTAL = 33
 console.log(`\n${failures === 0 ? `ALL GREEN (${TOTAL} assertions)` : `${failures} RED of ${TOTAL}`}`)
 process.exitCode = failures === 0 ? 0 : 1
