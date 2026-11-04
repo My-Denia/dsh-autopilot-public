@@ -111,7 +111,7 @@ describe('emptyLedger', () => {
       delegations: [],
       reviews: [],
       links: [],
-      autoContinue: { available: false, reason: 'not yet observed' },
+      autoContinue: { available: false, code: 'not-yet-observed', reason: 'not yet observed' },
       depth: { executorLead: 2, source: 'plugin-default' },
       legacyRunIds: [],
       updatedAt: T0,

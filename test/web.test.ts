@@ -90,7 +90,7 @@ describe('projectLedger', () => {
     const projected = projectLedger(ledger, [], ['n1', 'n2'])
     expect(projected).toEqual({
       v: 3, sessionId: 's1', revision: 4, previousGoals: [], delegations: [], reviews: [], links: [],
-      autoContinue: { available: false, reason: 'not yet observed' },
+      autoContinue: { available: false, code: 'not-yet-observed', reason: 'not yet observed' },
       depth: { executorLead: 2, source: 'plugin-default' },
       legacyRuns: [], notes: ['n1', 'n2'], updatedAt: T0,
     })

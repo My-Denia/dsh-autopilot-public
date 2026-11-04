@@ -32,7 +32,7 @@ describe('host-restart lost marking', () => {
       ['w-run', 'lost'], ['w-start', 'lost'], ['s-done', 'completed'], ['w-idle', 'idle'],
     ])
     expect(ledger.hostRestart).toEqual({ at: NOW, lostChildIds: ['w-run', 'w-start'] })
-    expect(ledger.autoContinue).toEqual({ available: false, reason: 'released after host restart' })
+    expect(ledger.autoContinue).toEqual({ available: false, code: 'released-after-restart', reason: 'released after host restart' })
     expect(ledger.delegations[0]).toMatchObject({ settledAt: NOW })
   })
 
