@@ -1,32 +1,20 @@
 /**
- * File-backed run store under $DSH_HOME/storages/dsh-autopilot.
+ * File-store paths and legacy readers under $DSH_HOME/storages/dsh-autopilot.
  *
- * WHY files and not Session events: dsh's durable Session event vocabulary is
- * closed to out-of-tree plugins today (KNOWN_SESSION_EVENT_TYPES; the
- * registration surface is explicitly deferred upstream). Appending unknown
- * event types would risk refusing session reconstruction on resume. Until dsh
- * opens that surface, run state lives beside the session — events.jsonl is
- * canonical (event-sourced, strictly folded on load), snapshot.json and
- * log.md are human/UI projections. This mirrors the CC harness's proven
- * goal-runs/<slug>/ artifact model.
- *
- * WHY this file moved under `src/store/` in v2: it is now ONE implementation
- * of {@link RunStoreLike}, not the only possible persistence. The other is
- * `./domain.ts` over `ctx.storageDomain`; the engine depends on the interface
- * and the run RECORDS which backend it actually got (`Enforcement.store`).
- *
- * Single-writer: only the engine writes here, and the engine serializes
- * mutations per run. Two dsh processes sharing one run is out of contract
- * (same as CC state.json) and is surfaced by fold failures rather than hidden.
+ * 0.3.0 writes only the v3 ledger (`./ledger.ts`, `<root>/ledgers/`). What stays
+ * here is the root resolution every backend shares and the path rules of the
+ * 0.2.x run tree (`runs/<id>/`, `sessions/<sid>.json`), which the frozen legacy
+ * reader follows. The 0.2.x `RunStore`
+ * class and its writers (`commit`, `appendLog`, `writeSessionIndex`) are gone.
  */
 
-import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
+import { readFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join, resolve } from 'node:path'
-import { foldRun } from '../domain/fold.js'
-import { AutopilotError, errorMessage } from '../domain/types.js'
-import type { LogEntry, Operation, RunEvent, RunId, Snapshot, StoreKind } from '../domain/types.js'
-import type { RunStoreLike } from './types.js'
+import type { SessionRunIndex } from './types.js'
+
+/** A run id (the 0.2.x run id was its root session id). */
+type RunId = string
 
 /**
  * Resolve the store root: $DSH_AUTOPILOT_HOME, else $DSH_HOME/storages/dsh-autopilot,
@@ -43,7 +31,7 @@ import type { RunStoreLike } from './types.js'
  * accepting it would make the root the empty string and scatter `runs/<id>`
  * across whatever the process cwd happens to be. The blank test is `trim()`-aware
  * to match this codebase's sibling rule for env overrides
- * (`outbound/manifest.ts` `manifestPath`), which already treats a
+ * (the retired outbound manifest path rule did the same), which treated a
  * whitespace-only value as absent.
  *
  * TILDE EXPANSION AND `resolve`, ADDED 2026-08-27 BECAUSE THE DIVERGENCE WAS
@@ -130,153 +118,26 @@ export function runDirFor(root: string, runId: RunId): string {
   return join(root, 'runs', sanitize(runId))
 }
 
-/** Durable store for run event streams and their projections. */
-export class RunStore implements RunStoreLike {
-  /** Recorded into `Enforcement.store`; never inferred by the engine. */
-  readonly kind: StoreKind = 'file'
+function sessionIndexPath(root: string, sessionId: string): string {
+  return join(root, 'sessions', `${sanitize(sessionId)}.json`)
+}
 
-  constructor(private readonly root: string) {}
-
-  runDir(runId: RunId): string {
-    return runDirFor(this.root, runId)
-  }
-
-  /**
-   * Enumerate run ids from the DIRECTORY TREE, not from anything this process
-   * remembers. The directory NAME cannot be trusted as the id: `sanitize`
-   * maps every character outside `[a-zA-Z0-9._-]` to `_`, which is lossy and
-   * not invertible. So each run's own `snapshot.json` is read for its
-   * authoritative `runId`. A directory whose projection is missing or
-   * unreadable is OMITTED rather than reported under its mangled path — a
-   * guessed id would be worse than an absent one, because callers would use it
-   * to `load()` and get nothing.
-   */
-  listRuns(): readonly RunId[] {
-    const runsRoot = join(this.root, 'runs')
-    if (!existsSync(runsRoot)) return []
-    let entries: string[]
-    try {
-      entries = readdirSync(runsRoot)
-    } catch {
-      return []
-    }
-    const ids: RunId[] = []
-    for (const entry of entries) {
-      try {
-        const raw = readFileSync(join(runsRoot, entry, 'snapshot.json'), 'utf8')
-        const parsed = JSON.parse(raw) as { runId?: unknown }
-        if (typeof parsed.runId === 'string' && parsed.runId.length > 0) ids.push(parsed.runId)
-      } catch {
-        // Unreadable or not a run directory: omit it. See the doc comment.
-      }
-    }
-    return ids
-  }
-
-  /**
-   * The revision the BACKING STORE currently holds for one run, WITHOUT
-   * folding its stream.
-   *
-   * WHY THIS EXISTS: `AutopilotEngine` memoizes a folded snapshot per run id,
-   * and a process that is only READING a run (the web profile serving
-   * `/api/autopilot/run?id=`) would otherwise serve its first observation
-   * forever while another process advanced the run on disk. Measured on this
-   * machine 2026-08-25: 41 file-backed runs and 5 domain-table runs, mutually
-   * invisible, with the read path pinned to whatever revision it happened to
-   * load first. A cheap revision probe lets the read path notice it is behind
-   * without paying a full fold on every GET.
-   *
-   * WHY `snapshot.json` AND NOT `events.jsonl`'s mtime: `commit` appends the
-   * canonical event FIRST and refreshes this projection SECOND (tmp+rename),
-   * so a bumped revision here proves the corresponding append already
-   * completed. That ordering is the reason a reader can reload without a lock
-   * and without ever observing a half-written stream: it only reloads when the
-   * writer has already published. An mtime would carry neither guarantee (it
-   * moves on the append, i.e. mid-write, and it is clock-dependent).
-   *
-   * TOTAL BY CONSTRUCTION: a missing, unreadable, or non-JSON projection
-   * answers `undefined` — "cannot tell", which the engine treats as "keep what
-   * you have". A freshness probe that throws would turn a cosmetic staleness
-   * into a failed read.
-   *
-   * @param runId - the run to probe.
-   * @returns the published revision, or `undefined` when it cannot be read.
-   */
-  currentRevision(runId: RunId): number | undefined {
-    try {
-      const parsed = JSON.parse(readFileSync(join(this.runDir(runId), 'snapshot.json'), 'utf8')) as { revision?: unknown }
-      return typeof parsed.revision === 'number' && Number.isFinite(parsed.revision) ? parsed.revision : undefined
-    } catch {
-      return undefined
-    }
-  }
-
-  /** Load and strictly fold a run's event stream. Returns undefined when no stream exists. */
-  load(runId: RunId): Snapshot | undefined {
-    const eventsPath = join(this.runDir(runId), 'events.jsonl')
-    if (!existsSync(eventsPath)) return undefined
-    const raw = readFileSync(eventsPath, 'utf8')
-    const lines = raw.split('\n').filter(line => line.trim().length > 0)
-    const events: RunEvent[] = []
-    for (const [index, line] of lines.entries()) {
-      try {
-        events.push(JSON.parse(line) as RunEvent)
-      } catch (error: unknown) {
-        throw new AutopilotError(
-          `run ${runId}: events.jsonl line ${index + 1} is not valid JSON: ${errorMessage(error)}`,
-          'AP_STORE_CORRUPT',
-        )
-      }
-    }
-    const state = foldRun(events)
-    return state.snapshot
-  }
-
-  /**
-   * Commit one event: validate-by-fold is the caller's job (engine folds via
-   * applyEvent before calling); here we only persist atomically enough for a
-   * single-writer file store: append the canonical line first, then refresh
-   * the snapshot projection via tmp+rename.
-   *
-   * WHY the body stays SYNCHRONOUS inside an async method: the seam is async
-   * because the domain backend's writes are (see `./types.ts`), not because
-   * this one became concurrent. Keeping `appendFileSync` -> `writeFileSync` ->
-   * `renameSync` unbroken means no other task can interleave between the
-   * canonical append and the projection refresh, which is exactly the
-   * discipline v1 relied on. Switching to `fs/promises` here would introduce
-   * an await window between the two and buy nothing.
-   */
-  async commit(runId: RunId, op: Operation, snapshot: Snapshot, detail?: unknown): Promise<RunEvent> {
-    const dir = this.runDir(runId)
-    mkdirSync(dir, { recursive: true })
-    const event: RunEvent = {
+/** Read the session's run index, or `undefined` when this session never started a second run. */
+export function readSessionIndex(root: string, sessionId: string): SessionRunIndex | undefined {
+  try {
+    const parsed = JSON.parse(readFileSync(sessionIndexPath(root, sessionId), 'utf8')) as Partial<SessionRunIndex>
+    if (parsed.v !== 1) return undefined
+    if (parsed.sessionId !== sessionId) return undefined
+    if (typeof parsed.currentRunId !== 'string' || parsed.currentRunId.length === 0) return undefined
+    if (!Array.isArray(parsed.runIds) || parsed.runIds.some(id => typeof id !== 'string' || id.length === 0)) return undefined
+    if (!parsed.runIds.includes(parsed.currentRunId)) return undefined
+    return {
       v: 1,
-      op,
-      revision: snapshot.revision,
-      time: new Date().toISOString(),
-      snapshot,
-      ...(detail === undefined ? {} : { detail }),
+      sessionId,
+      currentRunId: parsed.currentRunId,
+      runIds: parsed.runIds,
     }
-    appendFileSync(join(dir, 'events.jsonl'), `${JSON.stringify(event)}\n`, 'utf8')
-    const tmp = join(dir, 'snapshot.json.tmp')
-    writeFileSync(tmp, JSON.stringify(snapshot, null, 2), 'utf8')
-    renameSync(tmp, join(dir, 'snapshot.json'))
-    return event
-  }
-
-  /** Append one human-readable line to the run's log.md (CC execution-log.md counterpart). */
-  async appendLog(runId: RunId, entry: LogEntry): Promise<void> {
-    const dir = this.runDir(runId)
-    mkdirSync(dir, { recursive: true })
-    const suffix = [
-      entry.note !== undefined ? ` note: ${entry.note}` : '',
-      entry.escalationTarget !== undefined ? ` -> ${entry.escalationTarget}` : '',
-      entry.blockingScope !== undefined ? ` (blocks: ${entry.blockingScope})` : '',
-    ].join('')
-    appendFileSync(
-      join(dir, 'log.md'),
-      `- [${new Date().toISOString()}] [${entry.stance}] ${entry.text}${suffix}\n`,
-      'utf8',
-    )
+  } catch {
+    return undefined
   }
 }

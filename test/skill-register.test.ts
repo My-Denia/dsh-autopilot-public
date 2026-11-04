@@ -50,7 +50,7 @@ describe('createBundledSkillProvider against the shipped SKILL.md', () => {
     expect(candidate.name).toBe('dsh-autopilot')
     // The shipped description is a `>-` folded scalar; the file provider's
     // YAML delivers it as ONE line, and so must the mirror.
-    expect(candidate.description).toMatch(/^Run goal-driven engineering work/)
+    expect(candidate.description).toMatch(/^DSH adapter of the goal workflow/)
     expect(candidate.description).not.toContain('\n')
     expect(candidate.invocation).toEqual({ modelInvocable: true, userInvocable: true })
     // Honest source: the provider itself — no file-origin bucket is borrowed.
@@ -76,7 +76,9 @@ describe('createBundledSkillProvider against the shipped SKILL.md', () => {
     expect(definition.name).toBe('dsh-autopilot')
     expect(definition.description).toBe(candidate.description)
     expect(definition.content.startsWith('# dsh-autopilot')).toBe(true)
-    expect(definition.content).toContain('autopilot_init')
+    expect(definition.content).toContain('autopilot_delegate')
+    // The adapter binds the 0.3.0 tools; the retired init step is gone from the body.
+    expect(definition.content).not.toContain('autopilot_init')
     // The fence block is metadata, never body.
     expect(definition.content).not.toContain('name: dsh-autopilot')
     expect(definition.path).toBe(bundledSkillPath())
@@ -373,7 +375,7 @@ describe('apply() wiring', () => {
     await withSkillHome(async home => {
       const { registry, providers } = stubRegistry()
       const host = mountHost(registry)
-      const dispose = await apply(host.ctx, { storeRoot: tempRoot('dsh-autopilot-apply-skill-'), storeKind: 'file' })
+      const dispose = await apply(host.ctx, { storeRoot: tempRoot('dsh-autopilot-apply-skill-') })
       try {
         expect(providers).toHaveLength(1)
         expect(providers[0]?.name).toBe(BUNDLED_SKILL_PROVIDER_NAME)
@@ -395,7 +397,7 @@ describe('apply() wiring', () => {
   it('ctx.skills present: the registered provider serves the real bundled skill', async () => {
     const { registry, providers } = stubRegistry()
     const host = mountHost(registry)
-    const dispose = await apply(host.ctx, { storeRoot: tempRoot('dsh-autopilot-apply-skill-serve-'), storeKind: 'file' })
+    const dispose = await apply(host.ctx, { storeRoot: tempRoot('dsh-autopilot-apply-skill-serve-') })
     try {
       const provider = providers[0]
       if (provider === undefined) throw new Error('expected the registered provider')
@@ -413,7 +415,7 @@ describe('apply() wiring', () => {
     await withSkillHome(async home => {
       const { registry } = stubRegistry({ registerProviderError: new Error('registry refused: duplicate name') })
       const host = mountHost(registry)
-      const dispose = await apply(host.ctx, { storeRoot: tempRoot('dsh-autopilot-apply-skill-fallback-'), storeKind: 'file' })
+      const dispose = await apply(host.ctx, { storeRoot: tempRoot('dsh-autopilot-apply-skill-fallback-') })
       try {
         const dest = join(home, 'skills', 'dsh-autopilot', 'SKILL.md')
         expect(existsSync(dest)).toBe(true)
@@ -431,7 +433,7 @@ describe('apply() wiring', () => {
   it('ctx.skills absent: the file path is taken, unchanged', async () => {
     await withSkillHome(async home => {
       const host = mountHost(undefined)
-      const dispose = await apply(host.ctx, { storeRoot: tempRoot('dsh-autopilot-apply-skill-file-'), storeKind: 'file' })
+      const dispose = await apply(host.ctx, { storeRoot: tempRoot('dsh-autopilot-apply-skill-file-') })
       try {
         expect(existsSync(join(home, 'skills', 'dsh-autopilot', 'SKILL.md'))).toBe(true)
         expect(host.warnings).toEqual([])
@@ -448,7 +450,6 @@ describe('apply() wiring', () => {
       const host = mountHost(registry)
       const dispose = await apply(host.ctx, {
         storeRoot: tempRoot('dsh-autopilot-apply-skill-off-'),
-        storeKind: 'file',
         skillInstall: 'off',
       })
       try {

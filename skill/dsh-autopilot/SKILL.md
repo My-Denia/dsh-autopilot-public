@@ -1,161 +1,172 @@
 ---
 name: dsh-autopilot
 description: >-
-  Run goal-driven engineering work as a governed plan-execute-audit run using
-  the autopilot_* tools. Use by default for execution tasks that modify
-  files/config/remote state, debug or repair systems, or require sustained
-  autonomous progress; also when the user asks for goal mode, autopilot,
-  autonomous implementation, or plan-execute-audit.
+  DSH adapter of the goal workflow. Use only when the owner explicitly states a
+  goal, asks for autopilot, or gives sustained multi-stage work (several
+  stages, parallel pieces, a PR to land). Small reversible edits, questions and
+  ordinary read-only reviews stay in the main thread with no goal and no
+  autopilot tool calls.
 ---
 
-# dsh-autopilot
+# dsh-autopilot (DSH adapter of goal-workflow)
 
-When this skill triggers, start a run immediately with `autopilot_init` — do not
-wait for further instruction. Owner-only boundaries (push/PR/release/publish,
-destructive ops, credentials, payment, public-visible changes) still pause for
-the owner; autonomous start is not autonomous egress.
+A goal has an owner, roles, an independent review and a record on the issue and
+the PR. There is no run state machine, plan gate, sign-off or closeout packet.
+This file binds that workflow to DSH tool names; the plugin adds only role
+delegation with explicit model and effort (inheriting the host route, recorded as such, when routing is off or has no catalog), and a small ledger of who was
+started, with what route, and how it ended.
 
-## Triage (pick honestly, the engine enforces the combinations)
+| read this | it owns |
+| --- | --- |
+| [references/model-routing.md](references/model-routing.md) | which work class and model route each role gets, effort, escalation, the owner's ladder |
+| [references/governance-invariants.md](references/governance-invariants.md) | the invariants that still hold: evidence, review findings, delegation |
+| [references/refusals.md](references/refusals.md) | every `AP_*` code that still exists and what it requires |
+| `docs/reference.md` (in the package, not the installed skill) | tool parameters, ledger, configuration |
 
-- size: `lightweight` (≤3 files, single concern, straightforward validation) or `standard`.
-  Choosing `lightweight` waives the plan gate, the sandbox clamp AND the usage
-  dimension for the whole run. Nothing checks that choice — do not use it to
-  get out from under the gates.
-- risk: `low` / `medium` / `high` / `critical` — medium+ may NOT self-review; use
-  `auditMode: independent` or `external` (the engine keys off the disqualifier,
-  not an allow-list: `validateTriage` in `src/domain/types.ts`).
-- executionMode: `inline` (you implement) or `delegated` (standard only; a
-  continuable executor child implements and returns a packet).
-- auditMode: `self-check` only for lightweight+low, labeled honestly; otherwise
-  `independent` OR `external` — both are legal outside lightweight+low, and the
-  engine bars only self-review.
-  `external` is the owner-countersigned channel: owner-only (an agent-generated
-  turn is refused); `autopilot_external_audit` RECORDS a run-relative `reviewRef`
-  but does not create it — the file must exist in the run directory by closeout
-  or the run is refused there; and an external pass is weaker
-  evidence than a dispatched audit — the record keeps them distinguishable.
-- Set `touchesOperatingLayer: true` when the run modifies rules/skills/hooks/agent
-  config — it adds the required `rules` audit role.
-- `usageIds`: one id per user-visible change this run will make. Default is a
-  single `m1`. If the run changes three separate things a user can observe,
-  seed three ids — one entry answered once is not three changes answered.
-- Record the workspace baseline (commit, branch, dirty state) in the init call.
+## When it applies
 
-## Pipeline
+Only when the owner states the goal, says autopilot, or hands over work that
+clearly needs several stages. Then call `get_goal`; if none is current, call
+`create_goal` with the Outcome as the objective. The host accepts it only from
+the owner's direct turn, and a delegated child cannot call it.
 
-1. `autopilot_init` — standard runs clamp the session read-only until the plan gate passes.
-2. Investigate read-only; `autopilot_submit_plan` with milestones each carrying a
-   BINARY runnable validation check.
-3. `autopilot_usage` for every seeded id, BEFORE dispatching the plan audit.
-   A pass verdict on a run with an undeclared entry is recorded and then refused
-   at the gate flip — you pay for the auditor and the gate stays shut.
-4. Gate the plan, by the mode picked at init — the tools are NOT interchangeable
-   and the engine refuses a mismatch:
-   - `independent` → `autopilot_audit role=plan` with a bounded packet (never
-     your reasoning).
-   - `external` → `autopilot_external_audit role=plan` on a direct human turn.
-     `autopilot_audit` rejects every mode but `independent`, so an external run
-     that calls it stalls here.
-     THE TOOL ATTACHES NOTHING: it only RECORDS the run-relative `reviewRef`.
-     Someone must actually place that file in the run directory, or closeout
-     refuses the run — after both countersigns are already recorded, which is
-     the expensive way to find out. Note the ordering trap on standard runs:
-     writes are clamped until the plan gate passes, so a plan review file has
-     to be written by the owner (or by any path the clamp does not cover), not
-     by the run itself before the gate flips.
-   - `self-check` (lightweight+low only) → `autopilot_self_check`.
-   On needs-replan, revise — after 2 consecutive rounds the 3rd escalates to the owner.
-5. Execute per milestone (state the change, smallest edit, closest validation,
-   `autopilot_log` as you go). Delegated: `autopilot_executor action=start`.
-   The child submits with `autopilot_submit_packet` **including**
-   `executionRevision` equal to the live executor revision (1 at start, +1 on
-   each needs-fix resume). A stale or missing value is refused.
-6. `autopilot_submit_evidence` (inline) or the child's packet → gate execution
-   with the SAME mode-specific tool as step 4 (`autopilot_audit` /
-   `autopilot_external_audit` / `autopilot_self_check`), `role=execution`
-   (+ `role=rules` when required).
-7. `autopilot_submit_closeout` — one bearing artifact per acceptance criterion or
-   an honest `unproven`; every evidence item declares `kind: 'path' | 'command'`
-   (`path` folds against the run workspace, so `./x` and `/ws/x` are one artifact;
-   `command` compares verbatim, so `git status` and `./git status` stay two — the
-   tool schema refuses an item with no `kind`; the engine and replay require it
-   only on `proven` items, since an unproven entry has no bearer to classify);
-   a proven bearer may not carry two criteria of the same kind
-   (a `command` whose text equals a `path`'s folded form is a different artifact;
-   empty unproven bearers do not occupy that map); workspace cleanup; drift
-   ("none found" or exact facts).
+Everything else is simple work: do it directly, delegate nothing you do not need
+to, and make no `create_goal` or `autopilot_*` call.
 
-## Usage evidence (`autopilot_usage`)
+## Start
 
-Answers how a change was OPERATED, not that it built. Last-wins per id; a new id
-may be declared mid-run. The question is re-asked at closeout, so an entry
-downgraded back to `undeclared` blocks completion too.
+1. Read the project rules, the issue with its comments, and the repository as
+   they are now. If someone else claimed the work, stop and tell the owner.
+2. Write three things before changing anything: Outcome (what is true when
+   finished), Done (commands or observations that prove it, each able to fail)
+   and Not in scope. Post them on the issue, or in the PR description when there
+   is no issue. If the goal is one small change, one line is enough.
+3. Work in a worktree on a branch from the current default branch. Side findings
+   go on the backlog, not into this change.
 
-- `gui` / `cli` / `api-behavior` — ≥2 boundary states (≥1 from the menu) and ≥1 artifact.
-- `harness` — ≥1 artifact of kind `test-run`.
-- `internal` / `docs` — no artifact required.
-- `unsupported` — an honest terminal; needs `unsupportedReason` and a non-empty `attempted`.
+The issue and the PR are the record. `autopilot_status` shows the plugin ledger
+(delegations, routes, reviewer verdicts, links). It is a display aid, not a
+second todo list and not a completion judgement.
 
-Menu: `empty`, `full`, `at-top`, `at-bottom`, `extreme-value`, `interrupted`,
-`narrow-window`, `first-run`, `permission-denied`, `offline`, `fallback`,
-`long-running`, `concurrent`, `error-path`.
+## Roles
 
-Artifact refs are run-directory-relative and must post-date the plan-gate pass;
-they are settled against the filesystem at closeout. Pick the class that is TRUE.
-Nothing can observe a GUI change declared `internal` — that check is the
-auditor's, and declaring around the obligation is the failure this dimension
-exists to catch.
+The main agent owns the goal: it decides, integrates, reviews results and
+talks to the owner. Start every other role with `autopilot_delegate`
+(`role`, `task`, `writePaths`, optional `model` and `effort`; only you and an
+`executor-lead` may call it):
 
-## Egress (push / PR / release / publish)
+- `scout`: read-only search, inventory, log reading. Returns compressed findings.
+- `clerk`: external reads and writes through the connector tools that exist in
+  this session; returns a digest or a write readback and decides nothing. With
+  no connector present it says so instead of guessing.
+- `worker`: one bounded piece with explicit `writePaths`. Give it the outcome,
+  the files, what it may not touch and a checkable result.
+- `executor-lead`: owns one chunk end to end; may start scout, clerk and worker
+  children, integrates, validates and reports a short summary. It does not
+  review itself.
+- `planner`: read-only plan or diagnosis for hard or unclear work.
+- `reviewer`: one-shot, read-only, fresh context; returns a structured verdict.
 
-Write `<run>/outbound/manifest.json` BEFORE attempting the command. It must carry
-`v: 1`, the live `runId`, a `target`, `commands` (each ≥2 tokens, matching the
-command you will actually run at a shell token boundary), ≥1 `claims` each naming
-exactly one bearing artifact, the `artifacts` with their `covers` labels, and a
-`createdAt` under 6h old. `commands` must cover EVERY egress segment of the line
-you run: the command is split on `&&`, `||`, `;`, `|`, `&` and newlines, and a
-push-only manifest will not authorize `git push origin main && npm publish` —
-declare both, or run them as two commands with a manifest each. Every count-shaped phrase in a claim must appear
-verbatim in the artifact that bears it.
+Launch independent delegations together in one turn, not one after another.
+Parallel workers need disjoint `writePaths`; an overlap is refused before
+anything starts. Hand implementation, test runs and fixes to a worker and
+searches to a scout; do a step yourself only when it is a few short calls whose
+result you need at once.
 
-If the manifest is missing, stale, mismatched, does not cover every egress
-segment, or any artifact is empty/absent/outside the run directory, the call is
-DENIED before the owner is ever asked —
-so a rejection here is a manifest to fix, not an approval to chase. When it
-validates, the owner is asked through dsh's approval service and the manifest is
-archived as spent on dispatch. Never re-word a claim to get past the gate.
+`autopilot_agents` has one action, `wait`. To list children, message them or
+stop them, use the host's own `list_agents`, `send_message` and
+`interrupt_agent`. A delegated child that stalls calls `autopilot_escalate`
+(`reason`); that only records the request, and you decide and re-dispatch. A
+reviewer cannot escalate.
 
-What trips the matcher is TEXT, read command-shaped. On a `bash` / `pwsh` /
-`terminal_open` line an unquoted `#` comment and the inside of a multi-word
-quoted argument are dropped before matching, so `grep -rn "git push" .` and a
-commit message that mentions pushing do not trip it. An UNQUOTED mention still
-does (`cat notes/git-push.md`), and inside `run_code` source or `terminal_send`
-keystrokes ANY occurrence does, because neither is a shell command line. A
-read-only command refused that way is the over-inclusion recorded in
-DESIGN.md §6 — say so and move on; do not reshape the command to slip past it.
+### Model and effort
 
-Report `[TRIAGE]/[PLAN]/[USAGE]/[PLAN-AUDIT]/[EXEC]/[AUDIT]/[CLOSEOUT]` progress
-lines at every phase transition. `autopilot_status` is the canonical state; never
-narrate a status that contradicts it.
+Which work class a role belongs to, and how a route is chosen, is in
+[references/model-routing.md](references/model-routing.md). An explicit `model`
+or `effort` in the call, or a pin in the profile, beats the plugin's choice.
+Every dispatch reports the selected route and the observed one; read both and
+believe the observed one. Raise capability by giving a sufficient model more
+effort first, and move up a class only for a fresh child on the same contract.
+Escalation never widens what the role may do.
+
+## Review
+
+Every change that is not trivial gets one independent review from `reviewer`,
+given the diff and the claim, not your reasoning. Use a different model family
+from the one that produced the change. If no other family is reachable (a
+provider is down), a same-family reviewer is allowed, but record "reduced
+independence" with the reason on the issue or PR. Never present it as
+independent.
+
+The reviewer looks for normal work breaking, work being lost, a secret leaking
+and a result reported wrongly. Those block; other notes go to the backlog. Fix
+the blockers and verify them yourself.
+
+## Waiting
+
+- With children or background jobs pending inside a goal round, do not end the
+  turn. Block in it: `autopilot_agents` with `action: wait` for children, `job_output` with
+  `wait: true` for a background command or CI watcher, at most 10 minutes per
+  wait (the host clamps longer waits). Ending the turn early only spends goal
+  rounds, and the round cap ends in a blocker.
+- Only the main agent may set a reminder with `schedule_create` (children are
+  refused). A reminder delivers a message into the session after a restart; it
+  does not re-arm a paused or disarmed goal.
+- After a host restart running children are gone, and the goal stays disarmed
+  until the owner says "continue". Then call `get_goal`, resume with
+  `update_goal` (`action: resume`, exact `goal_id` and `revision`), and start a
+  new `executor-lead` or `worker` from the brief on the issue and the PR. Do not
+  take over its work in the main context, and do not ask the owner to start over.
+
+## Authority and outbound
+
+Commit, push, pull request and merge in the repository you are working on are
+ordinary work; the plugin adds no gate to them. The host's own approval
+settings still apply, and a pending or refused approval is a question for the
+user, not something to route around. Deploys, deletions of native content and
+anything spending money or changing an external account need the owner's order
+for that action.
+
+Before anything leaves the workspace (PR body, issue comment, upload), remove
+credentials, tokens and private paths that carry a user name.
+
+## Done
+
+A stage ending is not the goal ending. Opening a PR, green CI or merge-ready
+never calls `update_goal` with `complete`. Call it only when all of these hold:
+
+- Each Done check ran on the final commit, and you read its result and exit status.
+- An independent review ran and its blockers are fixed; otherwise say the change
+  is unreviewed, not done.
+- The PR is merged with CI green, or the owner has been told exactly why not.
+- Anything installed or deployed was checked in the real place, not only in tests.
+- The issue records what changed, the evidence, and what is still unverified.
+- Your worktrees and branches are gone.
+
+If a check cannot run, say so. Never report more than the evidence covers. When
+the goal is complete, continue with the next authorized work in the same session.
 
 ## Installing this skill
 
-`apply()` copies this file into the skill-scan root
-(`$DSH_AGENTS_HOME/skills/dsh-autopilot/SKILL.md`, default `~/.agents/skills`)
-if the dest is absent. A dest that already differs is a warning, not an
-overwrite (`skillInstall: 'off'` skips the copy). After upgrading the plugin,
-refresh a drifted copy by hand — replace the dest with the bundled file, or
-delete the dest and remount. Manual copy is the fallback when the plugin is
-not loaded:
+`apply()` publishes the bundled skill into the skill-scan root
+(`$DSH_AGENTS_HOME/skills/dsh-autopilot/`, default `~/.agents`): `SKILL.md`
+plus `references/`. A destination that already differs is a warning, not an
+overwrite (`skillInstall: 'off'` skips the copy); a filesystem that cannot
+hard-link is `unsupported` and writes nothing, with the manual remedy in
+`detail`. After upgrading the plugin, refresh a drifted copy by hand.
+
+Manual copy is the fallback when the plugin is not loaded:
 
 ```sh
-# macOS / Linux — fallback only
-mkdir -p ~/.agents/skills/dsh-autopilot
+# macOS / Linux, fallback only
+mkdir -p ~/.agents/skills/dsh-autopilot/references
 cp skill/dsh-autopilot/SKILL.md ~/.agents/skills/dsh-autopilot/SKILL.md
+cp skill/dsh-autopilot/references/*.md ~/.agents/skills/dsh-autopilot/references/
 ```
 
 ```powershell
-# Windows PowerShell — fallback only
-New-Item -ItemType Directory -Force "$HOME\.agents\skills\dsh-autopilot" | Out-Null
+# Windows PowerShell, fallback only
+New-Item -ItemType Directory -Force "$HOME\.agents\skills\dsh-autopilot\references" | Out-Null
 Copy-Item skill\dsh-autopilot\SKILL.md "$HOME\.agents\skills\dsh-autopilot\SKILL.md"
+Copy-Item skill\dsh-autopilot\references\*.md "$HOME\.agents\skills\dsh-autopilot\references\"
 ```

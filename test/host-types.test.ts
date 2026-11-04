@@ -21,20 +21,9 @@ import { Session } from '@deepseek-ai/dsh-session'
 import type { SessionId } from '@deepseek-ai/dsh-session'
 
 import type { SessionReadRef } from '../src/engine.js'
-import { hasDirectHumanTurn } from '../src/tools.js'
 
 function realSession(id: string): Session {
   return Session.create(id as SessionId)
-}
-
-/** A user-role message with source kind 'user' — the human-turn discriminator. */
-function humanMessage(text: string): never {
-  return {
-    id: 'm-1',
-    role: 'user',
-    content: [{ type: 'text', text }],
-    source: { kind: 'user' },
-  } as never
 }
 
 describe('host types satisfy the engine mirrors (dsh 0.1.2-rc.1)', () => {
@@ -49,23 +38,6 @@ describe('host types satisfy the engine mirrors (dsh 0.1.2-rc.1)', () => {
     expect(typeof mirror.snapshotEvents).toBe('function')
     expect(Array.isArray(mirror.snapshotEvents())).toBe(true)
     expect(mirror.header.cwd).toBeUndefined()
-  })
-
-  it('hasDirectHumanTurn reads a REAL session log: true inside an open turn with a user message', () => {
-    const session = realSession('host-types-human')
-    session.append('turn/start', { turn: 1 })
-    session.append('user/message', humanMessage('hello'), { surfaceOp: 'append' })
-    const agent: { session: SessionReadRef } = { session }
-    expect(hasDirectHumanTurn(agent)).toBe(true)
-  })
-
-  it('… and false when the open turn carries no user-sourced message', () => {
-    // DETECTOR for the case above: proves the predicate reads the log's
-    // CONTENT, not merely that `snapshotEvents()` returned an array.
-    const session = realSession('host-types-empty-turn')
-    session.append('turn/start', { turn: 1 })
-    const agent: { session: SessionReadRef } = { session }
-    expect(hasDirectHumanTurn(agent)).toBe(false)
   })
 
   it('snapshotEvents is taken fresh: an append after the first read is visible on the next read', () => {

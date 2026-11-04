@@ -14,15 +14,15 @@ const pkg = JSON.parse(readFileSync(pkgPath, 'utf8')) as {
   dependencies?: Record<string, string>
   devDependencies?: Record<string, string>
   peerDependencies?: Record<string, string>
+  engines?: { dsh?: string }
 }
 
 const TOOLS = '@deepseek-ai/dsh-tools'
-// The 0.2.0 line only (`<0.2.1-0` keeps 0.2.1 prereleases OUT under dsh's
-// includePrerelease compatibility check). dsh 0.1.7+ refuses to install a
-// plugin whose dsh peers do not satisfy the running version, so this string is
-// also the plugin's install gate (app-boot `plugin-compatibility.ts`).
-const PEER = '0.1.2-rc.1 || >=0.1.5-rc.1 <0.1.6 || >=0.2.0-rc.1 <0.2.1-0'
-const DEV_PIN = '0.2.0-rc.2'
+// dsh 0.2.1 prefers `engines.dsh` and otherwise keeps the peer check.
+// 0.3.0 targets dsh 0.2.1-rc.5 and later 0.2.x builds; `<0.3.0-0` keeps every
+// 0.3.0 prerelease of the host out until it has been tried.
+const RANGE = '>=0.2.1-rc.5 <0.3.0-0'
+const DEV_PIN = '0.2.1-rc.5'
 
 describe('package contract: dsh-tools is host-provided', () => {
   it('does not list @deepseek-ai/dsh-tools in runtime dependencies', () => {
@@ -31,8 +31,13 @@ describe('package contract: dsh-tools is host-provided', () => {
   })
 
   it('declares the bounded peer range that was live-tested', () => {
-    expect(pkg.peerDependencies?.[TOOLS]).toBe(PEER)
-    expect(pkg.peerDependencies?.[TOOLS]?.startsWith('>=')).toBe(false)
+    expect(pkg.peerDependencies?.[TOOLS]).toBe(RANGE)
+    // Bounded above: an open-ended `>=` would admit a host this was never run on.
+    expect(pkg.peerDependencies?.[TOOLS]).toMatch(/ <0\.3\.0-0$/)
+  })
+
+  it('declares the same range as engines.dsh, which dsh 0.2.1 checks first', () => {
+    expect(pkg.engines?.dsh).toBe(RANGE)
   })
 
   it('pins the test/build copy in devDependencies', () => {

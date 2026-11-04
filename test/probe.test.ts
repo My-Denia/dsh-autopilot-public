@@ -1,149 +1,40 @@
 /**
- * The enforcement probes. Every one of them is a BEARER for a claim written
- * into a durable run record, so every one needs a fixture where it says yes and
- * a fixture where it says no — a probe whose fail nobody has observed can only
- * ever record a confidence, never a fact.
+ * The deployment probes the 0.3.0 plugin still keeps, each a bearer for a claim it
+ * makes: the storage-domain facility (legacy history and ledger migration), the sandbox policy's
+ * default mode (what the lazy clamp restore may write), and the store resolution.
+ * Every probe has a fixture where it says yes and one where it says no.
+ *
+ * Retired with the run machine: the sandbox-confine and approval-answerer probes
+ * (they fed the `Enforcement` record) and the egress-channel resolver.
  */
 
-import { mkdtempSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { Context } from '@deepseek-ai/cordis'
 import { describe, expect, it } from 'vitest'
-import {
-  observeApproval,
-  probeApproval,
-  probeSandbox,
-  probeStorageDomain,
-  resolveEgressChannel,
-  resolveStore,
-} from '../src/index.js'
-import { DomainRunStore } from '../src/store/domain.js'
-import { RunStore } from '../src/store/file.js'
-import { fakeAgent, makeHarness, makeTriage } from './helpers.js'
+import { probeStorageDomain, resolveStore, sandboxDefaultModeOf } from '../src/index.js'
+import { FileLedgerStore, emptyLedger } from '../src/store/ledger.js'
+import { listLegacyRuns } from '../src/legacy/index.js'
+import { AUTOPILOT_DOMAIN_SPEC } from '../src/store/domain.js'
 
-describe('probeSandbox', () => {
-  it('true only when BOTH sandbox (confine) and sandboxPolicy are observable via ctx.get', () => {
-    const services: Record<string, unknown> = { sandbox: {}, sandboxPolicy: {} }
-    const ctx = { get: (name: string) => services[name] }
-    expect(probeSandbox(ctx)).toBe(true)
-  })
-
-  it('false when the confine provider is missing', () => {
-    const services: Record<string, unknown> = { sandboxPolicy: {} }
-    expect(probeSandbox({ get: (name: string) => services[name] })).toBe(false)
-  })
-
-  it('false when the policy service is missing', () => {
-    const services: Record<string, unknown> = { sandbox: {} }
-    expect(probeSandbox({ get: (name: string) => services[name] })).toBe(false)
+describe('sandboxDefaultModeOf', () => {
+  it('reads the default mode of the sandbox policy service through ctx.get', () => {
+    expect(sandboxDefaultModeOf({ get: (name: string) => (name === 'sandboxPolicy' ? { defaultMode: 'workspace-write' } : undefined) }))
+      .toBe('workspace-write')
   })
 
   it('falls back to property access when ctx.get is absent', () => {
-    expect(probeSandbox({ sandbox: {}, sandboxPolicy: {} })).toBe(true)
-    expect(probeSandbox({ sandbox: {} })).toBe(false)
+    expect(sandboxDefaultModeOf({ sandboxPolicy: { defaultMode: 'read-only' } })).toBe('read-only')
   })
 
-  it('a throwing ctx.get reads as unavailable via the property fallback, and a fully hostile ctx reads false', () => {
-    const throwingGetWithProps = {
-      get: () => { throw new Error('service access denied') },
-      sandbox: {},
-      sandboxPolicy: {},
-    }
-    // get() throws -> per-name fallback to property access still observes the services.
-    expect(probeSandbox(throwingGetWithProps)).toBe(true)
-    const hostile = new Proxy({}, { get: () => { throw new Error('boom') } })
-    expect(probeSandbox(hostile)).toBe(false)
+  it('undefined when the service is missing, or the field is not a string', () => {
+    expect(sandboxDefaultModeOf({})).toBeUndefined()
+    expect(sandboxDefaultModeOf({ sandboxPolicy: {} })).toBeUndefined()
+    expect(sandboxDefaultModeOf({ sandboxPolicy: { defaultMode: 3 } })).toBeUndefined()
   })
 
-  it('false on null-ish contexts', () => {
-    expect(probeSandbox({})).toBe(false)
-  })
-})
-
-/**
- * The approval probe, which used to ask only whether the service OBJECT existed.
- *
- * Its two siblings ask whether the service can do its job; this one did not, and
- * the live host showed exactly what that costs: one run recorded
- * `"approval":"native"` while every `approval/asked` in that same session
- * resolved `{"outcome":"unavailable"}`. The headless profile mounts the service
- * (base bundle) and composes no answerer, so the old check was structurally
- * unable to be false precisely where the claim was false.
- *
- * The fixtures below run through a REAL cordis `Context`: a real `EventsService`,
- * a real `ctx.on` registration, and the real `_hooks` record the probe reads —
- * because a fake `_hooks` object would only prove the probe agrees with my idea
- * of what cordis stores.
- */
-describe('observeApproval / probeApproval', () => {
-  function realCtx() {
-    const ctx = new Context()
-    return {
-      ctx,
-      /** Register an answerer the way `packages/acp` and `packages/host/apiproxy` do. */
-      answer: () => (ctx as unknown as { on(name: string, listener: () => void): () => void })
-        .on('approval/request', () => {}),
-    }
-  }
-
-  it('ANSWERABLE needs a service, a promptable default policy AND a composed answerer', () => {
-    const { ctx, answer } = realCtx()
-    ctx.provide('approval', { config: { policy: 'ask' } })
-    // The live shape: service mounted, nothing composed to answer it.
-    expect(observeApproval(ctx)).toBe('unanswerable')
-    expect(probeApproval(ctx)).toBe(false)
-
-    const dispose = answer()
-    expect(observeApproval(ctx)).toBe('answerable')
-    expect(probeApproval(ctx)).toBe(true)
-
-    // and it reads back DOWN when the answerer unmounts, on the same context.
-    dispose()
-    expect(observeApproval(ctx)).toBe('unanswerable')
-    expect(probeApproval(ctx)).toBe(false)
-  })
-
-  it('a deployment default policy of never is UNANSWERABLE even with an answerer composed', () => {
-    const { ctx, answer } = realCtx()
-    ctx.provide('approval', { config: { policy: 'never' } })
-    answer()
-    // `ApprovalService.decide` returns 'rejected' BEFORE dispatch under that
-    // policy, so the composed answerer is never reached. Not hypothetical: the
-    // base bundle sets it whenever DSH_PERMISSION_MODE is danger-full-access.
-    expect(observeApproval(ctx)).toBe('unanswerable')
-    expect(probeApproval(ctx)).toBe(false)
-  })
-
-  it('ABSENT when no approval service is composed at all', () => {
-    const { ctx } = realCtx()
-    expect(observeApproval(ctx)).toBe('absent')
-    expect(observeApproval({ get: () => undefined })).toBe('absent')
-    expect(observeApproval({})).toBe('absent')
-    expect(observeApproval({ approval: null })).toBe('absent')
-    expect(probeApproval({})).toBe(false)
-  })
-
-  it('an unreadable policy does not disqualify — absence of the field is not evidence of its value', () => {
-    // The answerer chain carries the positive evidence; the policy check only
-    // removes a claim the code can see is false.
-    expect(observeApproval({ approval: {}, events: { _hooks: { 'approval/request': [{}] } } })).toBe('answerable')
-    expect(observeApproval({ approval: { config: null }, events: { _hooks: { 'approval/request': [{}] } } })).toBe('answerable')
-  })
-
-  it('an unreadable or empty event bus reads DOWN — a probe that cannot see cannot upgrade a claim', () => {
-    expect(observeApproval({ approval: {} })).toBe('unanswerable')
-    expect(observeApproval({ approval: {}, events: null })).toBe('unanswerable')
-    expect(observeApproval({ approval: {}, events: { _hooks: 'not a record' } })).toBe('unanswerable')
-    expect(observeApproval({ approval: {}, events: { _hooks: {} } })).toBe('unanswerable')
-    expect(observeApproval({ approval: {}, events: { _hooks: { 'approval/request': [] } } })).toBe('unanswerable')
-    expect(observeApproval(new Proxy({}, { get: () => { throw new Error('boom') } }))).toBe('absent')
-  })
-
-  it('reads the answerer chain under the name the service actually waterfalls', () => {
-    // DETECTOR: a probe that looked for any other event name would report
-    // 'answerable' here, and 'unanswerable' for the real registration above.
-    expect(observeApproval({ approval: {}, events: { _hooks: { 'approval/asked': [{}] } } })).toBe('unanswerable')
+  it('a fully hostile ctx reads as undefined instead of throwing', () => {
+    expect(sandboxDefaultModeOf(new Proxy({}, { get: () => { throw new Error('boom') } }))).toBeUndefined()
   })
 })
 
@@ -159,7 +50,7 @@ describe('probeStorageDomain', () => {
     expect(probeStorageDomain({})).toBeUndefined()
   })
 
-  it('undefined for a truthy service that cannot open — presence is not capability', () => {
+  it('undefined for a truthy service that cannot open: presence is not capability', () => {
     expect(probeStorageDomain({ storageDomain: {} })).toBeUndefined()
     expect(probeStorageDomain({ storageDomain: { open: 'not a function' } })).toBeUndefined()
     expect(probeStorageDomain({ storageDomain: 'yes' })).toBeUndefined()
@@ -170,199 +61,153 @@ describe('probeStorageDomain', () => {
   })
 })
 
-describe('resolveEgressChannel', () => {
-  // Three-valued, asserted on each value.
-  it('native-ask when the seam installed', () => {
-    expect(resolveEgressChannel(true, true)).toBe('native-ask')
-  })
-
-  it('guard-deny when the seam did not install', () => {
-    expect(resolveEgressChannel(false, true)).toBe('guard-deny')
-  })
-
-  it('off when the owner disabled the boundary, regardless of the seam', () => {
-    expect(resolveEgressChannel(true, false)).toBe('off')
-    expect(resolveEgressChannel(false, false)).toBe('off')
-  })
-
-  it('UNDEFINED — no seam observed for THIS scope — reads as the less capable value', () => {
-    // The branch the docstring makes an explicit safety claim about ("a run must
-    // never record native-ask on the strength of some OTHER scope's seam") and
-    // the one no fixture reached: `seamInstalled === true` was the only value
-    // ever asserted against, so `!== false` would have passed too, and a root
-    // that never reached `maybeInstall` would have persisted 'native-ask'.
-    expect(resolveEgressChannel(undefined, true)).toBe('guard-deny')
-    expect(resolveEgressChannel(undefined, false)).toBe('off')
-  })
-})
-
 describe('resolveStore', () => {
-  const root = mkdtempSync(join(tmpdir(), 'dsh-autopilot-store-'))
-
-  /** A minimal in-memory stand-in for the storage-domain facility. */
-  function fakeFacility() {
-    const tables = new Map<string, Map<string, unknown>>()
+  /** A minimal in-memory stand-in for the storage-domain facility; counts opens like the real one refuses a second. */
+  function fakeFacility(seed: Record<string, Array<[string, unknown]>> = {}) {
+    const tables = new Map<string, Map<string, unknown>>(Object.entries(seed).map(([name, rows]) => [name, new Map(rows)]))
+    const state = { opens: 0, closes: 0 }
     return {
-      open: async () => ({
-        table: (name: string) => {
-          const store = tables.get(name) ?? new Map<string, unknown>()
-          tables.set(name, store)
-          return {
-            get: (key: string) => store.get(key),
-            entries: () => store.entries(),
-            keys: () => store.keys(),
-            put: async (key: string, value: unknown) => { store.set(key, value) },
-          }
-        },
-        close: async () => {},
-      }),
+      state,
+      open: async () => {
+        state.opens += 1
+        if (state.opens > 1) throw new Error('domain "dsh_autopilot" is already open')
+        return {
+          table: (name: string) => {
+            const store = tables.get(name) ?? new Map<string, unknown>()
+            tables.set(name, store)
+            return {
+              get: (key: string) => store.get(key),
+              entries: () => store.entries(),
+              keys: () => store.keys(),
+              put: async (key: string, value: unknown) => { store.set(key, value) },
+            }
+          },
+          close: async () => { state.closes += 1 },
+        }
+      },
     }
   }
 
-  it('storeKind file never touches the domain, even where one exists', async () => {
-    const resolution = await resolveStore({ storageDomain: fakeFacility() }, 'file', root)
-    expect(resolution.store).toBeInstanceOf(RunStore)
-    expect(resolution.store.kind).toBe('file')
-    // Files were what the operator ASKED for. Nothing degraded, so nothing is
-    // reported as having degraded — otherwise the reason would be noise on the
-    // one configuration where it means nothing.
+  const freshRoot = (): string => mkdtempSync(join(tmpdir(), 'dsh-autopilot-store-'))
+
+  // Changed with the cross-process fix: the domain's JSON backend republishes one whole file per put,
+  // so two processes writing ledger rows there lost rows. The ledger now always goes to its own file.
+  it('with a facility the ledger still goes to files under the root, and nothing degraded', async () => {
+    const resolution = await resolveStore({ storageDomain: fakeFacility() }, freshRoot())
+    expect(resolution.ledgers).toBeInstanceOf(FileLedgerStore)
+    expect(resolution.ledgers.kind).toBe('file')
     expect(resolution.degraded).toBeUndefined()
-  })
-
-  it('storeKind auto prefers the domain when the facility is observable', async () => {
-    const resolution = await resolveStore({ storageDomain: fakeFacility() }, 'auto', root)
-    expect(resolution.store).toBeInstanceOf(DomainRunStore)
-    expect(resolution.store.kind).toBe('domain')
-    expect(resolution.degraded).toBeUndefined()
-  })
-
-  it('storeKind auto falls back to files on a deployment with no facility', async () => {
-    const resolution = await resolveStore({}, 'auto', root)
-    expect(resolution.store).toBeInstanceOf(RunStore)
-    expect(resolution.store.kind).toBe('file')
-  })
-
-  it('storeKind auto falls back to files when open() rejects', async () => {
-    const broken = { storageDomain: { open: async () => { throw new Error('backend unavailable') } } }
-    const resolution = await resolveStore(broken, 'auto', root)
-    expect(resolution.store.kind).toBe('file')
   })
 
   /**
-   * `enforcement.store: 'file'` cannot tell these two apart, and the 'auto'
-   * branch used to discard the only thing that could: the thrown error went into
-   * a bare `catch {}` and nothing was recorded anywhere. A deployment that
-   * degraded looked exactly like one that never had a facility.
+   * A facility over a REAL single-file JSON medium, the shape of the host's `single`
+   * layout (`dsh-storage-json` `SingleJsonUnit`): the whole domain is one document,
+   * read at open and republished whole on every put. So any put, of any table,
+   * rewrites the bytes of the file that also holds the legacy v1 runs.
    */
-  it('says WHY auto did not get the domain, and the two reasons are distinguishable', async () => {
-    const none = await resolveStore({}, 'auto', root)
-    expect(none.store.kind).toBe('file')
-    expect(none.degraded).toMatch(/storageDomain is not observable/)
+  function fileFacility(path: string) {
+    return {
+      open: async () => {
+        const doc = JSON.parse(readFileSync(path, 'utf8')) as { version: number; tables: Record<string, Record<string, unknown>> }
+        return {
+          table: (name: string) => {
+            const rows = (doc.tables[name] ??= {})
+            return {
+              get: (key: string) => rows[key],
+              entries: () => Object.entries(rows)[Symbol.iterator](),
+              keys: () => Object.keys(rows)[Symbol.iterator](),
+              put: async (key: string, value: unknown) => {
+                rows[key] = value
+                writeFileSync(path, JSON.stringify(doc))
+              },
+            }
+          },
+          close: async () => {},
+        }
+      },
+    }
+  }
 
-    const broken = await resolveStore(
-      { storageDomain: { open: async () => { throw new Error('backend unavailable') } } },
-      'auto',
-      root,
-    )
-    expect(broken.store.kind).toBe('file')
-    // The thrown message SURVIVES: it is the only thing that says what broke.
+  it('the domain file (legacy runs and an earlier ledger row) stays byte-equal through migration, writes, legacy reads and close', async () => {
+    const root = freshRoot()
+    const storages = freshRoot()
+    const domainFile = join(storages, 'dsh_autopilot.json')
+    const legacyEvent = (runId: string) => ({ v: 1, op: 'init', revision: 1, time: '2026-03-01T09:01:00.000Z', snapshot: {
+      runId, revision: 1, plan: { revision: 0, text: '' }, phase: 'planning', planGate: 'pending', executionGate: 'pending',
+      audits: [], residualRisks: [], logCount: 0, consecutiveReplans: 0, enforcement: { sandbox: 'off', reminders: 0, ownerApprovals: [] },
+      triage: { objective: 'o', scope: [], nonGoals: [], acceptanceCriteria: ['a'], risk: 'low', size: 'lightweight', executionMode: 'inline', auditMode: 'self-check', touchesOperatingLayer: false, baseline: {} },
+    } })
+    const earlier = { ...emptyLedger('old-session', '2026-11-01T00:00:00.000Z'), revision: 3 }
+    writeFileSync(domainFile, JSON.stringify({ version: 1, tables: {
+      events: { 'run-1#000000000001': legacyEvent('run-1'), 'run-2#000000000001': legacyEvent('run-2') },
+      runs: { 'run-1': { runId: 'run-1' }, 'run-2': { runId: 'run-2' } },
+      ledgers: { 'old-session': earlier },
+    } }))
+    const before = readFileSync(domainFile)
+
+    const resolution = await resolveStore({ storageDomain: fileFacility(domainFile) }, root)
+    expect(resolution.ledgers.load('old-session')).toEqual(earlier) // migrated to its file
+    expect(existsSync(join(root, 'ledgers', 'old-session.json'))).toBe(true)
+    await resolution.ledgers.write(earlier, 3)
+    await resolution.ledgers.write(emptyLedger('new-session', '2026-11-04T00:00:00.000Z'), 0)
+    expect((await listLegacyRuns(resolution.sources)).map(run => run.runId).sort()).toEqual(['run-1', 'run-2'])
+    await resolution.close()
+
+    expect(readFileSync(domainFile).equals(before)).toBe(true)
+    expect(resolution.ledgers.list().map(l => [l.sessionId, l.revision]).sort()).toEqual([['new-session', 1], ['old-session', 4]])
+  })
+
+  it('without a facility the ledger goes to files under the root, and says why', async () => {
+    const resolution = await resolveStore({}, freshRoot())
+    expect(resolution.ledgers).toBeInstanceOf(FileLedgerStore)
+    expect(resolution.ledgers.kind).toBe('file')
+    expect(resolution.degraded).toMatch(/storageDomain is not observable/)
+  })
+
+  it('a facility whose open() rejects falls back to files, and the two reasons are distinguishable', async () => {
+    const none = await resolveStore({}, freshRoot())
+    const broken = await resolveStore({ storageDomain: { open: async () => { throw new Error('backend unavailable') } } }, freshRoot())
+    expect(broken.ledgers.kind).toBe('file')
     expect(broken.degraded).toContain('backend unavailable')
     expect(broken.degraded).not.toBe(none.degraded)
-
-    // A non-Error rejection is still reported rather than rendered as [object Object].
-    const odd = await resolveStore(
-      { storageDomain: { open: async () => { throw 'domain name already open' } } },
-      'auto',
-      root,
-    )
+    const odd = await resolveStore({ storageDomain: { open: async () => { throw 'domain name already open' } } }, freshRoot())
     expect(odd.degraded).toContain('domain name already open')
   })
 
-  it('storeKind domain REFUSES rather than silently mounting a different backend', async () => {
-    await expect(resolveStore({}, 'domain', root))
-      .rejects.toThrowError(/ctx.storageDomain is not observable/)
-  })
-})
-
-describe('enforcement record at init', () => {
-  it('records what the probes saw: store kind, approval channel, egress seam, consumed count', async () => {
-    const h = makeHarness({
-      environment: {
-        approvalAvailable: () => true,
-        egressChannel: () => 'native-ask',
-      },
-    })
-    const snapshot = await h.engine.init(h.root, makeTriage())
-    expect(snapshot.enforcement.store).toBe('file')
-    expect(snapshot.enforcement.approval).toBe('native')
-    expect(snapshot.enforcement.egress).toBe('native-ask')
-    expect(snapshot.enforcement.outboundConsumed).toBe(0)
+  it('the domain is opened ONCE and closed once: the ledger store and the legacy reader share the handle', async () => {
+    const facility = fakeFacility()
+    const resolution = await resolveStore({ storageDomain: facility }, freshRoot())
+    expect(facility.state.opens).toBe(1)
+    await listLegacyRuns(resolution.sources)
+    await resolution.ledgers.write(emptyLedger('s-1', '2026-11-04T00:00:00.000Z'), 0)
+    expect(facility.state.opens).toBe(1)
+    await resolution.close()
+    await resolution.close()
+    expect(facility.state.closes).toBe(1)
   })
 
-  it('records the LESS capable value when the probes say no', async () => {
-    const h = makeHarness({
-      environment: {
-        approvalAvailable: () => false,
-        egressChannel: () => 'guard-deny',
-      },
-    })
-    const snapshot = await h.engine.init(h.root, makeTriage())
-    expect(snapshot.enforcement.approval).toBe('signal-only')
-    expect(snapshot.enforcement.egress).toBe('guard-deny')
+  it('legacy sources always include BOTH the file root and the domain, whichever backend holds the ledger', async () => {
+    const root = freshRoot()
+    // A 0.2.x run in the file tree, and a different one in the domain events table.
+    mkdirSync(join(root, 'runs', 'file-run'), { recursive: true })
+    const event = (runId: string) => ({ v: 1, op: 'init', revision: 1, time: '2026-03-01T09:01:00.000Z', snapshot: {
+      runId, revision: 1, plan: { revision: 0, text: '' }, phase: 'planning', planGate: 'pending', executionGate: 'pending',
+      audits: [], residualRisks: [], logCount: 0, consecutiveReplans: 0, enforcement: { sandbox: 'off', reminders: 0, ownerApprovals: [] },
+      triage: { objective: 'o', scope: [], nonGoals: [], acceptanceCriteria: ['a'], risk: 'low', size: 'lightweight', executionMode: 'inline', auditMode: 'self-check', touchesOperatingLayer: false, baseline: {} },
+    } })
+    writeFileSync(join(root, 'runs', 'file-run', 'events.jsonl'), `${JSON.stringify(event('file-run'))}\n`)
+    const facility = fakeFacility({ events: [['domain-run#000000000001', event('domain-run')]] })
+
+    const withDomain = await resolveStore({ storageDomain: facility }, root)
+    expect(withDomain.ledgers.kind).toBe('file')
+    expect((await listLegacyRuns(withDomain.sources)).map(run => [run.runId, run.backend])).toEqual([['domain-run', 'domain'], ['file-run', 'file']])
+
+    const filesOnly = await resolveStore({}, root)
+    expect(filesOnly.ledgers.kind).toBe('file')
+    expect((await listLegacyRuns(filesOnly.sources)).map(run => run.runId)).toEqual(['file-run'])
   })
 
-  it('a THROWING probe never upgrades a claim', async () => {
-    const h = makeHarness({
-      environment: {
-        approvalAvailable: () => { throw new Error('probe exploded') },
-        egressChannel: () => { throw new Error('probe exploded') },
-      },
-    })
-    const snapshot = await h.engine.init(h.root, makeTriage())
-    expect(snapshot.enforcement.approval).toBe('signal-only')
-    expect(snapshot.enforcement.egress).toBe('guard-deny')
-  })
-
-  it('asks the egress probe about THIS run, so two roots cannot inherit each other channel', async () => {
-    // A mount-wide, last-write-wins flag lets a root whose seam installed record
-    // the channel of a root whose seam did not (and vice versa) — a value the
-    // code is not observing for the scope it names.
-    const asked: string[] = []
-    const h = makeHarness({
-      environment: {
-        egressChannel: (rootSessionId: string) => {
-          asked.push(rootSessionId)
-          return rootSessionId === 'root-1' ? 'native-ask' : 'guard-deny'
-        },
-      },
-    })
-    const snapshot = await h.engine.init(h.root, makeTriage())
-    expect(asked).toContain(h.root.id)
-    expect(snapshot.enforcement.egress).toBe('native-ask')
-
-    // Negative half on the same engine: a DIFFERENT root gets its own answer.
-    const other = fakeAgent('root-2')
-    h.agents.add(other)
-    const secondary = await h.engine.init(other, makeTriage())
-    expect(secondary.enforcement.egress).toBe('guard-deny')
-  })
-
-  it('records whether ctx.autopilot was actually provided at mount', async () => {
-    const yes = makeHarness({ environment: { serviceRegistered: () => true } })
-    expect((await yes.engine.init(yes.root, makeTriage())).enforcement.service).toBe('registered')
-
-    const no = makeHarness({ environment: { serviceRegistered: () => false } })
-    expect((await no.engine.init(no.root, makeTriage())).enforcement.service).toBe('unavailable')
-
-    // An unwired probe answers the least capable value, like every sibling.
-    const unwired = makeHarness()
-    expect((await unwired.engine.init(unwired.root, makeTriage())).enforcement.service).toBe('unavailable')
-  })
-
-  it('an UNWIRED probe set defaults to the same least-capable answers', async () => {
-    const h = makeHarness()
-    const snapshot = await h.engine.init(h.root, makeTriage())
-    expect(snapshot.enforcement.approval).toBe('signal-only')
-    expect(snapshot.enforcement.egress).toBe('guard-deny')
+  it('the spec the domain is opened with declares the events table, or the legacy rows would never materialize', async () => {
+    expect(Object.keys(AUTOPILOT_DOMAIN_SPEC.tables)).toContain('events')
   })
 })

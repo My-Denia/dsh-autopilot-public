@@ -173,7 +173,7 @@ export function resolvePluginGrant(grant: PluginGrant, policy: SessionPolicyStat
     .join(', ')
   const reason =
     `plugin-config grant (${label}) is outside the session model-selection policy [${policyList}]: ` +
-    'two owner grants conflict — dispatch blocked, run escalates needs-owner-decision'
+    'two owner grants conflict — dispatch blocked; re-deciding the lock needs the owner (nothing pauses the run)'
   return {
     kind: 'conflict',
     reason,

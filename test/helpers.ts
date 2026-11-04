@@ -1,47 +1,24 @@
-/** Shared test fixtures: snapshots, fake agents, stub subagents, temp stores. */
+/** Shared test fixtures: fake agents, stub subagents, temp ledger stores, the engine harness. */
 
-import { mkdtempSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { AutopilotEngine } from '../src/engine.js'
-import type { AgentOptionsLike, AgentRef, EnvironmentProbes, ResolvedConfig, RoutingPorts, SubagentsRef, SubagentRunRef } from '../src/engine.js'
+import type {
+  AgentRef,
+  EnginePorts,
+  EnvironmentProbes,
+  RoutingPorts,
+  SubagentActivationRef,
+  SubagentsRef,
+} from '../src/engine.js'
 import { resolveConfig } from '../src/index.js'
-import { RunStore } from '../src/store/file.js'
-import type { Snapshot, Triage, UsageEntry } from '../src/domain/types.js'
-
-export function makeTriage(overrides: Partial<Triage> = {}): Triage {
-  return {
-    objective: 'test objective',
-    scope: ['src/'],
-    nonGoals: ['docs/'],
-    acceptanceCriteria: ['tests pass'],
-    risk: 'low',
-    size: 'lightweight',
-    executionMode: 'inline',
-    auditMode: 'self-check',
-    touchesOperatingLayer: false,
-    baseline: {},
-    ...overrides,
-  }
-}
-
-export function makeSnapshot(overrides: Partial<Snapshot> = {}, triage: Partial<Triage> = {}): Snapshot {
-  return {
-    runId: 'run-1',
-    revision: 1,
-    triage: makeTriage(triage),
-    plan: { revision: 0, text: '' },
-    phase: 'planning',
-    planGate: 'pending',
-    executionGate: 'pending',
-    audits: [],
-    residualRisks: [],
-    logCount: 0,
-    consecutiveReplans: 0,
-    enforcement: { sandbox: 'off', reminders: 0, ownerApprovals: [] },
-    ...overrides,
-  }
-}
+import type { ConfigInput } from '../src/index.js'
+import { FileLedgerStore, legacySourcesOf } from '../src/store/ledger.js'
+import type { LedgerStoreLike } from '../src/store/ledger.js'
+import type { LegacySources } from '../src/legacy/index.js'
+import type { DelegationRecord } from '../src/domain/ledger-types.js'
 
 export interface FakeAgent extends AgentRef {
   readonly appended: Array<{ type: string; data: unknown }>
@@ -55,9 +32,6 @@ export function fakeAgent(id: string, parentSession?: string, cwd?: string, ctx?
     id,
     appended: events,
     options: { provider: 'fake', model: 'fake-model' },
-    // M6 ([R2-P3-1]): the scoped ctx is PRESENT only on real host agents —
-    // a test stubs it deliberately (the planner install requires it), and
-    // every other fixture keeps the absent-means-absent shape.
     ...(ctx === undefined ? {} : { ctx }),
     session: {
       header: {
@@ -75,118 +49,37 @@ export function fakeAgent(id: string, parentSession?: string, cwd?: string, ctx?
 export class FakeAgents {
   private readonly map = new Map<string, AgentRef>()
   add(agent: AgentRef): void { this.map.set(agent.id, agent) }
+  remove(id: string): void { this.map.delete(id) }
   get(id: string): AgentRef | undefined { return this.map.get(id) }
 }
 
-/** Scripted one-shot verdicts, FIFO. */
-export interface StubVerdictScript {
-  verdict: string
-  note: string
-  /**
-   * Override the child's logged `request/header` route (M4 observed leg).
-   * Absent ⇒ the stub logs a header AGREEING with the dispatch — what a
-   * healthy host does. `null` ⇒ no header event at all (observed unreadable).
-   * An object ⇒ a scripted divergence (model axis, provider axis, effort).
-   */
-  requestHeader?: { provider?: string; model?: string; reasoningEffort?: string } | null
-}
-
-export function stubSubagents(script: {
-  verdicts?: Array<StubVerdictScript | { stopReason: string }>
-  onFollowup?: (childId: string, text: string) => void
-  onStartContinuable?: (childId: string) => void
-  failContinuable?: boolean
-  followupFails?: number
-} = {}): SubagentsRef & {
-  followups: Array<{ childId: string; text: string }>
-  started: string[]
-  /** The agentOptions each one-shot auditor dispatch received (undefined = inherit). */
-  auditOptions: Array<AgentOptionsLike | undefined>
-  /** The agentOptions each continuable executor dispatch received (undefined = inherit). */
-  continuableOptions: Array<AgentOptionsLike | undefined>
+/** A subagent runtime that records every activation and resolves each one immediately. */
+export function stubSubagents(): SubagentsRef & {
+  readonly activations: Array<{ childId?: string; label: string; prompt: string }>
+  readonly messages: Array<{ childId: string; text: string }>
 } {
-  const verdicts = [...(script.verdicts ?? [])]
-  const followups: Array<{ childId: string; text: string }> = []
-  const started: string[] = []
-  const auditOptions: Array<AgentOptionsLike | undefined> = []
-  const continuableOptions: Array<AgentOptionsLike | undefined> = []
-  let auditCounter = 0
-  let followupFailsLeft = script.followupFails ?? 0
+  const activations: Array<{ childId?: string; label: string; prompt: string }> = []
+  const messages: Array<{ childId: string; text: string }> = []
+  let counter = 0
   return {
-    followups,
-    started,
-    auditOptions,
-    continuableOptions,
-    async start(_provider, request) {
-      auditOptions.push(request.agentOptions)
-      const next = verdicts.shift()
-      auditCounter += 1
-      const id = `auditor-${auditCounter}`
-      // The child the real host would create (`resolveChildAgentOptions`:
-      // the parent's route unless the request overrides it): creation options
-      // echo the dispatch, and the session logs a `request/header` for the
-      // request the child actually sent — AGREEING with the dispatch unless a
-      // test scripts a divergence via `requestHeader`.
-      const override = next !== undefined && !('stopReason' in next) ? next.requestHeader : undefined
-      const childOptions = {
-        provider: request.agentOptions?.provider ?? 'stub-llm',
-        model: request.agentOptions?.model ?? 'stub-model',
-      }
-      const effort = override !== null && override !== undefined && override.reasoningEffort !== undefined
-        ? override.reasoningEffort
-        : request.agentOptions?.reasoningEffort
-      const events: Array<{ type: string; data: unknown }> = override === null ? [] : [{
-        type: 'request/header',
-        data: {
-          header: {
-            config: {
-              provider: override?.provider ?? childOptions.provider,
-              model: override?.model ?? childOptions.model,
-              ...(effort === undefined ? {} : { reasoningEffort: effort }),
-            },
-          },
-          reason: 'initial',
-        },
-      }]
-      const run: SubagentRunRef = {
-        id,
-        localAgent: {
-          id,
-          session: { header: {}, snapshotEvents: () => events.slice(), append() {} },
-          options: childOptions,
-        },
-        result: Promise.resolve(
-          next === undefined
-            ? { stopReason: 'error', diagnostic: 'script exhausted' }
-            : 'stopReason' in next
-              ? { stopReason: next.stopReason }
-              : { stopReason: 'completed', structured: next },
-        ),
-        async dispose() {},
-      }
-      return run
+    activations,
+    messages,
+    async startActivation(spec): Promise<SubagentActivationRef> {
+      counter += 1
+      const childId = spec.childId ?? `child-${counter}`
+      activations.push({
+        ...(spec.childId === undefined ? {} : { childId: spec.childId }),
+        label: spec.label,
+        prompt: spec.request.prompt.map(block => block.text).join('\n'),
+      })
+      return { childId, result: Promise.resolve({ stopReason: 'completed' }), async dispose() {} }
     },
-    async startContinuable(spec) {
-      if (script.failContinuable === true) throw new Error('continuable startup failed (scripted)')
-      started.push(spec.childId)
-      continuableOptions.push(spec.request.agentOptions)
-      script.onStartContinuable?.(spec.childId)
-      return {}
-    },
-    // The resume transport (`SubagentManager.sendMessage`). The record keeps
-    // its historical `followups` name; the manager never had `followup`.
-    async sendMessage(_sender, childId, content, _options) {
-      if (followupFailsLeft > 0) {
-        followupFailsLeft -= 1
-        throw new Error('sendMessage failed (scripted)')
-      }
-      const text = content.map(block => block.text).join('\n')
-      followups.push({ childId, text })
-      script.onFollowup?.(childId, text)
+    async sendMessage(_sender, childId, content) {
+      messages.push({ childId, text: content.map(block => block.text).join('\n') })
       return {}
     },
     interrupt() {},
-    async drainContinuableChildren() { return {} },
+    async drainChildren() { return {} },
   }
 }
 
@@ -195,58 +88,281 @@ export interface Harness {
   agents: FakeAgents
   subagents: ReturnType<typeof stubSubagents>
   root: FakeAgent
+  ledgers: LedgerStoreLike
+  sources: LegacySources
   storeDir: string
+  warnings: string[]
 }
 
 export function makeHarness(options: {
-  config?: Parameters<typeof resolveConfig>[0]
+  config?: ConfigInput
   subagents?: ReturnType<typeof stubSubagents>
-  /** Sandbox confine-provider probe; tests default to true (provider mounted). */
-  sandboxAvailable?: () => boolean
-  /** Remaining enforcement bearers; each defaults to the LEAST capable answer. */
-  environment?: EnvironmentProbes
-  /** Routing ports (M3b): a stub catalog/policy pair; absent ⇒ 0.2.0/inherit parity. */
   routing?: RoutingPorts
-  /** M6: a deliberate scoped-ctx stub on the fake root agent (the planner install leg). */
-  rootCtx?: unknown
+  environment?: EnvironmentProbes
+  /** Legacy runs in the file root, as fixture file names under test/fixtures/legacy-synthetic. */
+  legacyFixtures?: readonly string[]
+  rootId?: string
   cwd?: string
+  rootCtx?: unknown
+  ports?: Partial<EnginePorts>
 } = {}): Harness {
   const storeDir = mkdtempSync(join(tmpdir(), 'dsh-autopilot-test-'))
   const agents = new FakeAgents()
-  const root = fakeAgent('root-1', undefined, options.cwd, options.rootCtx)
+  const root = fakeAgent(options.rootId ?? 'root-1', undefined, options.cwd, options.rootCtx)
   agents.add(root)
   const subagents = options.subagents ?? stubSubagents()
-  const config: ResolvedConfig = resolveConfig(options.config)
-  const engine = new AutopilotEngine(
-    agents,
-    subagents,
-    new RunStore(storeDir),
-    config,
-    options.sandboxAvailable ?? (() => true),
-    options.environment ?? {},
-    options.routing ?? {},
-  )
-  return { engine, agents, subagents, root, storeDir }
+  const warnings: string[] = []
+  for (const name of options.legacyFixtures ?? []) writeLegacyFixture(storeDir, name)
+  const ledgers = FileLedgerStore.open(storeDir)
+  const sources = legacySourcesOf(storeDir)
+  const engine = new AutopilotEngine(agents, subagents, ledgers, sources, resolveConfig(options.config), {
+    ...(options.routing === undefined ? {} : { routing: options.routing }),
+    ...(options.environment === undefined ? {} : { environment: options.environment }),
+    warn: message => warnings.push(message),
+    ...options.ports,
+  })
+  return { engine, agents, subagents, root, ledgers, sources, storeDir, warnings }
 }
 
-/** A well-formed usage entry for a CLI change, ready to pass `validateUsageEntry`. */
-export function makeUsageEntry(overrides: Partial<UsageEntry> = {}): UsageEntry {
+const LEGACY_FIXTURES = join(fileURLToPath(new URL('.', import.meta.url)), 'fixtures', 'legacy-synthetic')
+
+/** Copy one synthetic legacy stream into `<root>/runs/<runId>/events.jsonl`; returns its run id. */
+export function writeLegacyFixture(root: string, name: string): string {
+  const raw = readFileSync(join(LEGACY_FIXTURES, name), 'utf8')
+  const first = JSON.parse(raw.split('\n')[0]!) as { snapshot: { runId: string } }
+  const runId = first.snapshot.runId
+  mkdirSync(join(root, 'runs', runId), { recursive: true })
+  writeFileSync(join(root, 'runs', runId, 'events.jsonl'), raw)
+  return runId
+}
+
+/** A minimal delegation record for ledger fixtures. */
+export function delegation(childId: string, state: DelegationRecord['state'], overrides: Partial<DelegationRecord> = {}): DelegationRecord {
   return {
-    id: 'm1',
-    usageClass: 'cli',
-    boundaryStates: ['empty', 'happy-path'],
-    artifacts: [{
-      kind: 'session-log',
-      ref: 'usage/m1.log',
-      covers: ['empty'],
-      capturedAt: new Date().toISOString(),
-    }],
-    attempted: [],
+    childId,
+    role: 'worker',
+    parentId: 'root-1',
+    depth: 1,
+    generation: 1,
+    title: `task for ${childId}`,
+    state,
+    modelSource: 'inherit',
+    effortSource: 'host-default',
+    routeMatch: 'pending',
+    tools: 'inherit',
+    maxDepth: 1,
+    startedAt: '2026-11-04T00:00:00.000Z',
     ...overrides,
   }
 }
 
-/** Seed one `undeclared` entry, i.e. the shape `autopilot_init` gives a standard run. */
-export function undeclaredSeed(id = 'm1'): UsageEntry {
-  return { id, usageClass: 'undeclared', boundaryStates: [], artifacts: [], attempted: [] }
+// ─────────────────────────────────────────────────────────────────────────────
+// A fake host for the delegation tests: startActivation creates a real-shaped child agent,
+// announces it through the engine's agent/created hook, and settles on demand.
+// ─────────────────────────────────────────────────────────────────────────────
+
+import { RouteCatalog } from '../src/routing/catalog.js'
+import type { LlmCallConfig, LlmRuntimeSubset } from '../src/routing/catalog.js'
+import type { SessionPolicyState } from '../src/routing/authorize.js'
+import type { NativeGoalView } from '../src/engine.js'
+
+export interface StubModel {
+  readonly provider: string
+  readonly id: string
+  readonly contextWindow?: number
+  readonly defaultEffort?: string
+}
+
+export function stubLlm(models: readonly StubModel[], over: Partial<LlmRuntimeSubset> = {}): LlmRuntimeSubset {
+  const providers = [...new Set(models.map(model => model.provider))]
+  return {
+    listProviders: () => providers.map(id => ({ id, name: id })),
+    listModels: async (provider: string) => models.filter(m => m.provider === provider).map(m => ({ provider, id: m.id, name: m.id })),
+    resolveModelInfo: async (provider: string, model: string) => {
+      const hit = models.find(c => c.provider === provider && c.id === model)
+      if (hit === undefined) throw new Error(`unknown route ${provider}/${model}`)
+      return {
+        provider,
+        id: model,
+        name: model,
+        ...(hit.contextWindow !== undefined ? { context: { contextWindow: hit.contextWindow } } : {}),
+        ...(hit.defaultEffort !== undefined ? { reasoning: { efforts: [{ id: hit.defaultEffort, name: hit.defaultEffort }], defaultEffort: hit.defaultEffort } } : {}),
+      }
+    },
+    resolveCallConfig: async (config: LlmCallConfig) => ({ ...config }),
+    ...over,
+  }
+}
+
+export const catalogOf = (models: readonly StubModel[], over: Partial<LlmRuntimeSubset> = {}): RouteCatalog => new RouteCatalog(stubLlm(models, over))
+
+export const policyOf = (...routes: readonly [string, string][]): SessionPolicyState => ({
+  kind: 'present',
+  routes: routes.map(([provider, model]) => ({ provider, model })),
+})
+
+export interface Deferred { resolve(value: { stopReason: string; structured?: unknown; diagnostic?: string }): void }
+
+export interface DelegationHost {
+  engine: AutopilotEngine
+  agents: FakeAgents
+  root: FakeAgent
+  ledgers: LedgerStoreLike
+  storeDir: string
+  warnings: string[]
+  /** Every startActivation spec, in call order. */
+  starts: Array<{ childId?: string; label: string; delivery: string; maxDepth?: number; outputSchema?: object; agentOptions?: Record<string, unknown>; prompt: string; parentId: string; provider: string }>
+  /** restrict() calls per child id. */
+  restricts: Map<string, string[][]>
+  /** Tool names registered in each child's own scope. */
+  childTools: Map<string, string[]>
+  /** Settle one child's activation. */
+  settle(childId: string, result?: { stopReason: string; structured?: unknown; diagnostic?: string }): void
+  /**
+   * Settle one child the way dsh 0.2.1-rc.5 does (`dsh-subagent` `finishDisposal`):
+   * the child agent is disposed first (dropped from `ctx.agents`, `agent/disposed`
+   * delivered), and only then does the activation result resolve.
+   */
+  settleDisposed(childId: string, result?: { stopReason: string; structured?: unknown; diagnostic?: string }): void
+  /** With `headerOnFirstRequest`: append the child's route header, as its first model request does. */
+  firstRequest(childId: string): void
+  /** A child agent as the host would hold it (cold resume): created and announced without a start. */
+  announceExisting(childId: string, parentId?: string): FakeAgent
+  /** Make the next startActivation throw. */
+  failNextStart: { error?: Error }
+  /** Make restrict() throw for a child id once. */
+  restrictThrows: Map<string, Error>
+  /** Make EVERY restrict() throw while set. */
+  restrictAlways: { error?: Error }
+}
+
+export function delegationHost(options: {
+  config?: ConfigInput
+  models?: readonly StubModel[]
+  catalog?: RouteCatalog
+  policy?: SessionPolicyState
+  registered?: readonly string[]
+  maxDepthSetting?: number
+  goal?: () => NativeGoalView | undefined
+  driver?: () => boolean | undefined
+  rootId?: string
+  hold?: (childId: string) => boolean
+  /** Do not write the route header at creation (the real host writes it at the first request); see `firstRequest`. */
+  headerOnFirstRequest?: boolean
+} = {}): DelegationHost {
+  const storeDir = mkdtempSync(join(tmpdir(), 'dsh-autopilot-delegation-'))
+  const agents = new FakeAgents()
+  const rootTools: string[] = []
+  const root = fakeAgent(options.rootId ?? 'root-1', undefined, undefined, { tools: { register: (def: { name?: string }) => { rootTools.push(def.name ?? '?'); return () => {} } } })
+  agents.add(root)
+  const starts: DelegationHost['starts'] = []
+  const restricts = new Map<string, string[][]>()
+  const childTools = new Map<string, string[]>()
+  const deferreds = new Map<string, Deferred>()
+  const failNextStart: { error?: Error } = {}
+  const restrictThrows = new Map<string, Error>()
+  const restrictAlways: { error?: Error } = {}
+  const warnings: string[] = []
+  let counter = 0
+  let engine!: AutopilotEngine
+
+  const makeChild = (childId: string, parentId: string, options2?: Record<string, unknown>): FakeAgent => {
+    const tools: string[] = []
+    childTools.set(childId, tools)
+    const child = fakeAgent(childId, parentId, undefined, {
+      tools: {
+        restrict(filter: { allow: string[] }) {
+          if (restrictAlways.error !== undefined) throw restrictAlways.error
+          const thrown = restrictThrows.get(childId)
+          if (thrown !== undefined) { restrictThrows.delete(childId); throw thrown }
+          restricts.set(childId, [...(restricts.get(childId) ?? []), [...filter.allow]])
+        },
+        register(def: { name?: string }) { tools.push(def.name ?? '?'); return () => {} },
+      },
+    })
+    const config = { provider: (options2?.['provider'] as string | undefined) ?? 'host', model: (options2?.['model'] as string | undefined) ?? 'default', ...(options2?.['reasoningEffort'] === undefined ? {} : { reasoningEffort: options2['reasoningEffort'] }) }
+    if (options.headerOnFirstRequest === true) pendingHeaders.set(childId, config)
+    else child.session.append('request/header', { header: { config }, reason: 'initial' })
+    return child
+  }
+  const pendingHeaders = new Map<string, Record<string, unknown>>()
+
+  const subagents: SubagentsRef = {
+    async startActivation(spec): Promise<SubagentActivationRef> {
+      const pending = failNextStart.error
+      if (pending !== undefined) { failNextStart.error = undefined; throw pending }
+      counter += 1
+      const childId = spec.childId ?? `auto-child-${counter}`
+      const parent = spec.request.parent as FakeAgent
+      starts.push({
+        ...(spec.childId === undefined ? {} : { childId: spec.childId }),
+        label: spec.label,
+        delivery: spec.delivery,
+        ...(spec.request.maxDepth === undefined ? {} : { maxDepth: spec.request.maxDepth }),
+        ...(spec.request.outputSchema === undefined ? {} : { outputSchema: spec.request.outputSchema }),
+        ...(spec.request.agentOptions === undefined ? {} : { agentOptions: { ...spec.request.agentOptions } }),
+        prompt: spec.request.prompt.map(b => b.text).join('\n'),
+        parentId: parent.id,
+        provider: spec.provider,
+      })
+      const child = makeChild(childId, parent.id, spec.request.agentOptions as Record<string, unknown> | undefined)
+      agents.add(child)
+      // The host announces the child before startActivation returns; a throw vetoes it.
+      try {
+        engine.onChildCreated(child)
+      } catch (error) {
+        agents.remove(childId)
+        throw error
+      }
+      let resolve!: Deferred['resolve']
+      const result = new Promise<{ stopReason: string; structured?: unknown; diagnostic?: string }>((r) => { resolve = r })
+      deferreds.set(childId, { resolve })
+      return { childId, result, async dispose() {} }
+    },
+    async sendMessage() { return {} },
+    interrupt() {},
+    async drainChildren() { return {} },
+  }
+
+  const ledgers = FileLedgerStore.open(storeDir)
+  engine = new AutopilotEngine(agents, subagents, ledgers, legacySourcesOf(storeDir), resolveConfig(options.config), {
+    routing: {
+      ...(options.catalog === undefined && options.models === undefined ? {} : { catalog: options.catalog ?? catalogOf(options.models ?? []) }),
+      policyReader: () => options.policy ?? { kind: 'absent' },
+    },
+    environment: {
+      ...(options.registered === undefined ? {} : { registeredToolNames: () => options.registered }),
+      ...(options.maxDepthSetting === undefined ? {} : { subagentMaxDepth: () => options.maxDepthSetting }),
+      ...(options.goal === undefined ? {} : { readGoal: () => options.goal!() }),
+      ...(options.driver === undefined ? {} : { goalDriverPresent: options.driver }),
+    },
+    warn: message => warnings.push(message),
+    now: (() => { let t = 0; return () => `2026-11-04T10:00:${String(Math.min(59, t++)).padStart(2, '0')}.000Z` })(),
+  })
+  return {
+    engine, agents, root, ledgers, storeDir, warnings, starts, restricts, childTools,
+    settle(childId, result = { stopReason: 'completed' }) { deferreds.get(childId)?.resolve(result) },
+    settleDisposed(childId, result = { stopReason: 'completed' }) {
+      const child = agents.get(childId)
+      agents.remove(childId)
+      if (child !== undefined) engine.onChildDisposed(child)
+      deferreds.get(childId)?.resolve(result)
+    },
+    firstRequest(childId) {
+      const config = pendingHeaders.get(childId)
+      const child = agents.get(childId) as FakeAgent | undefined
+      if (config === undefined || child === undefined) throw new Error(`no pending first request for ${childId}`)
+      pendingHeaders.delete(childId)
+      child.session.append('request/header', { header: { config }, reason: 'initial' })
+    },
+    announceExisting(childId, parentId = root.id) {
+      const child = makeChild(childId, parentId)
+      agents.add(child)
+      engine.onChildCreated(child)
+      return child
+    },
+    failNextStart,
+    restrictThrows,
+    restrictAlways,
+  }
 }

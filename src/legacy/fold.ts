@@ -1,0 +1,1510 @@
+/**
+ * Strict replay fold over a run's event stream.
+ *
+ * The fold is the invariant guardian: every event is validated against the
+ * committed prefix before it is accepted, so an illegal stream (whether from a
+ * buggy writer or a hand-edited file) is rejected loudly instead of folding
+ * into a silently wrong state. Mirrors the CC rule that state.json is the only
+ * canonical status, plus the experimental-GAH insight that replay must reject
+ * malformed streams rather than tolerate them.
+ */
+
+import {
+  AutopilotError,
+  ROUTING_AUDITOR_ROLES,
+  ROUTING_AUTHORIZATION_SOURCES,
+  ROUTING_CANDIDATE_DISPOSITIONS,
+  ROUTING_COST_MATCHES,
+  ROUTING_IDENTITY_AXES,
+  ROUTING_INDEPENDENCE_OUTCOMES,
+  ROUTING_ROLES,
+  applyRoutingDecision,
+  sameRoutingPins,
+  validateExternalReview,
+  TERMINAL_PHASES,
+  evaluateCompletion,
+  evidenceKindProblems,
+  handoffProblems,
+  isAbsoluteShapedBearer,
+  usageDeclarationProblems,
+} from './types.js'
+import type { AuditRole, ExecutionGate, GateName, GateProvenance, GateSource, GateSources, Operation, Phase, PlanGate, RouteRecord, RunEvent, RoutingDecisionDetail, RoutingPin, Snapshot } from './types.js'
+
+/** Operations legal from each phase (undefined prior state only admits init). */
+const LEGAL_OPS: Record<Phase, readonly Operation[]> = {
+  'planning': ['submit-plan', 'audit', 'self-check', 'external-audit', 'log', 'replan', 'set-blocked', 'set-owner-decision', 'owner-approve', 'owner-gate-pass', 'owner-gate-withdraw', 'consume-approval', 'consume-manifest', 'declare-usage', 'sandbox'],
+  'plan-reviewing': ['audit', 'self-check', 'external-audit', 'log', 'set-blocked', 'set-owner-decision', 'owner-approve', 'owner-gate-pass', 'owner-gate-withdraw', 'consume-approval', 'consume-manifest', 'sandbox'],
+  'executing': ['start-executor', 'resume-executor', 'submit-packet', 'submit-evidence', 'amend-plan', 'log', 'replan', 'set-blocked', 'set-owner-decision', 'owner-approve', 'owner-gate-withdraw', 'consume-approval', 'consume-manifest', 'declare-usage', 'reminder', 'audit', 'self-check', 'external-audit', 'sandbox'],
+  'execution-reviewing': ['audit', 'self-check', 'external-audit', 'log', 'replan', 'amend-plan', 'set-blocked', 'set-owner-decision', 'owner-approve', 'owner-gate-pass', 'owner-gate-withdraw', 'consume-approval', 'consume-manifest', 'reminder', 'sandbox'],
+  'replanning': ['submit-plan', 'audit', 'self-check', 'external-audit', 'log', 'set-blocked', 'set-owner-decision', 'owner-gate-pass', 'owner-gate-withdraw', 'consume-manifest', 'declare-usage', 'sandbox'],
+  // 'declare-usage' is legal here on purpose (added 2026-08-24): an entry
+  // reverted to 'undeclared' during execution used to reach 'closing' with no
+  // way back — `submit-closeout` refuses it and the entry could not be
+  // re-declared, so the only exits were set-blocked or
+  // set-owner-decision -> owner-resolve(resume-planning), which resets the plan
+  // gate and forces the whole cycle to be redone. Answering the question late
+  // is strictly better than a liveness dead end, and completion still refuses
+  // until it IS answered.
+  'closing': ['audit', 'self-check', 'external-audit', 'log', 'submit-closeout', 'set-blocked', 'set-owner-decision', 'owner-approve', 'owner-gate-pass', 'owner-gate-withdraw', 'consume-approval', 'consume-manifest', 'declare-usage', 'sandbox'],
+  'completed': [],
+  'blocked': [],
+  'needs-owner-decision': ['owner-resolve', 'log', 'owner-approve', 'consume-approval', 'consume-manifest'],
+}
+
+function fail(message: string, code: string): never {
+  throw new AutopilotError(message, code)
+}
+
+function assertStartExecutor(prior: Snapshot, next: Snapshot): void {
+  const prev = prior.executor
+  const folded = next.executor
+  if (folded === undefined) fail('start-executor must carry an executor', 'LEGACY_EXECUTOR_OP')
+  if (prev === undefined || prev.state === 'completed' || prev.state === 'revoked') {
+    if (folded.executionRevision !== 1) fail('start-executor executionRevision must be 1', 'LEGACY_EXECUTOR_REVISION')
+    if (folded.state !== 'starting') fail('start-executor from a predecessor must land in starting', 'LEGACY_EXECUTOR_REVISION')
+    const expectedGen = prev === undefined ? 1 : prev.generation + 1
+    if (folded.generation !== expectedGen) {
+      fail(
+        `start-executor generation ${String(folded.generation)} is not ${String(expectedGen)}`,
+        'LEGACY_EXECUTOR_REVISION',
+      )
+    }
+    if (prev !== undefined && folded.childId === prev.childId) {
+      fail('start-executor must not reuse a predecessor childId', 'LEGACY_EXECUTOR_REVISION')
+    }
+    return
+  }
+  if (prev.state === 'starting') {
+    if (
+      folded.childId !== prev.childId
+      || folded.generation !== prev.generation
+      || folded.executionRevision !== prev.executionRevision
+    ) {
+      fail(
+        'start-executor starting transition must keep child identity and executionRevision',
+        'LEGACY_EXECUTOR_REVISION',
+      )
+    }
+    if (folded.state !== 'running' && folded.state !== 'revoked') {
+      fail(`start-executor from starting landed in ${folded.state}`, 'LEGACY_EXECUTOR_REVISION')
+    }
+    return
+  }
+  fail(`start-executor cannot replace a live executor in state ${prev.state}`, 'LEGACY_EXECUTOR_EXISTS')
+}
+
+function assertExecutorLifecycle(prior: Snapshot, next: Snapshot, op: Operation): void {
+  const prev = prior.executor
+  const folded = next.executor
+  if (prev === undefined && folded === undefined) return
+  if (prev === undefined || folded === undefined) {
+    fail('executor appeared or disappeared', 'LEGACY_EXECUTOR_MUTATED')
+  }
+  if (
+    folded.childId !== prev.childId
+    || folded.generation !== prev.generation
+    || folded.executionRevision !== prev.executionRevision
+    || JSON.stringify(folded.route) !== JSON.stringify(prev.route)
+  ) {
+    fail('executor identity mutated', 'LEGACY_EXECUTOR_MUTATED')
+  }
+  if (folded.state !== prev.state) {
+    if (prev.state === 'completed' || prev.state === 'revoked') {
+      fail(
+        `executor state ${prev.state} is terminal and must not change to ${folded.state}`,
+        'LEGACY_EXECUTOR_MUTATED',
+      )
+    }
+    if (folded.state !== 'completed' && folded.state !== 'revoked') {
+      fail(
+        `executor state ${prev.state} -> ${folded.state} is not a lifecycle terminal`,
+        'LEGACY_EXECUTOR_MUTATED',
+      )
+    }
+    if (op === 'replan' && folded.state !== 'revoked') {
+      fail(
+        `replan cannot move executor ${prev.state} to ${folded.state}`,
+        'LEGACY_EXECUTOR_MUTATED',
+      )
+    }
+    if (
+      (op === 'audit' || op === 'self-check' || op === 'external-audit')
+      && folded.state === 'completed'
+    ) {
+      const appended = next.audits.slice(prior.audits.length)
+      const latest = appended[appended.length - 1]
+      if (latest === undefined || latest.role !== 'execution' || latest.verdict !== 'pass') {
+        fail(
+          `executor completed without an execution-pass ${op}`,
+          'LEGACY_EXECUTOR_MUTATED',
+        )
+      }
+    }
+  }
+}
+
+/**
+ * Packet CAS stamp on a submit-packet event.
+ * Missing detail / missing executionRevision is legacy-exempt only when bearerBase is absent.
+ * A present non-integer revision/generation, or a present non-string childId, is not.
+ */
+function packetIdentityStamp(detail: unknown):
+  | { readonly kind: 'absent' }
+  | { readonly kind: 'invalid'; readonly field: string; readonly raw: unknown }
+  | {
+      readonly kind: 'ok'
+      readonly executionRevision: number
+      readonly generation: number | undefined
+      readonly childId: string | undefined
+    } {
+  if (detail === null || typeof detail !== 'object') return { kind: 'absent' }
+  if (!('executionRevision' in detail)) return { kind: 'absent' }
+  const claimed = (detail as { executionRevision?: unknown }).executionRevision
+  if (typeof claimed !== 'number' || !Number.isInteger(claimed)) {
+    return { kind: 'invalid', field: 'executionRevision', raw: claimed }
+  }
+  let generation: number | undefined
+  if ('generation' in detail) {
+    const raw = (detail as { generation?: unknown }).generation
+    if (typeof raw !== 'number' || !Number.isInteger(raw)) {
+      return { kind: 'invalid', field: 'generation', raw }
+    }
+    generation = raw
+  }
+  let childId: string | undefined
+  if ('childId' in detail) {
+    const raw = (detail as { childId?: unknown }).childId
+    if (typeof raw !== 'string' || raw.length === 0) {
+      return { kind: 'invalid', field: 'childId', raw }
+    }
+    childId = raw
+  }
+  return { kind: 'ok', executionRevision: claimed, generation, childId }
+}
+
+/**
+ * Evidence-kind format stamp on a submit-closeout event.
+ *
+ * WHY A STAMP AND NOT `bearerBase`. The packet-identity rule above uses
+ * "bearerBase present" as its current-format test, and that works there because
+ * both landed in the same change. `EvidenceEntry.kind` did not: `bearerBase` has
+ * been stamped since PR #4, so every closeout already completed on today's main
+ * carries a base and no kinds. Reusing that test would stop those streams
+ * replaying — the fold would reject history that was legal when it was written.
+ * A stamp the WRITER puts on the event says exactly what the writer promised,
+ * which is the only thing replay may hold it to.
+ *
+ * 'absent' = written before this change; 'v1' = "proven evidence kind
+ * validation v1": every PROVEN entry carries a kind (an unproven entry bears
+ * nothing and may omit it — the tool schema is stricter, replay is not);
+ * anything else in the field is a corrupt stamp, not an old stream.
+ */
+function evidenceKindStamp(detail: unknown): 'absent' | 'invalid' | 'v1' {
+  if (detail === null || typeof detail !== 'object') return 'absent'
+  if (!('evidenceKinds' in detail)) return 'absent'
+  return (detail as { evidenceKinds?: unknown }).evidenceKinds === 1 ? 'v1' : 'invalid'
+}
+
+/**
+ * Same stamp pattern for the partial-delivery contract: 'absent' = written
+ * before the handoff dimension existed (legacy reading: unproven criteria
+ * legal with no handoff requirement); 'v1' = "handoff/outcome validation v1";
+ * anything else is a corrupt stamp, not an old stream.
+ */
+function closeoutHandoffStamp(detail: unknown): 'absent' | 'invalid' | 'v1' {
+  if (detail === null || typeof detail !== 'object') return 'absent'
+  if (!('closeoutHandoff' in detail)) return 'absent'
+  return (detail as { closeoutHandoff?: unknown }).closeoutHandoff === 1 ? 'v1' : 'invalid'
+}
+
+/**
+ * The owner-resolve decision an event's detail carries, when it carries one.
+ * Pre-decision streams wrote NO detail on owner-resolve — those replay as
+ * resume-planning (the only decision that existed), which is exactly what
+ * their snapshots say.
+ */
+function ownerResolveDecisionOf(detail: unknown): 'resume-planning' | 'resume-execution' | 'block' | undefined {
+  if (detail === null || typeof detail !== 'object') return undefined
+  const decision = (detail as { decision?: unknown }).decision
+  if (decision === 'resume-planning' || decision === 'resume-execution' || decision === 'block') return decision
+  return undefined
+}
+
+/**
+ * The routing decision on a dispatch commit's `detail.routing`, STRICTLY
+ * validated (packet M3b): `{role, pin?, why, authorizationSource,
+ * fallbackFrom?, repinFrom?, candidates?}` and nothing else. Malformed ⇒ fold
+ * error — a routing decision is authorization-bearing state, and a hand-edited
+ * or foreign stream must be rejected loudly rather than folded into a pin the
+ * engine never wrote. The `candidates` set (execution-audit P2-2) is validated
+ * with the same strictness: a fabricated considered set is as dishonest on
+ * replay as a fabricated pin, entry by entry over closed vocabularies.
+ *
+ * F22 (PR #2 Codex round 10), ADDITIVE STRICTNESS: a decision whose
+ * `authorizationSource` is `'unreachable-inherit'` must be PINLESS. That
+ * source exists to label one thing — an inheritance-only result of an
+ * unreadable policy projection — so it cannot be the recorded authority for
+ * an explicit route; accepting the combination would persist an
+ * authorization-bearing pin whose stated source cannot authorize it.
+ * Replay-compat, stated here because the rule narrows what replays: it only
+ * REJECTS combinations that (a) no 0.2.0 stream ever contained —
+ * `detail.routing` itself is new in this branch, so every 0.2.0 event takes
+ * the no-routing arm below and no historical fixture can carry the pair —
+ * and (b) no stream this branch's engine writes can contain, because the
+ * engine stamps `'unreachable-inherit'` only on inheritance resolutions,
+ * which are pinless by construction (the no-catalog auto-inherit branch and
+ * the selector's unreachable-projection inherit). The rule therefore rejects
+ * only hand-edited or foreign streams; the 0.2.0 fixture replay stays green
+ * (asserted alongside, and by the legacy suite).
+ *
+ * F30 (PR #2 Codex round 16), ADDITIVE STRICTNESS — CANONICAL (TRIMMED)
+ * ROUTE FIELDS: every route-identity string in a routing detail — the pin's
+ * and `repinFrom`'s provider/model/reasoningEffort, and the provider/model
+ * of each `candidates` entry and `fallbackFrom` record, where those fields
+ * form pin state — must EQUAL ITS TRIMMED FORM (non-empty after trim, effort
+ * absent or non-empty). Replay used to persist these verbatim, so a padded
+ * pin (`' alpha '`/`' model '`/`' high '`) folded clean while every consumer
+ * compares trimmed: on reuse, policy membership and catalog liveness matched
+ * `alpha/model` but the preflight and the dispatched agentOptions received
+ * the RAW pin — authorized as one route, dispatched as another. The engine
+ * cannot write the rejected shape: every pin, candidate, and fallback field
+ * it stamps passes through `toRoutePin` (or the trimmed compositions at the
+ * engine's own seams), so only hand-edited or foreign streams are refused.
+ * Replay-compat is the F22 argument verbatim: `detail.routing` is new in this
+ * branch, no 0.2.0 event carries it, and no stream this branch's engine
+ * writes can fail the rule — the 0.2.0 fixtures take the no-routing arm.
+ *
+ * F31 (PR #2 Codex round 16), ADDITIVE STRICTNESS — THE CANDIDATES SET'S
+ * `selected` IS BOUND TO THE PIN: when a detail carries BOTH `candidates`
+ * and a pin, EXACTLY ONE entry may carry disposition `selected`, and its
+ * provider/model must be the pinned route (the effort comparison is vacuous
+ * today: the candidate vocabulary carries no effort field — an effort key on
+ * a candidate is an unknown-key rejection above — and must extend to it if
+ * the vocabulary ever grows one). Dispositions used to be vocabulary-checked
+ * only, so a foreign event could mark candidate B `selected` while the pin
+ * said A, or mark zero/several selected — a considered set that contradicts
+ * the decision it rides. The engine always emits exactly one selected entry
+ * matching the pin when the set is present (the selector marks the chosen
+ * candidate; the walk's dedupe keeps one entry per route), so no stream this
+ * branch writes can fail the rule; pinless details keep the current rules
+ * (no pin to bind). Same replay-compat argument as F22/F30.
+ *
+ * Returns the VALIDATED detail, or `undefined` when no routing decision is
+ * present (the 0.2.0 shape — every historical fixture takes this arm).
+ */
+function routingDecisionOf(op: Operation, detail: unknown): RoutingDecisionDetail | undefined {
+  if (detail === null || typeof detail !== 'object' || !('routing' in detail)) return undefined
+  const routing = (detail as { routing?: unknown }).routing
+  if (routing === undefined) return undefined
+  const where = `${op} detail.routing`
+  const problems: string[] = []
+  if (routing === null || typeof routing !== 'object' || Array.isArray(routing)) {
+    fail(`${where} must be an object, got ${typeof routing}`, 'LEGACY_ROUTING_DETAIL')
+  }
+  const record = routing as Record<string, unknown>
+  const known: readonly string[] = ['role', 'pin', 'why', 'authorizationSource', 'fallbackFrom', 'repinFrom', 'candidates', 'costMatch']
+  for (const key of Object.keys(record)) {
+    if (!known.includes(key)) problems.push(`${where} has an unknown key "${key}"`)
+  }
+  const pinProblems = (label: string, value: unknown): string[] => {
+    if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+      return [`${where}.${label} must be an object`]
+    }
+    const pin = value as Record<string, unknown>
+    const out: string[] = []
+    for (const key of Object.keys(pin)) {
+      if (key !== 'provider' && key !== 'model' && key !== 'reasoningEffort') {
+        out.push(`${where}.${label} has an unknown key "${key}"`)
+      }
+    }
+    for (const field of ['provider', 'model'] as const) {
+      const raw = pin[field]
+      if (typeof raw !== 'string' || raw.trim().length === 0) {
+        out.push(`${where}.${label}.${field} must be a non-empty string`)
+      } else if (raw !== raw.trim()) {
+        // F30 (PR #2 Codex round 16): a padded pin authorizes one route
+        // (membership/liveness compare trimmed) and dispatches another (the
+        // raw fields ride preflight/agentOptions) — noncanonical pin state.
+        out.push(
+          `${where}.${label}.${field} must equal its trimmed form, got ${JSON.stringify(raw)} — ` +
+            'padded route fields are not canonical pin state (authorization compares trimmed; the pin must be the route it dispatches)',
+        )
+      }
+    }
+    const effort = pin.reasoningEffort
+    if (effort !== undefined && (typeof effort !== 'string' || effort.trim().length === 0)) {
+      out.push(`${where}.${label}.reasoningEffort must be a non-empty string when present`)
+    } else if (typeof effort === 'string' && effort !== effort.trim()) {
+      // F30: same canonicality rule on the effort axis — a padded effort is
+      // dispatched raw while the fold's pin comparisons run exact.
+      out.push(
+        `${where}.${label}.reasoningEffort must equal its trimmed form, got ${JSON.stringify(effort)} — ` +
+          'padded route fields are not canonical pin state (authorization compares trimmed; the pin must be the route it dispatches)',
+      )
+    }
+    return out
+  }
+  const role = record.role
+  if (typeof role !== 'string' || !ROUTING_ROLES.includes(role)) {
+    problems.push(`${where}.role must be one of ${ROUTING_ROLES.join('|')}, got ${JSON.stringify(role)}`)
+  } else if (op === 'start-executor') {
+    if (role !== 'executor') problems.push(`${where}.role must be "executor" on a start-executor op, got "${role}"`)
+  } else if (op === 'audit') {
+    if (!ROUTING_AUDITOR_ROLES.includes(role)) {
+      problems.push(`${where}.role must be an auditor role (${ROUTING_AUDITOR_ROLES.join('|')}) on an audit op, got "${role}"`)
+    }
+  }
+  if ('pin' in record && record.pin !== undefined) problems.push(...pinProblems('pin', record.pin))
+  const why = record.why
+  if (!Array.isArray(why) || why.length === 0 || why.some((entry) => typeof entry !== 'string')) {
+    problems.push(`${where}.why must be a non-empty array of strings`)
+  }
+  const source = record.authorizationSource
+  if (source !== undefined) {
+    if (typeof source !== 'string' || !ROUTING_AUTHORIZATION_SOURCES.includes(source)) {
+      problems.push(
+        `${where}.authorizationSource must be one of ${ROUTING_AUTHORIZATION_SOURCES.join('|')}, got ${JSON.stringify(source)}`,
+      )
+    } else if (source === 'unreachable-inherit' && record.pin !== undefined) {
+      // F22 (see the doc comment above): the source names an inheritance-only
+      // result of an unreadable policy projection — it cannot authorize a pin.
+      problems.push(
+        `${where}: authorizationSource "unreachable-inherit" cannot authorize the pin ${JSON.stringify(record.pin)} — `
+          + 'that source marks an inheritance-only result of an unreadable policy projection; a decision carrying a pin must name an authority that can authorize it (session-policy or plugin-config) or carry no pin at all',
+      )
+    }
+  } else if ('pin' in record && record.pin !== undefined) {
+    // An explicit route always has an authority; an inherit under an absent
+    // policy has none (see RoutingDecisionDetail). REQUIRE it exactly there.
+    problems.push(`${where}.authorizationSource is required when a pin is present`)
+  }
+  if ('fallbackFrom' in record && record.fallbackFrom !== undefined) {
+    const fallback = record.fallbackFrom
+    if (!Array.isArray(fallback)) {
+      problems.push(`${where}.fallbackFrom must be an array`)
+    } else {
+      for (const entry of fallback) {
+        if (entry === null || typeof entry !== 'object' || Array.isArray(entry)) {
+          problems.push(`${where}.fallbackFrom entries must be objects`)
+          continue
+        }
+        const item = entry as Record<string, unknown>
+        for (const key of Object.keys(item)) {
+          if (key !== 'provider' && key !== 'model' && key !== 'reason') {
+            problems.push(`${where}.fallbackFrom entry has an unknown key "${key}"`)
+          }
+        }
+        for (const field of ['provider', 'model', 'reason'] as const) {
+          const raw = item[field]
+          if (typeof raw !== 'string' || raw.trim().length === 0) {
+            problems.push(`${where}.fallbackFrom entry .${field} must be a non-empty string`)
+          } else if (field !== 'reason' && raw !== raw.trim()) {
+            // F30 (PR #2 Codex round 16): fallbackFrom route fields are pin-
+            // state-adjacent route identity; padded values are noncanonical.
+            // (`reason` is prose, not a route field — exempt.)
+            problems.push(
+              `${where}.fallbackFrom entry .${field} must equal its trimmed form, got ${JSON.stringify(raw)} — ` +
+                'padded route fields are not canonical routing state',
+            )
+          }
+        }
+      }
+    }
+  }
+  if ('repinFrom' in record && record.repinFrom !== undefined) {
+    problems.push(...pinProblems('repinFrom', record.repinFrom))
+  }
+  if ('candidates' in record && record.candidates !== undefined) {
+    const candidates = record.candidates
+    if (!Array.isArray(candidates)) {
+      problems.push(`${where}.candidates must be an array`)
+    } else {
+      for (const entry of candidates) {
+        if (entry === null || typeof entry !== 'object' || Array.isArray(entry)) {
+          problems.push(`${where}.candidates entries must be objects`)
+          continue
+        }
+        const item = entry as Record<string, unknown>
+        const entryKeys: readonly string[] = ['provider', 'model', 'contextWindow', 'hasReasoningEfforts', 'independence', 'disposition', 'note']
+        for (const key of Object.keys(item)) {
+          if (!entryKeys.includes(key)) problems.push(`${where}.candidates entry has an unknown key "${key}"`)
+        }
+        for (const field of ['provider', 'model'] as const) {
+          const raw = item[field]
+          if (typeof raw !== 'string' || raw.trim().length === 0) {
+            problems.push(`${where}.candidates entry .${field} must be a non-empty string`)
+          } else if (raw !== raw.trim()) {
+            // F30 (PR #2 Codex round 16): candidate route fields form the
+            // considered set the pin binds to (F31 below) — padded values are
+            // noncanonical routing state, same rule as the pin's own fields.
+            problems.push(
+              `${where}.candidates entry .${field} must equal its trimmed form, got ${JSON.stringify(raw)} — ` +
+                'padded route fields are not canonical routing state',
+            )
+          }
+        }
+        const disposition = item.disposition
+        if (typeof disposition !== 'string' || !ROUTING_CANDIDATE_DISPOSITIONS.includes(disposition)) {
+          problems.push(
+            `${where}.candidates entry .disposition must be one of ${ROUTING_CANDIDATE_DISPOSITIONS.join('|')}, got ${JSON.stringify(disposition)}`,
+          )
+        }
+        const window = item.contextWindow
+        if (window !== undefined && (typeof window !== 'number' || !Number.isInteger(window) || window <= 0)) {
+          problems.push(`${where}.candidates entry .contextWindow must be a positive integer when present`)
+        }
+        if (typeof item.hasReasoningEfforts !== 'boolean') {
+          problems.push(`${where}.candidates entry .hasReasoningEfforts must be a boolean`)
+        }
+        const note = item.note
+        if (note !== undefined && (typeof note !== 'string' || note.trim().length === 0)) {
+          problems.push(`${where}.candidates entry .note must be a non-empty string when present`)
+        }
+        const independence = item.independence
+        if (independence !== undefined) {
+          if (independence === null || typeof independence !== 'object' || Array.isArray(independence)) {
+            problems.push(`${where}.candidates entry .independence must be an object`)
+          } else {
+            const axes = independence as Record<string, unknown>
+            for (const key of Object.keys(axes)) {
+              if (key !== 'modelAxis' && key !== 'providerAxis' && key !== 'outcome') {
+                problems.push(`${where}.candidates entry .independence has an unknown key "${key}"`)
+              }
+            }
+            for (const axis of ['modelAxis', 'providerAxis'] as const) {
+              const raw = axes[axis]
+              if (typeof raw !== 'string' || !ROUTING_IDENTITY_AXES.includes(raw)) {
+                problems.push(
+                  `${where}.candidates entry .independence.${axis} must be one of ${ROUTING_IDENTITY_AXES.join('|')}, got ${JSON.stringify(raw)}`,
+                )
+              }
+            }
+            const outcome = axes.outcome
+            if (typeof outcome !== 'string' || !ROUTING_INDEPENDENCE_OUTCOMES.includes(outcome)) {
+              problems.push(
+                `${where}.candidates entry .independence.outcome must be one of ${ROUTING_INDEPENDENCE_OUTCOMES.join('|')}, got ${JSON.stringify(outcome)}`,
+              )
+            }
+          }
+        }
+      }
+      // F31 (PR #2 Codex round 16), ADDITIVE STRICTNESS: bind the candidates
+      // set's `selected` entry to the pin when the detail carries BOTH. The
+      // engine always stamps exactly one selected entry matching the pin (the
+      // selector marks the chosen candidate; the walk dedupes routes), so a
+      // set marking another route selected, or zero/several, is a foreign or
+      // hand-edited stream contradicting the decision it rides. The
+      // comparison is trim-tolerant on purpose (canonicality is F30's own
+      // rejection above; this rule is about WHICH candidate is selected), and
+      // pinless details keep the current rules — there is no pin to bind.
+      // Effort: the candidate vocabulary carries no effort field (an effort
+      // key is an unknown-key rejection above), so provider/model is the
+      // whole binding today; if the vocabulary ever grows an effort field,
+      // the comparison must extend to it when named on both sides.
+      if (record.pin !== undefined && record.pin !== null && typeof record.pin === 'object') {
+        const pinFields = record.pin as { provider?: unknown; model?: unknown }
+        const pinProvider = typeof pinFields.provider === 'string' ? pinFields.provider.trim() : undefined
+        const pinModel = typeof pinFields.model === 'string' ? pinFields.model.trim() : undefined
+        const pinLabel = pinProvider !== undefined && pinModel !== undefined ? `${pinProvider}/${pinModel}` : JSON.stringify(record.pin)
+        const selectedEntries = candidates.filter(
+          (entry) => entry !== null && typeof entry === 'object' && !Array.isArray(entry)
+            && (entry as Record<string, unknown>).disposition === 'selected',
+        )
+        if (selectedEntries.length !== 1) {
+          problems.push(
+            `${where}: the decision pins ${pinLabel} but its candidates set marks ${String(selectedEntries.length)} entr${selectedEntries.length === 1 ? 'y' : 'ies'} selected — ` +
+              'exactly ONE selected entry is required, and it must be the pinned route',
+          )
+        } else {
+          const entry = selectedEntries[0] as { provider?: unknown; model?: unknown }
+          const entryProvider = typeof entry.provider === 'string' ? entry.provider.trim() : undefined
+          const entryModel = typeof entry.model === 'string' ? entry.model.trim() : undefined
+          if (entryProvider !== pinProvider || entryModel !== pinModel) {
+            problems.push(
+              `${where}: the candidates set marks ${String(entryProvider)}/${String(entryModel)} selected but the decision pins ${pinLabel} — ` +
+                'the selected candidate must be the pinned route (the engine stamps exactly one selected entry, matching the pin)',
+            )
+          }
+        }
+      }
+    }
+  }
+  const costMatch = record.costMatch
+  if (costMatch !== undefined && (typeof costMatch !== 'string' || !ROUTING_COST_MATCHES.includes(costMatch))) {
+    problems.push(`${where}.costMatch must be one of ${ROUTING_COST_MATCHES.join('|')}, got ${JSON.stringify(costMatch)}`)
+  }
+  if (problems.length > 0) {
+    fail(`${where} is malformed: ${problems.join('; ')}`, 'LEGACY_ROUTING_DETAIL')
+  }
+  return record as unknown as RoutingDecisionDetail
+}
+
+/**
+ * The audit role each auditor routing role names — the domain-side mirror of
+ * the engine's `routeRoleOf` (the fold may not import the engine that imports
+ * it; the mapping is the one rule both sides share, so it is stated once here
+ * and must move with the role vocabularies).
+ */
+export const AUDIT_ROLE_OF_ROUTING_ROLE: Readonly<Record<string, AuditRole>> = {
+  'plan-auditor': 'plan',
+  'execution-auditor': 'execution',
+  'rules-auditor': 'rules',
+}
+
+/** Field-wise pin equality: provider, model, and effort (absent equals absent). */
+function sameRoutePin(a: RoutingPin, b: RoutingPin): boolean {
+  return a.provider === b.provider && a.model === b.model && a.reasoningEffort === b.reasoningEffort
+}
+
+/**
+ * F26 (PR #2 Codex round 13), ADDITIVE STRICTNESS: when one dispatch commit
+ * carries BOTH a validated `detail.routing` AND a record the same commit
+ * appends (an AuditRecord on `audit`, the ExecutorRecord on `start-executor`),
+ * the two must agree — the detail's role names the appended record's role, and
+ * the detail's pin and the record's `selected` route are the SAME route.
+ * Before this, replay validated the detail and derived the pin state from it
+ * but never compared it to the appended record, so a foreign event could
+ * append an execution-auditor pass whose RouteRecord claims route B while the
+ * validated detail names plan-auditor pin A — and the fold accepted the
+ * contradictory canonical state.
+ *
+ * THE EXACT COMPARISON, per the engine's own stamp shapes (they define the
+ * legal space): the writer merges the decision onto the record it appends
+ * (`withRoutingRecord`), so an engine-written record's `selected` IS the
+ * detail's pin — present iff the pin is — and an audit detail's role is
+ * `routeRoleOf(record.role)`. Legitimate omissions are therefore exactly the
+ * ones the writer can produce: the record carries route-evidence legs the
+ * detail has no counterpart for (`observed`, `routeStatus`,
+ * `routeProvider`/`routeModel`, `crossFamily`, …) and mirrors the detail's
+ * decision fields under its own names (`why`, `authorizationSource`,
+ * `fallbackFrom`, `candidatesConsidered`) — those pairs are deliberately NOT
+ * compared. What is a genuine contradiction on either side: a role naming a
+ * different dispatch than the record it appends, a `selected` route with no
+ * pin behind it, a pin whose record carries a different `selected`, or the
+ * two routes differing on any axis (provider, model, effort — absent effort
+ * on one side and present on the other is a difference).
+ *
+ * Replay-compat, same argument as F22 above: the rule fires only when BOTH
+ * sides are present. `detail.routing` is new in this branch, so no 0.2.0
+ * event can carry it (every historical fixture takes the no-binding arm),
+ * and this branch's writer satisfies the equality by construction. A
+ * routing-detail-only event (a decision with no appended record) and every
+ * record-only event (all of 0.2.0, self-check, external countersigns) fold
+ * exactly as before.
+ */
+function bindRoutingDetailToRecords(
+  event: RunEvent,
+  routing: RoutingDecisionDetail,
+  prior: Snapshot,
+  next: Snapshot,
+): void {
+  if (event.op !== 'audit' && event.op !== 'start-executor') return // unreachable: callers pass only dispatch ops
+  const op = event.op
+  const pinEqualsSelected = (label: string, route: RouteRecord): void => {
+    if (routing.pin === undefined && route.selected === undefined) return
+    if (routing.pin !== undefined && route.selected !== undefined && sameRoutePin(routing.pin, route.selected)) return
+    fail(
+      `${op} detail.routing pins role "${routing.role}" to ${JSON.stringify(routing.pin)} but the appended ${label}'s route record carries selected ${JSON.stringify(route.selected)} — the decision and the record it stamps must name the same route, present on both or neither`,
+      'LEGACY_ROUTING_RECORD_MISMATCH',
+    )
+  }
+  if (op === 'audit') {
+    for (let i = prior.audits.length; i < next.audits.length; i++) {
+      const record = next.audits[i]
+      if (record === undefined) continue // the array is index-validated elsewhere; nothing to bind
+      const expectedRole = AUDIT_ROLE_OF_ROUTING_ROLE[routing.role]
+      if (expectedRole === undefined || expectedRole !== record.role) {
+        fail(
+          `audit detail.routing names role "${routing.role}" but appended audit record ${i} has role "${record.role}" — one dispatch, one role: the decision must bind the record it appends`,
+          'LEGACY_ROUTING_RECORD_MISMATCH',
+        )
+      }
+      pinEqualsSelected(`audit record ${i}`, record.route)
+    }
+    return
+  }
+  // start-executor: `routingDecisionOf` already held the detail to the
+  // 'executor' role on this op; the binding left to check is pin ↔ the
+  // executor record's own route.
+  if (next.executor !== undefined) pinEqualsSelected('executor record', next.executor.route)
+}
+
+/** The gate a signal's `detail` names, if it names one (shared by writer and fold). */
+function gateTargetOf(detail: unknown): GateName | undefined {
+  const value = (detail as { gate?: unknown } | undefined)?.gate
+  return value === 'plan' || value === 'execution' ? value : undefined
+}
+
+/** The note a gate signal carries, when it carries a non-blank one. */
+function gateNoteOf(detail: unknown): string | undefined {
+  const value = (detail as { note?: unknown } | undefined)?.note
+  return typeof value === 'string' && value.trim().length > 0 ? value : undefined
+}
+
+/** The audit role whose verdict decides a gate. */
+function gateRoleOf(gate: GateName): AuditRole {
+  return gate === 'plan' ? 'plan' : 'execution'
+}
+
+/**
+ * The value a gate falls back to when the owner WITHDRAWS their pass (DESIGN
+ * §9 item 8). Derived from the run's own audit stream at the CURRENT plan
+ * revision: the latest verdict for the gate's audit role captured at this
+ * generation, or `pending` when this generation has no such verdict — which is
+ * the honest reading, because the gate was passed by the owner and not by a
+ * review. A record captured under an older plan revision is superseded, never
+ * resurrected.
+ */
+export function withdrawnGateValue(prior: Snapshot, gate: 'plan'): PlanGate
+export function withdrawnGateValue(prior: Snapshot, gate: 'execution'): ExecutionGate
+export function withdrawnGateValue(prior: Snapshot, gate: GateName): PlanGate | ExecutionGate {
+  const latest = latestGateRecord(prior, gate)
+  if (latest === undefined) return 'pending'
+  if (gate === 'plan') return latest.verdict === 'needs-fix' ? 'pending' : latest.verdict as PlanGate
+  return latest.verdict as ExecutionGate
+}
+
+/** The source a withdrawn gate reads as: the review that actually ran, else `pending`. */
+function withdrawnGateSource(prior: Snapshot, gate: GateName): GateSource {
+  const latest = latestGateRecord(prior, gate)
+  if (latest === undefined) return 'pending'
+  return latest.auditorId === 'self-check' ? 'self-check' : 'auditor'
+}
+
+/** The latest audit record deciding this gate at the CURRENT plan revision. */
+function latestGateRecord(prior: Snapshot, gate: GateName): Snapshot['audits'][number] | undefined {
+  const role = gateRoleOf(gate)
+  return [...prior.audits].reverse()
+    .find(record => record.role === role && record.planRevision === prior.plan.revision)
+}
+
+/** The provenance a run starts from: both gates pending at the current plan revision. */
+function pendingGateSources(next: Snapshot): GateSources {
+  return {
+    plan: { source: 'pending', planRevision: next.plan.revision },
+    execution: { source: 'pending', planRevision: next.plan.revision },
+  }
+}
+
+/**
+ * Canonical provenance equality (key order is the writer's, so fold the two
+ * JSON shapes rather than comparing objects field by field — the same argument
+ * `sameRoutingPins` makes).
+ */
+function sameGateSources(a: GateSources | undefined, b: GateSources | undefined): boolean {
+  return JSON.stringify(a) === JSON.stringify(b)
+}
+
+/**
+ * THE GATE LEDGER: the provenance every gate reads as, plus the executor
+ * dispatch count, derived from the stream alone.
+ *
+ * This is the ONE rule both sides share — the writer composes it in
+ * `AutopilotEngine.commit`, and `applyEvent` re-derives it and refuses a
+ * stream that disagrees — exactly the arrangement `applyRoutingDecision` uses
+ * for pins. The cases:
+ *
+ * - init: both gates `pending` at the initial plan revision (absent stays
+ *   absent only on a legacy stream that never records provenance at all).
+ * - plan submission / replan / owner-resolve(resume-planning): the gates are
+ *   reset, so the reading is `pending` again — a new generation.
+ * - owner-gate-pass: `owner`, at this generation, with the next ordinal.
+ * - owner-gate-withdraw: the withdrawn decision keeps its ordinal, the source
+ *   falls back to the review that actually ran (or `pending`).
+ * - audit / self-check / external-audit: the appended record names the gate;
+ *   an owner pass in force for the SAME generation is NOT taken (the
+ *   objection is recorded, the gate stands).
+ * - everything else: unchanged.
+ */
+export function applyGateLedger(
+  prior: Snapshot | undefined,
+  event: { op: Operation; detail?: unknown },
+  next: Snapshot,
+): { gateSources: GateSources | undefined; executorDispatches: number | undefined } {
+  // COUNT DISPATCHES, NOT COMMITS. `startExecutor` commits `start-executor`
+  // TWICE for one dispatch — the `starting` record, then the `running` one — so
+  // counting ops would double every dispatch and the rotation ordinal would
+  // advance two steps at a time. The honest unit is a NEW CHILD: the record's
+  // `childId` changes exactly when a dispatch creates one, a resume keeps the
+  // child it continues, and a revoked-and-restarted executor gets a new id.
+  const dispatches = event.op === 'start-executor'
+    && next.executor !== undefined
+    && next.executor.childId !== prior?.executor?.childId
+  const executorDispatches = dispatches
+    ? (prior?.executorDispatches ?? 0) + 1
+    : prior?.executorDispatches
+  if (prior === undefined) {
+    return { gateSources: next.gateSources ?? pendingGateSources(next), executorDispatches }
+  }
+  const prev = prior.gateSources
+  // A STREAM THAT RECORDED NO PROVENANCE IS NEVER RETRO-FITTED. Every 0.2.0
+  // stream — and every fixture that hand-writes its events — folds exactly as
+  // it did: the field is introduced by a run's own init (a run this engine
+  // created) or by an owner gate decision (the one event whose entire content
+  // IS provenance), and from then on it is present for the rest of that
+  // stream. This is what keeps the `no-source` reading honest for the older
+  // streams instead of back-inferring an `auditor` nobody observed.
+  if (prev === undefined && event.op !== 'owner-gate-pass' && event.op !== 'owner-gate-withdraw') {
+    return { gateSources: undefined, executorDispatches }
+  }
+  const generation = next.plan.revision
+  let gateSources: GateSources | undefined
+  if (event.op === 'submit-plan' || event.op === 'replan'
+    || (event.op === 'owner-resolve' && ownerResolveDecisionOf(event.detail) === 'resume-planning')) {
+    gateSources = pendingGateSources(next)
+  } else if (event.op === 'owner-gate-pass') {
+    const gate = gateTargetOf(event.detail)
+    const note = gateNoteOf(event.detail)
+    gateSources = gate === undefined
+      ? prev
+      : {
+          ...prev,
+          [gate]: {
+            source: 'owner',
+            planRevision: generation,
+            ownerDecision: (prev?.[gate]?.ownerDecision ?? 0) + 1,
+            ...(note === undefined ? {} : { note }),
+          },
+        }
+  } else if (event.op === 'owner-gate-withdraw') {
+    const gate = gateTargetOf(event.detail)
+    const note = gateNoteOf(event.detail)
+    const history = gate === undefined ? undefined : prev?.[gate]
+    gateSources = gate === undefined || history === undefined
+      ? prev
+      : {
+          ...prev,
+          [gate]: {
+            source: withdrawnGateSource(prior, gate),
+            planRevision: generation,
+            ...(history.ownerDecision === undefined ? {} : { ownerDecision: history.ownerDecision }),
+            withdrawn: true,
+            ...(note === undefined ? {} : { note }),
+          },
+        }
+  } else if (event.op === 'audit' || event.op === 'self-check' || event.op === 'external-audit') {
+    const source: GateSource = event.op === 'self-check' ? 'self-check' : 'auditor'
+    let acc = prev
+    for (const record of next.audits.slice(prior.audits.length)) {
+      const gate: GateName | undefined = record.role === 'plan' ? 'plan' : record.role === 'execution' ? 'execution' : undefined
+      if (gate === undefined) continue
+      const history = acc?.[gate]
+      const ownerInForce = history?.source === 'owner' && history.withdrawn !== true && history.planRevision === generation
+      if (ownerInForce) continue
+      acc = {
+        ...acc,
+        [gate]: {
+          source,
+          planRevision: generation,
+          ...(history?.ownerDecision === undefined ? {} : { ownerDecision: history.ownerDecision }),
+          ...(history?.withdrawn === true ? { withdrawn: true } : {}),
+        },
+      }
+    }
+    gateSources = acc
+  } else {
+    gateSources = prev
+  }
+  return { gateSources, executorDispatches }
+}
+
+/** Assert one event is a legal successor of the prior snapshot; returns the new snapshot. */
+export function applyEvent(prior: Snapshot | undefined, event: RunEvent): Snapshot {
+  if (event.v !== 1) fail(`unsupported event version ${String((event as { v: unknown }).v)}`, 'LEGACY_EVENT_VERSION')
+  const next = event.snapshot
+
+  if (prior === undefined) {
+    if (event.op !== 'init') fail(`first event must be init, got ${event.op}`, 'LEGACY_FIRST_NOT_INIT')
+    if (event.revision !== 1 || next.revision !== 1) fail('init revision must be 1', 'LEGACY_INIT_REVISION')
+    if (next.phase !== 'planning') fail(`init phase must be planning, got ${next.phase}`, 'LEGACY_INIT_PHASE')
+    if (next.planGate !== 'pending' || next.executionGate !== 'pending') fail('init gates must be pending', 'LEGACY_INIT_GATES')
+    if (next.audits.length !== 0) fail('init audits must be empty', 'LEGACY_INIT_AUDITS')
+    if (next.executor !== undefined) fail('init executor must be absent', 'LEGACY_INIT_EXECUTOR')
+    if (next.routingPins !== undefined) {
+      fail('init routingPins must be absent — pins derive from dispatch detail.routing only', 'LEGACY_INIT_ROUTING_PINS')
+    }
+    // Gate provenance (DESIGN §9 item 8) is presence-gated the same way: a
+    // legacy init carries none and reads `no-source` forever; an init that
+    // carries it must carry exactly the pending reading of both gates (a
+    // decision cannot predate the run).
+    if (next.gateSources !== undefined && !sameGateSources(next.gateSources, pendingGateSources(next))) {
+      fail('init gateSources must be exactly the pending reading of both gates, or absent on a legacy stream', 'LEGACY_GATE_SOURCE_INVALID')
+    }
+    if (next.executorDispatches !== undefined) {
+      fail('init must not carry executorDispatches — the first start-executor writes it', 'LEGACY_EXECUTOR_DISPATCH_COUNT')
+    }
+    if (next.bearerBase !== undefined) {
+      if (next.bearerBase.length === 0) fail('init bearerBase must not be empty when present', 'LEGACY_BEARER_BASE_EMPTY')
+      if (!isAbsoluteShapedBearer(next.bearerBase)) {
+        fail('init bearerBase must be absolute-shaped when present', 'LEGACY_BEARER_BASE_RELATIVE')
+      }
+    }
+    // Carryover shape (presence-gated): whether the predecessor run really
+    // exists and completed is a FILESYSTEM question, settled once at the
+    // engine's init; the fold re-checks only the structural claim, so replay
+    // never depends on another run's directory still being present.
+    if (next.triage.carryover !== undefined) {
+      const carry = next.triage.carryover as { fromRunId?: unknown; note?: unknown; inherits?: unknown }
+      if (typeof carry.fromRunId !== 'string' || carry.fromRunId.trim().length === 0) {
+        fail('init carryover.fromRunId must be a non-empty string when present', 'LEGACY_CARRYOVER_INVALID')
+      }
+      if (typeof carry.note !== 'string' || carry.note.trim().length === 0) {
+        fail('init carryover.note must be a non-empty string when present', 'LEGACY_CARRYOVER_INVALID')
+      }
+      if (!Array.isArray(carry.inherits) || carry.inherits.length < 1
+        || carry.inherits.some((item: unknown) => typeof item !== 'string' || (item as string).trim().length === 0)) {
+        fail('init carryover.inherits must be a non-empty array of non-empty strings when present', 'LEGACY_CARRYOVER_INVALID')
+      }
+    }
+    return next
+  }
+
+  if (event.op === 'init') fail('run is already initialized', 'LEGACY_ALREADY_INITIALIZED')
+  if (TERMINAL_PHASES.includes(prior.phase)) fail(`no events after terminal phase ${prior.phase}`, 'LEGACY_AFTER_TERMINAL')
+  if (event.revision !== prior.revision + 1 || next.revision !== event.revision) {
+    fail(`non-monotonic revision: prior ${prior.revision}, event ${event.revision}, snapshot ${next.revision}`, 'LEGACY_REVISION')
+  }
+  if (next.runId !== prior.runId) fail('runId changed mid-stream', 'LEGACY_RUN_ID')
+  if (JSON.stringify(next.triage) !== JSON.stringify(prior.triage)) fail('triage is immutable after init', 'LEGACY_TRIAGE_MUTATED')
+  if (prior.bearerBase !== next.bearerBase) fail('bearerBase mutated', 'LEGACY_BEARER_BASE_MUTATED')
+  if (!LEGAL_OPS[prior.phase].includes(event.op)) {
+    fail(`op ${event.op} is illegal in phase ${prior.phase}`, 'LEGACY_ILLEGAL_OP')
+  }
+
+  // Routing pins derive from dispatch-op `detail.routing` ONLY (plan "Route
+  // records and stability", refined pinning delta): last-wins per role — set on
+  // a `route` decision, cleared on an `inherit`. The engine builds the committed
+  // snapshot with the SAME shared derivation (`applyRoutingDecision`), so this
+  // check holds every event to the one rule rather than trusting the writer's
+  // arithmetic. Events without `detail.routing` replay exactly as 0.2.0: the
+  // pin state must be byte-stable across them, which is also what makes a
+  // legacy stream with no pins at all fold unchanged.
+  const dispatchRouting = event.op === 'audit' || event.op === 'start-executor'
+    ? routingDecisionOf(event.op, event.detail)
+    : undefined
+  if (event.op === 'audit' || event.op === 'start-executor') {
+    const expected = dispatchRouting !== undefined ? applyRoutingDecision(prior.routingPins, dispatchRouting) : prior.routingPins
+    if (!sameRoutingPins(expected, next.routingPins)) {
+      fail(
+        dispatchRouting !== undefined
+          ? `routingPins do not match detail.routing for role "${dispatchRouting.role}" (expected ${JSON.stringify(expected)}, got ${JSON.stringify(next.routingPins)})`
+          : `routingPins mutated without a routing decision (expected ${JSON.stringify(prior.routingPins)}, got ${JSON.stringify(next.routingPins)})`,
+        'LEGACY_ROUTING_PINS',
+      )
+    }
+  } else if (!sameRoutingPins(prior.routingPins, next.routingPins)) {
+    fail(
+      `routingPins mutated via op ${event.op} (pins derive from audit/start-executor detail.routing only)`,
+      'LEGACY_ROUTING_PINS_MUTATED',
+    )
+  }
+
+  // Audit history is append-only.
+  if (next.audits.length < prior.audits.length) fail('audit history shrank', 'LEGACY_AUDITS_SHRANK')
+  for (let i = 0; i < prior.audits.length; i++) {
+    if (JSON.stringify(next.audits[i]) !== JSON.stringify(prior.audits[i])) {
+      fail(`audit record ${i} was modified`, 'LEGACY_AUDITS_MODIFIED')
+    }
+  }
+
+  // F26: bind a present routing detail to the record(s) this same commit
+  // appends (see bindRoutingDetailToRecords for the exact comparison and the
+  // replay-compat argument). Fires only when BOTH sides are present.
+  if (dispatchRouting !== undefined) {
+    bindRoutingDetailToRecords(event, dispatchRouting, prior, next)
+  }
+
+  // ── GATE PROVENANCE + EXECUTOR-DISPATCH LEDGER (DESIGN §9 items 8 and 15) ──
+  //
+  // Both fields are DERIVED, never authored: the engine's commit composes the
+  // same `applyGateLedger` call this fold re-derives with, so the writer has no
+  // freedom to invent a source a reader would have to trust. What the equality
+  // buys, mechanically: an owner pass is recorded with its generation and
+  // ordinal; an audit objection against a gate the owner passed is recorded
+  // WITHOUT taking the gate; a withdrawn owner decision stays withdrawn
+  // (nothing but a higher ordinal may read `owner` again); and the executor
+  // rotation ordinal comes from this run's own dispatch count rather than a
+  // mutable counter.
+  const ledger = applyGateLedger(prior, event, next)
+  // Presence-gated, like every other later-added field: a stream that never
+  // recorded the count (every legacy stream) is not retro-fitted with one, and
+  // the moment either side carries it the derivation binds.
+  const dispatchesRecorded = prior.executorDispatches !== undefined || next.executorDispatches !== undefined
+  if (dispatchesRecorded && next.executorDispatches !== ledger.executorDispatches) {
+    fail(
+      `executorDispatches must be ${String(ledger.executorDispatches)} (derived from this run's own start-executor ops, and only that op may first write it), got ${String(next.executorDispatches)}`,
+      'LEGACY_EXECUTOR_DISPATCH_COUNT',
+    )
+  }
+  // A WITHDRAWAL IS FINAL FOR ITS GENERATION: nothing but a NEW owner decision
+  // (a strictly higher ordinal) may make that gate read `owner` again. An
+  // ordinary reset or a later pass cannot resurrect it. Checked BEFORE the
+  // derivation equality below on purpose: a stream that writes the withdrawn
+  // ordinal back as `owner` is refused by THIS rule, with a diagnosis naming
+  // what actually happened, rather than by the generic 'the derivation
+  // disagrees' branch — which would leave this rule unreachable and its code
+  // decorative.
+  if (prior.gateSources !== undefined && next.gateSources !== undefined) {
+    for (const gate of ['plan', 'execution'] as const) {
+      const before = prior.gateSources[gate]
+      const after = next.gateSources[gate]
+      if (before?.withdrawn !== true || after?.source !== 'owner') continue
+      if ((after.ownerDecision ?? 0) <= (before.ownerDecision ?? 0)) {
+        fail(
+          `gate [${gate}] carries an owner pass at ordinal ${String(after.ownerDecision ?? 0)} after the owner WITHDREW ordinal ${String(before.ownerDecision ?? 0)} — a withdrawal is an appended record, and no ordinary reset or pass may resurrect it; only a new owner decision with a higher ordinal can`,
+          'LEGACY_OWNER_GATE_RESURRECTED',
+        )
+      }
+    }
+  }
+  // One gate per owner decision: passing the plan gate must not carry the
+  // execution gate along, and vice versa. Checked BEFORE the derivation
+  // equality for the same reason the withdrawal rule is: the failure this
+  // names is a decision that reached across gates, and the generic 'the
+  // derivation disagrees' branch would hide it.
+  if (event.op === 'owner-gate-pass') {
+    const gate = gateTargetOf(event.detail)
+    if (gate === undefined) {
+      fail('owner-gate-pass must name the gate it passes (detail.gate plan|execution)', 'LEGACY_OWNER_GATE_INVALID')
+    }
+    if (gate === 'plan') {
+      if (next.planGate !== 'pass') fail('owner-gate-pass plan must set planGate to pass', 'LEGACY_OWNER_GATE_INVALID')
+      if (next.executionGate !== prior.executionGate) {
+        fail('owner-gate-pass plan must not touch the execution gate — one owner decision, one gate', 'LEGACY_OWNER_GATE_INVALID')
+      }
+    } else {
+      if (next.executionGate !== 'pass') fail('owner-gate-pass execution must set executionGate to pass', 'LEGACY_OWNER_GATE_INVALID')
+      if (next.planGate !== prior.planGate) {
+        fail('owner-gate-pass execution must not touch the plan gate — one owner decision, one gate', 'LEGACY_OWNER_GATE_INVALID')
+      }
+    }
+  }
+
+  // Withdrawing a gate the owner never passed is refused: an audit-derived
+  // gate is not the owner's to revoke, a second withdraw of the same decision
+  // has nothing left to take back, and a pass from an EARLIER generation is
+  // already out of force (writing a withdrawal for it would record a
+  // retraction of a ruling that no longer exists).
+  if (event.op === 'owner-gate-withdraw') {
+    const gate = gateTargetOf(event.detail)
+    if (gate === undefined) {
+      fail('owner-gate-withdraw must name the gate it withdraws (detail.gate plan|execution)', 'LEGACY_OWNER_GATE_INVALID')
+    }
+    const history = prior.gateSources?.[gate]
+    if (history === undefined || history.source !== 'owner' || history.withdrawn === true) {
+      fail(
+        `owner-gate-withdraw ${gate}: no owner pass is in force for this gate (an audit-derived gate is not the owner's to withdraw, and a decision already withdrawn has nothing left to take back)`,
+        'LEGACY_OWNER_GATE_NOT_PASSED',
+      )
+    }
+    if (history.planRevision !== prior.plan.revision) {
+      fail(
+        `owner-gate-withdraw ${gate}: the owner's pass belongs to plan revision ${String(history.planRevision ?? 0)} while plan revision ${prior.plan.revision} is current — a superseded pass is already out of force`,
+        'LEGACY_OWNER_GATE_NOT_PASSED',
+      )
+    }
+    // ONE GATE, the same rule the pass carries: withdrawing one gate must not
+    // move the other one (a hand-authored stream could otherwise retract the
+    // plan pass and flip the execution gate in the same event, which the
+    // ledger's per-gate derivation cannot catch because it only touches the
+    // named gate).
+    if (gate === 'plan' && next.executionGate !== prior.executionGate) {
+      fail('owner-gate-withdraw plan must not touch the execution gate — one owner decision, one gate', 'LEGACY_OWNER_GATE_INVALID')
+    }
+    if (gate === 'execution' && next.planGate !== prior.planGate) {
+      fail('owner-gate-withdraw execution must not touch the plan gate — one owner decision, one gate', 'LEGACY_OWNER_GATE_INVALID')
+    }
+  }
+
+  // The shrinkage rule is checked BEFORE the derivation equality for the same
+  // reason the two shape rules are: once a stream has recorded provenance, a
+  // revision that drops it is refused by THIS rule, with the diagnosis that
+  // names what happened, instead of by the generic 'the derivation disagrees'
+  // branch — which would have made this code unreachable and its documented
+  // refusal decorative.
+  if (prior.gateSources !== undefined && next.gateSources === undefined) {
+    fail(
+      'gateSources disappeared after being recorded — a stream that recorded provenance keeps it; only a gate decision, a plan reset or a logout of the run could clear it, and none of them removes the field',
+      'LEGACY_GATE_SOURCE_SHRANK',
+    )
+  }
+  if (!sameGateSources(ledger.gateSources, next.gateSources)) {
+    fail(
+      `gateSources do not match the fold's derivation — expected ${JSON.stringify(ledger.gateSources)}, got ${JSON.stringify(next.gateSources)}: a gate's source is derived (owner decisions by generation and ordinal, audit/self-check verdicts otherwise), never chosen by the writer`,
+      'LEGACY_GATE_SOURCE_INVALID',
+    )
+  }
+
+  // AN OWNER PASS STANDS AGAINST A LATER AUDIT OBJECTION (the precedence rule
+  // DESIGN §9 item 8 states): the objection is RECORDED — the audit record is
+  // appended and never erased — while the gate it objects to does not move,
+  // and the other gate is untouched. Ending the pass is an explicit owner act
+  // (owner-gate-withdraw); a new plan submission, a replan and an owner
+  // resolution supersede the generation it was taken in.
+  const supersedesOwnerPass = event.op === 'submit-plan' || event.op === 'replan' || event.op === 'owner-resolve'
+    || event.op === 'owner-gate-pass' || event.op === 'owner-gate-withdraw'
+  if (prior.gateSources !== undefined && !supersedesOwnerPass) {
+    for (const gate of ['plan', 'execution'] as const) {
+      const history = prior.gateSources[gate]
+      if (history?.source !== 'owner' || history.withdrawn === true) continue
+      // THE GENERATION TEST IS LOAD-BEARING, and it was missing here while
+      // `applyGateLedger`'s audit branch and `AutopilotEngine.ownerPassInForce`
+      // both had it — one predicate, three copies, one of them blind. The
+      // failure it caused was not symmetric with the feature: `amend-plan`
+      // advances the plan revision WITHOUT touching `gateSources` (the ledger
+      // preserves it), so this guard kept a pass from the PREVIOUS generation in
+      // force, refused the gate move the writer had already made legal, and threw
+      // on the commit that carried the auditor's verdict — discarding the
+      // objection and leaving the run in `plan-reviewing`, a phase from which
+      // neither `submit-plan` nor `replan` is legal. A stale owner pass is NOT in
+      // force: it belongs to a plan revision that no longer exists.
+      if (history.planRevision !== prior.plan.revision) continue
+      const before = gate === 'plan' ? prior.planGate : prior.executionGate
+      const after = gate === 'plan' ? next.planGate : next.executionGate
+      if (before !== after) {
+        fail(
+          `gate [${gate}] moved ${before} -> ${after} while an owner pass is in force (plan revision ${String(history.planRevision ?? 0)}): the owner's pass takes precedence over a later audit objection, which is recorded rather than erased — withdraw it explicitly (autopilot_signal owner-gate-withdraw) to let the run's own reviews decide again`,
+          'LEGACY_OWNER_GATE_PRECEDENCE',
+        )
+      }
+    }
+  }
+
+  // An owner countersign is validated ON REPLAY, not only where it was written.
+  // This repo already paid for the other arrangement once: a class obligation
+  // enforced solely by the writer, so a hand-edited or foreign stream carried
+  // it straight through the fold. The FILESYSTEM half (does the review exist?)
+  // deliberately stays out — replay must not depend on disk state, so that half
+  // settles at completion in the engine.
+  for (let i = prior.audits.length; i < next.audits.length; i++) {
+    const record = next.audits[i]
+    if (record?.external === undefined) continue
+    if (next.triage.auditMode !== 'external') {
+      fail(
+        `audit record ${i} carries an external countersign but auditMode is ${next.triage.auditMode}`,
+        'LEGACY_EXTERNAL_WRONG_MODE',
+      )
+    }
+    const problems = validateExternalReview(record.external)
+    if (problems.length > 0) fail(`audit record ${i}: ${problems.join('; ')}`, 'LEGACY_EXTERNAL_INVALID')
+  }
+
+  // Structured findings (governance pragmatics v1), PRESENCE-GATED like the
+  // routing detail above: the contract fires only on records that carry the
+  // field, so every pre-findings stream keeps its old reading. The rule the
+  // field buys: needs-replan is reserved for plan-shape defects (a blocking
+  // finding the PLAN layer owns); an execution- or rules-layer defect is
+  // executor-fixable and belongs in needs-fix, where it resumes the same
+  // executor instead of resetting the run.
+  for (let i = prior.audits.length; i < next.audits.length; i++) {
+    const record = next.audits[i]
+    if (record?.findings === undefined) continue
+    const findings = record.findings
+    if (!Array.isArray(findings) || findings.length === 0) {
+      fail(`audit record ${i} carries an empty findings array; absent is the legacy arm, present must grade at least one finding`, 'LEGACY_AUDIT_FINDINGS_INVALID')
+    }
+    for (const finding of Array.isArray(findings) ? findings : []) {
+      if (typeof finding?.summary !== 'string' || finding.summary.trim().length === 0) {
+        fail(`audit record ${i} carries a finding with an empty summary`, 'LEGACY_AUDIT_FINDINGS_INVALID')
+      }
+      if (finding?.severity !== 'blocking' && finding?.severity !== 'non-blocking') {
+        fail(`audit record ${i} carries a finding whose severity is not blocking|non-blocking ("${String(finding?.severity)}")`, 'LEGACY_AUDIT_FINDINGS_INVALID')
+      }
+      if (finding?.layer !== 'plan' && finding?.layer !== 'execution' && finding?.layer !== 'rules') {
+        fail(`audit record ${i} carries a finding whose layer is not plan|execution|rules ("${String(finding?.layer)}")`, 'LEGACY_AUDIT_FINDINGS_INVALID')
+      }
+    }
+    const blockingPlan = Array.isArray(findings)
+      && findings.some(finding => finding?.severity === 'blocking' && finding?.layer === 'plan')
+    if (record?.verdict === 'needs-replan' && !blockingPlan) {
+      fail(
+        `audit record ${i} returns needs-replan without a blocking plan-layer finding; an execution- or rules-layer defect is executor-fixable (needs-fix)`,
+        'LEGACY_AUDIT_FINDINGS_INVALID',
+      )
+    }
+    if (record?.verdict === 'blocked' && !(Array.isArray(findings) && findings.some(finding => finding?.severity === 'blocking'))) {
+      fail(`audit record ${i} returns blocked without a blocking finding`, 'LEGACY_AUDIT_FINDINGS_INVALID')
+    }
+  }
+
+  // Plan revision is monotonic.
+  if (next.plan.revision < prior.plan.revision) fail('plan revision decreased', 'LEGACY_PLAN_REVISION')
+
+  // Usage evidence is append-or-replace, never subtractive. An id that was
+  // once declared names a real user-visible change; letting it vanish would
+  // let a run answer the usage question by deleting the question. Replacement
+  // (last-wins on the same id) is the legal way to upgrade a declaration.
+  if (prior.usage !== undefined) {
+    if (next.usage === undefined) fail('usage evidence disappeared', 'LEGACY_USAGE_SHRANK')
+    const ids = new Set(next.usage.entries.map(entry => entry.id))
+    for (const entry of prior.usage.entries) {
+      if (!ids.has(entry.id)) fail(`usage entry ${entry.id} was dropped`, 'LEGACY_USAGE_SHRANK')
+    }
+  }
+
+  // The plan-gate timestamp is the freshness anchor every usage artifact is
+  // measured against. Restamping it would silently re-validate artifacts that
+  // predate the gate, so it is write-once for the life of the run.
+  if (prior.planGatePassedAt !== undefined && next.planGatePassedAt !== prior.planGatePassedAt) {
+    fail('planGatePassedAt was restamped', 'LEGACY_GATE_STAMP_MUTATED')
+  }
+
+  // A new plan submission must not carry stale execution evidence or gate
+  // values into the next round (evidence chains restart per plan revision).
+  if (event.op === 'submit-plan') {
+    if (next.executionPacket !== undefined) fail('submit-plan must clear the execution packet', 'LEGACY_STALE_EVIDENCE')
+    if (next.executionGate !== 'pending') fail('submit-plan must reset executionGate to pending', 'LEGACY_STALE_EVIDENCE')
+  }
+
+  // Amend-plan (governance pragmatics v1): a plan revision that PRESERVES
+  // execution state — the mirror image of the submit-plan rule above. Gates
+  // must not reset, the packet must survive, and the amendment arms the delta
+  // re-audit binding: further submit-evidence/submit-closeout are refused
+  // until a plan-role PASS captured at or after the amended revision lands
+  // (the same binding shape as the executionGate/audit rule below). A
+  // plan change is always re-audited; what it never does again is destroy
+  // still-valid execution evidence.
+  if (event.op === 'amend-plan') {
+    if (next.plan.revision !== prior.plan.revision + 1) {
+      fail(
+        `amend-plan must advance plan revision by exactly 1 (prior ${prior.plan.revision}, next ${next.plan.revision})`,
+        'LEGACY_AMEND_PLAN_INVALID',
+      )
+    }
+    if (prior.planGate !== 'pass' || next.planGate !== 'pass') {
+      fail('amend-plan requires planGate pass on both sides (a failed plan is replanned, not amended)', 'LEGACY_AMEND_PLAN_INVALID')
+    }
+    if (next.executionGate !== prior.executionGate) {
+      fail('amend-plan must not reset executionGate', 'LEGACY_AMEND_PLAN_INVALID')
+    }
+    if (next.executionPacket !== prior.executionPacket) {
+      fail('amend-plan must preserve the execution packet', 'LEGACY_AMEND_PLAN_INVALID')
+    }
+    if (next.planAmendedAtRevision !== next.plan.revision) {
+      fail('amend-plan must arm the delta re-audit at the new plan revision', 'LEGACY_AMEND_PLAN_INVALID')
+    }
+  } else if (event.op === 'submit-plan' || event.op === 'replan') {
+    if (next.planAmendedAtRevision !== undefined) {
+      fail(`${event.op} must clear planAmendedAtRevision (the amendment cycle is superseded)`, 'LEGACY_AMEND_PLAN_INVALID')
+    }
+  } else if (event.op === 'audit' || event.op === 'self-check' || event.op === 'external-audit') {
+    // A plan-role PASS appended by THIS commit, captured at or after the
+    // amended revision, disarms the binding; anything else preserves it.
+    const amended = prior.planAmendedAtRevision
+    const appended = next.audits.length > prior.audits.length
+      ? next.audits.slice(prior.audits.length)
+      : []
+    const clears = amended !== undefined
+      && appended.some(record => record?.role === 'plan' && record.verdict === 'pass' && record.planRevision >= amended)
+    const expectedPlanAmended = clears ? undefined : prior.planAmendedAtRevision
+    if (next.planAmendedAtRevision !== expectedPlanAmended) {
+      fail(
+        'planAmendedAtRevision must follow the fold derivation (armed by amend-plan, cleared only by a plan-role pass at or after the amended revision)',
+        'LEGACY_AMEND_STATE_INVALID',
+      )
+    }
+  } else if (event.op === 'owner-resolve') {
+    const decision = ownerResolveDecisionOf(event.detail)
+    const expectedPlanAmended = decision === 'resume-execution' ? prior.planAmendedAtRevision : undefined
+    if (next.planAmendedAtRevision !== expectedPlanAmended) {
+      fail(
+        'planAmendedAtRevision must be preserved by owner-resolve(resume-execution) and cleared by resume-planning/block',
+        'LEGACY_AMEND_STATE_INVALID',
+      )
+    }
+  } else if (event.op === 'submit-evidence' || event.op === 'submit-closeout') {
+    if (prior.planAmendedAtRevision !== undefined) {
+      fail(
+        `plan amended at revision ${prior.planAmendedAtRevision} without a delta re-audit pass; ${event.op} requires a plan-role pass at or after the amended revision`,
+        'LEGACY_AMEND_REAUDIT_REQUIRED',
+      )
+    }
+    if (next.planAmendedAtRevision !== undefined) {
+      fail(`${event.op} cannot arm planAmendedAtRevision`, 'LEGACY_AMEND_STATE_INVALID')
+    }
+  } else if (next.planAmendedAtRevision !== prior.planAmendedAtRevision) {
+    fail(
+      `planAmendedAtRevision mutated via op ${event.op} (derives from amend-plan and plan-role passes only)`,
+      'LEGACY_AMEND_STATE_MUTATED',
+    )
+  }
+
+  // Owner resolution (governance pragmatics v1): resume-execution restores
+  // the paused-from phase with gates, packet, executor and the amendment
+  // binding byte-identical. The pause asked the owner a question; the answer
+  // must not destroy still-valid state. resume-planning keeps its full-reset
+  // reading, and a stream that predates pause-tracking has no pausedFrom and
+  // therefore cannot take the resume-execution arm at all.
+  if (event.op === 'owner-resolve' && ownerResolveDecisionOf(event.detail) === 'resume-execution') {
+    if (prior.pausedFrom === undefined
+      || (prior.pausedFrom !== 'executing' && prior.pausedFrom !== 'execution-reviewing')) {
+      fail(
+        'owner-resolve(resume-execution) requires pausedFrom executing|execution-reviewing; pre-pause-tracking streams keep the resume-planning-only reading',
+        'LEGACY_OWNER_RESUME_INVALID',
+      )
+    }
+    const pausedFrom = prior.pausedFrom
+    if (next.phase !== pausedFrom) {
+      fail(`owner-resolve(resume-execution) must restore phase ${pausedFrom}, got ${next.phase}`, 'LEGACY_OWNER_RESUME_INVALID')
+    }
+    if (next.planGate !== prior.planGate || next.executionGate !== prior.executionGate) {
+      fail('owner-resolve(resume-execution) must not touch the gates', 'LEGACY_OWNER_RESUME_INVALID')
+    }
+    if (next.executionPacket !== prior.executionPacket) {
+      fail('owner-resolve(resume-execution) must preserve the execution packet', 'LEGACY_OWNER_RESUME_INVALID')
+    }
+    if (JSON.stringify(next.executor) !== JSON.stringify(prior.executor)) {
+      fail('owner-resolve(resume-execution) must preserve the executor record', 'LEGACY_OWNER_RESUME_INVALID')
+    }
+  }
+
+  // pausedFrom derivation (presence-gated: a stream that never carries the
+  // field — every pre-pause-tracking stream — keeps its old reading).
+  if (prior.pausedFrom !== undefined || next.pausedFrom !== undefined) {
+    if (next.phase === 'needs-owner-decision') {
+      if (prior.phase === 'needs-owner-decision') {
+        if (next.pausedFrom !== prior.pausedFrom) {
+          fail('pausedFrom mutated while paused', 'LEGACY_PAUSE_STATE_INVALID')
+        }
+      } else if (next.pausedFrom !== prior.phase) {
+        fail(
+          `entering needs-owner-decision from ${prior.phase} must stamp pausedFrom=${prior.phase}`,
+          'LEGACY_PAUSE_STATE_INVALID',
+        )
+      }
+    } else if (next.pausedFrom !== undefined) {
+      fail(`leaving needs-owner-decision must clear pausedFrom (phase ${next.phase})`, 'LEGACY_PAUSE_STATE_INVALID')
+    }
+  }
+
+  // Stamped packet identity must match the live executor. Absent detail is
+  // legacy-exempt only when bearerBase is absent. A present non-integer
+  // revision/generation is a corrupt stamp, not an old stream. Current-format
+  // streams also require generation and childId so a replacement executor at
+  // revision 1 cannot accept a delayed packet from the revoked generation.
+  if (event.op === 'submit-packet') {
+    const stamp = packetIdentityStamp(event.detail)
+    if (stamp.kind === 'invalid') {
+      if (stamp.field === 'executionRevision') {
+        fail(
+          `submit-packet executionRevision is not an integer: ${String(stamp.raw)}`,
+          'LEGACY_PACKET_REVISION_REQUIRED',
+        )
+      }
+      fail(
+        `submit-packet ${stamp.field} is not valid: ${String(stamp.raw)}`,
+        'LEGACY_PACKET_REVISION_REQUIRED',
+      )
+    }
+    if (stamp.kind === 'absent' && prior.bearerBase !== undefined) {
+      fail(
+        'submit-packet executionRevision is required on current-format streams',
+        'LEGACY_PACKET_REVISION_REQUIRED',
+      )
+    }
+    if (stamp.kind === 'ok') {
+      if (prior.bearerBase !== undefined) {
+        if (stamp.generation === undefined) {
+          fail(
+            'submit-packet generation is required on current-format streams',
+            'LEGACY_PACKET_REVISION_REQUIRED',
+          )
+        }
+        if (stamp.childId === undefined) {
+          fail(
+            'submit-packet childId is required on current-format streams',
+            'LEGACY_PACKET_REVISION_REQUIRED',
+          )
+        }
+      }
+      const liveRev = prior.executor?.executionRevision
+      if (liveRev !== stamp.executionRevision) {
+        fail(
+          `submit-packet executionRevision ${String(stamp.executionRevision)} does not match live ${String(liveRev)}`,
+          'LEGACY_PACKET_REVISION_MISMATCH',
+        )
+      }
+      const foldedRev = next.executor?.executionRevision
+      if (foldedRev !== stamp.executionRevision) {
+        fail(
+          `submit-packet snapshot executionRevision ${String(foldedRev)} does not retain stamped live ${String(stamp.executionRevision)}`,
+          'LEGACY_PACKET_REVISION_MUTATED',
+        )
+      }
+      if (stamp.generation !== undefined && stamp.generation !== prior.executor?.generation) {
+        fail(
+          `submit-packet generation ${String(stamp.generation)} does not match live ${String(prior.executor?.generation)}`,
+          'LEGACY_PACKET_REVISION_MISMATCH',
+        )
+      }
+      if (stamp.childId !== undefined && stamp.childId !== prior.executor?.childId) {
+        fail(
+          `submit-packet childId ${stamp.childId} does not match live ${String(prior.executor?.childId)}`,
+          'LEGACY_PACKET_REVISION_MISMATCH',
+        )
+      }
+    }
+  }
+
+  // No executor before the plan gate has ever passed (start-executor requires it right now).
+  if (event.op === 'start-executor' && prior.planGate !== 'pass') {
+    fail('executor before planGate pass', 'LEGACY_EXECUTOR_BEFORE_GATE')
+  }
+  if (next.executor !== undefined && prior.executor === undefined && event.op !== 'start-executor') {
+    fail(`executor appeared via op ${event.op}`, 'LEGACY_EXECUTOR_OP')
+  }
+  if (event.op === 'resume-executor') {
+    const prev = prior.executor
+    const folded = next.executor
+    if (prev === undefined || folded === undefined) {
+      fail('resume-executor requires a live running executor', 'LEGACY_EXECUTOR_REVISION')
+    }
+    if (prev.state !== 'running' || folded.state !== 'running') {
+      fail(
+        `resume-executor state ${prev.state} -> ${folded.state} is not running -> running`,
+        'LEGACY_EXECUTOR_REVISION',
+      )
+    }
+    if (folded.childId !== prev.childId || folded.generation !== prev.generation) {
+      fail('resume-executor must keep childId and generation', 'LEGACY_EXECUTOR_REVISION')
+    }
+    if (folded.executionRevision !== prev.executionRevision + 1) {
+      fail(
+        `resume-executor executionRevision ${String(folded.executionRevision)} is not prior ${String(prev.executionRevision)} + 1`,
+        'LEGACY_EXECUTOR_REVISION',
+      )
+    }
+  } else if (event.op === 'start-executor') {
+    assertStartExecutor(prior, next)
+  } else if (
+    event.op === 'replan'
+    || event.op === 'audit'
+    || event.op === 'self-check'
+    || event.op === 'external-audit'
+  ) {
+    assertExecutorLifecycle(prior, next, event.op)
+  } else if (JSON.stringify(prior.executor) !== JSON.stringify(next.executor)) {
+    fail('executor mutated', 'LEGACY_EXECUTOR_MUTATED')
+  }
+
+  // Plan gate pass requires the usage question to have been answered. The
+  // coupling used to live ONLY in `AutopilotEngine.applyVerdict`, which is the
+  // writer — so a stream that arrived any other way (a hand-edited file, a
+  // buggy writer, an older build) folded clean and became the live snapshot on
+  // a cold resume, after which `start-executor` sees `planGate === 'pass'` and
+  // proceeds. The executionGate rule below already carried its invariant into
+  // the fold; this is the missing symmetric half.
+  if (next.planGate === 'pass' && prior.planGate !== 'pass') {
+    const undeclared = usageDeclarationProblems(next.usage)
+    if (undeclared.length > 0) {
+      fail(`planGate pass with unanswered usage evidence: ${undeclared.join('; ')}`, 'LEGACY_GATE_WITH_UNDECLARED_USAGE')
+    }
+  }
+
+  // Execution gate pass requires a matching latest execution-audit pass in the
+  // record — OR an owner pass in force for this generation (DESIGN §9 item 8).
+  //
+  // WHY THE OWNER ARM IS NOT A HOLE: the rule's substance is that a gate never
+  // flips to pass on nothing at all. An owner pass carries an explicit ruling,
+  // recorded with its generation (the plan revision) and its ordinal, and the
+  // write path additionally requires the evidence packet to exist before the
+  // execution gate can be passed at all. Every pass the owner did NOT give
+  // still needs the audit pass, and a stream that never recorded provenance
+  // (every legacy stream) keeps the old reading byte for byte.
+  if (next.executionGate === 'pass' && prior.executionGate !== 'pass') {
+    const executionAudits = next.audits.filter(record => record.role === 'execution')
+    const latest = executionAudits[executionAudits.length - 1]
+    const owner = next.gateSources?.execution
+    // THE GENERATION COMPARISON, spelled the same way the other three copies of
+    // this predicate spell it (prior.plan.revision, not next.plan.revision).
+    // They agree today — only submit-plan/amend-plan/init raise the plan
+    // revision and none of those is a gate-mover — and this bug was born from
+    // exactly this predicate existing in four places with one form different
+    // from the rest, so the forms are kept identical on purpose.
+    const ownerInForce = owner?.source === 'owner' && owner.withdrawn !== true
+      && owner.planRevision === prior.plan.revision
+    if (!ownerInForce && (latest === undefined || latest.verdict !== 'pass')) {
+      fail('executionGate pass without a latest execution-audit pass (or an in-force owner pass for this generation)', 'LEGACY_GATE_WITHOUT_AUDIT')
+    }
+  }
+
+  // Evidence kinds, BEFORE the completion re-check below. Order is the point:
+  // a kind-less proven entry also fails `evaluateCompletion`, and if that ran
+  // first the stream would be rejected as LEGACY_INCOMPLETE_COMPLETION — true but
+  // useless. The specific code is what tells a reader which rule was broken.
+  if (event.op === 'submit-closeout') {
+    const stamp = evidenceKindStamp(event.detail)
+    if (stamp === 'invalid') {
+      const raw = (event.detail as { evidenceKinds?: unknown }).evidenceKinds
+      fail(
+        `submit-closeout evidenceKinds stamp is not the integer 1: ${String(raw)}`,
+        'LEGACY_EVIDENCE_KIND_STAMP_INVALID',
+      )
+    }
+    if (stamp === 'v1') {
+      const problems = evidenceKindProblems(next.closeout?.evidence ?? [], { requireKind: true })
+      const first = problems[0]
+      if (first !== undefined) {
+        fail(
+          `submit-closeout stamped evidenceKinds 1: ${problems.map(problem => problem.message).join('; ')}`,
+          first.code,
+        )
+      }
+    }
+    // Partial-delivery contract, same stamp pattern as evidenceKinds: the
+    // stream's own stamp decides the arm, never the reading build. Unstamped
+    // (legacy) closeouts keep the old reading — unproven criteria legal, no
+    // handoff required, no outcome recorded.
+    const handoffStamp = closeoutHandoffStamp(event.detail)
+    if (handoffStamp === 'invalid') {
+      const raw = (event.detail as { closeoutHandoff?: unknown }).closeoutHandoff
+      fail(
+        `submit-closeout closeoutHandoff stamp is not the integer 1: ${String(raw)}`,
+        'LEGACY_HANDOFF_STAMP_INVALID',
+      )
+    }
+    if (handoffStamp === 'v1') {
+      const problems = handoffProblems(next.closeout ?? {
+        summary: '',
+        changedFiles: [],
+        commands: [],
+        evidence: [],
+        residualRisks: [],
+        exclusions: [],
+        workspaceCleanup: '',
+        drift: '',
+      }, next.triage.acceptanceCriteria)
+      if (problems.length > 0) {
+        fail(`submit-closeout stamped closeoutHandoff 1: ${problems.join('; ')}`, 'LEGACY_HANDOFF_INVALID')
+      }
+    }
+  }
+
+  // Completion is structurally validated, not asserted.
+  if (next.phase === 'completed') {
+    const check = evaluateCompletion(next)
+    if (!check.ok) {
+      fail(`completed snapshot fails completion check: ${check.problems.join('; ')}`, 'LEGACY_INCOMPLETE_COMPLETION')
+    }
+  }
+
+  return next
+}
+
+/** Fold result. */
+export interface FoldState {
+  readonly snapshot: Snapshot | undefined
+  readonly eventCount: number
+}
+
+/**
+ * Replay a full event stream strictly. Throws AutopilotError on the first
+ * illegal event. An empty stream folds to an uninitialized state.
+ */
+export function foldRun(events: readonly RunEvent[]): FoldState {
+  let snapshot: Snapshot | undefined
+  for (const event of events) {
+    snapshot = applyEvent(snapshot, event)
+  }
+  return { snapshot, eventCount: events.length }
+}

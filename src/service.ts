@@ -32,13 +32,15 @@
  * stated rather than glossed — is `Service`'s intercept-config resolution
  * (`[Service.resolveConfig]`) and its `[Service.filter]` isolate check. Both
  * exist to let a service be RECONFIGURED or ISOLATED per consuming context;
- * this surface exposes three read-only methods over one engine and has
+ * this surface exposes a few read-only methods over one ledger store and has
  * nothing to reconfigure or isolate. If that changes, the honest fix is to
  * take the runtime dependency deliberately, not to grow this file.
  */
 
-import type { RunId, Snapshot } from './domain/types.js'
-import type { AutopilotEngine, StatusView } from './engine.js'
+import type { LegacyRunProjection, LegacyRunSummary, LedgerProjection } from './domain/ledger-types.js'
+import type { LegacySources } from './legacy/index.js'
+import { projectLedger } from './web.js'
+import type { LedgerStoreLike } from './store/ledger.js'
 
 /** Cross-realm tracker key cordis reads when tracing service access. */
 const CORDIS_TRACKER = Symbol.for('cordis.tracker')
@@ -57,43 +59,103 @@ export interface ProvideHost {
 /**
  * The read-only surface published at `ctx.autopilot`.
  *
- * Deliberately read-only: the engine's single-writer authority rests on every
- * mutation proving it came from the exact live root Agent. A service handle
- * has no agent, so exposing a mutator here would be a second write path with
- * no authority check — the one thing the whole design exists to prevent.
+ * Deliberately read-only: the ledger is written by the engine alone, under the
+ * live root Agent's authority. A service handle has no agent, so a mutator here
+ * would be a second write path with no authority check.
+ *
+ * Ledger reads come from the store's in-memory cache (filled at open and
+ * advanced by this process's own writes); legacy reads go to the frozen 0.2.x
+ * reader and are asynchronous because they fold event streams.
  */
 export interface AutopilotReadOnly {
-  /**
-   * The folded snapshot of the run rooted at one session id.
-   *
-   * FRESHNESS IS PART OF THE CONTRACT (2026-08-27). Both readers answer from
-   * `AutopilotEngine.peekFresh`, i.e. the engine's per-run memo revalidated
-   * against the store's published revision. A consumer of this surface is by
-   * definition NOT the writer — the engine's write paths never come through
-   * here — so serving a memo that another process has already moved past is
-   * always wrong for this surface, and was: a web mount served its first
-   * observation of a headless-driven run forever.
-   */
-  peek(rootSessionId: RunId): Snapshot | undefined
-  /** The model-facing status projection, or undefined when no run is bound. Revalidated; see {@link AutopilotReadOnly.peek}. */
-  status(rootSessionId: RunId): StatusView | undefined
-  /** Run ids this mount has materialized. */
-  list(): readonly RunId[]
-  /** Which backend holds the canonical stream, as observed at mount. */
-  readonly storeKind: Snapshot['enforcement']['store']
+  /** The ledger projection of one root session (with its legacy runs attached), or `undefined`. */
+  ledger(sessionId: string): Promise<LedgerProjection | undefined>
+  /** Every session that has a ledger, projected. */
+  ledgers(): Promise<readonly LedgerProjection[]>
+  /** Every legacy run in both backends. */
+  legacyRuns(): Promise<readonly LegacyRunSummary[]>
+  /** One legacy run in full, or `undefined`. */
+  legacyRun(runId: string): Promise<LegacyRunProjection | undefined>
+  /** One-time notes (e.g. retired config keys that were ignored). */
+  notes(): readonly string[]
+  /** Which backend holds the ledgers. */
+  readonly storeKind: 'file' | 'domain'
 }
 
-/** Build the read-only view over one engine. */
-export function createAutopilotService(engine: AutopilotEngine): AutopilotReadOnly {
+/** The slice of `src/legacy` this service uses; injectable so tests need no fixtures on disk. */
+export interface LegacyReader {
+  list(sources: LegacySources): Promise<readonly LegacyRunSummary[]>
+  read(sources: LegacySources, runId: string): Promise<LegacyRunProjection | undefined>
+}
+
+/** The real reader, loaded on first use. */
+const frozenLegacyReader: LegacyReader = {
+  list: async (sources) => (await import('./legacy/index.js')).listLegacyRuns(sources),
+  read: async (sources, runId) => (await import('./legacy/index.js')).readLegacyRun(sources, runId).then(found => found?.projection),
+}
+
+export interface AutopilotServiceInput {
+  readonly ledgers: LedgerStoreLike
+  readonly sources: LegacySources
+  /** Notes are read on every call so a note added after mount still shows. */
+  readonly notes?: () => readonly string[]
+  readonly legacy?: LegacyReader
+  /**
+   * Called before a single-session ledger read: lets the owner of the live sessions mirror the
+   * session's native goal into its ledger, so a goal-only session has a ledger to show. Must not throw.
+   */
+  readonly syncSession?: (sessionId: string) => Promise<void>
+}
+
+/** Build the read-only view over a ledger store and the legacy sources. */
+export function createAutopilotService(input: AutopilotServiceInput): AutopilotReadOnly {
+  const legacy = input.legacy ?? frozenLegacyReader
+  const notes = (): readonly string[] => input.notes?.() ?? []
+  // The ledger is the only place the one-time sandbox restore outcome is kept, so it
+  // wins over the reader's default (`pending`) for every run, whichever route asks.
+  const restoreOf = (runId: string) => {
+    for (const ledger of input.ledgers.list()) {
+      const record = ledger.legacyRestores?.[runId]
+      if (record !== undefined) return record
+    }
+    return undefined
+  }
+  const listRuns = async (): Promise<readonly LegacyRunSummary[]> =>
+    (await legacy.list(input.sources)).map(run => {
+      const restore = restoreOf(run.runId)
+      return restore === undefined ? run : { ...run, sandboxRestore: restore }
+    })
+  const project = async (sessionId: string): Promise<LedgerProjection | undefined> => {
+    try { await input.syncSession?.(sessionId) } catch { /* a failed sync never hides the stored ledger */ }
+    const ledger = input.ledgers.load(sessionId)
+    if (ledger === undefined) return undefined
+    return projectLedger(ledger, await listRuns(), notes())
+  }
   const service: AutopilotReadOnly = {
-    peek: (rootSessionId) => engine.peekFresh(rootSessionId),
-    status: (rootSessionId) => {
-      const snapshot = engine.peekFresh(rootSessionId)
-      if (snapshot === undefined) return undefined
-      return engine.projectStatus(snapshot)
+    ledger: project,
+    ledgers: async () => {
+      const runs = await listRuns()
+      return input.ledgers.list().map(ledger => projectLedger(ledger, runs, notes()))
     },
-    list: () => engine.listRuns(),
-    storeKind: engine.storeKind,
+    legacyRuns: listRuns,
+    legacyRun: async (id) => {
+      let runId = id
+      let run = await legacy.read(input.sources, runId)
+      if (run === undefined) {
+        // A session id is also accepted: the first 0.2.x run of a session was named after it, and a later
+        // run is reached through the session's own listing. The last run listed for the session is served.
+        const ofSession = (await legacy.list(input.sources)).filter(candidate => candidate.sessionId === id)
+        const latest = ofSession[ofSession.length - 1]
+        if (latest !== undefined) {
+          runId = latest.runId
+          run = await legacy.read(input.sources, runId)
+        }
+      }
+      const restore = restoreOf(runId)
+      return run === undefined || restore === undefined ? run : { ...run, sandboxRestore: restore }
+    },
+    notes,
+    storeKind: input.ledgers.kind,
   }
   Object.defineProperty(service, CORDIS_TRACKER, {
     value: { associate: 'autopilot', property: 'ctx' },

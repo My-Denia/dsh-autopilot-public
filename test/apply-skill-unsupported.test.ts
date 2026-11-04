@@ -19,10 +19,14 @@ vi.mock('../src/skill-install.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../src/skill-install.js')>()
   return {
     ...actual,
-    syncBundledSkill: () => ({
+    // The mount publishes the whole skill directory, so THIS is the symbol the
+    // fallback calls. Mocking syncBundledSkill would leave the real tree
+    // publish running against the operator's skill home.
+    syncBundledSkillTree: () => ({
       status: 'unsupported' as const,
       dest: DEST,
-      detail: `skill home does not support hard links; nothing was written to ${DEST} — copy the bundled SKILL.md there manually to install`,
+      detail: `skill home does not support hard links; nothing was written to ${DEST} — copy /pkg/skill/dsh-autopilot/SKILL.md there manually to install`,
+      files: [],
     }),
   }
 })
@@ -52,7 +56,7 @@ describe('apply() with a skill home that cannot be published to', () => {
     const root = mkdtempSync(join(tmpdir(), 'dsh-autopilot-skill-unsupported-'))
     const host = tinyCtx()
 
-    const dispose = await apply(host.ctx, { storeRoot: root, storeKind: 'file' })
+    const dispose = await apply(host.ctx, { storeRoot: root })
 
     // Mounted: the failure to install a skill never fails the mount.
     expect(typeof dispose).toBe('function')
@@ -72,7 +76,7 @@ describe('apply() with a skill home that cannot be published to', () => {
     const root = mkdtempSync(join(tmpdir(), 'dsh-autopilot-skill-unsupported-off-'))
     const host = tinyCtx()
 
-    const dispose = await apply(host.ctx, { storeRoot: root, storeKind: 'file', skillInstall: 'off' })
+    const dispose = await apply(host.ctx, { storeRoot: root, skillInstall: 'off' })
 
     expect(host.warnings).toEqual([])
     await dispose()

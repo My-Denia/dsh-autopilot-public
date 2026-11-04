@@ -38,6 +38,8 @@
 
 import Schema from '@deepseek-ai/schemastery'
 import type { ConfigInput } from './index.js'
+import { DEFAULT_WORK_CLASSES } from './routing/work-class.js'
+import type { WorkClassName } from './routing/work-class.js'
 
 /**
  * Default tool surface for a delegated executor child (write-capable, no
@@ -58,7 +60,7 @@ import type { ConfigInput } from './index.js'
  * `terminal_send` / `terminal_read` / `terminal_signal` / `terminal_close`,
  * and substituting those here would GRANT a delegated child a capability it
  * never had. The rename went the other way instead: the gate's `SHELL_TOOLS`
- * scan (`./gate/decide.ts`) gained the terminal names, because widening what
+ * scan (`SHELL_TOOLS` in `./roles/tools.ts`, formerly the egress gate) gained the terminal names, because widening what
  * is SCANNED is the fail-closed direction and widening what is ALLOWED is not.
  * Nothing egress-capable belongs in this list, and `test/config.test.ts`
  * asserts both the exact array and that property — in BOTH directions, because
@@ -98,7 +100,7 @@ export const DEFAULT_EXECUTOR_TOOLS: readonly string[] = [
 const AgentOptions = Schema.object({
   provider: Schema.string().description('LLM provider id.'),
   model: Schema.string().description('Model id.'),
-  maxTokens: Schema.natural().description('Per-child output cap.'),
+  maxTokens: Schema.natural().description('Retired in 0.3.0 and ignored (the route grant is provider, model and reasoningEffort only).'),
   /**
    * Reasoning effort ([R2-P3-1]). Declared here so a legacy route may name
    * one; it is validated against exact model capability by the dispatch
@@ -111,7 +113,7 @@ const AgentOptions = Schema.object({
 
 /** Per-role auditor routing (the cross-family review matrix's landing point). */
 const AuditorRoute = Schema.object({
-  provider: Schema.string().description('Subagent transport provider for this role.'),
+  provider: Schema.string().description('Retired in 0.3.0 and ignored: the one-shot transport provider no longer exists. Reviews use the role route only.'),
   agentOptions: AgentOptions,
 })
 
@@ -177,6 +179,16 @@ const RoleRoutingShape = (defaultMode: 'auto' | 'inherit') => Schema.object({
     'Role floor in tokens for this role\'s EXPLICIT selections (unknown context windows stay eligible, ranked last). '
     + 'Applies in auto mode only; defaults are declared in src/routing/select.ts.',
   ),
+  workClass: Schema.union([
+    Schema.const('mechanical').description('Speed-dominant: holders of a real low effort (DESIGN §1.2).'),
+    Schema.const('simple').description('Daily work: speed + price, economy tier, rotation within the class.'),
+    Schema.const('hard').description('Try economy first; escalation is a request, not a prediction.'),
+    Schema.const('audit').description('Ceiling + independence: the standard tier.'),
+    Schema.const('extreme').description('Ceiling: the reserve tier; absence is recorded, never invented.'),
+  ]).volatile().description(
+    'The work class this role draws from (DESIGN §1.2). Absent = the role default: executor/planner simple, auditors audit. '
+    + 'Inert for locked/inherit modes — those make no selection.',
+  ),
 })
 
 /**
@@ -184,6 +196,61 @@ const RoleRoutingShape = (defaultMode: 'auto' | 'inherit') => Schema.object({
  * machine-readable, patch-writable config — no shipped Settings GUI is
  * claimed for it (the visible control surface is the run card).
  */
+/**
+ * The owner's routing ladder.
+ *
+ * WHY FIXED TIER NAMES rather than an owner-authored record: Schemastery
+ * refuses a volatile field beneath a transform or a keyed dict, and the loader
+ * follows volatile references only so deep. economy/standard/reserve are fixed
+ * paths, so each leaf stays volatile and live-editable, which is what makes an
+ * owner edit take effect without a restart.
+ */
+const LadderShape = Schema.object({
+  tiers: Schema.object({
+    economy: Schema.array(Schema.string()).default([]).volatile().description('Routes the owner places in the economy tier, as provider/model.'),
+    standard: Schema.array(Schema.string()).default([]).volatile().description('Routes the owner places in the standard tier, as provider/model.'),
+    reserve: Schema.array(Schema.string()).default([]).volatile().description('Routes the owner reserves, as provider/model.'),
+  }),
+  auditTier: Schema.union([
+    Schema.const('economy').description('Audit roles may draw from the economy tier.'),
+    Schema.const('standard').description('Audit roles may draw from the standard tier.'),
+    Schema.const('reserve').description('Audit roles may draw from the reserve tier.'),
+    Schema.const('none').description('No tier restriction is configured (the shipped default).'),
+  ]).default('none').volatile(),
+  rotation: Schema.boolean().default(false).volatile().description('Engine-level re-selection at a role\'s next dispatch (DESIGN §9 item 15): a healthy pin yields to a full re-selection — for an AUDITOR role the offset is its audit-count ordinal within the top independence class (never overriding independence), and for the EXECUTOR it is the run\'s own executorDispatches count (one per new child) within the ranked survivor list. A running executor child is never re-routed: only startExecutor reaches the resolver, and resumeExecutor continues the child on its recorded route. Default off preserves the shipped pin-stability semantics exactly.'),
+  speedOrder: Schema.array(Schema.string()).default([]).volatile().description('Owner-declared speed order, fastest first, as provider/model. Empty means speed is unknown and is not ranked.'),
+  costOverrides: Schema.array(Schema.string()).default([]).volatile().description('Owner cost overrides, "provider/model=inputPerM/outputPerM". These beat the seeded cost. A malformed entry is refused.'),
+})
+
+/**
+ * One work class (DESIGN §1.2): which ladder tiers it draws members from and
+ * which axis dominates. Fixed class names for the same schemastery volatile
+ * reason as the ladder tier names. The owner table is the declared default;
+ * an override replaces one class at a time, never the whole table.
+ *
+ * WHY A FACTORY: schemastery defaults live in node metadata — one shared
+ * instance would give every class the last-applied default (the same reason
+ * {@link RoleRoutingShape} is a factory).
+ */
+const WorkClassShape = (name: WorkClassName) =>
+  Schema.object({
+    tiers: Schema.array(
+      Schema.union([Schema.const('economy'), Schema.const('standard'), Schema.const('reserve')]),
+    )
+      .default([...DEFAULT_WORK_CLASSES[name].tiers])
+      .volatile()
+      .description('The ladder tiers this class draws members from. Empty = entry by the class\'s own thresholds (mechanical: the low-effort license).'),
+    axis: Schema.union([
+      Schema.const('speed').description('Owner-declared speedOrder first; cost is NOT an axis.'),
+      Schema.const('speed-cost').description('Speed first, effective cost breaks ties.'),
+      Schema.const('economy-first').description('Effective cost ascending first — the cheapest mapped tier is tried first.'),
+      Schema.const('ceiling-independence').description('No ranking of its own: the tier mapping and auditor independence carry it.'),
+      Schema.const('ceiling').description('No ranking of its own: the tier mapping carries it.'),
+    ])
+      .default(DEFAULT_WORK_CLASSES[name].axis)
+      .volatile(),
+  })
+
 const RoutingShape = Schema.object({
   mode: Schema.union([
     Schema.const('auto').description('Route by the ordered rule table over the session-authorized set.'),
@@ -193,7 +260,11 @@ const RoutingShape = Schema.object({
     Schema.const('balanced').description('Efforts preferred, then context window descending.'),
     Schema.const('economy').description('Smallest sufficient context window first.'),
     Schema.const('quality').description('Reasoning efforts first, then context window descending.'),
+    Schema.const('axis').description('Sufficiency thresholds pass/fail (never ranked), then survivors ranked on the declared axes: effective cost (outputPerM then inputPerM), then the owner-declared speed order when one is declared.'),
   ]).default('balanced').volatile(),
+  orderingAxisDefault: Schema.boolean().default(false).volatile().description(
+    'Owner opt-in: when no explicit preference is detectable, rank by the ordering axes (effective cost, then the owner-declared speed order) instead of the provisional balanced default. An explicit preference is never overridden.',
+  ),
   roles: Schema.object({
     executor: RoleRoutingShape('auto'),
     planner: RoleRoutingShape('inherit'),
@@ -201,6 +272,14 @@ const RoutingShape = Schema.object({
     executionAuditor: RoleRoutingShape('auto'),
     rulesAuditor: RoleRoutingShape('auto'),
   }),
+  ladder: LadderShape,
+  workClasses: Schema.object({
+    mechanical: WorkClassShape('mechanical'),
+    simple: WorkClassShape('simple'),
+    hard: WorkClassShape('hard'),
+    audit: WorkClassShape('audit'),
+    extreme: WorkClassShape('extreme'),
+  }).description('Per-class overrides of the owner-table work classes (DESIGN §1.2). A class absent here keeps the owner-table default.'),
 })
 
 /**
@@ -219,12 +298,12 @@ export const StoreKindSchema = Schema.union([
   Schema.const('auto').description('Prefer the storageDomain backend when it is observable, else files.'),
   Schema.const('file').description('Always the file store under $DSH_HOME/storages/dsh-autopilot.'),
   Schema.const('domain').description('Require ctx.storageDomain; refuse to mount without it.'),
-]).default('auto').description('Which backend holds the canonical event stream.')
+]).description('RETIRED in 0.3.0 and ignored: the ledger is always one file per session under the store root; legacy domain runs are only read. No default is declared, so only a written key reads as retired.')
 
 /** Declared plugin configuration shape; mirrors `ConfigInput` in `./index.ts`. */
 const ConfigShape = Schema.object({
-  auditProvider: Schema.string().default('spawn').description('Subagent transport provider for one-shot auditors.'),
-  executorProvider: Schema.string().default('spawn').description('Subagent transport provider for the continuable executor.'),
+  auditProvider: Schema.string().description('Retired in 0.3.0 and ignored. No default is declared, so only a written key reads as retired.'),
+  executorProvider: Schema.string().description('Retired in 0.3.0 and ignored. No default is declared, so only a written key reads as retired.'),
   auditors: Schema.object({
     plan: AuditorRoute,
     execution: AuditorRoute,
@@ -232,37 +311,43 @@ const ConfigShape = Schema.object({
   }).description('Per-role auditor routing; omitted roles inherit the deployment default.'),
   executor: Schema.object({
     agentOptions: AgentOptions,
-    persona: Schema.string().default('').description('Executor Lead persona override.'),
-    toolAllowList: Schema.array(Schema.string())
-      .default([...DEFAULT_EXECUTOR_TOOLS])
-      .description('Tool names the executor child may call.'),
+    persona: Schema.string().description('Retired in 0.3.0 and ignored: the role personas are fixed in src/roles.'),
+    toolAllowList: Schema.array(Schema.string()).description('Retired in 0.3.0 and ignored: the role tool surfaces are fixed in src/roles.'),
   }),
   crossFamily: Schema.object({
-    enabled: Schema.boolean().default(true)
-      .description('Seek an auditor from a family the executor is not from, once risk reaches minRisk.'),
-    minRisk: Schema.union(['low', 'medium', 'high', 'critical'] as const).default('medium')
-      .description('Risk floor at which cross-family review is sought.'),
-    pool: Schema.array(AgentOptions).default([])
-      .description('Candidate auditor routes to draw an out-of-family reviewer from.'),
-  }).description('Cross-family review: a blind spot shared by one provider passes both gates unchallenged, so at risk the reviewer should not be from the builder family. A strategy, not a gate — the outcome is recorded per audit rather than enforced.'),
+    enabled: Schema.boolean().description('Retired in 0.3.0 and ignored: a reviewer always seeks a different provider family than the work it reviews.'),
+    minRisk: Schema.union(['low', 'medium', 'high', 'critical'] as const).description('Retired in 0.3.0 and ignored.'),
+    pool: Schema.array(AgentOptions).description('Retired in 0.3.0 and ignored: the reviewer draws from the ladder and the session policy.'),
+  }).description('Retired in 0.3.0 and ignored (see each key).'),
   routing: RoutingShape.description(
     'Role-true model routing over the live catalog. Every GAH-config-sourced explicit route (a lock, legacy role config, a legacy pool pick) is a plugin-config grant under one rule in every mode; a grant outside an existing session model-selection policy escalates to the owner instead of dispatching. In auto mode the routing core subsumes the legacy pool fallback: pool entries stay consultable as grants, never widen the session-authorized set, and never override a role lock.',
   ),
+  // RETIRED in 0.3.0 and ignored. NO defaults are declared on these leaves on purpose: the loader fills
+  // declared defaults before `apply()` sees the config, and a default here would make every mount read
+  // as having written a retired key (`retiredKeysIn`). `resolveConfig` supplies its own defaults.
   gate: Schema.object({
-    sandboxCoupling: Schema.boolean().default(true).description('Clamp standard runs read-only until the plan gate passes.'),
-    toolDeny: Schema.boolean().default(true).description('Deny write/edit/str_replace_editor pre-plan-gate and while usage is undeclared.'),
-    egressDeny: Schema.boolean().default(true).description('Enforce the owner-only egress boundary.'),
-    stopReminder: Schema.boolean().default(true).description('Emit the bounded turn-stop execution reminder.'),
-    strictShell: Schema.boolean().default(false).description('Deny shell pre-plan-gate when the sandbox is not active.'),
-    restoreMode: Schema.string().default('workspace-write').description('Sandbox mode restored on plan-gate pass when none was recorded.'),
+    sandboxCoupling: Schema.boolean().description('Retired, ignored: the plan-gate sandbox clamp is gone.'),
+    toolDeny: Schema.boolean().description('Retired, ignored: the pre-plan-gate tool deny is gone.'),
+    egressDeny: Schema.boolean().description('Retired, ignored: the egress boundary is gone.'),
+    stopReminder: Schema.boolean().description('Retired, ignored: the turn-stop reminder is gone.'),
+    strictShell: Schema.boolean().description('Retired, ignored: the shell gate is gone.'),
+    restoreMode: Schema.string().description('Retired, ignored: a clamped session is restored to the mode its run recorded.'),
   }),
   storeKind: StoreKindSchema,
   storeRoot: Schema.string().default('').description('Run store directory; empty means $DSH_HOME/storages/dsh-autopilot.'),
+  governance: Schema.object({
+    maxAuditRoundsPerRole: Schema.number().min(1).description(
+      'Brake on audit storms: refuse further same-role audit dispatches beyond this many rounds. Retired in 0.3.0 and ignored. Off when unset; escalation to the owner is never automatic.',
+    ),
+    unattended: Schema.boolean().description(
+      'Retired in 0.3.0 and ignored: the egress policy it tuned no longer exists.',
+    ),
+  }).description('Governance pragmatics knobs (all optional, all off by default).'),
   skillInstall: Schema.union([
     Schema.const('auto').description('Copy bundled SKILL.md into the skill-scan root if absent; warn on drift, never overwrite.'),
     Schema.const('off').description('Do not touch the skill-scan root.'),
   ]).default('auto').description('Whether apply() installs the bundled skill into $DSH_AGENTS_HOME/skills.'),
-}).description('dsh-autopilot: plan-execute-audit gates, usage evidence, outbound manifests.')
+}).description('dsh-autopilot: role delegation routing, review independence and the delegation ledger.')
 
 /**
  * A node in the known-key tree: `null` marks a leaf (any shape the schema above
@@ -278,7 +363,9 @@ const AUDITOR_ROUTE_KEYS: KeySpec = { provider: null, agentOptions: AGENT_OPTION
 /** The lock shape inside `routing.roles.<role>` (mirrors {@link RouteLock}). */
 const ROUTE_LOCK_KEYS: KeySpec = { provider: null, model: null, reasoningEffort: null }
 /** One `routing.roles.<role>` entry. */
-const ROLE_ROUTING_KEYS: KeySpec = { mode: null, lock: ROUTE_LOCK_KEYS, minContext: null }
+const ROLE_ROUTING_KEYS: KeySpec = { mode: null, lock: ROUTE_LOCK_KEYS, minContext: null, workClass: null }
+/** One `routing.workClasses.<name>` entry. */
+const WORK_CLASS_KEYS: KeySpec = { tiers: null, axis: null }
 /** The five routable roles, exactly as the shape declares them. */
 const ROUTING_ROLES_KEYS: KeySpec = {
   executor: ROLE_ROUTING_KEYS,
@@ -302,7 +389,26 @@ const CONFIG_KEY_SPEC: KeySpec = {
   auditors: { plan: AUDITOR_ROUTE_KEYS, execution: AUDITOR_ROUTE_KEYS, rules: AUDITOR_ROUTE_KEYS },
   executor: { agentOptions: AGENT_OPTIONS_KEYS, persona: null, toolAllowList: null },
   crossFamily: { enabled: null, minRisk: null, pool: null },
-  routing: { mode: null, preference: null, roles: ROUTING_ROLES_KEYS },
+  routing: {
+    mode: null,
+    preference: null,
+    orderingAxisDefault: null,
+    roles: ROUTING_ROLES_KEYS,
+    ladder: {
+      tiers: { economy: null, standard: null, reserve: null },
+      auditTier: null,
+      rotation: null,
+      speedOrder: null,
+      costOverrides: null,
+    },
+    workClasses: {
+      mechanical: WORK_CLASS_KEYS,
+      simple: WORK_CLASS_KEYS,
+      hard: WORK_CLASS_KEYS,
+      audit: WORK_CLASS_KEYS,
+      extreme: WORK_CLASS_KEYS,
+    },
+  },
   gate: {
     sandboxCoupling: null,
     toolDeny: null,
@@ -314,6 +420,7 @@ const CONFIG_KEY_SPEC: KeySpec = {
   storeKind: null,
   storeRoot: null,
   skillInstall: null,
+  governance: { maxAuditRoundsPerRole: null, unattended: null },
 }
 
 /** Collect every dotted path in `value` that {@link CONFIG_KEY_SPEC} does not declare. */
@@ -397,4 +504,87 @@ export const Config: Schema<ConfigInput, ConfigInput> = ((raw: unknown, options?
   version: 1,
   vendor: 'dsh-autopilot',
   validate: (value: unknown) => validateConfig(value),
+}
+
+/**
+ * Settings whose mechanism 0.3.0 removed. The schema still ACCEPTS them, so a
+ * profile written for 0.2.x loads without error, but they have no effect.
+ *
+ * - `gate.*`: the sandbox clamp, tool deny, egress deny, stop reminder, strict
+ *   shell and restore mode belonged to the retired run state machine.
+ * - `governance.*`: audit-round cap and unattended egress policy likewise.
+ * - `storeKind`: history now reads both backends; the ledger follows what the
+ *   host offers.
+ *
+ * Still live (not listed): `routing.*` (child routing), `crossFamily.*`
+ * (reviewer independence), `storeRoot`, `skillInstall`. `auditors.*`,
+ * `auditProvider`, `executorProvider` and `executor.*` are accepted but are not
+ * yet listed here; whether 0.3.0 still reads them is the engine's call.
+ */
+export const RETIRED_CONFIG_KEYS: readonly string[] = [
+  'gate.sandboxCoupling',
+  'gate.toolDeny',
+  'gate.egressDeny',
+  'gate.stopReminder',
+  'gate.strictShell',
+  'gate.restoreMode',
+  'governance.maxAuditRoundsPerRole',
+  'governance.unattended',
+  'storeKind',
+  'auditProvider',
+  'executorProvider',
+  'executor.persona',
+  'executor.toolAllowList',
+  'executor.agentOptions.maxTokens',
+  'auditors.plan.provider',
+  'auditors.plan.agentOptions.maxTokens',
+  'auditors.execution.provider',
+  'auditors.execution.agentOptions.maxTokens',
+  'auditors.rules.provider',
+  'auditors.rules.agentOptions.maxTokens',
+  'crossFamily.enabled',
+  'crossFamily.minRisk',
+  'crossFamily.pool',
+]
+
+/**
+ * The legacy keys that are STILL READ, and by what. `executor.agentOptions`
+ * (provider, model, reasoningEffort) becomes the `routing.roles.executor` lock
+ * and so pins the worker and executor-lead route; `auditors.<role>.agentOptions`
+ * becomes the matching auditor lock and so pins the reviewer route (`legacyRouteFor`
+ * in `./index.ts`, read by `routeForDelegation`). Everything else of the 0.2.x
+ * surface is in {@link RETIRED_CONFIG_KEYS}.
+ */
+export const LEGACY_KEYS_STILL_READ: readonly string[] = [
+  'executor.agentOptions.provider',
+  'executor.agentOptions.model',
+  'executor.agentOptions.reasoningEffort',
+  'auditors.plan.agentOptions.provider',
+  'auditors.plan.agentOptions.model',
+  'auditors.plan.agentOptions.reasoningEffort',
+  'auditors.execution.agentOptions.provider',
+  'auditors.execution.agentOptions.model',
+  'auditors.execution.agentOptions.reasoningEffort',
+  'auditors.rules.agentOptions.provider',
+  'auditors.rules.agentOptions.model',
+  'auditors.rules.agentOptions.reasoningEffort',
+]
+
+/** The retired keys the user actually wrote in `input`, in {@link RETIRED_CONFIG_KEYS} order. */
+export function retiredKeysIn(input: unknown): readonly string[] {
+  return RETIRED_CONFIG_KEYS.filter(path => {
+    let node: unknown = input
+    for (const part of path.split('.')) {
+      if (typeof node !== 'object' || node === null || Array.isArray(node)) return false
+      node = (node as Record<string, unknown>)[part]
+    }
+    // An EMPTY array is what the loader fills in for an unwritten array leaf, so it is not a written key.
+    return node !== undefined && !(Array.isArray(node) && node.length === 0)
+  })
+}
+
+/** One plain status note naming the ignored keys, or `undefined` when there are none. */
+export function retiredConfigNote(keys: readonly string[]): string | undefined {
+  if (keys.length === 0) return undefined
+  return `dsh-autopilot 0.3.0 ignores retired settings: ${keys.join(', ')}; they no longer have an effect.`
 }

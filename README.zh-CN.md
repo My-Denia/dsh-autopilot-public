@@ -2,7 +2,7 @@
 
 # dsh-autopilot
 
-[DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)（dsh）的「计划 → 执行 → 审计」插件。它把 goal-autopilot harness（GAH）工作流移植到 dsh 插件钩子上：先做计划，独立子代理审计计划，委派执行器干活，第二轮审计检查结果，每条验收标准都有证据才能收尾。
+[DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)（dsh）上的 goal-workflow 适配器。owner 说出一个目标后，主代理保留判断和沟通，把其他工作交给显式指定模型和 effort 的角色子代理，取得独立评审，并持续推进到 Done 检查全部成立。记录以 issue 和 PR 为准；插件只保留一份小账本，记下启动了谁、走了哪条路线、结果如何。
 
 [![npm](https://img.shields.io/npm/v/dsh-goal-autopilot?style=flat-square)](https://www.npmjs.com/package/dsh-goal-autopilot)
 [![CI](https://img.shields.io/github/actions/workflow/status/My-Denia/dsh-autopilot-public/ci.yml?branch=main&style=flat-square)](https://github.com/My-Denia/dsh-autopilot-public/actions/workflows/ci.yml)
@@ -13,60 +13,49 @@
 
 ## 安装
 
-需要 dsh `0.2.0`（或 `0.1.2-rc.1` / `0.1.5-rc.1`）和 Node 22+。
+这份源码是 `0.3.0`（未发布，不在 npm 上）。只面向 dsh `0.2.1-rc.5`，没有在其他宿主上测试过。需要 Node 22+。Windows 桌面版和 WSL CLI 各自按原生环境处理，不互相代替。
 
-**桌面版：** 设置 → Plugins → Add plugin，输入 `dsh-goal-autopilot@0.2.0`，点 Install，再 Enable。
-
-**CLI / 无头 / Web：**
+早于 `0.2.1-rc.5` 的宿主（`0.1.x`、`0.2.0`）请继续用 `dsh-goal-autopilot@0.2.0`，这是它们的最后一个版本。目前 npm `latest` 仍是 `0.2.0`，`0.3.0` 没有发布，需要用这份源码打出的 tarball 安装。
 
 ```sh
+# 0.1.x 或 0.2.0 宿主
 dsh plugin --profile <name> add dsh-goal-autopilot@0.2.0
 ```
 
-## 使用
+WSL CLI 的 profile 需要退回旧宿主时，先备份 profile，再执行 `npm i -g @deepseek-ai/dsh@0.1.5-rc.1`。
 
-在该 profile 的对话里：
+## 什么时候启动
 
-```text
-Use dsh-autopilot to implement <goal> and verify the result.
-```
+只有 owner 说出目标、要求 autopilot，或交来明显需要多个阶段的工作（多阶段、可并行的部分、要合入的 PR）时，技能才生效。这时代理调用 `get_goal`，没有当前目标就用 Outcome 作为目标内容调用 `create_goal`。
 
-手动调用 `autopilot_*` 工具见 [操作参考](./docs/reference.md)。
+提问、小而可逆的修改、普通的只读评审留在主线程，不创建目标，也不调用任何 `autopilot_*` 工具。
 
-## 工作方式
+## 目标怎么运行
 
-<p align="center"><img src="./assets/workflow.svg" width="100%" alt="dsh-autopilot 运行流程"></p>
+- 开始：读项目规则和 issue，把 Outcome、Done、Not in scope 写在 issue 或 PR 上，在 worktree 里工作。
+- 角色：主代理负责判断、整合和同 owner 沟通。`autopilot_delegate` 启动 `scout`（只读检索）、`clerk`（通过现有连接器做外部读写）、`worker`（带独立 `writePaths` 的有界实现）、`executor-lead`（负责一个工作块的完整交付，可再启动 scout、clerk、worker）、`planner`（只读规划或诊断）和 `reviewer`。跟踪子代理用 `autopilot_agents`（只有 `wait` 一个动作）以及宿主自带的 `list_agents`、`send_message`、`interrupt_agent`；卡住的子代理调用 `autopilot_escalate`。
+- 并行委派：互相独立的子代理在同一轮一起启动。`writePaths` 有重叠的 worker 会在启动前被拒绝。
+- 独立评审：`reviewer` 一次性、只读、全新上下文，只看 diff 和结论。能找到不同模型家族时用不同家族；找不到则允许同家族，并记录为「降低独立性」。
+- 模型与 effort：每次派发都写明模型和 effort（路由关闭或没有目录时除外：子代理沿用宿主路线，账本记为 inherit/host-default）。调用里的显式值或 profile 里的固定值优先于插件的选择。账本和卡片同时显示选定路线和实际观察到的路线。
+- 目标持久：目标存放在 dsh 自带的 `get_goal` / `create_goal` / `update_goal` 中，由宿主的 goal round driver 续推。阶段完成、开 PR、CI 变绿都不等于目标完成，只有 Done 检查全部成立才由代理标记完成。等待子代理或后台任务时在本轮内等待（`autopilot_agents` 的 `wait`、带 `wait` 的 `job_output`）。
+- 重启之后：运行中的子代理已丢失，目标保持未启用，直到 owner 说「continue」。`schedule_create` 设的提醒会在重启后送达，但不会重新启用目标。
+- 旧运行：0.2.x 写下的运行仍可读取，在卡片上只读显示，不会被续跑。
 
-一次运行依次经过 `planning` → `plan-reviewing` → `executing` → `execution-reviewing` → `completed`，状态存放在 `$DSH_HOME/storages/dsh-autopilot/runs/<sessionId>/`。
-
-- **计划门禁**：计划审计通过前，写文件和编辑被拦截，并请求只读沙箱。计划写明目标、范围、非目标、风险、里程碑和验收标准，并用 `autopilot_usage` 声明可观察的使用状态。
-- **独立审计**：审计者是一次性子代理，只读工具、`maxDepth: 1`，返回 `pass`、`needs-replan` 或 `blocked`。
-- **同一执行器续跑**：由一个可续跑的执行器完成工作；`needs-fix` 时由同一个执行器继续。
-- **出站拦截**：`git push`、`gh release`、`npm publish` 会被拦截，需要有效的证据清单（`<run>/outbound/manifest.json`）和 owner 批准。
-- **证据收尾**：两道门禁都通过、每条验收标准都有落盘产物之前，不允许 `completed`。
-- **轮次提醒**：代理中途停下时最多提醒三次。
-
-设计细节见 [DESIGN.md](./DESIGN.md)。
+工具参数、账本和配置见[操作参考](./docs/reference.md)。
 
 ## 状态
 
-开发者预览版。
-
-| | |
-| --- | --- |
-| 已测试 | WSL2 + dsh 0.2.0-rc.2，本地 mock 模型：安装、挂载、技能注册、计划审计、委派执行、needs-fix 续跑 |
-| 尚未测试 | 真实模型完整运行、macOS/Windows 桌面版、原生 Windows、浏览器卡片渲染 |
-| 宿主范围 | dsh 0.2.0 系列、0.1.5-rc.1、0.1.2-rc.1（0.1.7 与 0.2.1 不在 peer 范围内） |
-| 分发 | npm；GitHub Releases 只有说明，不附包 |
-
-见 [docs/compatibility.md](./docs/compatibility.md) 和 [docs/security.md](./docs/security.md)。
+开发者预览版，`0.3.0` 未发布。[已在真实宿主上验证](./docs/compatibility.md#verified-on-a-real-host)一节是在 Windows、dsh `0.2.1-rc.5`、headless profile、单一模型厂商下观察到的行为；[未验证](./docs/compatibility.md#not-verified-on-a-real-host)一节是没有观察到的（桌面端卡片渲染、阶段结束后的下一轮 goal、重启后的定时提醒、跨厂商 reviewer）。测试通过、mock 运行和状态读取都不算观察。[docs/compatibility.md](./docs/compatibility.md) 里更早的测量针对插件 `0.2.x`。
 
 ## 文档
 
-- [DESIGN.md](./DESIGN.md)：架构、GAH 映射、状态机
-- [docs/compatibility.md](./docs/compatibility.md)：dsh 版本、桌面版说明、沙箱
-- [docs/security.md](./docs/security.md)：批准、出站拦截、沙箱
-- [docs/reference.md](./docs/reference.md)：`autopilot_*` 工具、运行状态、使用类别
+- [docs/reference.md](./docs/reference.md)：工具、账本、配置
+- [docs/compatibility.md](./docs/compatibility.md)：宿主、历史、尚未验证的部分
+- [docs/security.md](./docs/security.md)：插件管什么、不管什么
+- [skill/dsh-autopilot/SKILL.md](./skill/dsh-autopilot/SKILL.md)：会话内的适配器
+- [skill/dsh-autopilot/references/model-routing.md](./skill/dsh-autopilot/references/model-routing.md)：工作类别、梯度、升档
+- [skill/dsh-autopilot/references/refusals.md](./skill/dsh-autopilot/references/refusals.md)：仍然存在的 `AP_*` 拒绝
+- [DESIGN.md](./DESIGN.md)：架构和设计历史
 - [CHANGELOG.md](./CHANGELOG.md)
 
 ## 开发

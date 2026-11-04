@@ -8,3 +8,7 @@ build/
 .test-tmp/
 goal-runs/
 tsconfig.client.local.json
+
+# Sensitive debug logs (may carry provider session/WAF cookies) — never commit
+zai-mcp-debug.log
+*-mcp-debug.log

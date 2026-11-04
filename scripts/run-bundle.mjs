@@ -274,6 +274,214 @@ assert('A18 a PTC session (run_code dispatches) yields a card from the shipped b
     calls: ptc.node?.data?.calls?.length ?? null,
   }))
 
-const TOTAL = 19
+// A19 — the gate-provenance row, through the SHIPPED bundle.
+//
+// The same M7 lesson as A18: a row that renders in the test tree and NOT in
+// `lib/client.js` is invisible on the real host, so the artifact is asked
+// directly. The payload is overlaid onto a REAL folded card rather than
+// hand-built, so the node keeps every field the card expects.
+const withGates = (() => {
+  const base = fold('inline')
+  if (base.node === null || base.node === undefined) return null
+  return {
+    ...base.node,
+    data: {
+      ...base.node.data,
+      gateSources: {
+        value: {
+          plan: { source: 'owner', planRevision: 1, ownerDecision: 1 },
+          execution: { source: 'auditor', planRevision: 1 },
+        },
+        revision: base.node.data.revision ?? 1,
+      },
+    },
+  }
+})()
+let gateMarkup = ''
+try {
+  gateMarkup = withGates === null
+    ? 'no folded node'
+    : renderToStaticMarkup(React.createElement(exports.AutopilotRunCard, { node: withGates }))
+} catch (error) {
+  gateMarkup = `render threw: ${error.message}`
+}
+assert('A19 the shipped bundle renders the gate-provenance row (owner vs auditor)',
+  gateMarkup.includes('data-autopilot-gate-source="plan"')
+  && gateMarkup.includes('the OWNER')
+  && gateMarkup.includes('a dispatched auditor')
+  && gateMarkup.includes('plan revision 1'),
+  gateMarkup.slice(0, 200))
+
+// A20+ — the v3 goal ledger view, through the SHIPPED bundle and the real react.
+const fixture = (name) => JSON.parse(readFileSync(resolve(root, `test/client/fixtures/${name}.json`), 'utf8'))
+const ledgerOf = (name) => fixture(name).ledger
+const renderView = (name) => {
+  try {
+    return renderToStaticMarkup(React.createElement(exports.GoalLedgerView, { ledger: ledgerOf(name) }))
+  } catch (error) {
+    return `render threw: ${error.message}`
+  }
+}
+const count = (text, needle) => text.split(needle).length - 1
+
+const parallel = renderView('active-parallel')
+const leadAt = parallel.indexOf('data-autopilot-delegation="')
+const workerRow = parallel.match(/<div style="[^"]*padding-left:16px[^"]*" data-autopilot-delegation="[^"]*"/)
+assert('A20 active-parallel: five delegation rows, worker nested after the lead, scouts running',
+  count(parallel, 'data-autopilot-delegation="') === 5
+  && workerRow !== null && workerRow.index > leadAt
+  && count(parallel, 'data-autopilot-state="running"') === 4
+  && parallel.includes('Goal autopilot'),
+  parallel.slice(0, 200))
+assert('A21 active-parallel: cross-family review, issue as text, https PR as href, javascript: not an href',
+  parallel.includes('data-autopilot-review-independence="cross-family"')
+  && parallel.includes('MY-195')
+  && !parallel.includes('href="MY-195')
+  && parallel.includes('href="https://github.com/example/repo/pull/12"')
+  && parallel.includes('target="_blank"')
+  && parallel.includes('rel="noreferrer"')
+  && !/href="javascript:/i.test(parallel))
+
+const lost = renderView('restart-lost')
+assert('A22 restart-lost: unavailable auto-continue, lost row, not restarted automatically',
+  lost.includes('auto-continue unavailable: released after host restart')
+  && lost.includes('data-autopilot-state="lost"')
+  && lost.includes('not restarted automatically'))
+
+const mismatch = renderView('mismatch')
+assert('A23 mismatch: the mismatching row is flagged with both efforts shown',
+  mismatch.includes('data-autopilot-route-match="mismatch"')
+  && mismatch.includes('MISMATCH')
+  && mismatch.includes('effort high')
+  && mismatch.includes('effort medium')
+  && mismatch.includes('var(--dsw-alias-state-error-primary)'))
+
+const reduced = renderView('reduced')
+assert('A24 reduced: reduced independence is marked and the 503 note is shown',
+  reduced.includes('data-autopilot-review-independence="reduced"')
+  && reduced.includes('reduced independence')
+  && reduced.includes('HTTP 503'))
+
+const paused = renderView('paused-no-driver')
+assert('A25 paused-no-driver: says there is no driver and only the owner can resume',
+  paused.includes('no goal round driver in this composition')
+  && paused.includes('only you can resume'))
+
+const legacyRun = fixture('legacy-run').run
+let legacyMarkup = ''
+try {
+  legacyMarkup = renderToStaticMarkup(React.createElement(exports.AutopilotRunCard, {
+    node: { data: { revision: 0, calls: [], audits: [], reinitSeqs: [], stale: false } },
+    ledger: ledgerOf('legacy-ledger'),
+    legacyRuns: [legacyRun],
+  }))
+} catch (error) {
+  legacyMarkup = `render threw: ${error.message}`
+}
+const ownerDecision = legacyRun.ownerResolutions?.[0]?.text ?? ''
+assert('A26 legacy: archived section with amendments, owner decision and the rejected run',
+  legacyMarkup.startsWith('<div style="border:1px solid var(--dsw-alias-border-l2)')
+  && legacyMarkup.includes('data-autopilot-legacy=""')
+  && legacyMarkup.includes('Autopilot run')
+  && legacyMarkup.includes('archived, read-only')
+  && legacyMarkup.includes('data-autopilot-legacy-run="session-legacy-amend-01"')
+  && legacyMarkup.includes('data-autopilot-legacy-detail="session-legacy-amend-01"')
+  && legacyMarkup.includes('2 amendments')
+  && ownerDecision.length > 0 && legacyMarkup.includes(ownerDecision.replace(/&/g, '&amp;'))
+  && legacyMarkup.includes('data-autopilot-legacy-run="session-legacy-bad-02"')
+  && legacyMarkup.includes('could not be read'),
+  legacyMarkup.slice(0, 200))
+
+let emptyMarkup = ''
+try {
+  emptyMarkup = renderToStaticMarkup(React.createElement(exports.AutopilotRunCard, {
+    node: { data: { revision: 0, calls: [{ seq: 1, time: 0, name: 'autopilot_status', failed: false }], audits: [], reinitSeqs: [], stale: false } },
+  }))
+} catch (error) {
+  emptyMarkup = `render threw: ${error.message}`
+}
+assert('A27 no ledger and no v1 data: only the placeholder line, no archived section',
+  emptyMarkup.includes('Goal autopilot')
+  && emptyMarkup.includes('no goal ledger recorded for this session')
+  && !emptyMarkup.includes('data-autopilot-legacy=""'))
+
+const rendered = [parallel, lost, mismatch, reduced, paused, legacyMarkup, emptyMarkup, markup, delegatedMarkup]
+assert('A28 no rendered view has a button or a retired action',
+  rendered.every(m => !/<button/i.test(m) && !/approve|submit closeout|pass gate/i.test(m)),
+  JSON.stringify(rendered.map(m => /<button|approve|submit closeout|pass gate/i.exec(m)?.[0] ?? null)))
+
+assert('A29 v1 fold lives in the archived section only when the fold holds v1 data',
+  markup.includes('data-autopilot-legacy=""') && markup.includes('data-autopilot-run-fold=""')
+  && gateMarkup.includes('title="archived: ')
+  && !emptyMarkup.includes('data-autopilot-run-fold=""'))
+
+// A30 — a pre-upgrade v1 session the ledger route does not know: the card
+// still shows the archived run detail it fetched once by the fold's poll key,
+// including the sandbox-restore line and the amendment/owner history.
+let noLedgerV1 = ''
+try {
+  const archived = JSON.parse(readFileSync(resolve(root, 'test/client/fixtures/legacy-run.json'), 'utf8')).run
+  noLedgerV1 = renderToStaticMarkup(React.createElement(exports.AutopilotRunCard, {
+    node: fold('inline').node, legacyRuns: [archived],
+  }))
+} catch (error) {
+  noLedgerV1 = `render threw: ${error.message}`
+}
+assert('A30 no ledger, real v1 fold: archived detail still renders with sandbox and history',
+  noLedgerV1.includes('no goal ledger recorded for this session')
+  && noLedgerV1.includes('data-autopilot-legacy-detail="session-legacy-amend-01"')
+  && noLedgerV1.includes('sandbox restored to workspace-write')
+  && noLedgerV1.includes('2 amendments')
+  && noLedgerV1.includes('owner passed the plan gate after amendment')
+  && noLedgerV1.includes('data-autopilot-run-fold=""'),
+  noLedgerV1.slice(0, 160))
+
+// A32 — a goal-only session (native get_goal, no autopilot_* call), through the
+// SHIPPED bundle: the card anchors, asks the ledger route for the ROOT session
+// id, renders nothing on 404 no-ledger, and stays one card when an autopilot
+// call joins. (renderToStaticMarkup runs no effects, so the request is asserted
+// on the bundle's own fetchLedger/ledgerSessionId, which the card's hook calls.)
+const goalCall = (seq, name) => ({ type: 'tool/call', seq, time: seq, data: { name, callId: `g${seq}`, arguments: '{}' } })
+const foldEvents = (events) => {
+  let state
+  let starts = 0
+  const key = 'autopilot-run:run'
+  for (const event of events) {
+    const m = definition.match(event)
+    if (m === null) continue
+    if (m.role === 'start') { starts += 1; state = definition.start(); continue }
+    state = definition.update({ key, id: 'run', state, start: undefined, matches: [] },
+      { event, role: 'update', location: { kind: 'session' } })
+  }
+  return { starts, node: definition.buildViewNode({ key, id: 'run', state, start: undefined, matches: [] }) }
+}
+const turnOne = { type: 'turn/start', seq: 1, time: 1, data: { turn: 1 } }
+const goalOnly = foldEvents([turnOne, goalCall(4, 'get_goal')])
+const mixed = foldEvents([turnOne, goalCall(4, 'get_goal'), goalCall(6, 'autopilot_status')])
+const requested = []
+let goalLedger = 'unset'
+try {
+  goalLedger = await exports.fetchLedger(exports.ledgerSessionId({ sessionId: 'child-9', rootSessionId: 'root-1' }), async (url) => {
+    requested.push(url)
+    return { ok: false, status: 404, json: async () => ({ ok: false, error: 'no-ledger' }) }
+  })
+} catch (error) {
+  goalLedger = `threw: ${error.message}`
+}
+let goalMarkup = 'unset'
+try {
+  goalMarkup = renderToStaticMarkup(React.createElement(exports.AutopilotRunCard, { node: goalOnly.node, sessionId: 'root-1' }))
+} catch (error) {
+  goalMarkup = `render threw: ${error.message}`
+}
+assert('A32 a goal-only session (get_goal, no autopilot_*) anchors one card, requests the ledger for the root id, renders nothing on 404',
+  goalOnly.starts === 1 && goalOnly.node !== null && goalOnly.node.anchorSeq === 4
+  && goalOnly.node.data.calls.length === 0
+  && mixed.starts === 1 && mixed.node?.anchorSeq === 4 && mixed.node.data.calls.length === 1
+  && requested.length === 1 && requested[0].includes('session=root-1') && !requested[0].includes('child-9')
+  && goalLedger === undefined && goalMarkup === '',
+  JSON.stringify({ anchor: goalOnly.node?.anchorSeq ?? null, requested, goalLedger: String(goalLedger), goalMarkup }))
+
+const TOTAL = 32
 console.log(`\n${failures === 0 ? `ALL GREEN (${TOTAL} assertions)` : `${failures} RED of ${TOTAL}`}`)
 process.exitCode = failures === 0 ? 0 : 1

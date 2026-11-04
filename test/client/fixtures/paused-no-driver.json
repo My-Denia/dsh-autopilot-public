@@ -1,0 +1,31 @@
+{
+ "ok": true,
+ "ledger": {
+  "v": 3,
+  "sessionId": "session-synthetic-0001",
+  "revision": 7,
+  "previousGoals": [],
+  "delegations": [],
+  "reviews": [],
+  "links": [],
+  "autoContinue": {
+   "available": false,
+   "reason": "no goal round driver in this composition"
+  },
+  "depth": {
+   "executorLead": 2,
+   "source": "plugin-default"
+  },
+  "legacyRuns": [],
+  "notes": [],
+  "updatedAt": "2026-11-04T10:00:00Z",
+  "goal": {
+   "goalId": "goal-synth-a",
+   "revision": 3,
+   "status": "paused",
+   "objective": "Ship the synthetic card fixture goal",
+   "firstSeenAt": "2026-11-04T09:00:00Z",
+   "lastSeenAt": "2026-11-04T10:00:00Z"
+  }
+ }
+}

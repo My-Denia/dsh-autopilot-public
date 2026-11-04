@@ -1,118 +1,120 @@
 /**
- * dsh-autopilot plugin entry.
+ * dsh-autopilot plugin entry (0.3.0).
  *
  * One Cordis plugin that composes:
- * - the AutopilotEngine (event-sourced run state machine over a chosen store)
- * - per-root controller tools + tool guard + turn-stop reminder
- * - the native egress seam (tools/pre-execute + tools/execute) with the
- *   synchronous guard as its fail-closed fallback
- * - the autopilot:policy prompt section (root and executor-child flavors)
- * - the executor-child packet tool + guard (continuable setup)
- * - the read-only `ctx.autopilot` service
+ * - the AutopilotEngine (the slim per-session ledger writer; no run state machine)
+ * - the per-root `autopilot_status` tool (read-only)
+ * - the autopilot:policy prompt section (empty unless a host restart lost children)
+ * - the routing wiring and onboarding section
+ * - the bundled skill publication
+ * - the read-only `ctx.autopilot` service and its web routes (ledger + legacy runs)
  *
- * Config (all optional; the declared schema is `./config.js`):
- *   auditProvider / executorProvider: subagent transport provider (default 'spawn')
- *   auditors: { plan|execution|rules: { provider?, agentOptions? { provider, model, maxTokens? } } }
- *   executor: { agentOptions?, persona?, toolAllowList? }
- *   crossFamily: { enabled?, minRisk?, pool? } — seek an auditor outside the executor's family
- *   routing: { mode? auto|off, preference? balanced|economy|quality, roles? { executor, planner,
- *             planAuditor, executionAuditor, rulesAuditor: { mode? auto|inherit|locked,
- *             lock? { provider, model, reasoningEffort? }, minContext? } } } — role-true model routing
- *   gate: { sandboxCoupling?, toolDeny?, egressDeny?, stopReminder?, strictShell?, restoreMode? }
- *   storeKind: 'auto' | 'file' | 'domain' (default 'auto')
- *   storeRoot: run directory root (default $DSH_HOME/storages/dsh-autopilot)
- *   skillInstall: 'auto' | 'off' (default 'auto') — publish the bundled SKILL.md through the
- *               native skill registry (ctx.skills) when that service is present, else copy it
- *               into the skill-scan root; 'off' publishes through neither channel
+ * The 0.2.x run state machine, gates, outbound manifest and executor-child
+ * surface are retired. Their old run streams are still shown, read-only, by
+ * `src/legacy`, and a session a 0.2.x run left read-only is restored once, lazily,
+ * when it is opened.
+ *
+ * Config (all optional; the declared schema is `./config.js`). Every 0.2.x key is
+ * still ACCEPTED so an old config loads; the retired ones have no effect and are
+ * named once in a status note (`RETIRED_CONFIG_KEYS`).
+ *   routing: { mode, preference, roles, ladder, workClasses } — model routing
+ *   storeRoot: directory root for file ledgers and legacy run streams
+ *   skillInstall: 'auto' | 'off' — publish the bundled SKILL.md
  */
 
 import { AutopilotEngine } from './engine.js'
-import type { AgentOptionsLike, AgentRef, EnvironmentProbes, ResolvedConfig, ResolvedRouting, RoutingPorts } from './engine.js'
-import { installChildEgressGuard, installRootGate } from './gate/install.js'
-import type { GateAgentRef } from './gate/install.js'
-import { installPreExecuteGate } from './gate/preexecute.js'
-import type { PreExecuteHost } from './gate/preexecute.js'
-import { renderExecutorPolicy, renderRootPolicy } from './policy.js'
+import type { NativeGoalView } from './engine.js'
+import type { AgentOptionsLike, AgentRef, ResolvedConfig, ResolvedCostOverride, ResolvedLadder, ResolvedRouting, RoutingPorts } from './engine.js'
+import { observeOnboardingReachability, renderRoutingOnboarding } from './routing/onboarding.js'
+import type { WorkClassReachabilityReport } from './routing/coverage.js'
+import { renderRootPolicy } from './policy.js'
 import { createAutopilotService, registerAutopilotService } from './service.js'
 import { installAutopilotRoutes } from './web.js'
 import type { ProvideHost } from './service.js'
-import { RunStore, defaultStoreRoot } from './store/file.js'
-import { DomainRunStore } from './store/domain.js'
-import type { DomainFacilityLike } from './store/domain.js'
-import type { RunStoreLike } from './store/types.js'
-import { installRootTools, packetToolDefinition } from './tools.js'
-import { DEFAULT_EXECUTOR_TOOLS } from './config.js'
+import { defaultStoreRoot } from './store/file.js'
+import { AUTOPILOT_DOMAIN_SPEC, LEDGERS_TABLE, legacyDomainReaderOf } from './store/domain.js'
+import type { DomainFacilityLike, DomainLike, KvTableLike } from './store/domain.js'
+import { FileLedgerStore, legacySourcesOf } from './store/ledger.js'
+import type { LedgerStoreLike } from './store/ledger.js'
+import type { LegacySources } from './legacy/index.js'
+import { installRootTools } from './tools.js'
+import { DEFAULT_EXECUTOR_TOOLS, retiredConfigNote, retiredKeysIn } from './config.js'
 import { BUNDLED_SKILL_PROVIDER_NAME, BUNDLED_SKILL_PROVIDER_RANK, publishBundledSkill } from './skill-register.js'
 import type { SkillPublicationResult, SkillRegistryLike } from './skill-register.js'
 import type { SkillSyncResult } from './skill-install.js'
 import { DEFAULT_ROLE_MIN_CONTEXT } from './routing/select.js'
 import type { Role, RoleRouting, RoutePreference } from './routing/select.js'
+import { DEFAULT_WORK_CLASSES, WORK_CLASS_AXES, WORK_CLASS_NAMES } from './routing/work-class.js'
+import type { ResolvedWorkClass, WorkClassAxis, WorkClassName, WorkClassTier } from './routing/work-class.js'
 import { toRoutePin } from './routing/identity.js'
 import { RouteCatalog } from './routing/catalog.js'
 import type { LlmRuntimeSubset } from './routing/catalog.js'
 import type { SessionPolicyState } from './routing/authorize.js'
-import type { AuditRole, EgressChannel, StoreKind, Risk } from './domain/types.js'
+import type { ModelSelectionSetting } from './roles/route.js'
+import { errorMessage } from './domain/types.js'
+import type { AuditRole, Risk } from './domain/types.js'
 
 export * from './domain/types.js'
-export { foldRun, applyEvent } from './domain/fold.js'
-export {
-  USAGE_UNDECLARED_ENTRY,
-  hasFormatSignature,
-  settleUsageArtifacts,
-  usageDeclarationProblems,
-  validateUsageEntry,
-} from './domain/usage.js'
-export type { SettleUsageOptions, UsageArtifactRead } from './domain/usage.js'
-export { AutopilotEngine, approvalAuthorizes, effectiveSandboxMode, routeRoleOf } from './engine.js'
-export type { EnvironmentProbes, ResolvedConfig, ResolvedRouting, RoutingPorts, StatusView } from './engine.js'
-export { RunStore, defaultStoreRoot } from './store/file.js'
-export { AUTOPILOT_DOMAIN_SPEC, DomainRunStore, eventKey, parseEventKey } from './store/domain.js'
+export * from './domain/ledger-types.js'
+export { REFUSALS } from './domain/refusals.js'
+export type { RefusalCode } from './domain/refusals.js'
+export { AutopilotEngine, effectiveSandboxMode, observedRouteOf } from './engine.js'
+export type { EnginePorts, EnvironmentProbes, NativeGoalView, ResolvedConfig, ResolvedRouting, RoutingPorts } from './engine.js'
+export { defaultStoreRoot } from './store/file.js'
+export { AUTOPILOT_DOMAIN_SPEC, legacyDomainReaderOf } from './store/domain.js'
 export type { DomainFacilityLike } from './store/domain.js'
-export type { RunStoreLike } from './store/types.js'
-export {
-  EGRESS_FAIL_CLOSED_REASON,
-  SHELL_TOOLS,
-  commandTextOf,
-  decideTool,
-  egressCommandOf,
-  egressSegments,
-  isEgressCommand,
-} from './gate/decide.js'
-export type { GateConfig, GateDecision } from './gate/decide.js'
-export { MAX_PENDING_EGRESS_AUTHORIZATIONS, decideEgress, installPreExecuteGate } from './gate/preexecute.js'
-export type { PreDecision, PreExecuteHost, PreExecuteOptions } from './gate/preexecute.js'
-export {
-  archiveConsumed,
-  countClaims,
-  manifestPath,
-  matchesAtTokenBoundary,
-  parseManifest,
-  validateManifest,
-} from './outbound/manifest.js'
-export { hasDirectHumanTurn } from './tools.js'
-export { renderRootPolicy, renderExecutorPolicy } from './policy.js'
+export { FileLedgerStore, emptyLedger } from './store/ledger.js'
+export type { LedgerStoreLike } from './store/ledger.js'
+export { installChildTools } from './tools.js'
+export { Delegator, autoContinueFor, routeMatchOf } from './delegate.js'
+export { findWriteConflict, pathsIntersect } from './roles/paths.js'
+export { renderRootPolicy } from './policy.js'
 export { createAutopilotService, registerAutopilotService } from './service.js'
 export type { AutopilotReadOnly } from './service.js'
 export {
   AUTOPILOT_API_PREFIX,
   installAutopilotRoutes,
   makeAutopilotRoutes,
-  projectEnforcement,
-  projectRun,
-  projectRuns,
+  projectLedger,
   queryParam,
 } from './web.js'
-export type { AutopilotWebRoute, EnforcementProjection, RunProjection, RunsBody } from './web.js'
-export { Config, DEFAULT_EXECUTOR_TOOLS, StoreKindSchema } from './config.js'
+export type { AutopilotWebRoute } from './web.js'
+export { Config, DEFAULT_EXECUTOR_TOOLS, LEGACY_KEYS_STILL_READ, RETIRED_CONFIG_KEYS, StoreKindSchema, retiredConfigNote, retiredKeysIn } from './config.js'
 export type { Role, RoleRouting, RoutePreference } from './routing/select.js'
+export { coverageReport, coverageRouteKey, workClassReachability } from './routing/coverage.js'
+export type {
+  CoverageCatalog,
+  CoverageLadder,
+  CoverageOutcome,
+  CoverageReport,
+  ModelReachability,
+  ReachabilityOutcome,
+  WorkClassReachabilityReport,
+} from './routing/coverage.js'
+export { DEFAULT_WORK_CLASSES, WORK_CLASS_AXES, WORK_CLASS_NAMES, resolveWorkClassSelection } from './routing/work-class.js'
+export type { ResolvedWorkClass, WorkClassAxis, WorkClassName, WorkClassSelection, WorkClassTier } from './routing/work-class.js'
+export { observeOnboardingReachability, renderRoutingOnboarding } from './routing/onboarding.js'
+export type { RoutingOnboardingInput } from './routing/onboarding.js'
+export type { ResolvedCostOverride, ResolvedLadder } from './engine.js'
 export {
+  BUNDLED_SKILL_REFERENCES,
   SKILL_HOME_ENV,
+  SKILL_REFERENCES_DIR,
   SKILL_RELATIVE,
   bundledSkillPath,
+  bundledSkillRoot,
   skillHome,
   syncBundledSkill,
+  syncBundledSkillTree,
 } from './skill-install.js'
-export type { DestKind, SkillInstallStatus, SkillSyncIo, SkillSyncResult } from './skill-install.js'
+export type {
+  DestKind,
+  SkillInstallStatus,
+  SkillSyncIo,
+  SkillSyncResult,
+  SkillTreeFileResult,
+  SkillTreeSyncResult,
+} from './skill-install.js'
 export {
   BUNDLED_SKILL_PROVIDER_NAME,
   BUNDLED_SKILL_PROVIDER_RANK,
@@ -129,15 +131,14 @@ export type {
   SkillCandidate,
   SkillDefinition,
   SkillInvocationPolicy,
-  SkillLookupOptions,
   SkillProvider,
   SkillProviderControl,
-  SkillProviderObservation,
   SkillPublicationResult,
   SkillRegistryLike,
   SkillResourceBase,
   SkillSource,
   SkillSummary,
+  SkillLookupOptions,
 } from './skill-register.js'
 
 /** Cordis plugin name. */
@@ -192,6 +193,7 @@ export interface ConfigInput {
    * references structurally so both paths produce the same resolved config.
    */
   readonly routing?: RoutingInput
+  /** RETIRED in 0.3.0 and ignored: the gates are gone. Accepted so an old config still loads. */
   readonly gate?: {
     sandboxCoupling?: boolean
     toolDeny?: boolean
@@ -200,7 +202,11 @@ export interface ConfigInput {
     strictShell?: boolean
     restoreMode?: string
   }
-  /** Which backend holds the canonical event stream; 'auto' probes for ctx.storageDomain. */
+  /**
+   * RETIRED in 0.3.0 and ignored (reported once as a status note). The ledger
+   * always goes to one file per root session under `<storeRoot>/ledgers/`;
+   * legacy runs are read from the file root AND `ctx.storageDomain` regardless.
+   */
   readonly storeKind?: 'auto' | 'file' | 'domain'
   readonly storeRoot?: string
   /**
@@ -215,6 +221,11 @@ export interface ConfigInput {
    * a differing dest is a warning.
    */
   readonly skillInstall?: 'auto' | 'off'
+  /** RETIRED in 0.3.0 and ignored (audit rounds and the egress policy no longer exist). */
+  readonly governance?: {
+    readonly maxAuditRoundsPerRole?: number
+    readonly unattended?: boolean
+  }
 }
 
 /**
@@ -239,18 +250,77 @@ export interface RoleRoutingInput {
   readonly mode?: 'auto' | 'inherit' | 'locked'
   readonly lock?: RouteLockInput
   readonly minContext?: number
+  /**
+   * The work class this role draws from (DESIGN §1.2). Absent = the role
+   * default (`DEFAULT_ROLE_WORK_CLASS`: executor/planner `simple`, auditors
+   * `audit`). Written alongside a resolved locked/inherit role it is dropped,
+   * not honored — the same doctrine as `minContext`: those modes make no
+   * selection, so no class governs them.
+   */
+  readonly workClass?: WorkClassName
+}
+
+/** One work class as a profile may override it (`routing.workClasses.<name>`). */
+export interface WorkClassInput {
+  /** The ladder tiers this class draws members from. Empty = entry by the class's own thresholds (mechanical). */
+  readonly tiers?: readonly WorkClassTier[]
+  /** The dominant ordering axis of the class. */
+  readonly axis?: WorkClassAxis
 }
 
 /** The `routing` section as a profile may write it. */
 export interface RoutingInput {
   readonly mode?: 'auto' | 'off'
-  readonly preference?: 'balanced' | 'economy' | 'quality'
+  readonly preference?: 'balanced' | 'economy' | 'quality' | 'axis'
+  /**
+   * A2 (DESIGN section 9 item 13): the owner opt-in that lets the ordering-axis
+   * path become the effective default. It applies ONLY when no explicit
+   * preference is detectable (`preferenceSource === 'default'` — see
+   * `resolveRouting` for why a written 'balanced' counts as default): an
+   * owner who never picked a preference gets 'axis' instead of the provisional
+   * 'balanced', while any explicit preference (including an explicit 'axis')
+   * is untouched. Shipped default `false` — the plugin never flips a
+   * deployment's ranking on its own.
+   */
+  readonly orderingAxisDefault?: boolean
   readonly roles?: {
     readonly executor?: RoleRoutingInput
     readonly planner?: RoleRoutingInput
     readonly planAuditor?: RoleRoutingInput
     readonly executionAuditor?: RoleRoutingInput
     readonly rulesAuditor?: RoleRoutingInput
+  }
+  readonly ladder?: {
+    readonly tiers?: {
+      readonly economy?: readonly string[]
+      readonly standard?: readonly string[]
+      readonly reserve?: readonly string[]
+    }
+    readonly auditTier?: 'economy' | 'standard' | 'reserve' | 'none'
+    /**
+     * Engine-level rotation (DESIGN §9 item 15). Volatile, default off: when
+     * true a healthy pin yields to a full re-selection at the role's next
+     * dispatch (repinFrom + reason rotation). An auditor's offset stays within
+     * its independence class — never overriding independence; the executor's
+     * offset is its own dispatch count within the ranked survivor list, and a
+     * LIVE executor child is never re-routed (only `startExecutor` reaches the
+     * resolver; `resumeExecutor` continues the child on its recorded route).
+     */
+    readonly rotation?: boolean
+    readonly speedOrder?: readonly string[]
+    readonly costOverrides?: readonly string[]
+  }
+  /**
+   * Per-class overrides of the owner-table work classes (DESIGN §1.2). Class
+   * names are fixed paths (the same schemastery volatile constraint as the
+   * ladder tier names); a class absent here keeps the owner-table default.
+   */
+  readonly workClasses?: {
+    readonly mechanical?: WorkClassInput
+    readonly simple?: WorkClassInput
+    readonly hard?: WorkClassInput
+    readonly audit?: WorkClassInput
+    readonly extreme?: WorkClassInput
   }
 }
 
@@ -474,14 +544,41 @@ function legacyRouteFor(role: Role, input?: ConfigInput): { provider: string; mo
  * the floor governs auto selections only (a locked route is an explicit
  * owner selection and an inherited dispatch runs on the deployment default).
  */
+/**
+ * Whether this host exposes a config-edit surface the root agent may use to
+ * fix the routing ladder itself (DESIGN §9 item 12): the plan's
+ * `ctx.configEditor.edit()` / `ctx.settings.edit()` surfaces, probed
+ * structurally. A host without either (the desktop host this run targets
+ * included) takes the owner-edit degrade path in the onboarding text.
+ */
+function probeConfigEditor(rawCtx: unknown): boolean {
+  const hasEdit = (service: unknown) => typeof (service as { edit?: unknown } | undefined)?.edit === 'function'
+  return hasEdit(lookupService(rawCtx, 'configEditor')) || hasEdit(lookupService(rawCtx, 'settings'))
+}
+
 function resolveRouting(input?: ConfigInput): ResolvedRouting {
   const routing = input?.routing
   const mode = readSetting(routing?.mode) ?? 'auto'
-  const preference = readSetting(routing?.preference) ?? 'balanced'
+  const writtenPreference = readSetting(routing?.preference)
+  const preference = writtenPreference ?? 'balanced'
   if (mode !== 'auto' && mode !== 'off') throw new Error(`routing.mode must be 'auto' or 'off' (got ${JSON.stringify(mode)})`)
-  if (preference !== 'balanced' && preference !== 'economy' && preference !== 'quality') {
-    throw new Error(`routing.preference must be 'balanced', 'economy' or 'quality' (got ${JSON.stringify(preference)})`)
+  if (preference !== 'balanced' && preference !== 'economy' && preference !== 'quality' && preference !== 'axis') {
+    throw new Error(`routing.preference must be 'balanced', 'economy', 'quality' or 'axis' (got ${JSON.stringify(preference)})`)
   }
+  // A2 (DESIGN section 9 item 13): explicit-vs-default preference. The ceiling
+  // documented above applies verbatim — a preference WRITTEN as exactly the
+  // default is indistinguishable from an absent one on the loader path, so
+  // only a non-'balanced' value counts as explicit, on BOTH paths (the
+  // deep-equality fixture forbids path-dependent answers). The axis promotion
+  // fires only on the default source AND the owner's explicit opt-in leaf:
+  // the plugin never re-ranks a deployment that did not ask for it.
+  const preferenceSource: 'explicit' | 'default' =
+    writtenPreference !== undefined && writtenPreference !== 'balanced' ? 'explicit' : 'default'
+  const axisDefault = readSetting(routing?.orderingAxisDefault) ?? false
+  if (typeof axisDefault !== 'boolean') {
+    throw new Error(`routing.orderingAxisDefault must be a boolean (got ${JSON.stringify(axisDefault)})`)
+  }
+  const effectivePreference = preferenceSource === 'explicit' ? preference : (axisDefault ? 'axis' : preference)
   const roles = {} as Record<Role, RoleRouting>
   for (const key of ROLE_CONFIG_KEYS) {
     const role = ROLE_OF[key]
@@ -489,6 +586,10 @@ function resolveRouting(input?: ConfigInput): ResolvedRouting {
     const entryMode = readSetting(entry?.mode)
     const lockRoute = lockRouteOf(readSetting(entry?.lock))
     const minContext = readSetting(entry?.minContext)
+    const workClass = readSetting(entry?.workClass)
+    if (workClass !== undefined && !WORK_CLASS_NAMES.includes(workClass as WorkClassName)) {
+      throw new Error(`routing.roles.${key}.workClass must be one of ${WORK_CLASS_NAMES.join(' | ')} (got ${JSON.stringify(workClass)})`)
+    }
     const modeIsExplicit = entryMode !== undefined && entryMode !== DEFAULT_ROLE_MODE[role]
     if (entryMode === 'locked' && lockRoute === undefined) {
       throw new Error(`routing.roles.${key}.mode is "locked" but lock names no provider/model route — refusing to guess a route`)
@@ -513,28 +614,118 @@ function resolveRouting(input?: ConfigInput): ResolvedRouting {
       roles[role] = { mode: 'locked', ...legacy }
       continue
     }
-    roles[role] = { mode: 'auto', minContext: minContext ?? DEFAULT_ROLE_MIN_CONTEXT[role] }
+    roles[role] = {
+      mode: 'auto',
+      minContext: minContext ?? DEFAULT_ROLE_MIN_CONTEXT[role],
+      ...(workClass === undefined ? {} : { workClass: workClass as WorkClassName }),
+    }
   }
-  return { mode, preference, roles }
+  return { mode, preference: effectivePreference, preferenceSource, roles, ladder: resolveLadder(input), workClasses: resolveWorkClasses(input) }
+}
+
+/**
+ * Resolve the five work classes (DESIGN §1.2). Owner values win per class; a
+ * silent class keeps the owner-table default. A malformed tier or axis is
+ * REFUSED with its path, never dropped — a silently ignored class override
+ * would leave the owner believing a dispatch draws from tiers it does not.
+ */
+function resolveWorkClasses(input?: ConfigInput): Readonly<Record<WorkClassName, ResolvedWorkClass>> {
+  const raw = input?.routing?.workClasses
+  const out = {} as Record<WorkClassName, ResolvedWorkClass>
+  for (const name of WORK_CLASS_NAMES) {
+    const defaults = DEFAULT_WORK_CLASSES[name]
+    const entry = readSetting(raw?.[name])
+    const rawTiers = readSetting(entry?.tiers)
+    let tiers: readonly WorkClassTier[] = defaults.tiers
+    if (rawTiers !== undefined) {
+      if (!Array.isArray(rawTiers)) {
+        throw new Error(`routing.workClasses.${name}.tiers must be an array of 'economy' | 'standard' | 'reserve'`)
+      }
+      const seen: WorkClassTier[] = []
+      for (const tier of rawTiers) {
+        const value = readSetting(tier)
+        if (value !== 'economy' && value !== 'standard' && value !== 'reserve') {
+          throw new Error(`routing.workClasses.${name}.tiers entry must be 'economy', 'standard' or 'reserve' (got ${JSON.stringify(value)})`)
+        }
+        if (!seen.includes(value)) seen.push(value)
+      }
+      tiers = seen
+    }
+    const axis = readSetting(entry?.axis) ?? defaults.axis
+    if (!WORK_CLASS_AXES.includes(axis as WorkClassAxis)) {
+      throw new Error(`routing.workClasses.${name}.axis must be one of ${WORK_CLASS_AXES.join(' | ')} (got ${JSON.stringify(axis)})`)
+    }
+    out[name] = { name, tiers, axis: axis as WorkClassAxis }
+  }
+  return out
+}
+
+/** `provider/model=inputPerM/outputPerM`. Anything else is refused, never ignored. */
+const COST_OVERRIDE_PATTERN = /^([^/=]+)\/([^=]+)=([0-9]+(?:\.[0-9]+)?)\/([0-9]+(?:\.[0-9]+)?)$/
+
+/** Read an optional array-of-strings leaf, trim-exact, dropping blanks. */
+function ladderList(value: unknown): readonly string[] {
+  if (!Array.isArray(value)) return []
+  return value.filter((entry): entry is string => typeof entry === 'string').map(entry => entry.trim()).filter(entry => entry.length > 0)
+}
+
+function parseCostOverride(entry: string): ResolvedCostOverride {
+  const match = COST_OVERRIDE_PATTERN.exec(entry.trim())
+  const provider = (match?.[1] ?? '').trim()
+  const model = (match?.[2] ?? '').trim()
+  const inputPerM = Number(match?.[3])
+  const outputPerM = Number(match?.[4])
+  if (match === null || provider.length === 0 || model.length === 0
+    || !Number.isFinite(inputPerM) || !Number.isFinite(outputPerM) || inputPerM <= 0 || outputPerM <= 0) {
+    throw new Error(`routing.ladder.costOverrides entry ${JSON.stringify(entry)} is malformed — expected "provider/model=inputPerM/outputPerM" with positive prices`)
+  }
+  return { provider, model, inputPerM, outputPerM }
+}
+
+/**
+ * Resolve the owner's ladder.
+ *
+ * Owner values win; a declared default applies only where the owner is silent.
+ * Nothing here is derived from a model name or id, and a malformed cost
+ * override is REFUSED rather than dropped, because a silently ignored pricing
+ * instruction would leave the owner believing a route costs what it does not.
+ */
+function resolveLadder(input?: ConfigInput): ResolvedLadder {
+  const raw = input?.routing?.ladder
+  const tiers = readSetting(raw?.tiers)
+  const auditTier = readSetting(raw?.auditTier)
+  if (auditTier !== undefined && auditTier !== 'economy' && auditTier !== 'standard' && auditTier !== 'reserve' && auditTier !== 'none') {
+    throw new Error(`routing.ladder.auditTier must be 'economy', 'standard', 'reserve' or 'none' (got ${JSON.stringify(auditTier)})`)
+  }
+  return {
+    tiers: {
+      economy: ladderList(readSetting(tiers?.economy)),
+      standard: ladderList(readSetting(tiers?.standard)),
+      reserve: ladderList(readSetting(tiers?.reserve)),
+    },
+    auditTier: auditTier ?? 'none',
+    rotation: readSetting(raw?.rotation) === true,
+    speedOrder: ladderList(readSetting(raw?.speedOrder)),
+    costOverrides: ladderList(readSetting(raw?.costOverrides)).map(parseCostOverride),
+  }
 }
 
 /** Resolve raw config with defaults (manual, defensive — the schema governs writes, this governs reads). */
 export function resolveConfig(input?: ConfigInput): ResolvedConfig {
   const executorAgentOptions = presentOrAbsent(input?.executor?.agentOptions)
+  // The retired 0.2.x keys (auditProvider, executorProvider, executor.persona, executor.toolAllowList, crossFamily.*)
+  // are not read: they resolve to their shipped values whatever the input says, so the loader path and the plain
+  // path agree. `executor.agentOptions` and `auditors.<role>.agentOptions` are still read, through `resolveRouting`.
   return {
-    auditProvider: input?.auditProvider ?? 'spawn',
-    executorProvider: input?.executorProvider ?? 'spawn',
+    auditProvider: 'spawn',
+    executorProvider: 'spawn',
     auditors: compactAuditors(input?.auditors),
     executor: {
       ...(executorAgentOptions === undefined ? {} : { agentOptions: executorAgentOptions }),
-      persona: input?.executor?.persona ?? '',
-      toolAllowList: [...(input?.executor?.toolAllowList ?? DEFAULT_EXECUTOR_TOOLS)],
+      persona: '',
+      toolAllowList: [...DEFAULT_EXECUTOR_TOOLS],
     },
-    crossFamily: {
-      enabled: input?.crossFamily?.enabled ?? true,
-      minRisk: input?.crossFamily?.minRisk ?? 'medium',
-      pool: [...(input?.crossFamily?.pool ?? [])],
-    },
+    crossFamily: { enabled: true, minRisk: 'medium', pool: [] },
     routing: resolveRouting(input),
     gate: {
       sandboxCoupling: input?.gate?.sandboxCoupling ?? true,
@@ -545,6 +736,18 @@ export function resolveConfig(input?: ConfigInput): ResolvedConfig {
       restoreMode: input?.gate?.restoreMode ?? 'workspace-write',
     },
     skillInstall: input?.skillInstall ?? 'auto',
+    // Mirrors the loader path field-for-field: an unset governance section
+    // resolves to an EMPTY object on both paths (the engine reads
+    // governance?.maxAuditRoundsPerRole / governance?.unattended and treats
+    // absent as off).
+    governance: {
+      ...(input?.governance?.maxAuditRoundsPerRole === undefined
+        ? {}
+        : { maxAuditRoundsPerRole: input.governance.maxAuditRoundsPerRole }),
+      ...(input?.governance?.unattended === undefined
+        ? {}
+        : { unattended: input.governance.unattended }),
+    },
   }
 }
 
@@ -555,12 +758,6 @@ interface PluginContext {
     list(): Iterable<unknown>
     roots(): unknown[]
   }
-  /**
-   * dsh 0.1.2 removed `registerContinuableSetup` (the activation-setup
-   * registry is gone; child composition is owned by the subagent manager's
-   * private `setup` callback). The plugin reaches a child's scope through
-   * `agent/created` instead — see the executor-child block in `apply`.
-   */
   subagents: Record<string, unknown>
   systemPrompt: {
     section(section: {
@@ -571,7 +768,6 @@ interface PluginContext {
   }
   on(event: string, listener: (payload: never) => void): () => void
 }
-
 /**
  * Look one service up on a raw context the way dsh itself does: `ctx.get(name)`
  * first (property reads on undeclared services are not reliable), falling back
@@ -635,144 +831,133 @@ function info(rawCtx: unknown, message: string): void {
     // A logger that throws is still only a logger.
   }
 }
+/**
+ * The host's resolved default sandbox mode (`ctx.sandboxPolicy.defaultMode`), or
+ * `undefined` when the service is absent or the value is not a string. The lazy
+ * clamp restore writes it when a legacy run recorded no prior mode.
+ */
+/** Every tool name registered in the global scope, or `undefined` when the registry cannot be listed (or is empty). */
+export function registeredToolNamesOf(rawCtx: unknown): readonly string[] | undefined {
+  try {
+    const tools = lookupService(rawCtx, 'tools') as { schemas?: () => Array<{ name?: unknown }> } | undefined | null
+    const names = tools?.schemas?.().map(schema => schema.name).filter((name): name is string => typeof name === 'string')
+    return names === undefined || names.length === 0 ? undefined : names
+  } catch {
+    return undefined
+  }
+}
 
 /**
- * Bearer for the enforcement 'active' claim: BOTH the confine provider
- * ('sandbox') and the policy service ('sandboxPolicy') must be observable on
- * the context — mode events fold through sandboxPolicy, and shell consumers
- * confine argv through sandbox, so read-only holds only when both exist.
- * Any probe failure reads as unavailable (degraded, honest).
+ * The native subagent `maxDepth` setting. `ctx.subagents.config.maxDepth` is a
+ * volatile reference (`.get()`); a plain number is tolerated. Its shipped default
+ * is 1, which cannot be told from an explicit 1.
  */
-export function probeSandbox(rawCtx: unknown): boolean {
+export function subagentMaxDepthOf(rawCtx: unknown): number | undefined {
   try {
-    const confine = lookupService(rawCtx, 'sandbox')
-    const policy = lookupService(rawCtx, 'sandboxPolicy')
-    return confine !== undefined && confine !== null && policy !== undefined && policy !== null
+    const subagents = lookupService(rawCtx, 'subagents') as { config?: { maxDepth?: unknown } } | undefined | null
+    const setting = subagents?.config?.maxDepth
+    const value = typeof setting === 'number' ? setting : (setting as { get?: () => unknown } | undefined)?.get?.()
+    return typeof value === 'number' && Number.isFinite(value) ? value : undefined
   } catch {
+    return undefined
+  }
+}
+
+/** The session's native goal view from `ctx.goals.get(agent)` (dsh-goal), or `undefined` when there is no service or no goal. */
+export function readNativeGoal(rawCtx: unknown, root: unknown): NativeGoalView | undefined {
+  const goals = lookupService(rawCtx, 'goals') as { get?: (agent: unknown) => unknown } | undefined | null
+  const view = goals?.get?.(root) as Partial<NativeGoalView> | undefined
+  if (view === undefined || view === null || typeof view.id !== 'string') return undefined
+  return {
+    id: view.id,
+    revision: typeof view.revision === 'number' ? view.revision : 0,
+    objective: typeof view.objective === 'string' ? view.objective : '',
+    phase: typeof view.phase === 'string' ? view.phase : 'unknown',
+    maxGoalRounds: typeof view.maxGoalRounds === 'number' ? view.maxGoalRounds : 0,
+    roundsStarted: typeof view.roundsStarted === 'number' ? view.roundsStarted : 0,
+    activation: view.activation === 'armed' ? 'armed' : 'disarmed',
+    ...(view.blockedReason === undefined ? {} : { blockedReason: view.blockedReason }),
+  }
+}
+
+/**
+ * Whether the composition mounts an enabled goal round driver
+ * (`@deepseek-ai/dsh-goal-round-driver`, loader entry id `goal-round-driver`).
+ * The driver provides no service, so the only evidence is the loader's entry
+ * tree. `undefined` means the tree could not be inspected, which is NOT the same
+ * as false.
+ */
+export function goalDriverPresentIn(rawCtx: unknown): boolean | undefined {
+  try {
+    const loader = lookupService(rawCtx, 'loader') as { tree?: { entries?: () => Iterable<unknown> }; entries?: () => Iterable<unknown> } | undefined | null
+    const entries = loader?.tree?.entries?.() ?? loader?.entries?.()
+    if (entries === undefined) return undefined
+    for (const raw of entries) {
+      const entry = raw as { options?: { name?: unknown; id?: unknown; disabled?: unknown }; fiber?: { state?: unknown } }
+      const name = entry.options?.name
+      const id = entry.options?.id
+      const isDriver = (typeof name === 'string' && /goal-round-driver$/.test(name)) || id === 'goal-round-driver'
+      if (!isDriver) continue
+      if (entry.options?.disabled === true) continue
+      // An entry whose fiber has not loaded (or failed) is not a driver that will run.
+      if (typeof entry.fiber?.state === 'number' && entry.fiber.state !== 2) continue
+      return true
+    }
     return false
-  }
-}
-
-/**
- * The event the approval service waterfalls to reach its answerers
- * (`packages/interaction/user-approval/src/index.ts`: `ctx.waterfall(…,
- * 'approval/request', req, () => 'unavailable')`). With NO listener registered
- * under this name the waterfall falls straight through to its fail-closed
- * default, so every ask on that deployment resolves 'unavailable'.
- */
-const APPROVAL_REQUEST_EVENT = 'approval/request'
-
-/**
- * The deployment default policy under which the service short-circuits every
- * ask to 'rejected' BEFORE dispatching to any answerer (`ApprovalService.decide`).
- * Reachable in a shipped profile, not a hypothetical: the base bundle sets
- * `policy: 'never'` whenever `DSH_PERMISSION_MODE === 'danger-full-access'`
- * (`packages/bundle/base/cordis.patch.yml`).
- */
-const NEVER_POLICY = 'never'
-
-/**
- * What the mount can actually SEE about the owner-approval channel.
- *
- * - 'answerable'   — a service is present, its deployment default policy can
- *                    prompt, and at least one answerer is composed.
- * - 'unanswerable' — a service is present but no ask can reach a human: the
- *                    default policy is 'never' (deterministic 'rejected'), or
- *                    the answerer chain is empty (fail-closed 'unavailable').
- * - 'absent'       — no approval service at all.
- *
- * WHY THREE STATES AND NOT THE OLD PRESENCE CHECK. `probeApproval` used to ask
- * only whether the service object was non-null, while both of its siblings
- * ({@link probeSandbox}, {@link probeStorageDomain}) ask whether the service can
- * do its job. Measured on the real host: one run recorded
- * `"approval":"native"` while every `approval/asked` in that same session
- * resolved `{"outcome":"unavailable"}` — the headless profile mounts the service
- * (base bundle) and composes no answerer (no ACP bridge, no api-proxy), so the
- * presence check was structurally unable to be false exactly where the claim was
- * false. That is the pseudo-active defect class DESIGN.md §6 was written about,
- * recurring in a new field after `enforcement.sandbox` already paid for the
- * lesson once.
- *
- * WHAT IS HONESTLY OBSERVABLE FROM HERE, AND WHAT IS NOT. The answerer chain IS
- * inspectable: `_hooks` is a declared field of cordis's `EventsService`
- * (`vendor/cordis/src/events.ts`) holding one array per event name, one
- * `EventsService` instance is shared by the root context and every context
- * extended from it, and every dsh answerer registers through the ordinary
- * `ctx.on('approval/request', …)` (`packages/acp/acp`, `packages/host/apiproxy`)
- * — so an empty entry is positive evidence that no ask can be answered. The
- * deployment default policy IS readable: `ApprovalService` keeps it as a public
- * `config` field. Two things are NOT observable from a bare context and are
- * therefore deliberately not claimed: the SESSION-level override
- * (`effectiveApprovalPolicy` folds the asking session's own log, which this
- * probe never sees) and whether a composed answerer's own scope filter admits
- * the asking agent. 'answerable' states that an ask can REACH an answerer, never
- * that a human will say yes — which is exactly what `Enforcement.approval`
- * claims and no more.
- *
- * Every read is defensive and every failure reads DOWN, so a probe that cannot
- * see cannot upgrade a claim.
- */
-export type ApprovalObservation = 'answerable' | 'unanswerable' | 'absent'
-
-/** Whether any listener is composed for {@link APPROVAL_REQUEST_EVENT}. */
-function approvalAnswererComposed(rawCtx: unknown): boolean {
-  try {
-    const events = lookupService(rawCtx, 'events')
-    if (events === null || typeof events !== 'object') return false
-    const hooks = (events as { _hooks?: unknown })._hooks
-    if (hooks === null || typeof hooks !== 'object') return false
-    const listeners = (hooks as Record<string, unknown>)[APPROVAL_REQUEST_EVENT]
-    return Array.isArray(listeners) && listeners.length > 0
   } catch {
-    return false
+    return undefined
   }
 }
 
 /**
- * Whether the service's DEPLOYMENT DEFAULT policy rejects every ask outright.
- *
- * An unreadable config is NOT treated as 'never': absence of the field is not
- * evidence of the value. The positive evidence this probe requires lives in
- * {@link approvalAnswererComposed}; this function only removes a claim the code
- * can see is false.
+ * The user's `subagentModelSelection` setting, read live from the host's
+ * `ctx.subagentModelSelection` service (`current()` returns
+ * `{ enabled, allowedModels }`). The setting is only ever a RESTRICTION on
+ * delegation routing (see `roles/route.ts`); it is never selection authority.
+ * `undefined` when the service is absent, throws (the host rejects an enabled
+ * list with no routes), or answers a malformed shape: routing then behaves as
+ * if the setting did not exist. `onUnreadable` fires only for a throw or a
+ * malformed answer, never for a plainly absent service.
  */
-function approvalPolicyRejectsEverything(approval: unknown): boolean {
+export function modelSelectionSettingOf(rawCtx: unknown, onUnreadable: (message: string) => void = () => {}): ModelSelectionSetting | undefined {
+  let service: unknown
   try {
-    const config = (approval as { config?: unknown }).config
-    if (config === null || typeof config !== 'object') return false
-    return (config as { policy?: unknown }).policy === NEVER_POLICY
+    service = lookupService(rawCtx, 'subagentModelSelection')
   } catch {
-    return false
+    return undefined
+  }
+  if (service === null || typeof service !== 'object') return undefined
+  const current = (service as { current?: unknown }).current
+  if (typeof current !== 'function') return undefined
+  try {
+    const value = (current as () => unknown).call(service) as { enabled?: unknown; allowedModels?: unknown } | null | undefined
+    if (value === null || typeof value !== 'object' || typeof value.enabled !== 'boolean' || !Array.isArray(value.allowedModels)) {
+      onUnreadable('dsh-autopilot: the subagentModelSelection setting answered an unexpected shape; delegation routing ignores it')
+      return undefined
+    }
+    const allowedModels: Array<{ provider: string; model: string }> = []
+    for (const entry of value.allowedModels as unknown[]) {
+      const route = entry as { provider?: unknown; model?: unknown } | null
+      if (route === null || typeof route !== 'object' || typeof route.provider !== 'string' || typeof route.model !== 'string') {
+        onUnreadable('dsh-autopilot: the subagentModelSelection setting lists a malformed route; delegation routing ignores it')
+        return undefined
+      }
+      allowedModels.push({ provider: route.provider, model: route.model })
+    }
+    return { enabled: value.enabled, allowedModels }
+  } catch (error) {
+    onUnreadable(`dsh-autopilot: the subagentModelSelection setting is unreadable (${describeError(error)}); delegation routing ignores it`)
+    return undefined
   }
 }
 
-/** See {@link ApprovalObservation}. */
-export function observeApproval(rawCtx: unknown): ApprovalObservation {
-  let approval: unknown
+export function sandboxDefaultModeOf(rawCtx: unknown): string | undefined {
   try {
-    approval = lookupService(rawCtx, 'approval')
+    const policy = lookupService(rawCtx, 'sandboxPolicy') as { defaultMode?: unknown } | undefined | null
+    return typeof policy?.defaultMode === 'string' ? policy.defaultMode : undefined
   } catch {
-    return 'absent'
+    return undefined
   }
-  if (approval === undefined || approval === null) return 'absent'
-  if (approvalPolicyRejectsEverything(approval)) return 'unanswerable'
-  return approvalAnswererComposed(rawCtx) ? 'answerable' : 'unanswerable'
-}
-
-/**
- * Bearer for `Enforcement.approval: 'native'`.
- *
- * BOOLEAN because `EnvironmentProbes.approvalAvailable` — and the two-state
- * `ApprovalChannel` the engine writes from it — is a boolean; the three-state
- * fact is {@link observeApproval}. Both non-'answerable' states collapse to the
- * same recorded value, and that value is TRUE of both: the only owner channel
- * left is the direct-human-turn `autopilot_signal owner-approve`, which is what
- * 'signal-only' names. Distinguishing "no service" from "a service nothing can
- * answer" in the durable record needs a third `ApprovalChannel` member, which
- * lives in `./domain/types.js` and `./engine.js`.
- */
-export function probeApproval(rawCtx: unknown): boolean {
-  return observeApproval(rawCtx) === 'answerable'
 }
 
 /**
@@ -934,6 +1119,14 @@ export interface RoutingWiring {
    * semantics — the port simply appears when the import lands.
    */
   readonly installerReady: Promise<void>
+  /**
+   * The session policy KIND for one agent's session, read through the SAME
+   * reader the engine authorizes with. The M5 onboarding notice needs it:
+   * `absent`/`unreachable` means the ladder selects nothing in this session,
+   * and a notice about unreachable models that stayed silent about that would
+   * read as if autonomous selection were live.
+   */
+  readonly policyStateFor: (root: { session: unknown }) => SessionPolicyState['kind']
   /** Releases the mirror projection registration and the adapters-updated subscription. */
   dispose: () => void
 }
@@ -1079,6 +1272,12 @@ export function createRoutingWiring(rawCtx: unknown, onWarn: (message: string) =
   return {
     ports,
     installerReady,
+    /**
+     * The rendering session's policy KIND, for the M5 onboarding notice: the
+     * same reader the engine authorizes with, so the notice and the dispatch
+     * can never disagree about whether this session can select at all.
+     */
+    policyStateFor: (root: { session: unknown }): SessionPolicyState['kind'] => policyReader(root as AgentRef).kind,
     dispose: () => {
       for (const dispose of disposers.splice(0).reverse()) {
         try {
@@ -1092,325 +1291,76 @@ export function createRoutingWiring(rawCtx: unknown, onWarn: (message: string) =
 }
 
 /**
- * Which seam is actually enforcing egress, from what was observed — never from
- * what was configured.
+ * What {@link resolveStore} chose, and what it opened.
  *
- * @param seamInstalled - whether `tools/pre-execute` accepted our listener for
- * the scope being asked about. `undefined` means no root scope has been
- * configured under that name yet, which reads as the less capable value: a run
- * must never record 'native-ask' on the strength of some OTHER scope's seam.
- * @param egressDeny - the owner's master switch.
- */
-export function resolveEgressChannel(seamInstalled: boolean | undefined, egressDeny: boolean): EgressChannel {
-  if (!egressDeny) return 'off'
-  return seamInstalled === true ? 'native-ask' : 'guard-deny'
-}
-
-/**
- * What {@link resolveStore} chose and — when 'auto' did not get the domain
- * backend — WHY.
- *
- * The reason exists because `Enforcement.store: 'file'` is ambiguous by
- * construction: it reads identically on a deployment that mounts no
- * `ctx.storageDomain` at all (headless, by design, nothing wrong) and on one
- * that mounts a facility whose `open()` threw (a real degrade an operator needs
- * to know about). The 'auto' branch used to swallow the second case in a bare
- * `catch {}` and record nothing anywhere, so the two were indistinguishable
- * after the fact — and the thrown error, the only thing that said WHAT broke,
- * was discarded at the point it was caught.
+ * The domain is opened AT MOST ONCE: upstream `DomainFacility.open` refuses a
+ * name that is already open, so the legacy reader and the ledger migration share
+ * one handle, and `close` releases it exactly once.
  */
 export interface StoreResolution {
-  /** The backend the run's canonical event stream will use. */
-  readonly store: RunStoreLike
-  /**
-   * Why 'auto' did not get the domain backend. ABSENT when nothing degraded:
-   * files were what the operator asked for, or the domain opened.
-   */
+  /** Where ledgers are written: always one file per root session under `<root>/ledgers/`. */
+  readonly ledgers: LedgerStoreLike
+  /** Where the frozen legacy reader looks: the file root AND the domain when there is one, always. */
+  readonly sources: LegacySources
+  /** Why the domain could not be read (legacy history and ledger migration), when a facility was expected to give it. */
   readonly degraded?: string
+  /** Release what was opened. Idempotent. */
+  readonly close: () => Promise<void>
 }
 
-/** No facility on this deployment at all — the expected headless shape. */
+/** No facility on this deployment at all, the expected headless shape. */
 const NO_FACILITY_REASON = 'ctx.storageDomain is not observable on this deployment (it is mounted by the web-app bundle only)'
 
 /**
- * Choose the store backend.
+ * Open the ledger store and the legacy sources.
  *
- * 'domain' is a REQUIREMENT, not a preference: if the operator asked for it
- * and the facility is absent, mounting on files anyway would silently give the
- * deployment a backend it did not ask for. 'auto' is allowed to fall back,
- * because falling back is what 'auto' means — and it now returns WHY alongside
- * the store, so the fallback is visible rather than assumed.
+ * Ledgers always go to `<root>/ledgers/<id>.json`. The domain is still opened
+ * when the host mounts one, READ-ONLY: its `events`/`runs` tables are legacy
+ * history, and its `ledgers` table is what earlier 0.3.0 builds wrote, migrated
+ * to files on first load of each session. The host's JSON backend keeps the whole
+ * domain in one file that each process republishes on any put, so writing it from
+ * two processes lost rows; nothing here writes it any more. A facility that is
+ * present but cannot open says why in `degraded`; the ledgers are unaffected.
  */
-export async function resolveStore(
-  rawCtx: unknown,
-  kind: StoreKind | 'auto',
-  root: string,
-): Promise<StoreResolution> {
-  if (kind === 'file') return { store: new RunStore(root) }
+export async function resolveStore(rawCtx: unknown, root: string): Promise<StoreResolution> {
   const facility = probeStorageDomain(rawCtx)
-  if (kind === 'domain') {
-    if (facility === undefined) {
-      throw new Error(`storeKind "domain" was configured but ${NO_FACILITY_REASON}`)
-    }
-    return { store: await DomainRunStore.open(facility, undefined, { root }) }
-  }
-  if (facility === undefined) return { store: new RunStore(root), degraded: NO_FACILITY_REASON }
-  try {
-    return { store: await DomainRunStore.open(facility, undefined, { root }) }
-  } catch (error: unknown) {
-    // 'auto' degrades to files; `Enforcement.store` will say 'file', and the
-    // reason travels out with the store instead of dying in the catch.
-    return {
-      store: new RunStore(root),
-      degraded: `ctx.storageDomain.open() threw: ${describeError(error)}`,
+  let domain: DomainLike | undefined
+  let degraded: string | undefined
+  if (facility === undefined) {
+    degraded = NO_FACILITY_REASON
+  } else {
+    try {
+      domain = await facility.open(AUTOPILOT_DOMAIN_SPEC)
+    } catch (error: unknown) {
+      degraded = `ctx.storageDomain.open() threw: ${describeError(error)}`
     }
   }
-}
-
-/**
- * The child's own scoped context (`agent.ctx` of the agent announced by
- * `agent/created`; on dsh 0.1.1 the same object reached us through the
- * `registerContinuableSetup` registry).
- *
- * `agent` is declared as an OWN PROPERTY alongside `get`, because that is the
- * shape dsh 0.1.1–0.1.5 produced — see {@link createContinuableChildSetup}.
- * On dsh 0.1.7+ reading it throws (strict inject); see
- * {@link recognizeExecutorChild}, which prefers the announced Agent.
- */
-export interface ContinuableChildContext {
-  get(name: string): unknown
-  agent?: unknown
-  tools: {
-    register(definition: unknown): () => void
-    guard(fn: (execution: { name: string; arguments: unknown }) => string | undefined): () => void
+  const sources = legacySourcesOf(root, domain === undefined ? undefined : legacyDomainReaderOf(domain))
+  let closed = false
+  const close = async (): Promise<void> => {
+    if (closed || domain === undefined) return
+    closed = true
+    await domain.close()
   }
-}
-
-/**
- * Build the executor-child setup callback: packet tool + egress guard + native
- * egress seam, bound to the PARENT run.
- *
- * EXTRACTED FROM `apply()` so it has a surface a test can drive. It used to be
- * reachable only through `ctx.subagents.registerContinuableSetup` (dsh 0.1.1;
- * since 0.1.2 `apply()` calls it on `agent/created` with the child's `ctx`),
- * and at that time it was covered by exactly nothing — the suite's fake host
- * stubbed the registry with `() => () => {}` and never invoked the callback —
- * and it was broken:
- *
- * `childCtx.get('agent')` is UNCONDITIONALLY undefined on a real cordis 4.0.1
- * context. dsh publishes the agent with `ctx.accessor('agent', { get: … })`
- * plus `root.extend({ agent })`, never `ctx.provide('agent', …)`; an accessor
- * installs a property, and `Context.prototype.get` resolves only PROVIDED
- * services. So `rootId` stayed undefined, this function returned `() => {}`,
- * and a delegated child received no `tools/pre-execute` egress seam, no
- * `installChildEgressGuard`, and no `autopilot_submit_packet` — which is
- * registered at exactly one site, here. Delegated runs were therefore BOTH
- * ungated for egress AND unable to submit their packet.
- *
- * The fix is the module's own {@link lookupService}, which documents this exact
- * hazard ("property reads on undeclared services are not reliable") and tries
- * `get` first and the property second — so a host that DOES provide the service
- * and a host that only extends the context both resolve.
- */
-export function createContinuableChildSetup(
-  engine: AutopilotEngine,
-  gate: ResolvedConfig['gate'],
-): (childCtx: ContinuableChildContext) => () => void {
-  return (childCtx) => {
-    const rootId = recognizeExecutorChild(engine, childCtx)
-    if (rootId === undefined) return () => {}
-    return installExecutorChildSurface(engine, gate, childCtx, rootId)
+  let migrateFrom: KvTableLike | undefined
+  if (domain !== undefined) {
+    try { migrateFrom = domain.table(LEDGERS_TABLE) } catch { migrateFrom = undefined }
   }
-}
-
-/**
- * Is this child context the LIVE executor of a run this engine holds?
- *
- * Never throws: any lookup failure reads as "not recognized", because an
- * unrecognized child is a no-op by contract and must never veto its own
- * publication. Recognition works at announce time because `startExecutor`
- * commits `executor.state: 'starting'` with the minted childId BEFORE it calls
- * `startContinuable` (src/engine.ts).
- *
- * PREFER THE ANNOUNCED AGENT. `agent/created` hands the Agent itself to the
- * listener, and since dsh 0.1.7 that is the ONLY reliable way to reach it from
- * this plugin: on a real 0.2.0-rc.2 host `childCtx.get('agent')` is undefined
- * and the property read throws `cannot get property "agent" without inject`
- * (cordis strict-inject check; measured 2026-10-07, run
- * dsh-020-compat-20261007). The swallowed throw read as "not recognized", so
- * the delegated executor got no packet tool, no egress guard and no seam. The
- * context lookup stays only as the fallback for callers that hold nothing but
- * the context ({@link createContinuableChildSetup}).
- *
- * @param announced - the Agent from `agent/created`, when the caller has it.
- * @returns the parent run's root session id, or undefined.
- */
-export function recognizeExecutorChild(
-  engine: AutopilotEngine,
-  childCtx: ContinuableChildContext,
-  announced?: unknown,
-): string | undefined {
-  try {
-    const child = (announced ?? lookupService(childCtx, 'agent') ?? childCtx.agent) as AgentRef | undefined
-    if (child === undefined || child === null) return undefined
-    const parentId = child.session.header.parentSession
-    if (parentId === undefined) return undefined
-    const run = engine.peek(parentId)
-    if (run?.executor?.childId === child.id
-      && (run.executor.state === 'running' || run.executor.state === 'starting')) {
-      return parentId
-    }
-    return undefined
-  } catch {
-    return undefined
-  }
-}
-
-/** Cleanup failures collected while rolling back or disposing a child surface. */
-export interface ChildSurfaceCleanupFailure {
-  readonly step: 'seam' | 'packet-tool' | 'egress-guard'
-  readonly error: unknown
-}
-
-/**
- * Install the recognized executor child's surface — pre-execute seam, packet
- * tool, egress guard — TRANSACTIONALLY.
- *
- * CONTRACT (owner ruling 2026-09-04, Codex P2 on PR #6):
- *  - the three steps install in order; each successful step's disposer is
- *    kept;
- *  - when a later step throws, every already-installed step is rolled back in
- *    REVERSE order, each in its own try/catch, and then the ORIGINAL error is
- *    rethrown. A cleanup failure never masks it: failures are attached to the
- *    error as a non-enumerable `rollbackFailures` array (when the error is an
- *    object) and handed to `onCleanupFailure`;
- *  - the returned disposer attempts EVERY disposer in reverse order, each in
- *    its own try/catch, and only after attempting all of them throws an
- *    `AggregateError` naming the failed steps — so nothing is left half
- *    registered and a direct caller still learns of a failure.
- *
- * Nothing is registered on the caller's side until this returns: the caller
- * records the disposer only after a complete, successful install.
- *
- * @param onCleanupFailure - receives each cleanup failure (rollback or dispose); used for the plugin's warn channel.
- *   It is a NOTIFICATION: it is invoked in its own try/catch, so a throwing
- *   reporter neither stops the remaining disposers nor replaces the error the
- *   caller must see.
- */
-export function installExecutorChildSurface(
-  engine: AutopilotEngine,
-  gate: ResolvedConfig['gate'],
-  childCtx: ContinuableChildContext,
-  rootId: string,
-  onCleanupFailure: (failure: ChildSurfaceCleanupFailure) => void = () => {},
-): () => void {
-  const installed: Array<{ step: ChildSurfaceCleanupFailure['step']; dispose: () => void }> = []
-  const unwind = (): ChildSurfaceCleanupFailure[] => {
-    const failures: ChildSurfaceCleanupFailure[] = []
-    for (const entry of installed.splice(0).reverse()) {
-      try {
-        entry.dispose()
-      } catch (error: unknown) {
-        failures.push({ step: entry.step, error })
-        // REPORTING NEVER STEERS UNWINDING (Codex P2 on PR #6). `onCleanupFailure`
-        // is caller-supplied — the plugin passes a logger-backed warn — and a throw
-        // from it would escape the loop with `installed` already drained, leaving the
-        // remaining disposers unattempted and, on the rollback path, replacing the
-        // original install error with the reporter's. It is a notification, not a step.
-        try {
-          onCleanupFailure({ step: entry.step, error })
-        } catch {
-          // a reporter that cannot report changes nothing about the unwind.
-        }
-      }
-    }
-    return failures
-  }
-  try {
-    const childSeam = installPreExecuteGate(childCtx as unknown as PreExecuteHost, rootId, engine)
-    installed.push({ step: 'seam', dispose: childSeam.dispose })
-    installed.push({ step: 'packet-tool', dispose: childCtx.tools.register(packetToolDefinition(engine)) })
-    installed.push({
-      step: 'egress-guard',
-      dispose: installChildEgressGuard(childCtx.tools, rootId, engine, {
-        ...gate,
-        egressSeam: resolveEgressChannel(childSeam.installed, gate.egressDeny),
-      }),
-    })
-  } catch (error: unknown) {
-    const failures = unwind()
-    if (failures.length > 0 && typeof error === 'object' && error !== null) {
-      // BEST EFFORT, and it must stay that way: a frozen or otherwise
-      // non-extensible thrown value makes `defineProperty` throw, and letting
-      // THAT escape would replace the install failure with a TypeError about
-      // the annotation — exactly the masking this path exists to prevent
-      // (Codex P2 on PR #6). The failures still reached `onCleanupFailure`.
-      try {
-        Object.defineProperty(error, 'rollbackFailures', { value: failures, enumerable: false, configurable: true })
-      } catch {
-        // annotation refused; the original error travels unchanged.
-      }
-    }
-    throw error
-  }
-  let disposed = false
-  return () => {
-    if (disposed) return
-    disposed = true
-    const failures = unwind()
-    if (failures.length > 0) {
-      throw new AggregateError(
-        failures.map(failure => failure.error),
-        `child surface cleanup failed at ${failures.map(failure => failure.step).join(', ')} (every disposer was attempted)`,
-      )
-    }
-  }
+  const ledgers = FileLedgerStore.open(root, migrateFrom === undefined ? {} : { migrateFrom })
+  return { ledgers, sources, ...(degraded === undefined ? {} : { degraded }), close }
 }
 
 /**
  * Cordis plugin apply.
  *
- * ASYNC ON PURPOSE — that IS the fix for the mount-time race, and the seam is
- * the return value.
- *
- * WHAT CORDIS DOES WITH IT. A plugin's return value is its effect body: the
- * fiber's runner is `runtime.callback(this.ctx, this.config)`, `_execute()`
- * takes the `'then' in effect` branch for a thenable, and `_reload()` AWAITS
- * that before the fiber leaves LOADING (`vendor/cordis/src/fiber.ts`). So a
- * promise returned from here holds the fiber's `inertia` open, and every seam
- * that waits on a fiber therefore waits on this store:
- * `EntryTree.await()` collects `entry.fiber?.inertia`
- * (`vendor/loader/src/config/tree.ts`); `boot()` awaits `loader.await()` and
- * then refuses any entry that is not ACTIVE (`assertEntriesActivated`,
- * `packages/boot/app-boot/src/index.ts`); and the headless runner awaits
- * `ctx.get('loader')?.await()` in so many words BEFORE `agents.create()`
- * ("Loader siblings mount concurrently. Await the complete application before
- * creating an Agent so its scoped tools and adapters are not half-composed" —
- * `packages/bundle/headless/src/index.ts`).
- *
- * WHAT IT REPLACES, AND WHY THAT LOST THE RACE. Everything below used to be
- * registered inside `ctx.effect(async () => …)` while `apply` itself returned
- * `void`. An inner effect's setup promise is NOT what `_reload()` awaits — only
- * the plugin's own return value is — so the fiber reported ACTIVE with an EMPTY
- * autopilot surface, `loader.await()` returned, and the runner created the
- * session and composed the first request while `DomainRunStore.open` was still
- * doing tens of milliseconds of real fs I/O. Measured on the real host: 3 of 39
- * domain-backed boots lost that race and carried 25 tools / 0 `autopilot_*` in
- * `request/header` where a healthy boot carries 36 / 11; 0 of 20 file-store
- * boots lost it, only because `new RunStore()` constructs synchronously. The
- * store backend silently decided whether a run had a harness in it.
- *
- * WHY NOT REGISTER THE TOOLS SYNCHRONOUSLY AND LET THE STORE LAND BEHIND THEM.
- * That re-opens the split-brain window this comment used to be about: a run
- * admitted before the store resolves puts its first events in one backend and
- * the rest in another, and that stream folds to nothing coherent in either. It
- * trades a visible missing tool surface for an invisible corrupt event stream,
- * which is the worse of the two failures. The third option — failing closed —
- * is what this shape already gives for free: a store that cannot open rejects
- * `apply`, the fiber goes FAILED, and `boot()` refuses to start rather than
- * starting a harness with no harness in it.
- *
- * Exactly one store instance ever exists per mount, as before.
+ * ASYNC ON PURPOSE: the returned promise holds the fiber's `inertia` open, and
+ * every seam that waits on a fiber (`loader.await()`, `boot()`'s activation
+ * check, the headless runner creating its first Agent) therefore waits for the
+ * ledger store to open. Registering the surface synchronously and letting the
+ * store land behind it would let a root session be admitted with half a plugin;
+ * a store that cannot open rejects `apply` and fails the mount instead (the
+ * fiber goes FAILED and `boot()` refuses to start). Exactly one store instance
+ * ever exists per mount.
  */
 export async function apply(rawCtx: unknown, config?: ConfigInput): Promise<() => Promise<void>> {
   const ctx = rawCtx as PluginContext
@@ -1418,259 +1368,238 @@ export async function apply(rawCtx: unknown, config?: ConfigInput): Promise<() =
 
   const resolution = await resolveStore(
     rawCtx,
-    config?.storeKind ?? 'auto',
     config?.storeRoot !== undefined && config.storeRoot.length > 0 ? config.storeRoot : defaultStoreRoot(),
   )
-  const store = resolution.store
-  if (resolution.degraded !== undefined) {
-    // The one place a degrade is still visible. `enforcement.store` records
-    // WHICH backend the run got; only this says what it was supposed to get and
-    // what stopped it, which is the difference between "this deployment has no
-    // storageDomain" and "this deployment's storageDomain is broken".
-    warn(rawCtx, `dsh-autopilot: storeKind "auto" resolved to the ${store.kind} store: ${resolution.degraded}`)
+  // A deployment with no storage-domain facility at all is the expected headless shape and says
+  // nothing (`ctx.autopilot.storeKind` already reads "file"). A facility that is present but cannot
+  // open is a real degrade, and only the thrown reason tells the two apart afterwards.
+  if (resolution.degraded !== undefined && probeStorageDomain(rawCtx) !== undefined) {
+    warn(rawCtx, `dsh-autopilot: legacy history and ledger migration from the storage domain are unavailable: ${resolution.degraded}`)
   }
 
-  // EVERY registration below can throw, and until the disposer exists there
-  // is nothing to release the store. That matters because upstream
-  // `DomainFacility.open` refuses a name that is already open: a partial
-  // mount that never closed leaves the domain reserved for the life of the
-  // process, and every later mount under storeKind "auto" quietly degrades
-  // to the file backend. So the failure path closes what it opened, then
-  // rethrows the original error unchanged. F19 (PR #2 Codex round 8): the
-  // routing wiring is part of "what it opened" — once
-  // `createRoutingWiring` has subscribed `llm/adapters-updated` (and possibly
-  // registered the mirror projection), any LATER throw would leave those
-  // host-surface registrations behind, and every retry would stack another
-  // stale listener; the failure path holds its own reference and disposes it.
+  // Retired settings are accepted and ignored; say so once, here and on the status surfaces.
+  const retiredNote = retiredConfigNote(retiredKeysIn(config))
+  if (retiredNote !== undefined) warn(rawCtx, retiredNote)
+
+  // EVERY registration below can throw, and until the disposer exists nothing
+  // releases the domain. Upstream `DomainFacility.open` refuses a name that is
+  // already open, so a partial mount that never closed would leave the domain
+  // reserved for the life of the process and every later mount would quietly fall
+  // back to files. The failure path therefore closes what it opened and rethrows
+  // the original error unchanged. The routing wiring is part of "what it opened":
+  // once `createRoutingWiring` has subscribed `llm/adapters-updated`, a later
+  // throw would leave that listener behind and every retry would stack another.
   let wiringForFailure: RoutingWiring | undefined
+  let onboardingRefreshForFailure: (() => void) | undefined
+  let goalListenersForFailure: (() => void) | undefined
   try {
-    // Seam installation is PER ROOT AGENT, so the record of it is too: one
-    // root's `tools/pre-execute` registration can succeed while another's
-    // throws, and each root's guard is already configured from its own result.
-    // A single mount-wide flag would let whichever root was configured last
-    // decide what EVERY run persists in `enforcement.egress` — a claim about a
-    // scope the code was not observing. A root with no entry reads as
-    // 'guard-deny', which is the honest answer for a scope not yet configured.
-    const seamByRoot = new Map<string, boolean>()
-    // Registration outcome for `ctx.autopilot`, resolved once below and read by
-    // the probe. Declared here so the closure can see it before it is assigned.
-    let serviceRegistered = false
-    const probes: EnvironmentProbes = {
-      approvalAvailable: () => probeApproval(rawCtx),
-      egressChannel: (rootSessionId) => resolveEgressChannel(seamByRoot.get(rootSessionId), resolved.gate.egressDeny),
-      serviceRegistered: () => serviceRegistered,
-    }
-    // Routing ports (M3b): the live catalog + the session policy reader, from
-    // what this mount can actually see. Disposers (adapters-updated
-    // subscription, mirror projection registration) ride the plugin lifecycle.
     const routing = createRoutingWiring(rawCtx, message => warn(rawCtx, message))
+    // The setting is read per dispatch; an unreadable one is warned once, not per call.
+    let settingWarned = false
+    const warnSettingOnce = (message: string): void => {
+      if (settingWarned) return
+      settingWarned = true
+      warn(rawCtx, message)
+    }
     wiringForFailure = routing
-    // F3 (PR #2 Codex review): the planner installer port is a DYNAMIC
-    // import away, and the engine must never be exposed before it is known —
-    // a run entering planning at cold mount would otherwise record
-    // `plannerRouting: 'unsupported'` for a healthy host and never retry
-    // within the planning phase. `apply()` is already the async mount
-    // barrier the store relies on (the fiber awaits it before the plugin is
-    // ACTIVE), so the import settles HERE: the promise never rejects (an
-    // unresolvable module keeps the port honestly `undefined`), hence this
-    // await cannot unwind the mount.
+    // The planner installer port is a dynamic import away; settle it here so the
+    // engine is never exposed before it is known. The promise never rejects.
     await routing.installerReady
+    // Hoisted so the onboarding section below reads the SAME live routing the
+    // engine re-resolves per decision (volatile leaves, HMR applies).
+    const liveRouting = volatileRoutingAccess(config)
     const engine = new AutopilotEngine(
       ctx.agents as never,
       ctx.subagents as never,
-      store,
+      resolution.ledgers,
+      resolution.sources,
       resolved,
-      () => probeSandbox(rawCtx),
-      probes,
-      routing.ports,
-      // F2 (PR #2 Codex review): the per-decision routing re-read — wired
-      // exactly when the routing leaves arrived as volatile references (the
-      // Cordis loader path); `undefined` on the plain path, whose
-      // `config.routing` snapshot is therefore still the live truth.
-      volatileRoutingAccess(config),
+      {
+        routing: routing.ports,
+        ...(liveRouting === undefined ? {} : { liveRouting }),
+        environment: {
+          sandboxDefaultMode: () => sandboxDefaultModeOf(rawCtx),
+          registeredToolNames: () => registeredToolNamesOf(rawCtx),
+          subagentMaxDepth: () => subagentMaxDepthOf(rawCtx),
+          modelSelection: () => modelSelectionSettingOf(rawCtx, warnSettingOnce),
+          readGoal: root => readNativeGoal(rawCtx, root),
+          goalDriverPresent: () => goalDriverPresentIn(rawCtx),
+        },
+        warn: message => warn(rawCtx, message),
+      },
     )
 
-    // ── Policy prompt section (zero tokens without a run) ──────────────────
+    // ── Policy prompt section (zero tokens unless a host restart lost children) ──
     const disposeSection = ctx.systemPrompt.section({
       name: 'autopilot:policy',
       order: 60,
       text: (context) => {
         const agent = context.agent
         if (agent === undefined) return ''
-        const parentId = agent.session.header.parentSession
-        if (parentId === undefined) {
-          const snapshot = engine.peek(agent.id)
-          return snapshot === undefined ? '' : renderRootPolicy(snapshot)
-        }
-        const parentRun = engine.peek(parentId)
-        if (parentRun?.executor?.childId === agent.id && parentRun.executor.state !== 'revoked') {
-          return renderExecutorPolicy(parentRun)
-        }
-        return ''
+        if (agent.session.header.parentSession !== undefined) return ''
+        return renderRootPolicy(engine.peekLedger(agent.id))
+      },
+    })
+
+    // ── Routing onboarding section (DESIGN §9 item 12) ────────────────────
+    // Zero tokens unless the LIVE catalog lists models no tier-bound work class
+    // can reach. The report is cached at mount and on `llm/adapters-updated`, and
+    // revalidated stale-by-one when a rendered notice fires: the sync renderer
+    // cannot await a catalog read.
+    let onboardingReport: WorkClassReachabilityReport | undefined
+    const refreshOnboarding = (): void => {
+      const catalog = routing.ports.catalog
+      if (catalog === undefined) {
+        onboardingReport = undefined
+        return
+      }
+      const current = liveRouting?.() ?? resolved.routing
+      void observeOnboardingReachability(catalog, current.ladder, current.workClasses)
+        .then((report) => { onboardingReport = report })
+    }
+    refreshOnboarding()
+    let disposeOnboardingRefresh: () => void = () => {}
+    try {
+      disposeOnboardingRefresh =
+        (rawCtx as { on?: (event: string, listener: () => void) => () => void }).on?.('llm/adapters-updated', () => {
+          refreshOnboarding()
+        }) ?? (() => {})
+      onboardingRefreshForFailure = disposeOnboardingRefresh
+    } catch {
+      // A host that cannot be subscribed keeps the mount-time reading only.
+    }
+    const disposeOnboardingSection = ctx.systemPrompt.section({
+      name: 'autopilot:routing-onboarding',
+      order: 61,
+      text: (context) => {
+        const agent = context.agent
+        if (agent === undefined) return ''
+        if (agent.session.header.parentSession !== undefined) return ''
+        const current = liveRouting?.() ?? resolved.routing
+        const text = renderRoutingOnboarding({
+          mode: current.mode,
+          report: onboardingReport,
+          configEditorAvailable: probeConfigEditor(rawCtx),
+          // The same reader the engine authorizes with, for THIS rendering
+          // agent: a policy-less session selects nothing, and the notice says so.
+          policyState: routing.policyStateFor({ session: agent.session } as AgentRef),
+        })
+        if (text !== '') refreshOnboarding()
+        return text
       },
     })
 
     // ── Read-only service surface ─────────────────────────────────────────
-    // The outcome is READ, not dropped: registration can fail (a host that
-    // already provides `autopilot`, or one exposing no provide surface), the
-    // plugin deliberately survives that, and `enforcement.service` is where a
-    // run says which of the two it got.
-    const service = createAutopilotService(engine)
+    const service = createAutopilotService({
+      ledgers: resolution.ledgers,
+      sources: resolution.sources,
+      notes: () => (retiredNote === undefined ? [] : [retiredNote]),
+      // A goal-only session (create_goal, no autopilot_* call) has no ledger until its goal is mirrored.
+      syncSession: async (sessionId) => {
+        const live = ctx.agents.roots().find(agent => (agent as AgentRef).id === sessionId)
+        if (live !== undefined) await engine.syncGoal(live as AgentRef)
+      },
+    })
     const registration = registerAutopilotService(rawCtx as ProvideHost, service)
-    serviceRegistered = registration.registered
+    if (!registration.registered && registration.diagnostic !== undefined) {
+      warn(rawCtx, `dsh-autopilot: ${registration.diagnostic}`)
+    }
 
-    // ── Read-only HTTP surface (roadmap §9.3) ─────────────────────────────
-    // Lazy: `installAutopilotRoutes` goes through `ctx.inject(['webServer'],
-    // …)`, so on a profile with no api-gateway the callback never runs and
-    // nothing about this mount changes.
+    // ── Read-only HTTP surface ────────────────────────────────────────────
+    // Lazy: `installAutopilotRoutes` goes through `ctx.inject(['webServer'], …)`,
+    // so on a profile with no api-gateway the callback never runs.
     const disposeRoutes = installAutopilotRoutes(rawCtx, service)
 
-    // ── Per-root controller surface (tools + guard + native egress seam) ───
+    // ── Per-root surface: the status tool, and the session-open work ─────────
     const installed = new Map<unknown, () => void>()
-    const maybeInstall = (agent: unknown): void => {
-      // `ctx` rides AgentRef itself since M6 ([R2-P3-1]); the intersection
-      // here narrows it to the tools/pre-execute surface this mount touches.
-      const rootAgent = agent as AgentRef & GateAgentRef & {
-        ctx: { tools: { register(d: unknown): () => void } } & PreExecuteHost
-      }
-      if (installed.has(agent)) return
-      if (rootAgent.session.header.parentSession !== undefined) return
-      if (!ctx.agents.roots().includes(agent)) return
-      const disposers: Array<() => void> = []
+    /** Install the root tool surface on a top-level agent, once. */
+    const installRoot = (agent: unknown): boolean => {
+      const rootAgent = agent as AgentRef & { ctx: { tools: { register(d: unknown): () => void } } }
+      if (installed.has(agent)) return true
+      if (rootAgent.session.header.parentSession !== undefined) return false
+      if (!ctx.agents.roots().includes(agent)) return false
       try {
-        // The native seam goes FIRST: whether it installed decides what the
-        // synchronous guard does about egress, and the guard is what runs if
-        // it did not.
-        const seam = installPreExecuteGate(rootAgent.ctx, rootAgent.id, engine)
-        seamByRoot.set(rootAgent.id, seam.installed)
-        disposers.push(seam.dispose)
-        disposers.push(installRootTools(rootAgent.ctx.tools, engine))
-        disposers.push(installRootGate(rootAgent, engine, {
-          ...resolved.gate,
-          egressSeam: resolveEgressChannel(seam.installed, resolved.gate.egressDeny),
-        }))
-      } catch {
-        for (const dispose of disposers.reverse()) dispose()
-        return
-      }
-      installed.set(agent, () => {
-        for (const dispose of disposers.reverse()) dispose()
-      })
-    }
-    // ── Executor-child surface: packet tool + guard + native egress seam ───
-    //
-    // Until dsh 0.1.1 this went through `ctx.subagents.registerContinuableSetup`,
-    // a registry the subagent manager applied inside each child's creation
-    // window. dsh 0.1.2 removed that registry (measured on the real host:
-    // `ctx.subagents.registerContinuableSetup is not a function`); the manager
-    // now passes its own private `setup` to `agents.create()`. What a plugin
-    // still gets is `agent/created`, which the agent registry announces for
-    // EVERY agent — children included — after setup and `session/created`, and
-    // BEFORE `agent/session-start` and the first prompt assembly (rc.1
-    // `packages/core/agent-loop/src/index.ts` publication order:
-    // sessions.enter → agents.enter → sessions.announce → agents.announce →
-    // agent/session-start; `CreateAgentOptions.setup` doc). So the child
-    // surface is installed there, on `agent.ctx` (the child's own scope), keyed
-    // by agent and released on `agent/disposed`.
-    //
-    // THE LISTENER'S CONTRACT (owner ruling 2026-09-04, after Codex P2
-    // 3933411711 on PR #6):
-    //  - a child that is NOT this run's live executor is a harmless no-op:
-    //    nothing is installed and nothing can throw, so an unrelated child is
-    //    never vetoed;
-    //  - a RECOGNIZED executor child is installed transactionally
-    //    (`installExecutorChildSurface`): a failing step rolls back every
-    //    step already installed, in reverse, and the original error is
-    //    rethrown — DELIBERATELY out of this listener. On rc.1 a synchronous
-    //    throw from an `agent/created` listener vetoes the child's publication
-    //    (`AgentRegistry.announce()`), `startContinuable` rejects, and the
-    //    engine records the executor as `revoked` with the failure as its
-    //    startup diagnostic — a fail-closed start instead of a `running`
-    //    executor that can never submit its packet;
-    //  - `childInstalled` gains an entry ONLY after the complete surface
-    //    installed; `agent/disposed` removes the entry first and then attempts
-    //    every disposer, so one failing disposer neither keeps the entry nor
-    //    skips the others.
-    //
-    // DECLARED RESIDUAL — the mount-time sweep below. On a plugin REMOUNT
-    // while an executor is live (the persisted run says `running` with a
-    // matching childId), a pre-existing child is recognized here, but there is
-    // no publication left to veto and no plugin→engine revoke API; a failed
-    // install on that one path is WARNED (run id + child id) and the executor
-    // record is not corrected. The P2 condition can therefore persist across a
-    // remount; recorded in DESIGN.md §6 and the PR body.
-    const childInstalled = new Map<unknown, () => void>()
-    const cleanupWarn = (agentId: string, rootId: string) => (failure: ChildSurfaceCleanupFailure): void => {
-      warn(rawCtx, `dsh-autopilot: child surface cleanup failed at ${failure.step} (run ${rootId}, child ${agentId}): ${describeError(failure.error)}`)
-    }
-    const installChild = (agent: unknown): void => {
-      const child = agent as Partial<AgentRef> & { ctx?: unknown }
-      if (childInstalled.has(agent)) return
-      if (child.session?.header?.parentSession === undefined) return
-      if (child.ctx === undefined || child.ctx === null) return
-      const childCtx = child.ctx as ContinuableChildContext
-      const rootId = recognizeExecutorChild(engine, childCtx, agent)
-      if (rootId === undefined) return
-      const dispose = installExecutorChildSurface(engine, resolved.gate, childCtx, rootId, cleanupWarn(String(child.id), rootId))
-      childInstalled.set(agent, dispose)
-    }
-    const disposeChild = (agent: unknown): void => {
-      const dispose = childInstalled.get(agent)
-      childInstalled.delete(agent)
-      if (dispose === undefined) return
-      try {
-        dispose()
+        installed.set(agent, installRootTools(rootAgent.ctx.tools, service, engine))
       } catch (error: unknown) {
-        warn(rawCtx, `dsh-autopilot: child surface release failed for child ${String((agent as Partial<AgentRef>).id)}: ${describeError(error)}`)
+        warn(rawCtx, `dsh-autopilot: the root tool surface failed to install for ${rootAgent.id}: ${errorMessage(error)}`)
+        return false
       }
+      return true
     }
 
+    // Roots already live at mount are open sessions: install on them and run the
+    // per-session open work (lost marking, legacy link, lazy restore). Never bulk:
+    // sessions that are not open are not touched.
     for (const agent of ctx.agents.list()) {
-      maybeInstall(agent)
-      try {
-        installChild(agent)
-      } catch (error: unknown) {
-        // The declared residual: no publication to veto here.
-        const child = agent as Partial<AgentRef>
-        warn(rawCtx, `dsh-autopilot: executor child surface failed to install at mount for child ${String(child.id)} (run ${String(child.session?.header?.parentSession)}); the executor record cannot be corrected from here: ${describeError(error)}`)
-      }
+      if (installRoot(agent)) await engine.onRootOpened(agent as AgentRef)
     }
-    const disposeCreated = ctx.on('agent/created', (payload: { agent: unknown }) => {
-      maybeInstall(payload.agent)
-      installChild(payload.agent)
+    // `agent/created` is announced for EVERY agent, after setup and before the first
+    // prompt, through a serial dispatch the host awaits: so the restore lands before
+    // the first request, and a listener that threw would veto the agent's
+    // publication. Hence `onRootOpened` never rejects. A child agent is the opposite case:
+    // its restriction must fail closed.
+    const disposeCreated = ctx.on('agent/created', async (payload: { agent: unknown }) => {
+      const agent = payload.agent as AgentRef
+      if (agent.session?.header?.parentSession !== undefined) {
+        // A child: its tool allow-list and own tools, keyed by ITS id. A throw here is deliberate: it
+        // vetoes the child's publication (fail closed), and the delegation is recorded as failed.
+        engine.onChildCreated(agent)
+        return
+      }
+      if (installRoot(payload.agent)) await engine.onRootOpened(agent)
     })
+    // ── Native goal changes: mirror them now, not at the next route read ──
+    // dsh-goal emits `goal/changed` (agent-scoped, after the `goal/change` session
+    // event committed) for every accepted mutation, and app-level
+    // `goal/activation-changed` when a round arms or disarms. Only a ROOT's goal is
+    // mirrored: a child's would create a ledger keyed by the child id. `syncGoal`
+    // never rejects; route reads still sync too.
+    const onGoalEvent = (rawCtx as { on?: (event: string, listener: (payload: unknown) => void) => () => void }).on
+    const syncRootGoal = (agent: unknown): void => {
+      const candidate = agent as AgentRef | undefined
+      if (candidate === undefined || candidate.session?.header?.parentSession !== undefined) return
+      if (!ctx.agents.roots().includes(agent)) return
+      void engine.syncGoal(candidate)
+    }
+    let disposeGoalChanged: () => void = () => {}
+    let disposeGoalActivation: () => void = () => {}
+    try {
+      disposeGoalChanged = onGoalEvent?.call(rawCtx, 'goal/changed', (payload) => {
+        syncRootGoal((payload as { agent?: unknown } | undefined)?.agent)
+      }) ?? (() => {})
+      disposeGoalActivation = onGoalEvent?.call(rawCtx, 'goal/activation-changed', (payload) => {
+        const sessionId = (payload as { sessionId?: unknown } | undefined)?.sessionId
+        if (typeof sessionId !== 'string') return
+        syncRootGoal(ctx.agents.roots().find(agent => (agent as AgentRef).id === sessionId))
+      }) ?? (() => {})
+    } catch {
+      // A host that cannot be subscribed keeps the open-time and route-read syncs.
+    }
+    goalListenersForFailure = () => { disposeGoalChanged(); disposeGoalActivation() }
+
     const disposeDisposed = ctx.on('agent/disposed', (payload: { agent: unknown }) => {
       installed.get(payload.agent)?.()
       installed.delete(payload.agent)
-      disposeChild(payload.agent)
+      const agent = payload.agent as AgentRef
+      if (agent.session?.header?.parentSession !== undefined) engine.onChildDisposed(agent)
     })
-    const disposeChildSetup = (): void => {
-      for (const agent of [...childInstalled.keys()]) disposeChild(agent)
-    }
 
     // ── Bundled-skill publication: native registry first, file fallback ───
     //
-    // Skill publication is best-effort and runs only after every required
-    // registration succeeded, so a failed mount persists nothing. Exactly one
-    // channel is ever active (plan v3 "Skill"):
-    //
-    // - `ctx.skills` PROBED (never injected — see {@link probeSkillRegistry})
-    //   and present ⇒ `registerProvider` serves the in-package SKILL.md with
-    //   NO filesystem copy; the disposer rides the plugin lifecycle. Rank 700
-    //   loses to every file-scan rank, so an owner's installed or drifted
-    //   file copy still wins the name (the anti-silent-override rule,
-    //   `src/skill-register.ts` module header).
-    // - registration THREW ⇒ the 0.2.0 filesystem copy runs instead, with the
-    //   failure recorded in the publication result and warned here.
-    // - no skill service on this profile ⇒ the unchanged filesystem path.
-    // - `skillInstall: 'off'` ⇒ none of the above (neither channel).
+    // Best-effort, after every required registration succeeded, so a failed mount
+    // persists nothing. Exactly one channel is ever active:
+    // - `ctx.skills` PROBED (never injected; see {@link probeSkillRegistry}) and
+    //   present: `registerProvider` serves the in-package SKILL.md with no
+    //   filesystem copy; rank 700 loses to every file-scan rank, so an installed or
+    //   drifted file copy still wins the name (the anti-silent-override rule).
+    // - registration THREW: the filesystem copy runs instead, the failure warned.
+    // - no skill service on this profile: the unchanged filesystem path.
+    // - `skillInstall: 'off'`: neither channel.
     let disposeSkillProvider: (() => void) | undefined
     if (resolved.skillInstall !== 'off') {
       const publication: SkillPublicationResult = publishBundledSkill(probeSkillRegistry(rawCtx))
       if (publication.status === 'provider-registered') {
         disposeSkillProvider = publication.dispose
-        // WHICH path published — the honest diagnosis the packet requires;
-        // info, not warn, because nothing degraded.
         info(
           rawCtx,
           `dsh-autopilot: bundled skill published through the native skill registry (provider "${BUNDLED_SKILL_PROVIDER_NAME}", rank ${BUNDLED_SKILL_PROVIDER_RANK}; serving ${publication.path}); no filesystem copy was made`,
@@ -1682,9 +1611,6 @@ export async function apply(rawCtx: unknown, config?: ConfigInput): Promise<() =
             `dsh-autopilot: native skill registration failed (${publication.failure}); fell back to the filesystem skill copy`,
           )
         }
-        // The filesystem result's own warning, byte-identical to the 0.2.0
-        // behavior for the statuses where the model is NOT going to be told
-        // to start a run on this host and a silent mount would hide that.
         const skill: SkillSyncResult = publication.status === 'provider-failed-fallback' ? publication.fallback : publication
         if (skill.status === 'drift' || skill.status === 'error' || skill.status === 'unsupported') {
           warn(
@@ -1697,40 +1623,38 @@ export async function apply(rawCtx: unknown, config?: ConfigInput): Promise<() =
 
     return async () => {
       disposeSection()
+      disposeOnboardingSection()
+      disposeOnboardingRefresh()
       registration.dispose()
       disposeRoutes()
       routing.dispose()
       disposeSkillProvider?.()
       disposeCreated()
       disposeDisposed()
-      disposeChildSetup()
+      disposeGoalChanged()
+      disposeGoalActivation()
       for (const dispose of installed.values()) dispose()
       installed.clear()
-      // Async tail: dispose waits (bounded) for in-flight transactions to settle.
+      // Async tail: dispose waits (bounded) for in-flight session opens and ledger writes.
       await engine.dispose()
-      if (store instanceof DomainRunStore) await store.close()
+      await resolution.close()
     }
   } catch (error: unknown) {
-    // F19 (PR #2 Codex round 8): release the wiring's host-surface
-    // registrations (the `llm/adapters-updated` subscription, the mirror
-    // projection) BEFORE the rethrow, alongside the store close — a failed
-    // mount must not leave them behind for the next one to stack on. The
-    // disposer is idempotent (`splice(0)` drains it once; the plugin
-    // lifecycle disposer calls it again safely) and it already swallows each
-    // inner disposer's throw; the belt-and-braces catch below only guards
-    // against the loop itself failing, so teardown can never mask the error
-    // that caused the unwind.
+    // Release the wiring's host-surface registrations BEFORE the rethrow, alongside
+    // the domain close. The disposer is idempotent and swallows each inner
+    // disposer's throw; the catch below only guards against the loop itself failing,
+    // so teardown can never mask the error that caused the unwind.
     try {
       wiringForFailure?.dispose()
+      onboardingRefreshForFailure?.()
+      goalListenersForFailure?.()
     } catch {
       // A wiring teardown failure must not mask the original error.
     }
-    if (store instanceof DomainRunStore) {
-      try {
-        await store.close()
-      } catch {
-        // A failing close must not mask the error that caused the unwind.
-      }
+    try {
+      await resolution.close()
+    } catch {
+      // A failing close must not mask the error that caused the unwind.
     }
     throw error
   }
