@@ -66,7 +66,7 @@ composition, not a person typing in a client):
   was 2.3 s after boot.
 - After the restart no goal round ran until the agent explicitly called
   `update_goal` with `action: resume`. An owner-style "continue" message alone
-  did not lead the agent to resume in one run, so the goal stayed disarmed.
+  did not lead the agent to resume in one of two runs, so the goal stayed disarmed.
 - When the agent called resume and then ended its turn, a goal round started
   immediately.
 - When the agent called `schedule_create` and ended its turn with the goal
@@ -76,13 +76,15 @@ composition, not a person typing in a client):
 - The ledger route returned 200.
 
 Owner's daily Windows desktop app, plugin `0.3.0-rc.1`: the native goal round
-started stage 2 by itself.
+started stage 2 by itself. The prompt was pasted into the desktop GUI by an
+agent, not typed by the owner.
 
 ## Not verified on a real host
 
 None of the following has been observed on dsh `0.2.1-rc.5`.
 
-- The desktop app's rendering of the card (a person has to look at it), and
+- The desktop app's rendering of the card (a person has to look at it; on rc.1
+  no card rendered, fixed in rc.2, re-check pending), and
   installing the plugin from the desktop Plugins page.
 - A cross-family reviewer. The test machine had only one provider family
   configured.

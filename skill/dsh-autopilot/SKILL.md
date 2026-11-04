@@ -111,23 +111,28 @@ the blockers and verify them yourself.
   rounds, and the round cap ends in a blocker.
 - While the goal is active and armed, never end the turn to wait for a
   `schedule_create` reminder. A pending reminder is not pending work: the goal
-  driver queues a new round about once a second whenever the main agent is idle
-  and the goal is armed, so the turn-end burns rounds toward the 256-round cap
-  (a `round-limit` blocker). Wait inside the turn instead, repeating the
+  driver queues a new round immediately each time the main agent goes idle while
+  the goal is armed (it waits for children to settle, not for background jobs or
+  reminders), so the turn-end burns rounds toward the 256-round cap (a
+  `round-limit` blocker). Wait inside the turn instead, repeating the
   10-minute waits above for as long as CI or children need. If a wait is longer
   than in-turn waiting reasonably allows, tell the owner so and let them pause
-  the goal (pausing needs the owner's direct turn); do not spend rounds.
+  the goal (pausing needs the owner's direct turn), then the owner resumes it in
+  the client when the wait is over; do not spend rounds.
 - Reminders are for waits outside an active goal, or after the owner has paused
   it. Only the main agent may set one (children are refused). A reminder
   delivers a message into the session after a restart; it does not re-arm a
   paused or disarmed goal.
 - After a host restart running children are gone, and the goal stays disarmed.
-  When the owner says "continue" (or "继续") after a restart or a pause, do not
-  just answer in text: call `get_goal`, then `update_goal` with
+  When the owner says "continue" (or "继续") after a restart (the goal is
+  active but disarmed), do not just answer in text: call `get_goal`, then `update_goal` with
   `action: resume` and the exact current `goal_id` and `revision` (the owner's
   message is the direct turn it needs). Then start a new `executor-lead` or
   `worker` from the brief on the issue and the PR. Do not take over its work in
   the main context, and do not ask the owner to start over.
+- A paused goal is different: the model's resume is refused
+  (`GOAL_TOOL_RESUME_PAUSED`, "the user must resume it"), even in a direct owner
+  turn. Tell the owner to resume it in the client; do not call `update_goal` for it.
 - End the turn after a stage only when nothing is pending (no child, no
   background job, no CI you are waiting on), so the driver can start the next
   round.
