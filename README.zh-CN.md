@@ -45,7 +45,7 @@ WSL CLI 的 profile 需要退回旧宿主时，先备份 profile，再执行 `np
 
 ## 状态
 
-开发者预览版，`0.3.0` 未发布。[尚未在真实宿主上验证](./docs/compatibility.md#not-yet-verified-on-a-real-host)一节列出的行为，没有在 dsh `0.2.1-rc.5` 上观察过；测试通过、mock 运行和状态读取都不算。[docs/compatibility.md](./docs/compatibility.md) 里更早的测量针对插件 `0.2.x`。
+开发者预览版，`0.3.0` 未发布。[已在真实宿主上验证](./docs/compatibility.md#verified-on-a-real-host)一节是在 Windows、dsh `0.2.1-rc.5`、headless profile、单一模型厂商下观察到的行为；[未验证](./docs/compatibility.md#not-verified-on-a-real-host)一节是没有观察到的（桌面端卡片渲染、阶段结束后的下一轮 goal、重启后的定时提醒、跨厂商 reviewer）。测试通过、mock 运行和状态读取都不算观察。[docs/compatibility.md](./docs/compatibility.md) 里更早的测量针对插件 `0.2.x`。
 
 ## 文档
 

@@ -45,12 +45,12 @@ The tool parameters, the ledger and the configuration are in the [operator refer
 
 ## Status
 
-Developer preview. `0.3.0` is unreleased. Behavior listed in [Not yet verified on a real host](./docs/compatibility.md#not-yet-verified-on-a-real-host) has not been observed on dsh `0.2.1-rc.5`; passing tests, mock runs and status reads are not counted as that. The earlier measurements in [docs/compatibility.md](./docs/compatibility.md) are for plugin `0.2.x`.
+Developer preview. `0.3.0` is unreleased. The [verified list](./docs/compatibility.md#verified-on-a-real-host) is what was observed on Windows with dsh `0.2.1-rc.5`, headless profile and one provider family; the [not-verified list](./docs/compatibility.md#not-verified-on-a-real-host) is what was not (desktop card rendering, the next goal round after a stage, schedule reminders across a restart, a cross-family reviewer). Passing tests, mock runs and status reads are not counted as observation. The earlier measurements in [docs/compatibility.md](./docs/compatibility.md) are for plugin `0.2.x`.
 
 ## Documentation
 
 - [docs/reference.md](./docs/reference.md): tools, ledger, configuration
-- [docs/compatibility.md](./docs/compatibility.md): hosts, history, what is not yet verified
+- [docs/compatibility.md](./docs/compatibility.md): hosts, history, what is and is not verified
 - [docs/security.md](./docs/security.md): what the plugin does and does not gate
 - [skill/dsh-autopilot/SKILL.md](./skill/dsh-autopilot/SKILL.md): the in-session adapter
 - [skill/dsh-autopilot/references/model-routing.md](./skill/dsh-autopilot/references/model-routing.md): work classes, ladder, escalation

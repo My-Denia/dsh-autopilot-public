@@ -7,8 +7,21 @@ Host and packaging bounds that outlive a single release are in
 
 The plugin becomes the dsh adapter of the goal-workflow. It is **not**
 published: npm `latest` is still `dsh-goal-autopilot@0.2.0`. Target host is dsh
-`0.2.1-rc.5` only. None of this is yet observed on a real host; the open list is
-in [docs/compatibility.md](docs/compatibility.md#not-yet-verified-on-a-real-host).
+`0.2.1-rc.5` only. See Verification below for what was observed on a real host.
+
+### Verification
+
+Observed on Windows with dsh `0.2.1-rc.5`, headless profile, one provider
+family: plugin load and tool list, simple work with no `autopilot_*` or
+`create_goal` call, concurrent scouts, depth-2 delegation, effort pin, reviewer
+verdict (independence "reduced"), observed route equal to selected route for
+every delegation, own-repo push and draft PR with no refusal, a goal kept active
+through a CI wait, restart recovery and "continue", goal A then B, two
+concurrent processes, and 47 legacy runs folded with 0 rejected. Not verified:
+desktop card rendering, the next goal round after a stage, schedule reminders
+across a restart, a cross-family reviewer, a user-changed sandbox mode after the
+old clamp, and any model task on WSL. Details:
+[docs/compatibility.md](docs/compatibility.md#verified-on-a-real-host).
 
 ### Breaking changes
 
@@ -47,7 +60,7 @@ in [docs/compatibility.md](docs/compatibility.md#not-yet-verified-on-a-real-host
 - `autopilot_agents`: wait for children (`action: wait`, default 300 s, at most
   600 s). Listing, messaging and stopping children use the host's own
   `list_agents`, `send_message` and `interrupt_agent`; whether they reach
-  children started by the plugin on a real host is not yet verified.
+  children started by the plugin is not verified on a real host.
 - `autopilot_escalate`: a delegated child other than the reviewer records a
   request for a stronger model, more effort or a different split; the parent
   decides and re-dispatches with `replaces`.

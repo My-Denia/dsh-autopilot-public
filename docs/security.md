@@ -61,8 +61,8 @@ Runs from plugin 0.2.x could leave a session in read-only sandbox mode. When
 such a session is opened or resumed, 0.3.0 restores the mode, but only if the
 current mode is still read-only and the last sandbox event is the plugin's own
 clamp. The target is the recorded prior mode, otherwise the host default. A mode
-the user changed after the clamp stays. This has not yet been observed on a real
-host (see [compatibility.md](compatibility.md#not-yet-verified-on-a-real-host)).
+the user changed after the clamp stays. A clamped legacy session was restored to its prior mode on a real host; the case where the user changed the mode after the clamp was not observed (see
+[compatibility.md](compatibility.md#verified-on-a-real-host)).
 
 ## Enforcement labels (do not over-read)
 

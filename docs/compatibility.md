@@ -24,45 +24,64 @@ Source version `0.3.0`, the goal-workflow adapter. It is not published: npm
 Nothing in this section is a measurement of 0.3.0 behavior. What has and has not
 been observed is below.
 
-## Not yet verified on a real host
+## Verified on a real host
 
-Plugin 0.3.0 on dsh 0.2.1-rc.5. None of these has been observed on a real host.
-The list is trimmed as items are observed. Passing tests,
-mock runs and status reads do not count as observation.
+Plugin 0.3.0-rc.1 on Windows, DeepSeek Harness `0.2.1-rc.5`, headless profile
+(base + headless + plugin), `deepseek-official` provider only, with the packed
+tarball installed through `dsh plugin add`. Tests, mock runs and status reads are
+not counted here; these were observed in real model sessions.
 
-- Upgrade keeps the legacy run cards: the same count before and after (45 file
-  runs plus the domain-store runs on Windows desktop), three sampled runs open
-  and render, including one run with an amended plan and one with an owner
-  resolution, and no fold rejection.
-- Clamp restore on a real clamped legacy session: the sandbox mode is restored,
-  and a mode the user changed after the clamp stays unchanged.
-- Simple work is not pulled into the goal flow: 0 `autopilot_*` calls and 0
-  `create_goal` calls in the session log.
-- Goal work: `create_goal` after the owner states a goal; two scouts' run
-  intervals overlap; an `executor-lead` child starts a `worker` child (depth 2);
-  the reviewer's observed provider family differs from the lead's; selected and
-  observed model and effort match on the card and in the ledger; a pinned effort
-  is observed.
-- A stage ending does not end the goal: PR open with CI pending keeps the goal
-  active, and the rounds consumed during one real CI wait stay within
-  `ceil(wait_minutes / 10) + 2`.
-- Own-repo outbound: `git push` and `gh pr create` from a dsh session with no
-  `AP_*` refusal.
-- Restart recovery: the card says auto-continue was released or a worker was
-  lost; the owner's "continue" resumes; a `schedule_create` reminder set before
-  the restart is delivered after it, while the goal stays disarmed until the
-  owner says "continue".
-- Same-session goal A then B: both are shown, and A's delegation and review
-  records are unchanged.
-- WSL CLI `0.2.1-rc.5` install of 0.3.0 from npm or a tarball; a headless run
-  passes the simple-work check and a reduced goal-work check.
-- Whether children started by the plugin's runtime get native settlement notices
-  and can be driven by the host's `send_message`, `list_agents` and
+- The plugin loads. The session tool list contains `autopilot_status`,
+  `autopilot_delegate` and `autopilot_agents`, and the retired tools are absent.
+- Simple work stays out of the goal flow: a single-file edit made 0
+  `autopilot_*` calls and 0 `create_goal` calls.
+- Goal work: `create_goal` was called; two scouts ran concurrently; an
+  `executor-lead` started a `worker` (depth 2); a role effort pin (`max`) was
+  seen in the request headers; the reviewer returned a structured verdict that
+  the ledger recorded with independence "reduced", because only one provider
+  family was reachable. Every delegation recorded observed route equal to
+  selected route (8 of 8 in one run, 6 of 6 in a later one).
+- Own-repo outbound: `git push` and `gh pr create --draft` ran with no refusal.
+  The goal stayed active through a CI wait with 0 idle rounds, because the agent
+  waited inside the turn.
+- Restart recovery: after the host was killed mid-worker and resumed, the worker
+  showed as lost and auto-continue was released. The owner's "continue" led to
+  `update_goal` resume, a new worker, and completion.
+- Same session, goal A then goal B: A's records were unchanged.
+- Two concurrent headless processes on one profile: both ledgers were complete
+  (one file per session), and the legacy domain file was byte-identical.
+- A goal completion appeared in the ledger within milliseconds (the
+  goal-changed listener).
+- Legacy data: 47 legacy runs (45 file, 2 domain) fold and project with 0
+  rejected, and the legacy store was left untouched. A legacy session clamped to
+  read-only was restored to its prior `workspace-write` mode, and a write
+  succeeded.
+- WSL: the plugin installs and loads on dsh `0.2.1-rc.5`. No model task ran
+  there, because the WSL environment had no credentials.
+
+## Not verified on a real host
+
+None of the following has been observed on dsh `0.2.1-rc.5`.
+
+- The desktop app's rendering of the card (a person has to look at it), and
+  installing the plugin from the desktop Plugins page.
+- The next goal round executing after a stage ends. The headless runner exits
+  before the queued round runs, so this needs a desktop or web host.
+- A `schedule_create` reminder delivered across a restart. The schedule tool is
+  only in the web and desktop compositions.
+- A cross-family reviewer. The test machine had only one provider family
+  configured.
+- A session whose sandbox mode the user changed after the old clamp stays
+  unchanged. The candidate session needs a preset that headless refuses.
+- A model task on WSL.
+- The card in a live web client for a session whose only goal activity is a
+  native goal call.
+- Whether children started by the plugin's runtime get native settlement
+  notices and can be driven by the host's `send_message`, `list_agents` and
   `interrupt_agent`. The plugin ships no list, message or stop tool
-  (`autopilot_agents` has only `wait`), so these native tools are the only way
-  to do that.
-- Anything that needs the real model API: earlier attempts returned HTTP
-  503/502. Such items are "unverified (API 503)", never replaced by a mock run.
+  (`autopilot_agents` has only `wait`).
+- Whether the host's `subagentModelSelection` setting is honoured end to end.
+  Only fakes have covered it.
 
 ## Measured for plugin 0.2.x (history)
 
@@ -90,7 +109,7 @@ Source version of that line: **0.2.1-rc.1**, a pre-release adapted to dsh
 | Windows | out of scope | **not verified** | **not verified** |
 
 The "Windows | out of scope" row above is the 0.2.x position. For 0.3.0 the
-Windows desktop app is a target environment, not yet verified (see above).
+Windows desktop app is a target environment. The headless profile on Windows is verified (see above); the desktop GUI is not.
 
 ### dsh Desktop
 
@@ -237,7 +256,7 @@ packages and the Windows Desktop app (2026-10-10/12):
 | Subagent route authorization (`subagentModelSelection` session policy) | present | **used** — the session's allowed-model lock bounds every routing selection (see the policy-triad rule above) |
 | Reasoning effort (`reasoningEffort` at dispatch, `defaultEffort` per model) | present | **used** — the dispatch packet names the pinned effort; a route with none means the fixed setting IS the ceiling and the plugin never invents one |
 | Token cost / usage metering | **absent** | the price seed in `references/model-routing.md` is a dated, provenance-labelled tie-break seed, never a live fact |
-| Host-native goal-autopilot surface | **absent** in 0.2.0-rc.2 | 0.2.x stance. 0.3.0 targets a host that has native goal tools and a goal round driver, and uses them; whether they behave as expected is in the unverified list |
+| Host-native goal-autopilot surface | **absent** in 0.2.0-rc.2 | 0.2.x stance. 0.3.0 targets a host that has native goal tools and a goal round driver, and uses them; what was observed is in the verified list above, and what was not is in the not-verified list |
 | Skill registry | present | **used** — the adapter ships as a skill installed through the host's own registry |
 | Run storage backends | `file` / `storageDomain` | both supported; Desktop needs the shipped `storeKind: file` pin (see the profile-patch hazard above) |
 
