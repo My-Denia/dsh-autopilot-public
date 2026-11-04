@@ -46,7 +46,7 @@ isolated web host and the desktop app are in the compatibility doc.
 Desktop, rc.2 and rc.3 (dsh `0.2.1-rc.5`, one provider family): scouts through
 `autopilot_delegate` with overlapping runs (47.0 s and 17.7 s), reviewer through
 `autopilot_delegate` with a recorded verdict, stage 2 started natively with no
-human message, goal complete, and the turn-level card matching the ledger. On
+human message, goal complete, and the turn-level card matching the ledger (except an unsupported "same provider family" label prefix on rc.2, fixed in rc.3). On
 rc.3 a reviewer without `reviewedChildIds` linked both scouts, independence was
 "reduced" with `excludedFamilies` `[deepseek-official]`, and the card label is
 the recorded note. Profile note: dsh `0.2.1-rc.5` rejects a `models` key under

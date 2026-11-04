@@ -92,7 +92,9 @@ human-turn message.
 - After stage 1 the native goal round started stage 2 with no human message,
   and the goal completed.
 - The card renders at turn level (rc.2 fix confirmed) and its fields match the
-  ledger. On rc.3 the independence label is the recorded independence note.
+  ledger, except that the rc.2 review label added a "same provider family"
+  prefix the ledger did not support. On rc.3 the independence label is the
+  recorded independence note.
 - rc.2 finding: a reviewer called without `reviewedChildIds` linked nothing,
   because the scouts were read-only. Fixed in rc.3: the same call linked both
   scouts by default. Independence stayed "reduced" with `excludedFamilies`
