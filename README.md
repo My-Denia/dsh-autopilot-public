@@ -13,9 +13,9 @@ The [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (dsh) ad
 
 ## Install
 
-This source is version `0.3.0` (unreleased, not on npm). It targets dsh `0.2.1-rc.5` only and has been tested on no other host. Node 22+ is required. The Windows desktop app and the WSL CLI are each treated as a native environment, not as one standing in for the other.
+This source is version `0.3.0` (`0.3.0-rc.1` and `0.3.0-rc.3` were published to npm; `next` points to `0.3.0-rc.3`; stable is unreleased). It targets dsh `0.2.1-rc.5` only and has been tested on no other host. Node 22+ is required. The Windows desktop app and the WSL CLI are each treated as a native environment, not as one standing in for the other.
 
-Hosts older than `0.2.1-rc.5` (`0.1.x`, `0.2.0`) should stay on `dsh-goal-autopilot@0.2.0`, the last version for them. npm `latest` is still `0.2.0` today; `0.3.0` is not published, so install it from a tarball built from this source.
+Hosts older than `0.2.1-rc.5` (`0.1.x`, `0.2.0`) should stay on `dsh-goal-autopilot@0.2.0`, the last version for them. npm `latest` is still `0.2.0` today; stable `0.3.0` is not published; install a pre-release with `next` or a tarball built from this source.
 
 ```sh
 # a host on 0.1.x or 0.2.0
@@ -45,7 +45,7 @@ The tool parameters, the ledger and the configuration are in the [operator refer
 
 ## Status
 
-Developer preview. `0.3.0-rc.1` is on npm under the `next` tag; `latest` is still `0.2.0`. The [verified list](./docs/compatibility.md#verified-on-a-real-host) is what was observed with dsh `0.2.1-rc.5` on Windows: a headless profile, the owner's daily desktop app, and an isolated Web Session host, with one provider family. The [not-verified list](./docs/compatibility.md#not-verified-on-a-real-host) is what was not (among them the desktop card rendering after the turn-level fix, and a cross-family reviewer). Passing tests, mock runs and status reads are not counted as observation. The earlier measurements in [docs/compatibility.md](./docs/compatibility.md) are for plugin `0.2.x`.
+Developer preview. `0.3.0-rc.3` is on npm under the `next` tag; `latest` is still `0.2.0`. The [verified list](./docs/compatibility.md#verified-on-a-real-host) is what was observed with dsh `0.2.1-rc.5` on Windows: a headless profile, the owner's daily desktop app (prompts pasted by an agent through the GUI), and an isolated Web Session host (prompts sent by an agent through the API), with one provider family. The [not-verified list](./docs/compatibility.md#not-verified-on-a-real-host) is what was not (among them a cross-family reviewer, which needs a second provider family). Passing tests, mock runs and status reads are not counted as observation. The earlier measurements in [docs/compatibility.md](./docs/compatibility.md) are for plugin `0.2.x`.
 
 ## Documentation
 
