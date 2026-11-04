@@ -575,6 +575,24 @@ describe('the reviewer', () => {
     expect(review.reviewedChildIds).not.toContain(inA)
   })
 
+  it('the review syncs the goal itself: a switch with no goal event still narrows the window', async () => {
+    let view: NativeGoalView = { id: 'g-a', revision: 1, objective: 'goal A', phase: 'active', maxGoalRounds: 40, roundsStarted: 0, activation: 'disarmed' }
+    const h = delegationHost({ registered: REG, models: MODELS, policy: policyOf(['alpha', 'm-a'], ['beta', 'm-b']), goal: () => view, driver: () => true })
+    const inA = await settledScout(h)
+    view = { ...view, id: 'g-b', objective: 'goal B' }
+    // no syncGoal here: the scout's own start() mirrors B, the review must not rely on that
+    const inB = await settledScout(h)
+    view = { ...view, id: 'g-c', objective: 'goal C' }
+    const pending = h.engine.delegate(h.root, { role: 'reviewer', task: 'review goal C' })
+    for (let i = 0; i < 50 && h.starts.length < 3; i += 1) await new Promise(r => setTimeout(r, 2))
+    h.settle(h.starts[2]!.childId!, { stopReason: 'completed', structured: PASS })
+    await pending
+    const review = ledgerOf(h).reviews[0]!
+    expect(review.reviewedChildIds).toEqual([])
+    expect(review.reviewedChildIds).not.toContain(inA)
+    expect(review.reviewedChildIds).not.toContain(inB)
+  })
+
   it('a goal first mirrored at the first dispatch still includes that dispatch', async () => {
     const view: NativeGoalView = { id: 'g-1', revision: 1, objective: 'only goal', phase: 'active', maxGoalRounds: 40, roundsStarted: 0, activation: 'disarmed' }
     const h = delegationHost({ registered: REG, models: MODELS, policy: policyOf(['alpha', 'm-a'], ['beta', 'm-b']), goal: () => view, driver: () => true })
