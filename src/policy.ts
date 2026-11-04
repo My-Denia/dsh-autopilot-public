@@ -22,6 +22,8 @@ import type { Ledger } from './domain/ledger-types.js'
 export function renderRootPolicy(ledger: Ledger | undefined): string {
   const marker = ledger?.hostRestart
   if (ledger === undefined || marker === undefined) return ''
+  // Once the goal is armed again (or the composition says otherwise) the restart is history, not news.
+  if (ledger.autoContinue.code !== undefined && ledger.autoContinue.code !== 'released-after-restart') return ''
   const lost = ledger.delegations.filter(d => d.state === 'lost')
   const named = lost.length === 0
     ? marker.lostChildIds

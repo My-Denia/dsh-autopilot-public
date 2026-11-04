@@ -446,7 +446,7 @@ describe('§3 the plugin mount as the host observes it', () => {
   it('exposes the root controller surface once ctx.plugin() resolves', async () => {
     const bed = await pluginBed()
     await bed.mounted.plugin(autopilotPlugin, { storeRoot: mkdtempSync(join(tmpdir(), 'dsh-autopilot-mount-')) })
-    expect(rootSurface(bed)).toEqual(['autopilot_status'])
+    expect(rootSurface(bed)).toEqual(['autopilot_agents', 'autopilot_delegate', 'autopilot_status'])
   })
 
   it('a slow store cannot remove tools from the surface the host observes', async () => {
@@ -465,6 +465,6 @@ describe('§3 the plugin mount as the host observes it', () => {
     })
     await bed.mounted.plugin(autopilotPlugin, { storeRoot: mkdtempSync(join(tmpdir(), 'dsh-autopilot-slow-')) })
     expect(opened).toBe(true)
-    expect(rootSurface(bed)).toEqual(['autopilot_status'])
+    expect(rootSurface(bed)).toEqual(['autopilot_agents', 'autopilot_delegate', 'autopilot_status'])
   })
 })

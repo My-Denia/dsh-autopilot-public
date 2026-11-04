@@ -206,6 +206,9 @@ function stubLlmRuntime() {
 }
 
 
+/** The root tool surface: status, delegate, wait (agents). Children get their own scope tools. */
+const ROOT_TOOLS = ['autopilot_status', 'autopilot_delegate', 'autopilot_agents']
+
 const tmp = (label = 'apply'): string => mkdtempSync(join(tmpdir(), `dsh-autopilot-${label}-`))
 const FIXTURES = join(fileURLToPath(new URL('.', import.meta.url)), 'fixtures', 'legacy-synthetic')
 
@@ -234,7 +237,7 @@ describe('apply', () => {
 
     const dispose = await mount
     expect(host.recorded.sections).toEqual(['autopilot:policy', 'autopilot:routing-onboarding'])
-    expect(host.recorded.toolNames).toEqual(['autopilot_status'])
+    expect(host.recorded.toolNames).toEqual(ROOT_TOOLS)
     await expect(host.announce(host.childAgent)).resolves.toBeUndefined()
     await dispose()
   })
@@ -454,7 +457,7 @@ describe('apply: a degraded store says why', () => {
     const host = fakeCtx(root, {})
     delete (host.ctx as { logger?: unknown }).logger
     const dispose = await apply(host.ctx, { storeRoot: root })
-    expect(host.recorded.toolNames).toEqual(['autopilot_status'])
+    expect(host.recorded.toolNames).toEqual(ROOT_TOOLS)
     await dispose()
   })
 })
@@ -476,10 +479,10 @@ describe('apply: which agents get the root surface', () => {
 
   it('a re-announced root is installed ONCE, not stacked', async () => {
     const { host, dispose } = await mounted()
-    expect(host.recorded.toolNames).toEqual(['autopilot_status'])
+    expect(host.recorded.toolNames).toEqual(ROOT_TOOLS)
     await host.announce(host.rootAgent)
     await host.announce(host.rootAgent)
-    expect(host.recorded.toolNames).toEqual(['autopilot_status'])
+    expect(host.recorded.toolNames).toEqual(ROOT_TOOLS)
     await dispose()
   })
 
@@ -488,7 +491,7 @@ describe('apply: which agents get the root surface', () => {
     // The host DOES list it as a root, so the parentSession guard is the only thing that can refuse it.
     expect(host.ctx.agents.roots()).toContain(host.childAgent as unknown)
     await host.announce(host.childAgent)
-    expect(host.recorded.toolNames).toEqual(['autopilot_status'])
+    expect(host.recorded.toolNames).toEqual(ROOT_TOOLS)
     await dispose()
   })
 
@@ -496,7 +499,7 @@ describe('apply: which agents get the root surface', () => {
     const { host, dispose } = await mounted()
     expect(host.otherRoot.session.header).toEqual({})
     await host.announce(host.otherRoot)
-    expect(host.recorded.toolNames).toEqual(['autopilot_status'])
+    expect(host.recorded.toolNames).toEqual(ROOT_TOOLS)
     await dispose()
   })
 
@@ -504,7 +507,7 @@ describe('apply: which agents get the root surface', () => {
     const { host, dispose } = await mounted()
     host.dispose(host.rootAgent)
     await host.announce(host.rootAgent)
-    expect(host.recorded.toolNames).toEqual(['autopilot_status', 'autopilot_status'])
+    expect(host.recorded.toolNames).toEqual([...ROOT_TOOLS, ...ROOT_TOOLS])
     await dispose()
   })
 })
@@ -515,15 +518,26 @@ describe('apply: retired settings', () => {
     gate: { sandboxCoupling: false, toolDeny: false, egressDeny: false, stopReminder: false, strictShell: true, restoreMode: 'read-only' },
     governance: { maxAuditRoundsPerRole: 3, unattended: true },
     storeKind: 'file' as const,
+    auditProvider: 'spawn',
+    executorProvider: 'spawn',
+    executor: { persona: 'lead', toolAllowList: ['read'], agentOptions: { maxTokens: 10 } },
+    auditors: {
+      plan: { provider: 'spawn', agentOptions: { maxTokens: 10 } },
+      execution: { provider: 'spawn', agentOptions: { maxTokens: 10 } },
+      rules: { provider: 'spawn', agentOptions: { maxTokens: 10 } },
+    },
+    crossFamily: { enabled: false, minRisk: 'high' as const, pool: [{ provider: 'p', model: 'm' }] },
   }
 
   it('the fixture really writes every retired key (so a newly retired key cannot be forgotten here)', () => {
-    const written = [
-      ...Object.keys(OLD_CONFIG.gate).map(k => `gate.${k}`),
-      ...Object.keys(OLD_CONFIG.governance).map(k => `governance.${k}`),
-      'storeKind',
-    ].sort()
-    expect(written).toEqual([...RETIRED_CONFIG_KEYS].sort())
+    const paths: string[] = []
+    const walk = (value: unknown, path: string): void => {
+      if (value !== null && typeof value === 'object' && !Array.isArray(value)) {
+        for (const [k, v] of Object.entries(value)) walk(v, path === '' ? k : `${path}.${k}`)
+      } else paths.push(path)
+    }
+    walk(OLD_CONFIG, '')
+    expect(paths.sort()).toEqual([...RETIRED_CONFIG_KEYS].sort())
   })
 
   it('an old config carrying every retired key mounts, and yields exactly ONE note (service) and ONE warning', async () => {
@@ -746,7 +760,7 @@ describe('apply through a REAL cordis fiber', () => {
 
     // The assertion that needs no timing: by the time the host's wait has returned, the tool surface EXISTS.
     // Assert the SET, not a count: a bare length is a moving anchor that is cheapest to "fix" by bumping it.
-    expect(toolNames.filter(tool => tool.startsWith('autopilot_')).sort()).toEqual(['autopilot_status'])
+    expect(toolNames.filter(tool => tool.startsWith('autopilot_')).sort()).toEqual([...ROOT_TOOLS].sort())
 
     await ctx.fiber.dispose()
   })
@@ -755,7 +769,7 @@ describe('apply through a REAL cordis fiber', () => {
     const root = tmp('real')
     const { ctx, toolNames } = realHost({ open: async () => { throw new Error('backend down') } })
     await mount(ctx, { storeRoot: root })
-    expect(toolNames).toEqual(['autopilot_status'])
+    expect(toolNames).toEqual(ROOT_TOOLS)
     await ctx.fiber.dispose()
   })
 
@@ -790,7 +804,7 @@ describe('apply through a REAL cordis fiber', () => {
       gate: { sandboxCoupling: false, toolDeny: false, egressDeny: false, stopReminder: false, strictShell: true, restoreMode: 'read-only' },
       governance: { maxAuditRoundsPerRole: 3, unattended: true },
     })
-    expect(toolNames).toEqual(['autopilot_status'])
+    expect(toolNames).toEqual(ROOT_TOOLS)
     await ctx.fiber.dispose()
   })
 })

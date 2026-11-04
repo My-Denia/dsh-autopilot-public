@@ -132,8 +132,19 @@ export function createAutopilotService(input: AutopilotServiceInput): AutopilotR
       return input.ledgers.list().map(ledger => projectLedger(ledger, runs, notes()))
     },
     legacyRuns: listRuns,
-    legacyRun: async (runId) => {
-      const run = await legacy.read(input.sources, runId)
+    legacyRun: async (id) => {
+      let runId = id
+      let run = await legacy.read(input.sources, runId)
+      if (run === undefined) {
+        // A session id is also accepted: the first 0.2.x run of a session was named after it, and a later
+        // run is reached through the session's own listing. The last run listed for the session is served.
+        const ofSession = (await legacy.list(input.sources)).filter(candidate => candidate.sessionId === id)
+        const latest = ofSession[ofSession.length - 1]
+        if (latest !== undefined) {
+          runId = latest.runId
+          run = await legacy.read(input.sources, runId)
+        }
+      }
       const restore = restoreOf(runId)
       return run === undefined || restore === undefined ? run : { ...run, sandboxRestore: restore }
     },

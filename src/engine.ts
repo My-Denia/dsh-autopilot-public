@@ -20,7 +20,10 @@
 import { AP_DISPOSED, AP_LEDGER_BUSY, AP_LEDGER_CONFLICT } from './domain/refusals.js'
 import { AutopilotError, errorMessage } from './domain/types.js'
 import type { AuditRole, RoutingPin } from './domain/types.js'
-import type { DelegationRecord, Ledger, LegacyRunSummary, SandboxRestoreRecord } from './domain/ledger-types.js'
+import type { DelegationRecord, GoalRef, Ledger, LegacyRunSummary, LinkRecord, SandboxRestoreRecord } from './domain/ledger-types.js'
+import { Delegator, autoContinueFor } from './delegate.js'
+import type { DelegateArgs, DelegateResult } from './delegate.js'
+import type { ModelSelectionSetting } from './roles/route.js'
 import { legacyClampOf, listLegacyRuns, readLegacyRun } from './legacy/index.js'
 import type { LegacySources } from './legacy/index.js'
 import type { CrossFamilyPolicy } from './roles/cross-family.js'
@@ -297,6 +300,26 @@ export interface EnvironmentProbes {
    * a per-session override.
    */
   readonly sandboxDefaultMode?: () => string | undefined
+  /** The user's native subagent `maxDepth` setting (`ctx.subagents.config.maxDepth`), or `undefined` when unreadable. */
+  readonly subagentMaxDepth?: () => number | undefined
+  /** The user's native `subagentModelSelection` setting, or `undefined` when unreadable or off. */
+  readonly modelSelection?: () => ModelSelectionSetting | undefined
+  /** The session's native dsh-goal (`ctx.goals.get`), or `undefined` when the service or the goal is absent. */
+  readonly readGoal?: (root: AgentRef) => NativeGoalView | undefined
+  /** Whether the composition has an ACTIVE goal round driver: true, false, or `undefined` when it cannot be inspected. */
+  readonly goalDriverPresent?: () => boolean | undefined
+}
+
+/** The slice of the host's goal view the ledger mirrors (`dsh-goal` `GoalView`). */
+export interface NativeGoalView {
+  readonly id: string
+  readonly revision: number
+  readonly objective: string
+  readonly phase: string
+  readonly maxGoalRounds: number
+  readonly roundsStarted: number
+  readonly activation: 'armed' | 'disarmed'
+  readonly blockedReason?: { readonly code: string; readonly message: string }
 }
 
 /**
@@ -430,6 +453,7 @@ export class AutopilotEngine {
   private legacyListing: Promise<readonly LegacyRunSummary[]> | undefined
   private readonly now: () => string
   private readonly warn: (message: string) => void
+  private readonly delegator: Delegator
 
   constructor(
     readonly agents: AgentsRef,
@@ -441,6 +465,109 @@ export class AutopilotEngine {
   ) {
     this.now = ports.now ?? isoNow
     this.warn = ports.warn ?? (() => {})
+    this.delegator = new Delegator(this)
+  }
+
+  /** A plain diagnostic through the mount's warn channel. */
+  report(message: string): void {
+    this.warn(`dsh-autopilot: ${message}`)
+  }
+
+  // ── Delegation (see ./delegate.ts) ─────────────────────────────────────────
+
+  delegate(caller: AgentRef, args: DelegateArgs): Promise<DelegateResult> {
+    return this.delegator.delegate(caller, args)
+  }
+
+  wait(caller: AgentRef, childIds: readonly string[] | undefined, timeoutSeconds: number) {
+    return this.delegator.wait(caller, childIds, timeoutSeconds)
+  }
+
+  escalate(child: AgentRef, reason: string): Promise<string> {
+    return this.delegator.escalate(child, reason)
+  }
+
+  /** `agent/created` of a child: apply its armed or ledger-derived tool allow-list, then give it its own tools. Throws to veto. */
+  onChildCreated(child: AgentRef): void {
+    this.delegator.onChildCreated(child)
+  }
+
+  onChildDisposed(child: AgentRef): void {
+    this.delegator.onChildDisposed(child)
+  }
+
+  rootIdOf(agent: AgentRef): string {
+    return this.delegator.rootIdOf(agent)
+  }
+
+  /** Record observed routes of this root's children from their request headers. */
+  refreshRoutes(rootId: string): Promise<void> {
+    return this.delegator.refreshRoutes(rootId)
+  }
+
+  // ── Goal mirror and links ──────────────────────────────────────────────────
+
+  /**
+   * Mirror the session's native goal into the ledger and recompute auto-continue.
+   * A session with a goal gets a ledger even when nothing was dispatched (the card
+   * anchors on it); a session with neither a goal nor a ledger gets none. Never throws.
+   */
+  async syncGoal(root: AgentRef): Promise<void> {
+    try {
+      const env = this.ports.environment
+      let view: ReturnType<NonNullable<EnvironmentProbes['readGoal']>>
+      try { view = env?.readGoal?.(root) } catch { view = undefined }
+      if (view === undefined && this.ledgers.load(root.id) === undefined) return
+      const driver = env?.goalDriverPresent?.()
+      if (view === undefined && driver === undefined) return
+      await this.mutate(root.id, (ledger) => {
+        const at = this.now()
+        let goal = ledger.goal
+        let previousGoals = ledger.previousGoals
+        let changed = false
+        if (view !== undefined) {
+          const same = goal?.goalId === view.id
+          const next: GoalRef = {
+            goalId: view.id,
+            revision: view.revision,
+            status: view.phase,
+            objective: view.objective,
+            activation: view.activation,
+            roundsStarted: view.roundsStarted,
+            maxGoalRounds: view.maxGoalRounds,
+            ...(view.blockedReason === undefined ? {} : { blockedReason: view.blockedReason }),
+            firstSeenAt: same ? goal!.firstSeenAt : at,
+            lastSeenAt: at,
+          }
+          const { lastSeenAt: _a, ...nextCore } = next
+          const { lastSeenAt: _b, ...goalCore } = goal ?? { lastSeenAt: '' }
+          if (goal === undefined || JSON.stringify(nextCore) !== JSON.stringify(goalCore)) {
+            if (goal !== undefined && !same && !previousGoals.some(g => g.goalId === goal!.goalId)) previousGoals = [...previousGoals, goal]
+            goal = next
+            changed = true
+          }
+        }
+        const autoContinue = autoContinueFor({ ...ledger, ...(goal === undefined ? {} : { goal }) }, goal, driver)
+        const sameAuto = autoContinue.available === ledger.autoContinue.available && autoContinue.code === ledger.autoContinue.code && autoContinue.reason === ledger.autoContinue.reason
+        if (!changed && sameAuto) return undefined
+        return { ...ledger, ...(goal === undefined ? {} : { goal }), previousGoals, autoContinue }
+      })
+    } catch (error: unknown) {
+      this.report(`mirroring the goal of session ${root.id} failed: ${errorMessage(error)}`)
+    }
+  }
+
+  /** Append an issue or PR link; idempotent on (kind, ref), which only fills a missing url. */
+  async addLink(rootId: string, link: { readonly kind: 'issue' | 'pr'; readonly ref: string; readonly url?: string }): Promise<Ledger | undefined> {
+    return await this.mutate(rootId, (ledger) => {
+      const existing = ledger.links.find(l => l.kind === link.kind && l.ref === link.ref)
+      if (existing !== undefined) {
+        if (existing.url !== undefined || link.url === undefined) return undefined
+        return { ...ledger, links: ledger.links.map(l => (l === existing ? { ...l, url: link.url! } : l)) }
+      }
+      const added: LinkRecord = { kind: link.kind, ref: link.ref, ...(link.url === undefined ? {} : { url: link.url }), at: this.now() }
+      return { ...ledger, links: [...ledger.links, added] }
+    })
   }
 
   /** The routing ports (catalog, policy reader, installer); empty when none was wired. */
@@ -544,6 +671,7 @@ export class AutopilotEngine {
     const tail = this.openTails.get(root.id) ?? Promise.resolve()
     const work: Promise<RootOpenedOutcome> = tail
       .then(() => this.openRoot(root, skipChildIds))
+      .then(async (outcome) => { await this.syncGoal(root); return outcome })
       .catch((error: unknown): RootOpenedOutcome => {
         this.warn(`dsh-autopilot: opening session ${root.id} failed: ${errorMessage(error)}`)
         return { lostChildIds: [], restoredRunIds: [] }

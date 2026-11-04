@@ -44,6 +44,17 @@ describe('renderRootPolicy: zero tokens by default', () => {
   })
 })
 
+describe('renderRootPolicy: once the restart is history', () => {
+  it('goes silent when auto-continue is available again (goal re-armed), however old the restart marker', () => {
+    expect(renderRootPolicy(restarted({ autoContinue: { available: true, code: 'driver-present', reason: 'goal round driver present' } }))).toBe('')
+  })
+
+  it('stays while the code still says released-after-restart, and goes silent for a composition with no driver', () => {
+    expect(renderRootPolicy(restarted({ autoContinue: { available: false, code: 'released-after-restart', reason: 'released after host restart' } }))).toContain('Lost children')
+    expect(renderRootPolicy(restarted({ autoContinue: { available: false, code: 'no-driver-in-composition', reason: 'no goal round driver in this composition' } }))).toBe('')
+  })
+})
+
 describe('renderRootPolicy: after a host restart', () => {
   it('names the lost child with its role and task, and not the one that finished', () => {
     const text = renderRootPolicy(restarted())

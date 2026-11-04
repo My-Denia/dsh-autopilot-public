@@ -12,7 +12,7 @@
  */
 
 import { describe, expect, it } from 'vitest'
-import { Config, DEFAULT_EXECUTOR_TOOLS, RETIRED_CONFIG_KEYS, retiredConfigNote, retiredKeysIn } from '../src/config.js'
+import { Config, DEFAULT_EXECUTOR_TOOLS, LEGACY_KEYS_STILL_READ, RETIRED_CONFIG_KEYS, retiredConfigNote, retiredKeysIn } from '../src/config.js'
 import { SHELL_TOOLS } from '../src/roles/tools.js'
 import { resolveConfig, volatileRoutingAccess } from '../src/index.js'
 import type { ConfigInput, ResolvedRouting } from '../src/index.js'
@@ -79,10 +79,10 @@ describe('Config — the loader path', () => {
     expect(routed.auditors.execution).toBeUndefined()
   })
 
-  it('still honours an explicitly empty allow-list (the default is a default, not a floor)', () => {
-    const result = loaded({ executor: { toolAllowList: [] } })
+  it('executor.toolAllowList is retired: whatever it says, the resolved list is the shipped one', () => {
+    const result = loaded({ executor: { toolAllowList: ['read'] } })
     expect(result.issues).toBeUndefined()
-    expect(resolveConfig(result.value).executor.toolAllowList).toEqual([])
+    expect(resolveConfig(result.value).executor.toolAllowList).toEqual([...DEFAULT_EXECUTOR_TOOLS])
   })
 
   it('accepts a fully specified profile (positive control for every negative below)', () => {
@@ -484,15 +484,12 @@ describe('resolveConfig — legacy explicit routes map to locked (documented, te
     expect(resolved.executor.agentOptions).toEqual({ maxTokens: 8192 })
   })
 
-  it('crossFamily.pool entries are NOT mapped into locks (E3 handles pool as grants in off mode only)', () => {
+  it('crossFamily.pool is retired: it maps into no lock and is not carried', () => {
     const resolved = resolveConfig({
       crossFamily: { pool: [{ provider: 'openai', model: 'gpt-6.1-sol' }, { provider: 'anthropic', model: 'claude-x' }] },
     })
     expect(resolved.routing).toEqual(resolveConfig({}).routing)
-    expect(resolved.crossFamily.pool).toEqual([
-      { provider: 'openai', model: 'gpt-6.1-sol' },
-      { provider: 'anthropic', model: 'claude-x' },
-    ])
+    expect(resolved.crossFamily.pool).toEqual([])
   })
 
   it('the legacy→locked mapping agrees between the loader path and the plain path', () => {
@@ -711,7 +708,14 @@ describe('retired 0.2.x settings', () => {
     governance: { maxAuditRoundsPerRole: 2, unattended: true },
     storeKind: 'file',
     auditProvider: 'spawn',
-    crossFamily: { enabled: true, minRisk: 'high' },
+    executorProvider: 'spawn',
+    executor: { persona: 'lead', toolAllowList: ['read'], agentOptions: { maxTokens: 100 } },
+    auditors: {
+      plan: { provider: 'spawn', agentOptions: { maxTokens: 100 } },
+      execution: { provider: 'spawn', agentOptions: { maxTokens: 100 } },
+      rules: { provider: 'spawn', agentOptions: { maxTokens: 100 } },
+    },
+    crossFamily: { enabled: true, minRisk: 'high', pool: [{ provider: 'openai', model: 'gpt-6.1-sol' }] },
   }
 
   it('an old profile with every retired key set loads with no issue, through the schema and the plain path', () => {
@@ -736,7 +740,7 @@ describe('retired 0.2.x settings', () => {
   })
 
   it('retiredKeysIn returns exactly the retired keys written, in table order', () => {
-    expect(retiredKeysIn(oldProfile)).toEqual([...RETIRED_CONFIG_KEYS])
+    expect([...retiredKeysIn(oldProfile)].sort()).toEqual([...RETIRED_CONFIG_KEYS].sort())
     expect(retiredKeysIn({ gate: { toolDeny: true }, governance: { unattended: false }, routing: { mode: 'off' } }))
       .toEqual(['gate.toolDeny', 'governance.unattended'])
     // A key whose value is false is still written.
@@ -744,7 +748,7 @@ describe('retired 0.2.x settings', () => {
   })
 
   it('live settings are not reported, and a malformed input does not throw', () => {
-    expect(retiredKeysIn({ routing: { mode: 'off' }, crossFamily: { enabled: true }, storeRoot: '/x', skillInstall: 'off' })).toEqual([])
+    expect(retiredKeysIn({ routing: { mode: 'off' }, storeRoot: '/x', skillInstall: 'off', executor: { agentOptions: { provider: 'p' } } })).toEqual([])
     expect(retiredKeysIn(undefined)).toEqual([])
     expect(retiredKeysIn(null)).toEqual([])
     expect(retiredKeysIn('gate')).toEqual([])
@@ -759,10 +763,43 @@ describe('retired 0.2.x settings', () => {
   })
 
   it('every retired key is still declared by the schema (it must keep loading)', () => {
-    for (const path of RETIRED_CONFIG_KEYS) {
-      const [head, tail] = path.split('.')
-      const raw = tail === undefined ? { [head!]: 'file' } : { [head!]: { [tail]: tail === 'restoreMode' ? 'read-only' : tail === 'maxAuditRoundsPerRole' ? 2 : true } }
-      expect(loaded(raw).issues, path).toBeUndefined()
+    const valueFor = (leaf: string): unknown => {
+      if (leaf === 'restoreMode' || leaf === 'persona' || leaf.endsWith('Provider') || leaf === 'provider' || leaf === 'storeKind') return leaf === 'storeKind' ? 'file' : 'x'
+      if (leaf === 'maxAuditRoundsPerRole' || leaf === 'maxTokens') return 2
+      if (leaf === 'toolAllowList') return ['read']
+      if (leaf === 'pool') return [{ provider: 'p', model: 'm' }]
+      if (leaf === 'minRisk') return 'high'
+      return true
     }
+    for (const path of RETIRED_CONFIG_KEYS) {
+      const parts = path.split('.')
+      let raw: unknown = valueFor(parts[parts.length - 1]!)
+      for (let i = parts.length - 1; i >= 0; i -= 1) raw = { [parts[i]!]: raw }
+      expect(loaded(raw).issues, path).toBeUndefined()
+      expect(retiredKeysIn((loaded(raw).value))).toContain(path)
+    }
+  })
+
+  it('the final list: what is retired, and what the 0.2.x agentOptions surface still feeds', () => {
+    expect([...RETIRED_CONFIG_KEYS].sort()).toEqual([
+      'auditProvider', 'auditors.execution.agentOptions.maxTokens', 'auditors.execution.provider',
+      'auditors.plan.agentOptions.maxTokens', 'auditors.plan.provider', 'auditors.rules.agentOptions.maxTokens',
+      'auditors.rules.provider', 'crossFamily.enabled', 'crossFamily.minRisk', 'crossFamily.pool',
+      'executor.agentOptions.maxTokens', 'executor.persona', 'executor.toolAllowList', 'executorProvider',
+      'gate.egressDeny', 'gate.restoreMode', 'gate.sandboxCoupling', 'gate.stopReminder', 'gate.strictShell', 'gate.toolDeny',
+      'governance.maxAuditRoundsPerRole', 'governance.unattended', 'storeKind',
+    ].sort())
+    expect(LEGACY_KEYS_STILL_READ.filter(key => RETIRED_CONFIG_KEYS.includes(key))).toEqual([])
+  })
+
+  it('the keys still read really do pin the role routes: executor.agentOptions locks the executor, auditors.<role> lock the auditors', () => {
+    const resolved = resolveConfig({
+      executor: { agentOptions: { provider: 'e', model: 'em', reasoningEffort: 'high' } },
+      auditors: { plan: { agentOptions: { provider: 'a', model: 'am' } }, execution: { agentOptions: { provider: 'b', model: 'bm' } }, rules: { agentOptions: { provider: 'c', model: 'cm' } } },
+    })
+    expect(resolved.routing.roles.executor).toMatchObject({ mode: 'locked', provider: 'e', model: 'em', reasoningEffort: 'high' })
+    expect(resolved.routing.roles['plan-auditor']).toMatchObject({ mode: 'locked', provider: 'a', model: 'am' })
+    expect(resolved.routing.roles['execution-auditor']).toMatchObject({ mode: 'locked', provider: 'b' })
+    expect(resolved.routing.roles['rules-auditor']).toMatchObject({ mode: 'locked', provider: 'c' })
   })
 })

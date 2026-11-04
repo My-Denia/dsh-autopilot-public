@@ -155,3 +155,189 @@ export function delegation(childId: string, state: DelegationRecord['state'], ov
     ...overrides,
   }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// A fake host for the delegation tests: startActivation creates a real-shaped child agent,
+// announces it through the engine's agent/created hook, and settles on demand.
+// ─────────────────────────────────────────────────────────────────────────────
+
+import { RouteCatalog } from '../src/routing/catalog.js'
+import type { LlmCallConfig, LlmRuntimeSubset } from '../src/routing/catalog.js'
+import type { SessionPolicyState } from '../src/routing/authorize.js'
+import type { NativeGoalView } from '../src/engine.js'
+
+export interface StubModel {
+  readonly provider: string
+  readonly id: string
+  readonly contextWindow?: number
+  readonly defaultEffort?: string
+}
+
+export function stubLlm(models: readonly StubModel[], over: Partial<LlmRuntimeSubset> = {}): LlmRuntimeSubset {
+  const providers = [...new Set(models.map(model => model.provider))]
+  return {
+    listProviders: () => providers.map(id => ({ id, name: id })),
+    listModels: async (provider: string) => models.filter(m => m.provider === provider).map(m => ({ provider, id: m.id, name: m.id })),
+    resolveModelInfo: async (provider: string, model: string) => {
+      const hit = models.find(c => c.provider === provider && c.id === model)
+      if (hit === undefined) throw new Error(`unknown route ${provider}/${model}`)
+      return {
+        provider,
+        id: model,
+        name: model,
+        ...(hit.contextWindow !== undefined ? { context: { contextWindow: hit.contextWindow } } : {}),
+        ...(hit.defaultEffort !== undefined ? { reasoning: { efforts: [{ id: hit.defaultEffort, name: hit.defaultEffort }], defaultEffort: hit.defaultEffort } } : {}),
+      }
+    },
+    resolveCallConfig: async (config: LlmCallConfig) => ({ ...config }),
+    ...over,
+  }
+}
+
+export const catalogOf = (models: readonly StubModel[], over: Partial<LlmRuntimeSubset> = {}): RouteCatalog => new RouteCatalog(stubLlm(models, over))
+
+export const policyOf = (...routes: readonly [string, string][]): SessionPolicyState => ({
+  kind: 'present',
+  routes: routes.map(([provider, model]) => ({ provider, model })),
+})
+
+export interface Deferred { resolve(value: { stopReason: string; structured?: unknown; diagnostic?: string }): void }
+
+export interface DelegationHost {
+  engine: AutopilotEngine
+  agents: FakeAgents
+  root: FakeAgent
+  ledgers: LedgerStoreLike
+  storeDir: string
+  warnings: string[]
+  /** Every startActivation spec, in call order. */
+  starts: Array<{ childId?: string; label: string; delivery: string; maxDepth?: number; outputSchema?: object; agentOptions?: Record<string, unknown>; prompt: string; parentId: string; provider: string }>
+  /** restrict() calls per child id. */
+  restricts: Map<string, string[][]>
+  /** Tool names registered in each child's own scope. */
+  childTools: Map<string, string[]>
+  /** Settle one child's activation. */
+  settle(childId: string, result?: { stopReason: string; structured?: unknown; diagnostic?: string }): void
+  /** A child agent as the host would hold it (cold resume): created and announced without a start. */
+  announceExisting(childId: string, parentId?: string): FakeAgent
+  /** Make the next startActivation throw. */
+  failNextStart: { error?: Error }
+  /** Make restrict() throw for a child id once. */
+  restrictThrows: Map<string, Error>
+  /** Make EVERY restrict() throw while set. */
+  restrictAlways: { error?: Error }
+}
+
+export function delegationHost(options: {
+  config?: ConfigInput
+  models?: readonly StubModel[]
+  catalog?: RouteCatalog
+  policy?: SessionPolicyState
+  registered?: readonly string[]
+  maxDepthSetting?: number
+  goal?: () => NativeGoalView | undefined
+  driver?: () => boolean | undefined
+  rootId?: string
+  hold?: (childId: string) => boolean
+} = {}): DelegationHost {
+  const storeDir = mkdtempSync(join(tmpdir(), 'dsh-autopilot-delegation-'))
+  const agents = new FakeAgents()
+  const rootTools: string[] = []
+  const root = fakeAgent(options.rootId ?? 'root-1', undefined, undefined, { tools: { register: (def: { name?: string }) => { rootTools.push(def.name ?? '?'); return () => {} } } })
+  agents.add(root)
+  const starts: DelegationHost['starts'] = []
+  const restricts = new Map<string, string[][]>()
+  const childTools = new Map<string, string[]>()
+  const deferreds = new Map<string, Deferred>()
+  const failNextStart: { error?: Error } = {}
+  const restrictThrows = new Map<string, Error>()
+  const restrictAlways: { error?: Error } = {}
+  const warnings: string[] = []
+  let counter = 0
+  let engine!: AutopilotEngine
+
+  const makeChild = (childId: string, parentId: string, options2?: Record<string, unknown>): FakeAgent => {
+    const tools: string[] = []
+    childTools.set(childId, tools)
+    const child = fakeAgent(childId, parentId, undefined, {
+      tools: {
+        restrict(filter: { allow: string[] }) {
+          if (restrictAlways.error !== undefined) throw restrictAlways.error
+          const thrown = restrictThrows.get(childId)
+          if (thrown !== undefined) { restrictThrows.delete(childId); throw thrown }
+          restricts.set(childId, [...(restricts.get(childId) ?? []), [...filter.allow]])
+        },
+        register(def: { name?: string }) { tools.push(def.name ?? '?'); return () => {} },
+      },
+    })
+    const config = { provider: (options2?.['provider'] as string | undefined) ?? 'host', model: (options2?.['model'] as string | undefined) ?? 'default', ...(options2?.['reasoningEffort'] === undefined ? {} : { reasoningEffort: options2['reasoningEffort'] }) }
+    child.session.append('request/header', { header: { config }, reason: 'initial' })
+    return child
+  }
+
+  const subagents: SubagentsRef = {
+    async startActivation(spec): Promise<SubagentActivationRef> {
+      const pending = failNextStart.error
+      if (pending !== undefined) { failNextStart.error = undefined; throw pending }
+      counter += 1
+      const childId = spec.childId ?? `auto-child-${counter}`
+      const parent = spec.request.parent as FakeAgent
+      starts.push({
+        ...(spec.childId === undefined ? {} : { childId: spec.childId }),
+        label: spec.label,
+        delivery: spec.delivery,
+        ...(spec.request.maxDepth === undefined ? {} : { maxDepth: spec.request.maxDepth }),
+        ...(spec.request.outputSchema === undefined ? {} : { outputSchema: spec.request.outputSchema }),
+        ...(spec.request.agentOptions === undefined ? {} : { agentOptions: { ...spec.request.agentOptions } }),
+        prompt: spec.request.prompt.map(b => b.text).join('\n'),
+        parentId: parent.id,
+        provider: spec.provider,
+      })
+      const child = makeChild(childId, parent.id, spec.request.agentOptions as Record<string, unknown> | undefined)
+      agents.add(child)
+      // The host announces the child before startActivation returns; a throw vetoes it.
+      try {
+        engine.onChildCreated(child)
+      } catch (error) {
+        agents.remove(childId)
+        throw error
+      }
+      let resolve!: Deferred['resolve']
+      const result = new Promise<{ stopReason: string; structured?: unknown; diagnostic?: string }>((r) => { resolve = r })
+      deferreds.set(childId, { resolve })
+      return { childId, result, async dispose() {} }
+    },
+    async sendMessage() { return {} },
+    interrupt() {},
+    async drainChildren() { return {} },
+  }
+
+  const ledgers = FileLedgerStore.open(storeDir)
+  engine = new AutopilotEngine(agents, subagents, ledgers, legacySourcesOf(storeDir), resolveConfig(options.config), {
+    routing: {
+      ...(options.catalog === undefined && options.models === undefined ? {} : { catalog: options.catalog ?? catalogOf(options.models ?? []) }),
+      policyReader: () => options.policy ?? { kind: 'absent' },
+    },
+    environment: {
+      ...(options.registered === undefined ? {} : { registeredToolNames: () => options.registered }),
+      ...(options.maxDepthSetting === undefined ? {} : { subagentMaxDepth: () => options.maxDepthSetting }),
+      ...(options.goal === undefined ? {} : { readGoal: () => options.goal!() }),
+      ...(options.driver === undefined ? {} : { goalDriverPresent: options.driver }),
+    },
+    warn: message => warnings.push(message),
+    now: (() => { let t = 0; return () => `2026-11-04T10:00:${String(Math.min(59, t++)).padStart(2, '0')}.000Z` })(),
+  })
+  return {
+    engine, agents, root, ledgers, storeDir, warnings, starts, restricts, childTools,
+    settle(childId, result = { stopReason: 'completed' }) { deferreds.get(childId)?.resolve(result) },
+    announceExisting(childId, parentId = root.id) {
+      const child = makeChild(childId, parentId)
+      agents.add(child)
+      engine.onChildCreated(child)
+      return child
+    },
+    failNextStart,
+    restrictThrows,
+    restrictAlways,
+  }
+}

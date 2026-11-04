@@ -100,7 +100,7 @@ export const DEFAULT_EXECUTOR_TOOLS: readonly string[] = [
 const AgentOptions = Schema.object({
   provider: Schema.string().description('LLM provider id.'),
   model: Schema.string().description('Model id.'),
-  maxTokens: Schema.natural().description('Per-child output cap.'),
+  maxTokens: Schema.natural().description('Retired in 0.3.0 and ignored (the route grant is provider, model and reasoningEffort only).'),
   /**
    * Reasoning effort ([R2-P3-1]). Declared here so a legacy route may name
    * one; it is validated against exact model capability by the dispatch
@@ -113,7 +113,7 @@ const AgentOptions = Schema.object({
 
 /** Per-role auditor routing (the cross-family review matrix's landing point). */
 const AuditorRoute = Schema.object({
-  provider: Schema.string().description('Subagent transport provider for this role.'),
+  provider: Schema.string().description('Retired in 0.3.0 and ignored: the one-shot transport provider no longer exists. Reviews use the role route only.'),
   agentOptions: AgentOptions,
 })
 
@@ -302,8 +302,8 @@ export const StoreKindSchema = Schema.union([
 
 /** Declared plugin configuration shape; mirrors `ConfigInput` in `./index.ts`. */
 const ConfigShape = Schema.object({
-  auditProvider: Schema.string().default('spawn').description('Subagent transport provider for one-shot auditors.'),
-  executorProvider: Schema.string().default('spawn').description('Subagent transport provider for the continuable executor.'),
+  auditProvider: Schema.string().description('Retired in 0.3.0 and ignored. No default is declared, so only a written key reads as retired.'),
+  executorProvider: Schema.string().description('Retired in 0.3.0 and ignored. No default is declared, so only a written key reads as retired.'),
   auditors: Schema.object({
     plan: AuditorRoute,
     execution: AuditorRoute,
@@ -311,19 +311,14 @@ const ConfigShape = Schema.object({
   }).description('Per-role auditor routing; omitted roles inherit the deployment default.'),
   executor: Schema.object({
     agentOptions: AgentOptions,
-    persona: Schema.string().default('').description('Executor Lead persona override.'),
-    toolAllowList: Schema.array(Schema.string())
-      .default([...DEFAULT_EXECUTOR_TOOLS])
-      .description('Tool names the executor child may call.'),
+    persona: Schema.string().description('Retired in 0.3.0 and ignored: the role personas are fixed in src/roles.'),
+    toolAllowList: Schema.array(Schema.string()).description('Retired in 0.3.0 and ignored: the role tool surfaces are fixed in src/roles.'),
   }),
   crossFamily: Schema.object({
-    enabled: Schema.boolean().default(true)
-      .description('Seek an auditor from a family the executor is not from, once risk reaches minRisk.'),
-    minRisk: Schema.union(['low', 'medium', 'high', 'critical'] as const).default('medium')
-      .description('Risk floor at which cross-family review is sought.'),
-    pool: Schema.array(AgentOptions).default([])
-      .description('Candidate auditor routes to draw an out-of-family reviewer from.'),
-  }).description('Cross-family review: a blind spot shared by one provider passes both gates unchallenged, so at risk the reviewer should not be from the builder family. A strategy, not a gate — the outcome is recorded per audit rather than enforced.'),
+    enabled: Schema.boolean().description('Retired in 0.3.0 and ignored: a reviewer always seeks a different provider family than the work it reviews.'),
+    minRisk: Schema.union(['low', 'medium', 'high', 'critical'] as const).description('Retired in 0.3.0 and ignored.'),
+    pool: Schema.array(AgentOptions).description('Retired in 0.3.0 and ignored: the reviewer draws from the ladder and the session policy.'),
+  }).description('Retired in 0.3.0 and ignored (see each key).'),
   routing: RoutingShape.description(
     'Role-true model routing over the live catalog. Every GAH-config-sourced explicit route (a lock, legacy role config, a legacy pool pick) is a plugin-config grant under one rule in every mode; a grant outside an existing session model-selection policy escalates to the owner instead of dispatching. In auto mode the routing core subsumes the legacy pool fallback: pool entries stay consultable as grants, never widen the session-authorized set, and never override a role lock.',
   ),
@@ -536,6 +531,43 @@ export const RETIRED_CONFIG_KEYS: readonly string[] = [
   'governance.maxAuditRoundsPerRole',
   'governance.unattended',
   'storeKind',
+  'auditProvider',
+  'executorProvider',
+  'executor.persona',
+  'executor.toolAllowList',
+  'executor.agentOptions.maxTokens',
+  'auditors.plan.provider',
+  'auditors.plan.agentOptions.maxTokens',
+  'auditors.execution.provider',
+  'auditors.execution.agentOptions.maxTokens',
+  'auditors.rules.provider',
+  'auditors.rules.agentOptions.maxTokens',
+  'crossFamily.enabled',
+  'crossFamily.minRisk',
+  'crossFamily.pool',
+]
+
+/**
+ * The legacy keys that are STILL READ, and by what. `executor.agentOptions`
+ * (provider, model, reasoningEffort) becomes the `routing.roles.executor` lock
+ * and so pins the worker and executor-lead route; `auditors.<role>.agentOptions`
+ * becomes the matching auditor lock and so pins the reviewer route (`legacyRouteFor`
+ * in `./index.ts`, read by `routeForDelegation`). Everything else of the 0.2.x
+ * surface is in {@link RETIRED_CONFIG_KEYS}.
+ */
+export const LEGACY_KEYS_STILL_READ: readonly string[] = [
+  'executor.agentOptions.provider',
+  'executor.agentOptions.model',
+  'executor.agentOptions.reasoningEffort',
+  'auditors.plan.agentOptions.provider',
+  'auditors.plan.agentOptions.model',
+  'auditors.plan.agentOptions.reasoningEffort',
+  'auditors.execution.agentOptions.provider',
+  'auditors.execution.agentOptions.model',
+  'auditors.execution.agentOptions.reasoningEffort',
+  'auditors.rules.agentOptions.provider',
+  'auditors.rules.agentOptions.model',
+  'auditors.rules.agentOptions.reasoningEffort',
 ]
 
 /** The retired keys the user actually wrote in `input`, in {@link RETIRED_CONFIG_KEYS} order. */
@@ -546,7 +578,8 @@ export function retiredKeysIn(input: unknown): readonly string[] {
       if (typeof node !== 'object' || node === null || Array.isArray(node)) return false
       node = (node as Record<string, unknown>)[part]
     }
-    return node !== undefined
+    // An EMPTY array is what the loader fills in for an unwritten array leaf, so it is not a written key.
+    return node !== undefined && !(Array.isArray(node) && node.length === 0)
   })
 }
 

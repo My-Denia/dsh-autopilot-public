@@ -23,6 +23,7 @@
  */
 
 import { AutopilotEngine } from './engine.js'
+import type { NativeGoalView } from './engine.js'
 import type { AgentOptionsLike, AgentRef, ResolvedConfig, ResolvedCostOverride, ResolvedLadder, ResolvedRouting, RoutingPorts } from './engine.js'
 import { observeOnboardingReachability, renderRoutingOnboarding } from './routing/onboarding.js'
 import type { WorkClassReachabilityReport } from './routing/coverage.js'
@@ -57,13 +58,15 @@ export * from './domain/ledger-types.js'
 export { REFUSALS } from './domain/refusals.js'
 export type { RefusalCode } from './domain/refusals.js'
 export { AutopilotEngine, effectiveSandboxMode, observedRouteOf } from './engine.js'
-export type { EnginePorts, EnvironmentProbes, ResolvedConfig, ResolvedRouting, RoutingPorts } from './engine.js'
+export type { EnginePorts, EnvironmentProbes, NativeGoalView, ResolvedConfig, ResolvedRouting, RoutingPorts } from './engine.js'
 export { defaultStoreRoot } from './store/file.js'
 export { AUTOPILOT_DOMAIN_SPEC, legacyDomainReaderOf } from './store/domain.js'
 export type { DomainFacilityLike } from './store/domain.js'
 export { DomainLedgerStore, FileLedgerStore, emptyLedger } from './store/ledger.js'
 export type { LedgerStoreLike } from './store/ledger.js'
-export { hasDirectHumanTurn, requireDirectHumanTurn } from './tools.js'
+export { hasDirectHumanTurn, installChildTools, requireDirectHumanTurn } from './tools.js'
+export { Delegator, autoContinueFor, routeMatchOf } from './delegate.js'
+export { findWriteConflict, pathsIntersect } from './roles/paths.js'
 export { renderRootPolicy } from './policy.js'
 export { createAutopilotService, registerAutopilotService } from './service.js'
 export type { AutopilotReadOnly } from './service.js'
@@ -75,7 +78,7 @@ export {
   queryParam,
 } from './web.js'
 export type { AutopilotWebRoute } from './web.js'
-export { Config, DEFAULT_EXECUTOR_TOOLS, RETIRED_CONFIG_KEYS, StoreKindSchema, retiredConfigNote, retiredKeysIn } from './config.js'
+export { Config, DEFAULT_EXECUTOR_TOOLS, LEGACY_KEYS_STILL_READ, RETIRED_CONFIG_KEYS, StoreKindSchema, retiredConfigNote, retiredKeysIn } from './config.js'
 export type { Role, RoleRouting, RoutePreference } from './routing/select.js'
 export { coverageReport, coverageRouteKey, workClassReachability } from './routing/coverage.js'
 export type {
@@ -709,20 +712,19 @@ function resolveLadder(input?: ConfigInput): ResolvedLadder {
 /** Resolve raw config with defaults (manual, defensive — the schema governs writes, this governs reads). */
 export function resolveConfig(input?: ConfigInput): ResolvedConfig {
   const executorAgentOptions = presentOrAbsent(input?.executor?.agentOptions)
+  // The retired 0.2.x keys (auditProvider, executorProvider, executor.persona, executor.toolAllowList, crossFamily.*)
+  // are not read: they resolve to their shipped values whatever the input says, so the loader path and the plain
+  // path agree. `executor.agentOptions` and `auditors.<role>.agentOptions` are still read, through `resolveRouting`.
   return {
-    auditProvider: input?.auditProvider ?? 'spawn',
-    executorProvider: input?.executorProvider ?? 'spawn',
+    auditProvider: 'spawn',
+    executorProvider: 'spawn',
     auditors: compactAuditors(input?.auditors),
     executor: {
       ...(executorAgentOptions === undefined ? {} : { agentOptions: executorAgentOptions }),
-      persona: input?.executor?.persona ?? '',
-      toolAllowList: [...(input?.executor?.toolAllowList ?? DEFAULT_EXECUTOR_TOOLS)],
+      persona: '',
+      toolAllowList: [...DEFAULT_EXECUTOR_TOOLS],
     },
-    crossFamily: {
-      enabled: input?.crossFamily?.enabled ?? true,
-      minRisk: input?.crossFamily?.minRisk ?? 'medium',
-      pool: [...(input?.crossFamily?.pool ?? [])],
-    },
+    crossFamily: { enabled: true, minRisk: 'medium', pool: [] },
     routing: resolveRouting(input),
     gate: {
       sandboxCoupling: input?.gate?.sandboxCoupling ?? true,
@@ -833,6 +835,79 @@ function info(rawCtx: unknown, message: string): void {
  * `undefined` when the service is absent or the value is not a string. The lazy
  * clamp restore writes it when a legacy run recorded no prior mode.
  */
+/** Every tool name registered in the global scope, or `undefined` when the registry cannot be listed (or is empty). */
+export function registeredToolNamesOf(rawCtx: unknown): readonly string[] | undefined {
+  try {
+    const tools = lookupService(rawCtx, 'tools') as { schemas?: () => Array<{ name?: unknown }> } | undefined | null
+    const names = tools?.schemas?.().map(schema => schema.name).filter((name): name is string => typeof name === 'string')
+    return names === undefined || names.length === 0 ? undefined : names
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * The native subagent `maxDepth` setting. `ctx.subagents.config.maxDepth` is a
+ * volatile reference (`.get()`); a plain number is tolerated. Its shipped default
+ * is 1, which cannot be told from an explicit 1.
+ */
+export function subagentMaxDepthOf(rawCtx: unknown): number | undefined {
+  try {
+    const subagents = lookupService(rawCtx, 'subagents') as { config?: { maxDepth?: unknown } } | undefined | null
+    const setting = subagents?.config?.maxDepth
+    const value = typeof setting === 'number' ? setting : (setting as { get?: () => unknown } | undefined)?.get?.()
+    return typeof value === 'number' && Number.isFinite(value) ? value : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/** The session's native goal view from `ctx.goals.get(agent)` (dsh-goal), or `undefined` when there is no service or no goal. */
+export function readNativeGoal(rawCtx: unknown, root: unknown): NativeGoalView | undefined {
+  const goals = lookupService(rawCtx, 'goals') as { get?: (agent: unknown) => unknown } | undefined | null
+  const view = goals?.get?.(root) as Partial<NativeGoalView> | undefined
+  if (view === undefined || view === null || typeof view.id !== 'string') return undefined
+  return {
+    id: view.id,
+    revision: typeof view.revision === 'number' ? view.revision : 0,
+    objective: typeof view.objective === 'string' ? view.objective : '',
+    phase: typeof view.phase === 'string' ? view.phase : 'unknown',
+    maxGoalRounds: typeof view.maxGoalRounds === 'number' ? view.maxGoalRounds : 0,
+    roundsStarted: typeof view.roundsStarted === 'number' ? view.roundsStarted : 0,
+    activation: view.activation === 'armed' ? 'armed' : 'disarmed',
+    ...(view.blockedReason === undefined ? {} : { blockedReason: view.blockedReason }),
+  }
+}
+
+/**
+ * Whether the composition mounts an enabled goal round driver
+ * (`@deepseek-ai/dsh-goal-round-driver`, loader entry id `goal-round-driver`).
+ * The driver provides no service, so the only evidence is the loader's entry
+ * tree. `undefined` means the tree could not be inspected, which is NOT the same
+ * as false.
+ */
+export function goalDriverPresentIn(rawCtx: unknown): boolean | undefined {
+  try {
+    const loader = lookupService(rawCtx, 'loader') as { tree?: { entries?: () => Iterable<unknown> }; entries?: () => Iterable<unknown> } | undefined | null
+    const entries = loader?.tree?.entries?.() ?? loader?.entries?.()
+    if (entries === undefined) return undefined
+    for (const raw of entries) {
+      const entry = raw as { options?: { name?: unknown; id?: unknown; disabled?: unknown }; fiber?: { state?: unknown } }
+      const name = entry.options?.name
+      const id = entry.options?.id
+      const isDriver = (typeof name === 'string' && /goal-round-driver$/.test(name)) || id === 'goal-round-driver'
+      if (!isDriver) continue
+      if (entry.options?.disabled === true) continue
+      // An entry whose fiber has not loaded (or failed) is not a driver that will run.
+      if (typeof entry.fiber?.state === 'number' && entry.fiber.state !== 2) continue
+      return true
+    }
+    return false
+  } catch {
+    return undefined
+  }
+}
+
 export function sandboxDefaultModeOf(rawCtx: unknown): string | undefined {
   try {
     const policy = lookupService(rawCtx, 'sandboxPolicy') as { defaultMode?: unknown } | undefined | null
@@ -1288,7 +1363,13 @@ export async function apply(rawCtx: unknown, config?: ConfigInput): Promise<() =
       {
         routing: routing.ports,
         ...(liveRouting === undefined ? {} : { liveRouting }),
-        environment: { sandboxDefaultMode: () => sandboxDefaultModeOf(rawCtx) },
+        environment: {
+          sandboxDefaultMode: () => sandboxDefaultModeOf(rawCtx),
+          registeredToolNames: () => registeredToolNamesOf(rawCtx),
+          subagentMaxDepth: () => subagentMaxDepthOf(rawCtx),
+          readGoal: root => readNativeGoal(rawCtx, root),
+          goalDriverPresent: () => goalDriverPresentIn(rawCtx),
+        },
         warn: message => warn(rawCtx, message),
       },
     )
@@ -1378,7 +1459,7 @@ export async function apply(rawCtx: unknown, config?: ConfigInput): Promise<() =
       if (rootAgent.session.header.parentSession !== undefined) return false
       if (!ctx.agents.roots().includes(agent)) return false
       try {
-        installed.set(agent, installRootTools(rootAgent.ctx.tools, service))
+        installed.set(agent, installRootTools(rootAgent.ctx.tools, service, engine))
       } catch (error: unknown) {
         warn(rawCtx, `dsh-autopilot: the root tool surface failed to install for ${rootAgent.id}: ${errorMessage(error)}`)
         return false
@@ -1395,14 +1476,23 @@ export async function apply(rawCtx: unknown, config?: ConfigInput): Promise<() =
     // `agent/created` is announced for EVERY agent, after setup and before the first
     // prompt, through a serial dispatch the host awaits: so the restore lands before
     // the first request, and a listener that threw would veto the agent's
-    // publication. Hence `onRootOpened` never rejects. A child agent is a no-op in
-    // 0.3.0 stage 1; dispatch re-adds the armed allow-list here, keyed by childId.
+    // publication. Hence `onRootOpened` never rejects. A child agent is the opposite case:
+    // its restriction must fail closed.
     const disposeCreated = ctx.on('agent/created', async (payload: { agent: unknown }) => {
-      if (installRoot(payload.agent)) await engine.onRootOpened(payload.agent as AgentRef)
+      const agent = payload.agent as AgentRef
+      if (agent.session?.header?.parentSession !== undefined) {
+        // A child: its tool allow-list and own tools, keyed by ITS id. A throw here is deliberate: it
+        // vetoes the child's publication (fail closed), and the delegation is recorded as failed.
+        engine.onChildCreated(agent)
+        return
+      }
+      if (installRoot(payload.agent)) await engine.onRootOpened(agent)
     })
     const disposeDisposed = ctx.on('agent/disposed', (payload: { agent: unknown }) => {
       installed.get(payload.agent)?.()
       installed.delete(payload.agent)
+      const agent = payload.agent as AgentRef
+      if (agent.session?.header?.parentSession !== undefined) engine.onChildDisposed(agent)
     })
 
     // ── Bundled-skill publication: native registry first, file fallback ───
