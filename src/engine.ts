@@ -287,12 +287,14 @@ export interface ResolvedConfig {
  */
 export interface EnvironmentProbes {
   /**
-   * The global tool names this deployment actually registers, or `undefined`
-   * when the host cannot be asked. `tools.restrict()` is all-or-nothing: one
-   * name the profile does not register throws and takes the dispatch with it,
-   * so an allow-list request is narrowed against this view first.
+   * The tool names the registry shows `scope` (an agent), or `undefined` when
+   * the host cannot be asked. `tools.restrict()` is all-or-nothing: one name
+   * the profile does not register throws and takes the dispatch with it, so an
+   * allow-list request is narrowed against this view first. The scope matters:
+   * a preset composition registers the model-facing tools in the preset's
+   * scope layer, which the global view does not include.
    */
-  readonly registeredToolNames?: () => readonly string[] | undefined
+  readonly registeredToolNames?: (scope?: AgentRef) => readonly string[] | undefined
   /**
    * The host's resolved default sandbox mode (`ctx.sandboxPolicy.defaultMode`),
    * or `undefined` when it cannot be read. The lazy clamp restore writes it when

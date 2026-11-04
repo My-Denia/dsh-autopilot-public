@@ -468,3 +468,116 @@ describe('§3 the plugin mount as the host observes it', () => {
     expect(rootSurface(bed)).toEqual(['autopilot_agents', 'autopilot_delegate', 'autopilot_status'])
   })
 })
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * §4  role allow-lists × a PRESET composition (the desktop / web-app shape)
+ *
+ * dsh-web-app 0.2.1-rc.5 disables `tool-fs`, `tool-fs-search` and `tool-bash`
+ * on the host plane (`dsh-web-app/cordis.patch.yml`, rows `tool-fs` /
+ * `tool-fs-search` / `tool-bash`: `disabled: true`) and mounts them again inside
+ * each agent preset (`presets/standard.patch.yml`). A preset registers into its
+ * generation's scope layer, and an agent joins that generation through
+ * `bindScopeParent` (`dsh-agent-preset-registry` `join`); a delegated child joins
+ * the parent's generation the same way (`dsh-subagent` `applyChildComposition`
+ * → `composeFrom`). So on that composition `read` is NOT in the global layer:
+ * `tools.schemas()` without a scope never lists it, while `tools.schemas(agent)`
+ * and the child's `restrict()` both see it through the scope chain.
+ *
+ * The headless profile registers the same tools globally, which is why the
+ * unscoped probe passed there and refused every scout and reviewer on the
+ * desktop app with "this deployment does not register "read"".
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+const bindScopeParent = (await loadFromDshTools('@deepseek-ai/dsh-scope'))['bindScopeParent'] as
+  (key: unknown, parent: unknown) => unknown
+const createScopeWithParent = (await loadFromDshTools('@deepseek-ai/dsh-scope'))['createScope'] as
+  (ctx: unknown, key: unknown, options?: { parent?: unknown }) => { ctx: Context }
+
+/** The model-facing tools a `standard` preset mounts (tool-fs, tool-fs-search, tool-bash, tool-web). */
+const PRESET_TOOL_NAMES: readonly string[] = ['read', 'read_image', 'write', 'edit', 'glob', 'grep', 'bash', 'web_search', 'web_fetch']
+
+interface PresetBed {
+  readonly mounted: Mounted
+  readonly root: StructuralAgent
+  readonly childKey: object
+  readonly childCtx: Context
+}
+
+/**
+ * A real registry shaped like the web-app composition: one host-plane global
+ * tool, the preset's tools in a generation scope, and a root agent and a child
+ * that both join that generation.
+ */
+async function presetBed(presetNames: readonly string[] = PRESET_TOOL_NAMES): Promise<PresetBed> {
+  const mounted = await mountRuntime()
+  mounted.ctx.tools.register(standInTool('ask_user_question') as never)
+  const generation = { id: 'preset-standard-generation' }
+  const root = structuralAgent('preset-root')
+  const childKey = { id: 'preset-child' }
+  let childCtx: Context | undefined
+  await mounted.plugin(Object.assign(
+    (inner: Context) => {
+      const presetCtx = createScopeWithParent(inner, generation).ctx as unknown as { tools: ToolRuntime }
+      for (const name of presetNames) presetCtx.tools.register(standInTool(name) as never)
+      ;(root as unknown as Record<string, unknown>)['ctx'] = createScopeWithParent(inner, root, { parent: generation }).ctx
+      childCtx = createScopeWithParent(inner, childKey).ctx
+      bindScopeParent(childKey, generation)
+    },
+    { inject: ['tools', 'systemPrompt'] },
+  ))
+  if (childCtx === undefined) throw new Error('preset scope minting did not run')
+  return { mounted, root, childKey, childCtx }
+}
+
+describe('§4 role allow-lists against a preset composition', () => {
+  it('UPSTREAM CANARY: preset tools are absent from the global view and present in the agent view', async () => {
+    const bed = await presetBed()
+    const globalNames = bed.mounted.ctx.tools.schemas().map(schema => schema.name)
+    const rootNames = bed.mounted.ctx.tools.schemas(bed.root as never).map(schema => schema.name)
+    expect(globalNames).toEqual(['ask_user_question'])
+    expect(rootNames).toContain('read')
+    expect(rootNames).toContain('ask_user_question')
+  })
+
+  it('the probe reads the calling agent\'s scope, so a scout resolves and the child accepts its list', async () => {
+    const bed = await presetBed()
+    const registered = autopilotPlugin.registeredToolNamesOf(bed.mounted.ctx, bed.root)
+    expect(registered).toContain('read')
+    for (const role of ['scout', 'reviewer', 'planner', 'clerk'] as const) {
+      const allow = allowListFor(role, registered)
+      expect(allow).not.toBe('inherit')
+      const fresh = await presetBed()
+      applyChildComposition(fresh.childCtx, { ctx: undefined } as never, { toolFilter: { allow: [...(allow as readonly string[])] } as never })
+      const visible = fresh.mounted.ctx.tools.schemas(fresh.childKey as never).map(schema => schema.name).sort()
+      expect(visible).toContain('read')
+      expect(visible).toEqual([...(allow as readonly string[])].sort())
+    }
+  })
+
+  it('a preset that really lacks read still refuses the scout and names read', async () => {
+    const bed = await presetBed(PRESET_TOOL_NAMES.filter(name => name !== 'read'))
+    const registered = autopilotPlugin.registeredToolNamesOf(bed.mounted.ctx, bed.root)
+    expect(registered).not.toContain('read')
+    expect(() => allowListFor('scout', registered)).toThrowError(/does not register "read"/)
+  })
+
+  for (const role of ['scout', 'reviewer'] as const) {
+    it(`autopilot_delegate(${role}) through the mounted plugin is not refused for read`, async () => {
+      const bed = await presetBed()
+      bed.mounted.provide('agents', { get: () => undefined, list: () => [bed.root], roots: () => [bed.root] })
+      bed.mounted.provide('subagents', {})
+      await bed.mounted.plugin(autopilotPlugin, { storeRoot: mkdtempSync(join(tmpdir(), 'dsh-autopilot-preset-')) })
+      openDirectHumanTurn(bed.root)
+      const result = await bed.mounted.ctx.tools.execute({
+        signal: new AbortController().signal,
+        callId: ToolCallId(`boundary-preset-${role}`),
+        name: 'autopilot_delegate',
+        arguments: { role, task: 'list the callers of parse()' },
+        agent: bed.root as never,
+      })
+      const text = JSON.stringify(result)
+      expect(text).not.toMatch(/does not register/)
+      expect(text).not.toMatch(/AP_TOOL_SURFACE_INCOMPLETE/)
+    })
+  }
+})

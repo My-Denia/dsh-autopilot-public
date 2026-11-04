@@ -9,6 +9,11 @@ The plugin becomes the dsh adapter of the goal-workflow. It is **not**
 published: npm `latest` is still `dsh-goal-autopilot@0.2.0`. Target host is dsh
 `0.2.1-rc.5` only. See Verification below for what was observed on a real host.
 
+`0.3.0-rc.1` was published to npm `next` on 2026-11-04. `0.3.0-rc.2` contains
+two desktop fixes: the tool probe for `scout` and `reviewer` is scoped to those
+roles, and the delegate card is shown at turn level. Neither fix has been
+verified on a real host yet.
+
 ### Verification
 
 Observed on Windows with dsh `0.2.1-rc.5`, headless profile, one provider
@@ -124,6 +129,21 @@ that exact host, plus the previously supported `0.1.2-rc.1`, `0.1.5-rc.1`, and
 
 ### Fixed
 
+- Scout, reviewer, planner and clerk delegations on the DeepSeek Harness
+  desktop app (and any dsh-web-app composition). There, `read`, `grep`, `bash`
+  and the other model-facing tools are mounted by the agent preset into its own
+  scope layer, not the global one. The plugin listed the registry without a
+  scope, never saw `read`, and refused every read-only role with "this
+  deployment does not register "read"" while the root was calling `read`. The
+  registry is now read for the calling agent (a delegated child joins the same
+  preset), and for the child itself on a cold resume. A deployment that really
+  has no `read` is still refused, and the refusal still names `read`.
+- The goal card on the desktop app. dsh 0.2.1-rc.5's Chat view puts every turn
+  node without a group-tree position into a collapsed tool-activity group and
+  folds a completed turn's process under its "done" line. The card anchors at
+  the first autopilot or goal call, so it sat inside the first collapsed tool
+  group and was never on screen. The card now stands at turn level
+  (`groupTree: 'turn'`), like the host's own turn notices.
 - Child start on dsh 0.2.1-rc.2. That host replaced `start` /
   `startContinuable` / `drainContinuableChildren` with `startActivation` /
   `drainChildren`. `startActivation` does not take `toolFilter`; the plugin

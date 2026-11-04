@@ -242,6 +242,8 @@ export function delegationHost(options: {
   catalog?: RouteCatalog
   policy?: SessionPolicyState
   registered?: readonly string[]
+  /** Per-scope registry, for tests that need the probe to see which agent it is asked for. */
+  registeredFor?: (scope: unknown) => readonly string[] | undefined
   maxDepthSetting?: number
   goal?: () => NativeGoalView | undefined
   driver?: () => boolean | undefined
@@ -331,7 +333,9 @@ export function delegationHost(options: {
       policyReader: () => options.policy ?? { kind: 'absent' },
     },
     environment: {
-      ...(options.registered === undefined ? {} : { registeredToolNames: () => options.registered }),
+      ...(options.registeredFor !== undefined
+        ? { registeredToolNames: (scope?: unknown) => options.registeredFor!(scope) }
+        : options.registered === undefined ? {} : { registeredToolNames: () => options.registered }),
       ...(options.maxDepthSetting === undefined ? {} : { subagentMaxDepth: () => options.maxDepthSetting }),
       ...(options.goal === undefined ? {} : { readGoal: () => options.goal!() }),
       ...(options.driver === undefined ? {} : { goalDriverPresent: options.driver }),

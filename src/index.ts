@@ -836,11 +836,22 @@ function info(rawCtx: unknown, message: string): void {
  * `undefined` when the service is absent or the value is not a string. The lazy
  * clamp restore writes it when a legacy run recorded no prior mode.
  */
-/** Every tool name registered in the global scope, or `undefined` when the registry cannot be listed (or is empty). */
-export function registeredToolNamesOf(rawCtx: unknown): readonly string[] | undefined {
+/**
+ * Every tool name the registry shows `scope`, or `undefined` when the registry
+ * cannot be listed (or is empty).
+ *
+ * `scope` is the agent the names are read FOR (dsh-tools scope keys are the
+ * Agent objects themselves). It is not optional in practice: on a preset
+ * composition (dsh-web-app, the desktop app) the model-facing tools — `read`,
+ * `grep`, `bash`, ... — are registered in the preset generation's scope layer,
+ * not the global one, so the unscoped view lists none of them. A delegated
+ * child joins its parent's generation, so the caller's view is the surface the
+ * child inherits.
+ */
+export function registeredToolNamesOf(rawCtx: unknown, scope?: unknown): readonly string[] | undefined {
   try {
-    const tools = lookupService(rawCtx, 'tools') as { schemas?: () => Array<{ name?: unknown }> } | undefined | null
-    const names = tools?.schemas?.().map(schema => schema.name).filter((name): name is string => typeof name === 'string')
+    const tools = lookupService(rawCtx, 'tools') as { schemas?: (scope?: unknown) => Array<{ name?: unknown }> } | undefined | null
+    const names = tools?.schemas?.(scope).map(schema => schema.name).filter((name): name is string => typeof name === 'string')
     return names === undefined || names.length === 0 ? undefined : names
   } catch {
     return undefined
@@ -1419,7 +1430,7 @@ export async function apply(rawCtx: unknown, config?: ConfigInput): Promise<() =
         ...(liveRouting === undefined ? {} : { liveRouting }),
         environment: {
           sandboxDefaultMode: () => sandboxDefaultModeOf(rawCtx),
-          registeredToolNames: () => registeredToolNamesOf(rawCtx),
+          registeredToolNames: scope => registeredToolNamesOf(rawCtx, scope),
           subagentMaxDepth: () => subagentMaxDepthOf(rawCtx),
           modelSelection: () => modelSelectionSettingOf(rawCtx, warnSettingOnce),
           readGoal: root => readNativeGoal(rawCtx, root),
