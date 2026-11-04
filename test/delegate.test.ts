@@ -370,6 +370,58 @@ describe('effort, end to end (the agentOptions the host receives)', () => {
   })
 })
 
+describe('observed route when the host disposes the child before settling (dsh 0.2.1-rc.5 order)', () => {
+  // rc.5 `finishDisposal` disposes the child agent (gone from ctx.agents, agent/disposed delivered)
+  // and only then resolves the activation result, and the child writes its request/header at its
+  // first request, after agent/created. The route must still be recorded.
+  const MODELS = [{ provider: 'alpha', id: 'm-a', contextWindow: 200000, defaultEffort: 'medium' }]
+
+  it('a scout that settles after disposal still records its observed route as a match', async () => {
+    const h = delegationHost({ registered: REG, headerOnFirstRequest: true })
+    const { childId } = await h.engine.delegate(h.root, { role: 'scout', task: 't' })
+    h.firstRequest(childId)
+    const waited = h.engine.wait(h.root, [childId], 5)
+    h.settleDisposed(childId)
+    await waited
+    expect(h.agents.get(childId)).toBeUndefined()
+    const record = ledgerOf(h).delegations.find(d => d.childId === childId)!
+    expect(record.state).toBe('idle')
+    expect(record.observed).toEqual({ provider: 'host', model: 'default' })
+    expect(record.routeMatch).toBe('match')
+  })
+
+  it('a pinned worker: the observed effort is compared after disposal too', async () => {
+    const h = delegationHost({ registered: REG, models: MODELS, headerOnFirstRequest: true })
+    const { childId } = await h.engine.delegate(h.root, { role: 'worker', task: 't', writePaths: ['a'], provider: 'alpha', model: 'm-a', effort: 'high' })
+    h.firstRequest(childId)
+    const waited = h.engine.wait(h.root, [childId], 5)
+    h.settleDisposed(childId)
+    await waited
+    expect(ledgerOf(h).delegations.find(d => d.childId === childId)).toMatchObject({
+      routeMatch: 'match', observed: { provider: 'alpha', model: 'm-a', reasoningEffort: 'high' },
+    })
+  })
+
+  it('a running child that has not sent its first request is pending, not unreadable', async () => {
+    const h = delegationHost({ registered: REG, headerOnFirstRequest: true })
+    const { childId } = await h.engine.delegate(h.root, { role: 'scout', task: 't' })
+    await h.engine.refreshRoutes('root-1')
+    expect(ledgerOf(h).delegations.find(d => d.childId === childId)?.routeMatch).toBe('pending')
+  })
+
+  it('a child that settles without ever sending a request is unreadable', async () => {
+    const h = delegationHost({ registered: REG, headerOnFirstRequest: true })
+    const { childId } = await h.engine.delegate(h.root, { role: 'scout', task: 't' })
+    const waited = h.engine.wait(h.root, [childId], 5)
+    h.settleDisposed(childId, { stopReason: 'error', diagnostic: 'boom' })
+    await waited
+    const record = ledgerOf(h).delegations.find(d => d.childId === childId)!
+    expect(record.state).toBe('failed')
+    expect(record.observed).toBeUndefined()
+    expect(record.routeMatch).toBe('unreadable')
+  })
+})
+
 describe('the reviewer', () => {
   const MODELS = [
     { provider: 'alpha', id: 'm-a', contextWindow: 200000 },

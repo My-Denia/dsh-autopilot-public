@@ -218,6 +218,14 @@ export interface DelegationHost {
   childTools: Map<string, string[]>
   /** Settle one child's activation. */
   settle(childId: string, result?: { stopReason: string; structured?: unknown; diagnostic?: string }): void
+  /**
+   * Settle one child the way dsh 0.2.1-rc.5 does (`dsh-subagent` `finishDisposal`):
+   * the child agent is disposed first (dropped from `ctx.agents`, `agent/disposed`
+   * delivered), and only then does the activation result resolve.
+   */
+  settleDisposed(childId: string, result?: { stopReason: string; structured?: unknown; diagnostic?: string }): void
+  /** With `headerOnFirstRequest`: append the child's route header, as its first model request does. */
+  firstRequest(childId: string): void
   /** A child agent as the host would hold it (cold resume): created and announced without a start. */
   announceExisting(childId: string, parentId?: string): FakeAgent
   /** Make the next startActivation throw. */
@@ -239,6 +247,8 @@ export function delegationHost(options: {
   driver?: () => boolean | undefined
   rootId?: string
   hold?: (childId: string) => boolean
+  /** Do not write the route header at creation (the real host writes it at the first request); see `firstRequest`. */
+  headerOnFirstRequest?: boolean
 } = {}): DelegationHost {
   const storeDir = mkdtempSync(join(tmpdir(), 'dsh-autopilot-delegation-'))
   const agents = new FakeAgents()
@@ -271,9 +281,11 @@ export function delegationHost(options: {
       },
     })
     const config = { provider: (options2?.['provider'] as string | undefined) ?? 'host', model: (options2?.['model'] as string | undefined) ?? 'default', ...(options2?.['reasoningEffort'] === undefined ? {} : { reasoningEffort: options2['reasoningEffort'] }) }
-    child.session.append('request/header', { header: { config }, reason: 'initial' })
+    if (options.headerOnFirstRequest === true) pendingHeaders.set(childId, config)
+    else child.session.append('request/header', { header: { config }, reason: 'initial' })
     return child
   }
+  const pendingHeaders = new Map<string, Record<string, unknown>>()
 
   const subagents: SubagentsRef = {
     async startActivation(spec): Promise<SubagentActivationRef> {
@@ -330,6 +342,19 @@ export function delegationHost(options: {
   return {
     engine, agents, root, ledgers, storeDir, warnings, starts, restricts, childTools,
     settle(childId, result = { stopReason: 'completed' }) { deferreds.get(childId)?.resolve(result) },
+    settleDisposed(childId, result = { stopReason: 'completed' }) {
+      const child = agents.get(childId)
+      agents.remove(childId)
+      if (child !== undefined) engine.onChildDisposed(child)
+      deferreds.get(childId)?.resolve(result)
+    },
+    firstRequest(childId) {
+      const config = pendingHeaders.get(childId)
+      const child = agents.get(childId) as FakeAgent | undefined
+      if (config === undefined || child === undefined) throw new Error(`no pending first request for ${childId}`)
+      pendingHeaders.delete(childId)
+      child.session.append('request/header', { header: { config }, reason: 'initial' })
+    },
     announceExisting(childId, parentId = root.id) {
       const child = makeChild(childId, parentId)
       agents.add(child)

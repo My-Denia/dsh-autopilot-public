@@ -186,7 +186,15 @@ export {
 // Reviewer verdict
 // ─────────────────────────────────────────────────────────────────────────────
 
-/** JSON schema handed to the host as the reviewer's `outputSchema`. */
+/**
+ * JSON schema handed to the host as the reviewer's `outputSchema`.
+ *
+ * Only the host's enforced subset is allowed here (dsh-tools `json-schema`:
+ * type/oneOf/properties/required/additionalProperties/items/enum/const plus
+ * annotations); rc.5 rejects anything else at `startActivation`, so a keyword
+ * such as `minLength` fails every reviewer dispatch. Non-empty `subject` and
+ * `summary` are enforced by {@link parseReviewVerdict} instead.
+ */
 export const REVIEW_VERDICT_SCHEMA = {
   type: 'object',
   additionalProperties: false,
@@ -201,12 +209,12 @@ export const REVIEW_VERDICT_SCHEMA = {
         required: ['severity', 'summary'],
         properties: {
           severity: { type: 'string', enum: ['blocker', 'major', 'minor'] },
-          summary: { type: 'string', minLength: 1 },
+          summary: { type: 'string', description: 'non-empty' },
           where: { type: 'string' },
         },
       },
     },
-    subject: { type: 'string', minLength: 1 },
+    subject: { type: 'string', description: 'non-empty' },
   },
 } as const
 

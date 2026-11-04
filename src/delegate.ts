@@ -44,7 +44,7 @@ import type {
   ReviewRecord,
   RouteMatch,
 } from './domain/ledger-types.js'
-import type { AgentRef, AutopilotEngine, ResolvedRouting } from './engine.js'
+import type { AgentRef, AutopilotEngine, ResolvedRouting, SessionReadRef } from './engine.js'
 import { observedRouteOf } from './engine.js'
 import { REVIEW_VERDICT_SCHEMA, ROLES, ROLE_NAMES, parseReviewVerdict } from './roles/index.js'
 import { isRouteRefusal, routeForDelegation } from './roles/route.js'
@@ -135,6 +135,16 @@ export class Delegator {
   /** Settlement of each tracked child, resolved after the ledger write. */
   private readonly settlements = new Map<string, Promise<void>>()
   private readonly childSurfaces = new Map<string, () => void>()
+  /**
+   * Each delegated child's session, retained from `agent/created` until its
+   * observed route has been read after settlement. dsh 0.2.1-rc.5 disposes a
+   * settled child (and drops it from `ctx.agents`) BEFORE it resolves the
+   * activation result (`dsh-subagent` `finishDisposal`), so by the time
+   * {@link settle} refreshes routes `agents.get(childId)` is already empty. The
+   * session object outlives the registry entry and its in-memory log is not
+   * cleared on disposal, so the final `request/header` stays readable here.
+   */
+  private readonly childSessions = new Map<string, SessionReadRef>()
   private learnedToolNames: readonly string[] | undefined
 
   constructor(private readonly engine: AutopilotEngine) {}
@@ -434,11 +444,22 @@ export class Delegator {
     const updates = new Map<string, { observed?: LedgerRoute; routeMatch: RouteMatch }>()
     for (const d of ledger.delegations) {
       if (d.state === 'lost' || d.routeMatch === 'match' || d.routeMatch === 'mismatch') continue
-      const read = observedRouteOf(this.engine.agents.get(d.childId)?.session)
-      const routeMatch = routeMatchOf(d.selected, d.effortSource, read.observed, read.unreadable !== undefined)
+      // Live agent first; a settled child is already gone from the registry, so its retained session.
+      const read = observedRouteOf(this.engine.agents.get(d.childId)?.session ?? this.childSessions.get(d.childId))
+      // A child that has not settled may simply not have sent its first request yet: still pending.
+      const live = d.state === 'starting' || d.state === 'running'
+      const routeMatch = routeMatchOf(d.selected, d.effortSource, read.observed, read.unreadable !== undefined && !live)
       if (routeMatch !== d.routeMatch || (read.observed !== undefined && d.observed === undefined)) {
         updates.set(d.childId, { ...(read.observed === undefined ? {} : { observed: read.observed }), routeMatch })
       }
+    }
+    // Release retained sessions once they can tell nothing more: the child settled and left the
+    // registry (this read was its last), or its route is already decided. A cold resume re-retains.
+    for (const d of ledger.delegations) {
+      if (!this.childSessions.has(d.childId)) continue
+      const decided = d.routeMatch === 'match' || d.routeMatch === 'mismatch' || d.state === 'lost'
+      const gone = d.state !== 'starting' && d.state !== 'running' && this.engine.agents.get(d.childId) === undefined
+      if (decided || gone) this.childSessions.delete(d.childId)
     }
     if (updates.size === 0) return
     await this.engine.mutate(rootId, current => ({
@@ -592,6 +613,8 @@ export class Delegator {
       armed = { role: record.role, allow: allowListFor(record.role, this.registeredNames()) }
     }
     this.armed.delete(agent.id)
+    // Retain the session itself, not a snapshot: no request/header exists before the first prompt.
+    this.childSessions.set(agent.id, agent.session)
     const ctx = agent.ctx as { tools?: { restrict?: (filter: { allow: readonly string[] }) => void; register?: (def: unknown) => () => void } } | undefined
     try {
       if (armed.allow !== 'inherit') this.restrict(ctx?.tools, armed.allow)
@@ -600,6 +623,7 @@ export class Delegator {
         this.childSurfaces.set(agent.id, installChildTools(ctx.tools as { register(d: unknown): () => void }, this.engine, armed.role))
       }
     } catch (error: unknown) {
+      this.childSessions.delete(agent.id)
       const message = `tool restriction failed: ${errorMessage(error)}`
       void this.engine.mutate(rootId, ledger => ({
         ...ledger,
@@ -624,6 +648,12 @@ export class Delegator {
     }
   }
 
+  /**
+   * `agent/disposed` of a child. The retained session is deliberately KEPT: on
+   * rc.5 this fires before the activation result resolves, so dropping it here
+   * would leave the settlement refresh nothing to read; {@link refreshRoutes}
+   * releases it after that read.
+   */
   onChildDisposed(agent: AgentRef): void {
     this.childSurfaces.get(agent.id)?.()
     this.childSurfaces.delete(agent.id)
