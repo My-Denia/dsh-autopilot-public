@@ -26,8 +26,13 @@
  * crashed writer and is taken over; a lock that stays busy past the wait bound
  * is reported as `AP_LEDGER_CONFLICT`, which the engine already retries.
  *
- * READS COME FROM DISK. `load` and `list` read the directory every call: a
- * cache filled at open would hide what another process wrote since.
+ * READS COME FROM DISK. `load` reads its file every call: a cache filled at
+ * open would hide what another process wrote since. `list` still scans the
+ * directory every call, but keeps the one successful read per file that still
+ * carries the same stat fingerprint (`mtimeNs:size:ino`, bigint stat): an
+ * atomic rename by another process changes that fingerprint, so its ledger is
+ * re-read; a file that did not parse is never memoised, so its diagnostic is
+ * produced on every call.
  *
  * MIGRATION. A ledger an earlier build wrote into the domain `ledgers` table is
  * still read (passed in as `migrateFrom`, read-only). The first `load` of that
@@ -66,7 +71,10 @@ export interface LedgerStoreLike {
   readonly kind: 'file'
   /** The stored ledger for a root session, read now, or `undefined` when it has none. */
   load(sessionId: string): Ledger | undefined
-  /** Every stored ledger, read now, unordered. */
+  /**
+   * Every stored ledger, unordered. A file already read at its current stat
+   * fingerprint is not read again; a changed, absent or damaged file is.
+   */
   list(): readonly Ledger[]
   /**
    * Compare-and-swap write. Stores `next` with `revision = expectedRevision + 1`
@@ -199,6 +207,13 @@ type Read =
 export class FileLedgerStore implements LedgerStoreLike {
   readonly kind = 'file' as const
   private scanned: readonly LedgerDiagnostic[] = []
+  /**
+   * `list`'s memo: file name → the ledger that file held at `fingerprint`.
+   * Successful reads only. A skipped or absent result is never kept here: a
+   * transient Windows EPERM/EBUSY or a half-finished external write must not
+   * stick. Keyed by stat identity, so another process's rename is seen.
+   */
+  private readonly listed = new Map<string, { readonly fingerprint: string; readonly ledger: Ledger }>()
   private readonly now: () => string
   private readonly dir: string
   private readonly legacy: LegacyLedgerTable | undefined
@@ -266,6 +281,29 @@ export class FileLedgerStore implements LedgerStoreLike {
     return after.kind === 'ledger' ? after.ledger : row
   }
 
+  /**
+   * One ledger file as seen by `list`: the memo when the file's stat identity is
+   * unchanged, a fresh read otherwise. The stat is taken BEFORE the read, so a
+   * write racing this read can only leave a stale fingerprint (a re-read next
+   * time), never a current fingerprint on stale bytes.
+   */
+  private readListed(name: string): Read {
+    let fingerprint: string
+    try {
+      const stats = statSync(join(this.dir, name), { bigint: true })
+      fingerprint = `${stats.mtimeNs}:${stats.size}:${stats.ino}`
+    } catch {
+      this.listed.delete(name) // absent or not statable: no memo can be trusted
+      return this.readFile(name)
+    }
+    const cached = this.listed.get(name)
+    if (cached !== undefined && cached.fingerprint === fingerprint) return { kind: 'ledger', ledger: cached.ledger }
+    const read = this.readFile(name)
+    if (read.kind === 'ledger') this.listed.set(name, { fingerprint, ledger: read.ledger })
+    else this.listed.delete(name)
+    return read
+  }
+
   list(): readonly Ledger[] {
     const skipped: LedgerDiagnostic[] = []
     const found = new Map<string, Ledger>()
@@ -278,11 +316,16 @@ export class FileLedgerStore implements LedgerStoreLike {
       }
     }
     for (const name of names) {
-      const read = this.readFile(name)
+      const read = this.readListed(name)
       if (read.kind === 'ledger') found.set(read.ledger.sessionId, read.ledger)
       else if (read.kind === 'skipped') skipped.push({ where: name, reason: read.reason })
     }
+    // Names gone from the directory must not linger in the memo: a recreated file
+    // could otherwise be matched against an identity it no longer has.
+    const present = new Set(names)
+    for (const name of this.listed.keys()) if (!present.has(name)) this.listed.delete(name)
     // Rows only the legacy table holds stay listed (read-only) until their session is opened.
+    // This branch is not memoised: the table can change under us and a row is cheap to read.
     if (this.legacy !== undefined) {
       let rows: Array<[string, unknown]> = []
       try { rows = [...this.legacy.entries()] } catch { rows = [] }
@@ -358,6 +401,9 @@ export class FileLedgerStore implements LedgerStoreLike {
       try { unlinkSync(tmp) } catch { /* nothing to clean */ }
       throw error
     }
+    // Our own write is always visible to the next `list` at once, whatever the
+    // fingerprint granularity of this filesystem turns out to be.
+    this.listed.delete(ledgerFileName(ledger.sessionId))
   }
 
   async write(next: Ledger, expectedRevision: number): Promise<Ledger> {
