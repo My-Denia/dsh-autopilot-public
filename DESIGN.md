@@ -16,11 +16,18 @@ Visitor landing page: [README.md](README.md).
 - [Governance invariants](skill/dsh-autopilot/references/governance-invariants.md) — host-neutral rules this adapter consumes
 - [Model routing](skill/dsh-autopilot/references/model-routing.md) — the routing contract: authority order, thresholds vs axes, ladder, recorded boundaries
 - [Changelog](CHANGELOG.md)
+- 设计历史：§8.10 记录 0.3.0 退役治理状态机的因果（逐机制：解决什么、为何改、现在谁承担）
+
+`skill/dsh-autopilot/SKILL.md` 现在是 agent-core goal-workflow 的 DSH 适配器（adapter），不再是 GAH 流水线的说明；上面标注 operator reference、governance-invariants 的条目若描述已退役的门禁，以 §8.10 为准。
 
 ## 1. 设计前提与决策
 
 - **蓝本**：CC GAH（`~/.claude/skills/goal-autopilot-harness/SKILL.md`）的
-  计划-执行-审计门禁、单写者状态、证据契约、收尾纪律。
+  计划-执行-审计门禁、单写者状态、证据契约、收尾纪律。**2026-11-04 起蓝本是 agent-core
+  的 goal-workflow**（`agent-core/core/skills/goal-workflow/SKILL.md`）：GAH 的
+  run 状态机已在 agent-core a32226c（2026-11-02）退役。本文件 §2、§3、§5、§6 描述的门禁
+  是 0.2.x 的蓝本，保留为历史。0.3.0 退役了哪些机制、当初解决什么问题、现在由什么承担，
+  见 §8.10；0.3.0 的真机行为尚未验证，同见 §8.10 开头的状态声明。
 - **不依赖 dsh 树内实验包**：dsh 源码树自带私有实验包 `@deepseek-ai/dsh-experimental-gah`
   （`ctx.gah`）。本项目按用户决定独立重建，但**复用其被验证过的模式**：
   全快照事件 + 单调 revision、精确活体 root 校验、一次性审计子代理 + 结构化裁决
@@ -383,6 +390,8 @@ model selection（UI 文案 "Allow agents to choose models for Subagents"，**�
 
 ## 2. CC 机制 → dsh 原生机制映射
 
+> 历史记录：此节描述 0.2.x 的机制，0.3.0 退役，见 §8.10。内容保留不改。
+
 | CC GAH 机制（Claude Code 上的形态） | dsh-autopilot 原生形态 | 强度变化 |
 |---|---|---|
 | `state.json` + "单写者纪律"（模型自觉 + helper 脚本） | 引擎单写者：每个公开方法校验精确活体 root Agent（同一对象引用 + 无 parentSession）；全部转移先过 fold 校验再落盘 | 纪律 → 结构性不可能伪造 |
@@ -406,6 +415,8 @@ shell 类工具走与 plan gate 同一条阶梯（sandbox `active` 放行、`str
 | Owner-only 边界（暂停等 owner） | `needs-owner-decision` 非终态 + `owner-resolve`（direct-human-turn 校验，复用 dsh goal 工具的权限判定模式）| 等价并可恢复 |
 
 ## 3. 状态机
+
+> 历史记录：此节描述 0.2.x 的机制，0.3.0 退役，见 §8.10。内容保留不改。
 
 阶段：`planning → plan-reviewing → executing → execution-reviewing → replanning → closing → completed | blocked | needs-owner-decision`。
 
@@ -459,6 +470,8 @@ harness，静默跳过一个必需事件会重建出错误的会话。该常量�
 多进程共享同一 run 不在契约内（与 CC state.json 相同），由 fold 校验失败显式暴露。
 
 ## 5. 不可机械化的不变量（承自 CC，写给使用者与审计者）
+
+> 历史记录：此节中描述 plan/execution 门禁、usage、egress、closeout、external 审计等的条目属 0.2.x 机制，0.3.0 退役，见 §8.10。内容保留不改。
 
 以下规则无法由本插件强制，属于教义层（policy 区段只放可执行摘要，全文在此）：
 
@@ -583,6 +596,8 @@ Single-Bearer 规则的直接推论，“八个透镜都这么说”在这里恰
   profile（§8.1）。承重层存在，不等于承重层覆盖全部。
 
 ## 6. 诚实上限（不是缺陷清单的省略）
+
+> 历史记录：此节中描述 plan/execution 门禁、usage、egress、closeout、external 审计等的条目属 0.2.x 机制，0.3.0 退役，见 §8.10。内容保留不改。
 
 v1 起就存在、v2 没有挪走的边界：
 
@@ -3196,3 +3211,106 @@ root 的治理出口；两个入口写入同一个寄存器（`commitLogEntry` �
    `DSH_STORE=~/dsh-client-deps/store pnpm run test:client-bundle` 19/19 断言全绿。
    `check:client` / `test:client-bundle` 用的声明与运行时来自按精确版本取回的 npm 包
    （`~/dsh-client-deps/`，机器本地、不入仓），因为本机没有带依赖的 0.2.0-rc.2 源树。
+
+### 8.10 Retiring the governance state machine (2026-11-04, goal MY-195)
+
+本节记录 0.3.0 退役的机制，按 §8 以后的惯例写因果：每个机制当初解决什么真实问题
+（引用已有章节），为什么现在改，以及这个问题现在由什么承担。原节正文不改、不删，
+只在节首加了"历史记录"提示。
+
+**状态声明（先读这条）**：0.3.0 在真机上的行为**尚未验证**。事实表只确认了设计目标、
+目标宿主和一份"未在真机验证"清单（见 docs/compatibility.md）：旧 run 卡片升级后是否
+保留、钳制恢复、简单工作是否不被拉进目标流程、真并发与 depth-2 委派、选定路由与观察
+路由是否一致、阶段完成不终止目标、自有仓库 push/PR 无 AP_* 拒绝、重启恢复、同会话
+目标 A→B、WSL CLI 安装，以及插件运行时启动的子代理能否被宿主原生 `send_message` /
+`list_agents` 驱动，全部是**未验证**。真实模型 API 在先前的尝试中返回 HTTP 503/502，
+记为"未验证（API 503）"，不用 mock 代替。mock 运行、状态读取和测试通过都不是真机验证。
+目标宿主只有 DSH 0.2.1-rc.5；0.1.x / 0.2.0 宿主继续使用 npm 上的 0.2.0。
+
+#### 为什么现在改（四条来源，原话）
+
+1. owner 2026-11-04 目标提示词（"dsh 插件跟进当前 agent-core／goal-workflow 设计"）的
+   "不希望出现的结果"第一条：「不希望出现用新增门禁、白名单、批准回执或流程状态修补
+   原本由流程造成的摩擦」。同一提示词期望结果 1 要求插件"不再要求用户和 agent 为已经
+   退役的 GAH 运行状态机、plan gate、sign-off 或重复自证材料承担额外手续"，并要求
+   "既有设计原本解决的问题，有明确保留或替代的承担方式"——所以下表每行都写了 (c)。
+2. owner 2026-10-15：「dsh插件，设计应该跟着agent core中的gah最新设计走，如果有过时，
+   相背的实现，那就是错误」。本文件 §1 的"蓝本"就是当时的 GAH，蓝本变了，实现跟着变。
+3. agent-core 提交 a32226c（2026-11-02，"Replace GAH and NAH with one shared goal
+   workflow"）：删除 GAH/NAH 的 run 状态机、goal gate、Stop 校验和子代理生命周期日志，
+   保留经一个 reviewer 角色的独立审阅，角色收敛为 scout、worker、planner、reviewer。
+4. agent-core 设计历史 2026-11-03：「默认不强制，简单的活在主线程直接做」。
+
+另有一条对照：owner 的规则是"规则优先于 hook，不用更大的门禁去解决门禁造成的摩擦"
+（agent-core owner-preferences §11）。0.2.x 后半程的 §8.5、§8.6、§8.9 正是在给状态机
+打补丁（替 amend、替 unattended、替 owner pass），这条路在 0.3.0 停止。
+
+#### 退役机制逐项
+
+(a) 当初解决的问题与记录位置；(b) 为什么现在改；(c) 现在由什么承担。(b) 栏中"总因"指
+上面四条来源，不再逐行重复，只写该机制特有的补充。
+
+| 机制 | (a) 当初解决什么，记于何处 | (b) 为什么现在改 | (c) 现在谁承担 |
+|---|---|---|---|
+| run 阶段与门禁（plan gate、execution gate、closing、replan 预算 `MAX_REPLAN_ROUNDS`） | 没审就执行、没证据就宣布完成；有界升级。§2（有界升级行、validate_goal_run 行）、§3（`closing` 阶段、事件溯源）、§8.5 第 5 条（replan 预算归零机械触发 owner，m6-live 实录门禁全有效却被锁死）、§8.6 第 1 条（plan-reviewing 楔死 P0）、§8.5 第 2 条（amend-plan） | 总因。a32226c 已删掉 GAH 的状态机；§8.5/§8.6 的楔死、amend 死锁都是状态机自己造成的摩擦 | 新工作由 issue + PR 上的 Outcome / Done / Not in scope 承担；reviewer 的 blocker 先于合并；Done 逐条在最终提交上核对（goal-workflow）。不再有"相位"可卡死；新增的 v3 账本只服务执行、取消、恢复和展示 |
+| 分诊（size / risk / executionMode / auditMode） | 防止 lightweight 逃避门禁，并按风险决定审计强度。§2 分诊行、§3、§1（"medium+ 默认派发 executor lead"一条）、§8.5 第 4 条（triage 不可变，carryover 挂在其上） | 门禁没了，分诊就没有决定对象；goal-workflow 本来就是"默认不强制，简单的活在主线程直接做" | 风险判断写在 SKILL.md 文字里（"小而可逆就一句话说清"）；简单工作留在主线程，不启动角色链。Linear MY-87 随之作废 |
+| usage id（用户可见改动被操作过的自报） | 用户可见改动从未被真正操作过就宣布完成。§2 usage 行、§6 的 usage 各条（自报、`inheritedFrom` 结算豁免、二进制只验签名）——§6 自己承认类别与条目数全是自报 | 总因；§6 已记录它只能结算"文件在不在"，不能证明操作发生过 | Done 必须含真机观察；reviewer 的"报告是否失实"blocker 检查声称与证据是否对得上。承担得更弱的部分见下"未覆盖" |
+| 只读沙箱钳制与 toolDeny | plan gate 之前不许写文件，堵 Bash 写文件的盲区。§2 PreToolUse 行、§6 的"sandbox 钳制依赖平台后端""guard 是质量门禁不是权限系统" | 总因；钳制随 plan gate 一起失去对象，且钳制会把会话留在只读，需要专门恢复 | worktree + reviewer 审阅。升级时对遗留 run 留下的只读会话做一次懒恢复：打开或恢复该会话时，仅当当前模式仍为只读且最后一条 `sandbox/mode` 事件是插件自己的钳制，才恢复到记录的原模式（没有记录则回宿主默认）；用户在钳制后改过的模式保持不动。**真机未验证** |
+| closeout 包、handoff、部分交付、carryover | 半完成被当成完成交付；跨 run 承继证据。§3（`closing` 阶段）、§2 validate_goal_run 行、§8.5 第 3、4 条（`Closeout.handoff`、`Triage.carryover`、`AP_CARRYOVER_*`） | 总因；"另建一套声称同样权威的待办、回执或完成记录"正是目标提示词期望结果 6 反对的 | issue 评论如实列出未验证和未完成项（"如实记录的边界"这一惯例保留，只是不再进状态机）；后续目标用同会话的 dsh-goal 承接（A→B）；账本只放链接，不是权威 |
+| egress 门禁与无人值守模式 | 没有证据就外发；无人值守时 ask 会无限等待。§2 出站两行、§6 的 guard fail-closed 一条与 outbound 各条、§8.6 第 2 条（`governance.unattended`、`enforcement.egressDecisions`） | 总因；目标提示词期望结果 3：插件应承接用户既有授权，"不再把普通自有仓库操作一概变成重新询问 owner 的边界"。本插件是分发的，默认措辞不应固化某位 owner 的规则 | 自有仓库的 commit、push、PR、merge 是普通工作，插件不设门禁；宿主自带的批准设置照常生效。外发前的脱敏是 SKILL.md 的一步指令，不是门禁；PR 审阅和 reviewer 的"泄露"blocker 兜底。旧配置键仍被接受并忽略 |
+| outbound manifest | 出站文本里的断言要有工件支撑，且一次一批准。§2 出站行（6h 新鲜度、每 claim 一个 bearer）、§6 的"归档不是重放保护"与计数语义 | 总因；它是 egress 门禁的证据通道，门禁撤了它就是纯手续 | PR 描述 + reviewer 核对；`files` 中也去掉该证据项 |
+| external_audit | 一个在进程之外读过并签字的人。§6 的"`external` 审计模式在 v1 被 init 拒绝"与"external 附署无法被验证真的发生过" | §6 自己写明这个附署无法验证，机械化的只有"附了东西"；总因 | CI 结果和 owner 的审阅记录在 PR 上。Linear MY-83 随之作废 |
+| owner-gate-pass / withdraw 与 `gateSources` | owner 对单道门禁的裁决及来源溯源，对齐当时 Codex GAH。§1（owner gate 通道一条）、§8.9 第 1、3、4 条（`applyGateLedger`、世代、`AP_OWNER_GATE_*`、卡片的 gate-source 行） | 门禁没了；这套通道本身是 §8.9 为适配 GAH 的 gate 来源模型而造的，GAH 已退役 | 新写入停止。owner 若豁免审阅，按 agent-core audit-invariants 把原话和 UTC 时间记在 issue 上。遗留事件仍可折叠显示 |
+| plan / execution / rules 三个审计员 | 独立复核；审计者只读、深度 1、裁决带内返回。§2 审计员两行、§3（审计角色三分）、§8.5 第 1、6 条（findings 分级、轮次上限）、§8.6 第 1 条 | a32226c 将独立审阅收敛为一个 reviewer 角色；三分对应的是三道已退役的门禁 | 一次性 reviewer：只读 `toolFilter`、`maxDepth` 1、`outputSchema` 结构化裁决，由 reviewer 子代理带内返回，主线程不能代写；优先选与被审者不同模型家族，否则记为"独立性降低"，不伪造 |
+| `stopReminder`（`agent/turn-stopping` + followup） | 替 CC 的 Stop hook：门禁没过就不让回合停。§2 Stop hook 行、§6 的"turn-stopping 提醒依赖 followup 唤醒语义" | 它是在提醒"状态机里还有门禁没过"，门禁没了，提醒就没内容；持续推进改由宿主 goal 机制做 | 有 goal-round-driver 时由它续轮；没有时卡片如实显示"auto-continue unavailable"。等待期的行为见下 |
+
+#### 保留的部分及理由
+
+- 模型路由（work class、梯度、pin、onboarding、catalog、覆盖面指标）：§1.2、§8.7、§8.8
+  的问题（总返工成本、请求式升档、选定与实际路由一致）和 goal-workflow 不冲突，目标提示词
+  期望结果 5 也要求继承。每次派发显式带 model + effort，并报告 selected 与 observed 两条
+  路由。reviewer 独立性（不同模型家族）保留，对应 agent-core 的独立审阅原则。
+- executor 世代号（CAS）、drain-before-replace、续用传输与轮转（§1、§8.9 第 2 条）：保留，
+  推广为按每个子代理记世代、支持 N 个子代理；轮转仍留在 routing 里。它们解决的是
+  "子代理丢失或被替换时不双写、不丢结果"，与有没有 plan gate 无关。
+- 遗留 run 只读显示：旧事件折叠冻结为只读的 legacy reader，不收紧对旧流的重放校验，
+  不向旧流写新事件，旧 run 卡片和历史保留（目标提示词期望结果 7 要求保留有价值的历史）。
+  遗留的 `storeKind` 文件 / domain 后端仍可读。
+- `requireDirectHumanTurn` 收窄：只用于账本里 owner 显式动作（如清除遗留归档）。目标的创建、
+  编辑、恢复由 dsh-tool-goal 原生的直接人类回合校验负责，不再由插件重复一道。
+- 同会话目标 A→B、skill 的安装与复制机制：保留。
+- 角色的 `escalate` 动作保留为子代理向主线程提议升档的通道（§1.2 "升档是请求"）。
+
+#### 配置键
+
+`gate.*`、`governance.*`、`storeKind`、`crossFamily` 仍被接受但不再生效；status 提示一次。
+`routing.*` 照常。
+
+#### 未覆盖 / 承担得更弱的部分
+
+- usage 与 outbound manifest 原本给的是"有工件在场"的机械检查，现在换成 reviewer 判断和
+  Done 里的真机观察，是人和模型的判断，不是机械不变量。这是有意的取舍（目标提示词不希望
+  用新增机制修补流程摩擦），不是等价替代。
+- 等待期间的轮次消耗依赖 goal-round-driver：它在根代理空闲时排一轮，默认上限 256 轮后
+  给出 `round-limit` 阻塞。SKILL.md 要求在有未完成子代理或后台任务的目标轮内用
+  `job_output` / `autopilot_agents` 的等待阻塞在回合内，而不是结束回合；一次真实 CI 等待
+  所耗轮数的界限（不超过 ceil(等待分钟/10)+2）是**待验证**的目标，不是已测结果。
+  跨重启的继续需要 owner 说"continue"；`schedule_create` 的提醒会在重启后送达会话，但
+  不会重新武装目标。
+- 事实表未确认插件运行时启动的子代理是否会收到宿主原生的结算通知、能否用原生
+  `send_message` / `list_agents` 驱动；这决定 `autopilot_agents` 的最终动作集，**可能变化**。
+
+#### 兼容与回滚
+
+0.3.0 只在 DSH 0.2.1-rc.5 上测试。0.1.x / 0.2.0 宿主继续用 npm 上的 0.2.0；WSL CLI 的回滚是
+`npm i -g @deepseek-ai/dsh@0.1.5-rc.1`，先备份 profile。docs/compatibility.md 中更早在其他
+宿主（0.2.0-rc.2、0.2.1-rc.2、0.1.5-rc.1 等）测得的行是 0.2.x 插件的历史，不能当作 0.3.0
+在那些宿主上可用的证据。
+
+#### 被撤销的旧工具名
+
+autopilot_init（不再是必需的第一步）、autopilot_submit_plan、autopilot_audit、
+autopilot_self_check、autopilot_usage、autopilot_submit_evidence、autopilot_submit_closeout、
+autopilot_submit_packet、autopilot_external_audit、autopilot_amend_plan、autopilot_signal、
+autopilot_executor。现行工具面见 `autopilot_status` 与宿主显示的工具列表；
+`autopilot_delegate` 和 `autopilot_agents` 的最终形态由引擎部分决定，写作时未定稿。

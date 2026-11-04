@@ -1,154 +1,148 @@
 # Operator reference
 
-First-time users should start from the [README](../README.md) natural-language
-path. This page is the operator / tool protocol that used to live on the
-landing page.
+First-time users should start from the [README](../README.md). This page is for
+operators: the tools the plugin registers, the ledger it keeps, the DSH tools
+the workflow relies on, and configuration. The tool list the host shows in a
+session is authoritative; the plugin's tool surface may still change while the
+engine work lands, so check it before scripting against a name or parameter.
 
-Ownership is by LAYER. A document may **name** a rule another document owns; a
-rule's defining text — its table, its menu, its contract — belongs to exactly one
-place:
+Who owns what:
 
-Two defining blocks are *mechanically* censused today (the usage-class table and
-the boundary-state menu, by `test/references-contract.test.ts`), plus the
-declared census of governance-invariant headings. Outside those anchors this is a review discipline, not an
-invariant: the manual-install commands and the closeout/external-audit
-summaries deliberately appear in more than one layer, because an operator
-reading this page should not have to open the adapter to copy two files. Where
-they overlap they are summaries; the contract itself is owned once, and
-`references/refusals.md` is where a refusal's contract lives. The layer owners:
-
-- `skill/dsh-autopilot/SKILL.md` is the in-session **adapter** — the DSH
-  bindings and the order of operations.
-- this page owns the **tool protocol** — tool names, parameters, phases and run
-  state.
+- `skill/dsh-autopilot/SKILL.md` is the in-session adapter: when the workflow
+  applies and the order of operations.
+- This page owns tool names, parameters, the ledger and configuration.
+- [../skill/dsh-autopilot/references/model-routing.md](../skill/dsh-autopilot/references/model-routing.md)
+  owns work classes, the ladder, escalation and the routing contract.
 - [../skill/dsh-autopilot/references/governance-invariants.md](../skill/dsh-autopilot/references/governance-invariants.md)
-  owns the **host-neutral rules** (risk, audit modes, the audit invariants,
-  evidence sufficiency, closeout). The skill routes there rather than restating
-  them. It is published into the skill directory, so the in-session reader
-  reaches it too.
+  owns the invariants that still hold (evidence, review findings, delegation).
 - [../skill/dsh-autopilot/references/refusals.md](../skill/dsh-autopilot/references/refusals.md)
-  owns **every refusal**: what each `AP_*` code requires in advance and what to
-  do when you get it.
+  owns every remaining `AP_*` refusal and its remedy.
 
-## Tool sequence
+There is no init step and no run phase. A goal is started by the owner through
+the host's goal tools; the plugin tools below only start, follow and record
+children.
 
-1. `autopilot_init` — triage: objective, scope, non-goals, acceptance
-   criteria, risk, size, executionMode (inline/delegated), auditMode
-   (self-check/independent/external). An inline run at medium risk or
-   above must also record `inlineReason` — a reason, not an approval
-   (`AP_INLINE_REASON_REQUIRED`). May record `ownerRequirements`:
-   owner-verbatim requirement strings, immutable with the triage, surfaced
-   in status and the root policy so an audit checks the owner's words, not
-   a paraphrase. Standard runs also seed usage ids
-   (default: one entry, `m1`). Optionally declares `carryoverFromRunId` +
-   `carryoverNote` + `carryoverInherits`: this run continues a COMPLETED
-   predecessor's authorized work (refused when the predecessor is missing or
-   not completed).
-2. `autopilot_submit_plan` → `autopilot_usage` for every seeded id →
-   `autopilot_audit role=plan` (or `autopilot_self_check` on
-   lightweight+low, or `autopilot_external_audit` on `auditMode: external`).
-   A pass verdict on a run with an undeclared entry is recorded and then
-   refused at the gate flip. Auditors may return graded `findings`
-   (`blocking`/`non-blocking` × `plan`/`execution`/`rules`): a `pass` may
-   carry non-blocking findings; a `needs-replan` without a blocking
-   plan-layer finding is refused pre-commit (`AP_AUDIT_FINDINGS_INVALID`) —
-   executor-fixable defects belong in `needs-fix`.
-3. Implement (inline), or `autopilot_executor action=start` (delegated; the
-   child returns via private `autopilot_submit_packet`). Mid-execution plan
-   refinement goes through `autopilot_amend_plan` (text + note): the plan
-   revision bumps, execution state survives, and evidence/closeout are gated
-   until a plan-role delta pass at the amended revision lands
-   (`AP_AMEND_REAUDIT_REQUIRED`).
-4. `autopilot_submit_evidence` (inline) → `autopilot_audit role=execution`
-   (`role=rules` when the run touches the operating layer or risk ≥ high).
-5. `autopilot_submit_closeout` — completes the run, or names what is
-   missing. Unproven criteria make it a PARTIAL delivery:
-   `handoffOpenItems` must map every unproven criterion to exactly one open
-   item (`implemented-unverified` / `not-implemented` /
-   `known-limitation`), optionally `handoffNextAuthorizedAction`; the
-   outcome label (`complete`/`partial`) is DERIVED by the engine, never
-   taken from the caller. Structured `commandRecords`
-   (`{command, cwd, exitStatus, coverage}` per command) may accompany the
-   free-text `commands` log; a record without its exit fact is refused.
+## Plugin tools
 
-`autopilot_status` shows phase, gates, required roles, replan budget, and
-enforcement. `autopilot_log` records four-cell checkpoints
-(`on-plan|detour|grind|escalate`). `autopilot_signal` carries replan /
-block / owner-decision / owner-approve / owner-resolve, plus the gate actions
-`owner-gate-pass` and `owner-gate-withdraw` (owner-only, and both name exactly
-one gate with `gate: plan|execution`). A gate the owner passed stands against a
-later audit objection — the objection is recorded, the gate does not move, and
-the other gate is never carried along — and `status.gateSources` says which
-authority set each gate, for which plan revision. The reading is PER GATE: a
-gate the stream recorded nothing about answers `no-source`, which is a
-statement about the stream rather than a claim that nobody decided.
-`owner-resolve` takes `resume-planning` (full reset), `resume-execution`
-(restore the paused-from phase with gates/evidence untouched — requires a
-pause that stamped it), or `block`. Replan-budget exhaustion never forces an
-owner decision: the run stays in its replanning lane with the exhaustion
-visible; escalation is deliberate.
+### `autopilot_delegate`
 
-**No structured verdict** means a gate does not flip.
+Starts one role child. Parameters:
 
-## Closeout evidence kinds
+| parameter | meaning |
+| --- | --- |
+| `role` | `scout`, `clerk`, `worker`, `executor-lead`, `planner` or `reviewer` |
+| `task` | the brief: outcome, files, what the child may not touch, a checkable result |
+| `writePaths` | paths the child may write; read-only roles get none |
+| `model`, `effort` | optional explicit route. Beats a profile pin and the plugin's choice |
 
-Every evidence item carries `kind: 'path' | 'command'`. The tool refuses an
-item without it. Three layers, deliberately different:
+Roles:
 
-- TOOL SCHEMA requires `kind` on every item.
-- ENGINE and REPLAY require it only on `proven` items.
-- The `evidenceKinds: 1` stamp on the closeout event means "proven evidence
-  kind validation v1", not "every item carries a non-empty kind".
+| role | what it is | tools |
+| --- | --- | --- |
+| `scout` | search, inventory, log reading; returns compressed findings | read-only, depth 1 |
+| `clerk` | external reads and writes through connector tools present in the session; says so when none are | read-only plus the connector tools that exist |
+| `worker` | one bounded piece with explicit `writePaths` | write access limited to its `writePaths`, depth 1 |
+| `executor-lead` | owns one chunk end to end; may start scout, clerk and worker children; integrates and validates | depth 2 |
+| `planner` | read-only plan or diagnosis | read-only |
+| `reviewer` | independent one-shot review, fresh context, structured verdict | read-only, one-shot |
 
-Closeout keys off event format stamps, not `// bearerBase`. Each proven
-bearer is exactly one acceptance criterion.
+Children started in the same turn run in parallel. A `worker` whose
+`writePaths` intersect those of a running worker is refused before anything
+starts; this is a check, not an approval step. A child started by an
+`executor-lead` is a child of that lead (depth 2). A lower explicit user
+`maxDepth` is respected.
 
-An artifact citing a prior run via `inheritedFrom` returns from settlement
-unchecked; the exemption is visible in the snapshot, and the audit layer
-owns it.
+The reviewer returns its verdict in-band. The main agent cannot write a
+verdict into the ledger. The reviewer is given a model family different from
+the change when one is reachable; otherwise the record says "reduced
+independence".
 
-## External audit
+Every dispatch carries an explicit model and effort. The result reports the
+selected route and the observed one; trust the observed one.
 
-`auditMode: external` is owner-countersigned: `autopilot_external_audit` on
-a direct human turn. An agent-generated turn is refused. `reviewRef` names a
-file inside the run directory. The optional `treeHash` is **declared, never
-verified** — this package contains no git. An external pass is weaker
-evidence than a dispatched audit; the record keeps them distinguishable.
-`self-check` remains refused in this mode.
+### `autopilot_agents`
 
-## Delegated executor
+Follows and steers the children the plugin started:
+`action: list | wait | message | stop | escalate`. `wait` blocks for children
+inside the turn (host-clamped, at most 10 minutes per wait). `escalate` is how a
+child proposes a new dispatch on a higher route; the new child gets the same
+contract and the role's eligibility is never widened.
 
-The child is continuable. `needs-fix` resumes the **same** child;
-`needs-replan` drains before revoking. Packet submission CASes on
-`executionRevision` (`AP_PACKET_REVISION_REQUIRED` /
-`AP_PACKET_REVISION_MISMATCH`) plus the occupied-slot check.
+The exact action set depends on whether the host's own `list_agents` and
+`send_message` cover children started by the plugin runtime. That is not yet
+verified (see [compatibility.md](compatibility.md#not-yet-verified-on-a-real-host)),
+so this tool may shrink.
 
-Install of the child's packet tool, egress guard, and native seam is
-**transactional** from `agent/created`. A plugin **remount** while an
-executor is already live is **warned, not vetoed** — there is no publication
-to refuse. Details: [DESIGN.md §6](../DESIGN.md).
+### `autopilot_status`
 
-On a stock node-only profile the auditor filter names only tools such a
-deployment registers; any name it does not register is **dropped** with a
-recorded diagnostic rather than aborting the dispatch.
+Shows the ledger for the current session: delegations, routes, reviewer
+verdicts, links, legacy runs, and a one-time note when a removed config key was
+supplied.
 
-## Run state
+### Other plugin tools
 
-Run state lives under `$DSH_HOME/storages/dsh-autopilot/runs/<sessionId>/`
-(`events.jsonl` canonical, `snapshot.json` + `log.md` projections).
+`autopilot_log` and `autopilot_request_escalation` may still be registered;
+check the tool list the host shows. They are not part of the contract above.
 
-This is **not** part of the dsh Session log. Upstream
-`KNOWN_SESSION_EVENT_TYPES` is closed to out-of-tree plugins
-([DESIGN.md §4](../DESIGN.md)). **Two processes** sharing one run are out of
-contract and surface as loud fold failures.
+## Ledger
 
-`storeKind` is `auto` in the schema, but this bundle's `cordis.patch.yml`
-pins `storeKind: file` so a web profile and a headless profile do not split
-the canonical medium. Override the root with `storeRoot` in config, or with
-`DSH_AUTOPILOT_HOME` in the environment; both accept a leading `~`.
+The issue and the PR are the record. The ledger is a display aid for execution,
+cancel, resume and history. It is not a todo list and not a completion
+judgement. Each delegation record holds:
 
-For a web profile, include the web app bundle (it mounts `ctx.storageDomain`)
-and the npm package name:
+| field | meaning |
+| --- | --- |
+| `role` | the role it was started as |
+| child id | the host's id for the child |
+| generation | the child's generation; a replacement child gets the next one |
+| selected route, source | the model and effort the plugin or the call chose, and why: pin, ladder, call argument or adapter default |
+| observed route | the model and effort the host reports the child actually ran on |
+| `state` | where the child is now, including `lost` for a child that was running when the host restarted |
+| `writePaths` | the paths a worker may write |
+| reviewer verdict | the verdict text and the model family, as evidence of independence |
+| links | the issue and PR the goal belongs to |
+
+The ledger also carries the goal id and revision it was started under and
+markers for legacy runs.
+
+Legacy runs written by plugin 0.2.x stay readable. They are shown read-only on
+the card, are not continued, and no new event is written to their streams. The
+`autopilot_status` view lists them.
+
+## DSH tools the workflow uses
+
+These belong to the host, not the plugin.
+
+| tool | use |
+| --- | --- |
+| `get_goal` | read the current goal with its `goal_id` and `revision` |
+| `create_goal` | create the goal with the Outcome as its objective. Needs the owner's direct top-level turn |
+| `update_goal` | `complete` or `blocked` (also allowed in an autonomous goal round), `resume`, edit, pause. Needs the exact `goal_id` and `revision` from `get_goal`; all but `complete`/`blocked` need the owner's direct turn |
+| `job_output` | `job_id`, optional `wait` and `timeout_ms` (default wait 30 s, cap 10 minutes) for a background command or CI watcher |
+| `list_agents`, `send_message` | the host's own view of and channel to agents |
+| `schedule_create` | set a delayed reminder (`after_seconds` and related). Only the main agent may call it; a child is refused (`subagent_session`) |
+
+A goal stays disarmed after a session resume, fork or host restart until the
+owner says "continue" (`update_goal` with `action: resume`). A reminder from
+`schedule_create` is delivered into the session after a restart but does not
+re-arm the goal. The goal round cap defaults to 256 and ends in the blocker
+code `round-limit`.
+
+## Configuration
+
+`routing.*` keeps working: mode, preference, roles, ladder and work classes.
+See
+[model-routing.md](../skill/dsh-autopilot/references/model-routing.md) for the
+shape and how roles map to work classes. `skillInstall` (`auto` or `off`) and `storeRoot` are kept.
+
+Removed keys are accepted and ignored: `gate.*`, `governance.*`, `storeKind` and
+`crossFamily`. A profile that still sets
+them loads without error, and `autopilot_status` notes this once. Legacy
+`storeKind` file and domain backends stay readable for history. The root can
+still be set with `storeRoot` or `DSH_AUTOPILOT_HOME` (both accept a leading
+`~`).
+
+For a web profile, include the web app bundle and the npm package name:
 
 ```json
 "dsh": { "profile": { "bundles": [
@@ -163,39 +157,23 @@ Runs stranded in domain tables can be exported on demand with
 writes). It never deletes a domain record and never overwrites a file-backed
 run.
 
-Config is a Schemastery `Config` with explicit **unknown-key** refusal. See
-[DESIGN.md §7](../DESIGN.md).
-
-## Usage classes
-
-`autopilot_usage` answers, per change id, how the change was actually
-operated. Last-wins per id; the question is re-asked at closeout.
-
-The class table and the boundary-state menu are owned once, by the adapter the
-agent is actually routed to:
-[Usage classes](../skill/dsh-autopilot/SKILL.md#usage-classes-autopilot_usage). This page deliberately does
-not carry a second copy — two copies of a table is how the two copies start
-disagreeing.
-
-Outbound evidence rules: [security.md](security.md).
-
 ## Skill copy fallback
 
 When the plugin is not loaded, or hard-link publication is `unsupported`:
 
 ```sh
-# macOS / Linux — fallback only
+# macOS / Linux, fallback only
 mkdir -p ~/.agents/skills/dsh-autopilot/references
 cp skill/dsh-autopilot/SKILL.md ~/.agents/skills/dsh-autopilot/SKILL.md
 cp skill/dsh-autopilot/references/*.md ~/.agents/skills/dsh-autopilot/references/
 ```
 
 ```powershell
-# Windows PowerShell — fallback only (not a Windows support claim)
+# Windows PowerShell, fallback only
 New-Item -ItemType Directory -Force "$HOME\.agents\skills\dsh-autopilot\references" | Out-Null
 Copy-Item skill\dsh-autopilot\SKILL.md "$HOME\.agents\skills\dsh-autopilot\SKILL.md"
 Copy-Item skill\dsh-autopilot\references\*.md "$HOME\.agents\skills\dsh-autopilot\references\"
 ```
 
-Copying only `SKILL.md` installs an adapter whose routed references are absent —
+Copying only `SKILL.md` installs an adapter whose routed references are absent:
 the adapter's links then point at nothing.

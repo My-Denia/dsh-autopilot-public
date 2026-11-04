@@ -3,11 +3,75 @@
 This page records **measured** host and packaging bounds for
 `dsh-goal-autopilot`. It is not a wish list.
 
-Source version: **0.2.1-rc.1**, a pre-release. It adapts the plugin to dsh
-`0.2.1-rc.2` and keeps the earlier host ranges. It is **not** npm `latest`.
-The published stable package remains **0.2.0** (the 2026-10-16 registry
-check stands; it is not evidence that 0.2.1-rc.1 has been published).
-Earlier: **0.1.1**, a packaging / runtime compatibility fix.
+## 0.3.0 (unreleased)
+
+Source version `0.3.0`, the goal-workflow adapter. It is not published: npm
+`latest` is still `0.2.0`.
+
+- **Target host:** dsh `0.2.1-rc.5` only (npm `@deepseek-ai/dsh` `latest` was
+  `0.2.1-rc.5` on 2026-10-29; that is the Windows desktop build). The plugin is
+  tested on no other host. The `engines` range will be `>=0.2.1-rc.5 <0.3.0-0`
+  once the integration step sets it in `package.json`; until then the manifest
+  still carries the 0.2.x range.
+- **Environments:** the Windows desktop app (profile `desktop`) and the WSL CLI
+  (profile `autopilot-rc`) are each treated as a native environment. The WSL CLI
+  has no run history; the Windows desktop profile has 45 legacy run streams.
+- **Old hosts:** `0.1.x` and `0.2.0` hosts stay on `dsh-goal-autopilot@0.2.0`,
+  the last version for them.
+- **WSL rollback:** back up the profile, then
+  `npm i -g @deepseek-ai/dsh@0.1.5-rc.1`.
+
+Nothing in this section is a measurement of 0.3.0 behavior. What has and has not
+been observed is below.
+
+## Not yet verified on a real host
+
+Plugin 0.3.0 on dsh 0.2.1-rc.5. None of these has been observed on a real host.
+The integration step will trim this list as items are observed. Passing tests,
+mock runs and status reads do not count as observation.
+
+- Upgrade keeps the legacy run cards: the same count before and after (45 file
+  runs plus the domain-store runs on Windows desktop), three sampled runs open
+  and render, including one run with an amended plan and one with an owner
+  resolution, and no fold rejection.
+- Clamp restore on a real clamped legacy session: the sandbox mode is restored,
+  and a mode the user changed after the clamp stays unchanged.
+- Simple work is not pulled into the goal flow: 0 `autopilot_*` calls and 0
+  `create_goal` calls in the session log.
+- Goal work: `create_goal` after the owner states a goal; two scouts' run
+  intervals overlap; an `executor-lead` child starts a `worker` child (depth 2);
+  the reviewer's observed provider family differs from the lead's; selected and
+  observed model and effort match on the card and in the ledger; a pinned effort
+  is observed.
+- A stage ending does not end the goal: PR open with CI pending keeps the goal
+  active, and the rounds consumed during one real CI wait stay within
+  `ceil(wait_minutes / 10) + 2`.
+- Own-repo outbound: `git push` and `gh pr create` from a dsh session with no
+  `AP_*` refusal.
+- Restart recovery: the card says auto-continue was released or a worker was
+  lost; the owner's "continue" resumes; a `schedule_create` reminder set before
+  the restart is delivered after it, while the goal stays disarmed until the
+  owner says "continue".
+- Same-session goal A then B: both are shown, and A's delegation and review
+  records are unchanged.
+- WSL CLI `0.2.1-rc.5` install of 0.3.0 from npm or a tarball; a headless run
+  passes the simple-work check and a reduced goal-work check.
+- Whether children started by the plugin's runtime get native settlement notices
+  and can be driven by the host's `send_message` and `list_agents`. This decides
+  how large the `autopilot_agents` tool stays.
+- Anything that needs the real model API: earlier attempts returned HTTP
+  503/502. Such items are "unverified (API 503)", never replaced by a mock run.
+
+## Measured for plugin 0.2.x (history)
+
+Everything below this line was measured, or written, for plugin 0.2.x and
+earlier on other hosts (`0.2.0-rc.2`, `0.2.1-rc.2`, `0.1.5-rc.1` and so on). It
+is history. It does not say 0.3.0 works on those hosts, and the hosts in it are
+outside the 0.3.0 target. The tool names, run phases and gates mentioned in
+those measurements belong to the retired 0.2.x design.
+
+Source version of that line: **0.2.1-rc.1**, a pre-release adapted to dsh
+`0.2.1-rc.2`. The published stable package for it remains **0.2.0**.
 
 ## Host matrix
 
@@ -23,8 +87,8 @@ Earlier: **0.1.1**, a packaging / runtime compatibility fix.
 | Windows Desktop 0.2.0-rc.2 (app, real account) | **run 2026-10-10**, profile `desktop`, candidate tarball | **verified:** plugin mount; the shipped system-prompt section renders against the LIVE catalog (`m7/desktop-onboarding-section.md` in the run store); the routing config on the profile patch is what the host mounts, and the session's own run stayed visible (`enforcement.store=file`) after a restart | **partially verified:** run persistence across a host restart (needs the packaged `storeKind: file` pin repeated in the profile patch — see below); the composed-config dump is a HEADLESS artifact (the managed `desktop` profile refuses `--dump-config`), so the desktop side is backed by the on-disk patch plus the restarted session's own run state; **not verified:** full write lifecycle / closeout on Desktop, macOS |
 | Windows | out of scope | **not verified** | **not verified** |
 
-Windows is **not** a supported platform in this snapshot. Do not read the
-PowerShell skill-copy fallback as Windows support.
+The "Windows | out of scope" row above is the 0.2.x position. For 0.3.0 the
+Windows desktop app is a target environment, not yet verified (see above).
 
 ### dsh Desktop
 
@@ -38,7 +102,13 @@ plugin. Install from the Desktop plugin manager by package name
 dsh plugin --profile <name> add dsh-goal-autopilot@0.2.0
 ```
 
-### Profile patch hazard: re-declaring the plugin id drops the packaged store pin
+### Profile patch hazard: re-declaring the plugin id drops the packaged store pin (0.2.x history; retired store key)
+
+Still true in general: a profile patch layer replaces the config of the entry it
+targets instead of merging into it. In 0.3.0 `storeKind` is a removed key that
+is accepted and ignored, so this exact loss of file-backed runs is a 0.2.x
+matter; legacy runs are read from whichever backend holds them. The text below
+is the 0.2.x measurement.
 
 The plugin ships its own bundle layer (`cordis.patch.yml`) which pins
 `storeKind: file`. A profile's patch layer **replaces** the config of the entry
@@ -76,7 +146,7 @@ On a 0.1.5 profile, `dsh plugin add` may print a pnpm **peer WARN** because
 the WSL measurement; `pnpm peers check` lists the missing names. That WARN
 alone is not a signal to downgrade the host CLI.
 
-## What 0.2.0 fixed
+## What 0.2.0 fixed (history)
 
 dsh 0.1.7 added an install/start compatibility check on plugin peers, and the
 0.1.7 session format and runtime changed four seams this plugin uses. Details
@@ -91,13 +161,13 @@ and measurements: [DESIGN.md §8.4](../DESIGN.md).
   resume only after the fix.
 - **Executor recognition** uses the agent announced by `agent/created`. On
   0.2 the child context throws on `ctx.agent`, and the executor got no
-  `autopilot_submit_packet`, egress guard, or seam.
+  executor packet tool, egress guard, or seam.
 - **Stop reminder** source kind is `dsh-autopilot`. Session format v4 refuses
   `kind: 'plugin'`, and the first reminder exited dsh.
 - **Run card** accepts `tool/ptc-dispatch(-start)` as well as the old
   `tool/code-dispatch(-start)` names.
 
-## What 0.1.1 fixed
+## What 0.1.1 fixed (history)
 
 `@deepseek-ai/dsh-tools` is a **host-provided peer**, range
 `0.1.2-rc.1 || >=0.1.5-rc.1 <0.1.6`. The test/build pin stays in
@@ -137,7 +207,7 @@ skill home whose filesystem does not support hard links the install is
 to it. The mount still succeeds; copy the file by hand to install
 it. Manual copy commands live in [reference](reference.md).
 
-## Verified on WSL2 + `dsh` `0.1.5-rc.1` (0.1.1)
+## Verified on WSL2 + `dsh` `0.1.5-rc.1` (plugin 0.1.1, history)
 
 Verified: npm install, compose/mount, skill install/load, autopilot entry,
 and plan/replan/audit through the plan gate.
@@ -152,7 +222,7 @@ The domain store backend has been driven to `autopilot_init` and no further
 on that path; artifact settlement and some store-error arms are file-backend
 evidence only. See [DESIGN.md §6](../DESIGN.md).
 
-## Host capability map (measured, 0.2.0-rc.2)
+## Host capability map (measured for plugin 0.2.x, 0.2.0-rc.2)
 
 Which host capabilities this plugin rides on, and which it must carry
 itself — established against the published `@deepseek-ai/*` 0.2.0-rc.2
@@ -165,7 +235,7 @@ packages and the Windows Desktop app (2026-10-10/12):
 | Subagent route authorization (`subagentModelSelection` session policy) | present | **used** — the session's allowed-model lock bounds every routing selection (see the policy-triad rule above) |
 | Reasoning effort (`reasoningEffort` at dispatch, `defaultEffort` per model) | present | **used** — the dispatch packet names the pinned effort; a route with none means the fixed setting IS the ceiling and the plugin never invents one |
 | Token cost / usage metering | **absent** | the price seed in `references/model-routing.md` is a dated, provenance-labelled tie-break seed, never a live fact |
-| Host-native goal-autopilot surface | **absent** | this plugin IS the DSH GAH; there is no host system to defer to or duplicate |
+| Host-native goal-autopilot surface | **absent** in 0.2.0-rc.2 | 0.2.x stance. 0.3.0 targets a host that has native goal tools and a goal round driver, and uses them; whether they behave as expected is in the unverified list |
 | Skill registry | present | **used** — the adapter ships as a skill installed through the host's own registry |
 | Run storage backends | `file` / `storageDomain` | both supported; Desktop needs the shipped `storeKind: file` pin (see the profile-patch hazard above) |
 
@@ -186,5 +256,5 @@ on purpose because those commands need a local dsh tree.
 ## See also
 
 - [DESIGN.md](../DESIGN.md) — architecture, honest limits, verification record
-- [security.md](security.md) — sandbox / egress assumptions
+- [security.md](security.md) — what the plugin does and does not gate
 - [CHANGELOG.md](../CHANGELOG.md) — release notes

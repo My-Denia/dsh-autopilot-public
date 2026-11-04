@@ -29,26 +29,13 @@ const referenceFile = join(skillDir, SKILL_REFERENCES_DIR, 'governance-invariant
  * catch. Adding a rule to the reference means adding it here in the same change.
  */
 const INVARIANT_HEADINGS = [
-  'Risk levels',
-  'Audit modes',
   'Checker-Resolution Invariant',
   'Moving-Anchor Invariant',
   'Evidence Sufficiency',
-  'Audit-Packet Rule',
-  'Concurrent-Audit Rule',
   'Statement-Artifact Sync Rule',
   'Stated-Contract Invariant',
-  'Sizing and replanning',
   'Delegation',
-  'Owner-Verbatim Requirements',
-  'State and evidence',
-  'Closeout',
-  'Audit Findings Grading',
-  'Minimum-Sufficient Admission',
-  'Plan Amendment and Delta Re-audit',
-  'Partial Delivery and Carryover',
-  'Owner-Decision Boundaries',
-  'Owner Gate Decisions and Provenance',
+  'Review Findings',
   'Red flags',
 ] as const
 
@@ -74,7 +61,7 @@ describe('governance reference layer', () => {
   it('states every invariant it owns, as its own heading', () => {
     // Cardinality floor first (Checker-Resolution Invariant): an empty list
     // would make the loop below vacuous and the test would report a calm pass.
-    expect(INVARIANT_HEADINGS.length).toBeGreaterThanOrEqual(10)
+    expect(INVARIANT_HEADINGS.length).toBeGreaterThanOrEqual(6)
     const missing = INVARIANT_HEADINGS.filter(
       heading => !new RegExp(`^## ${heading.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*$`, 'm').test(reference),
     )
@@ -108,19 +95,17 @@ describe('governance reference layer', () => {
 
   it('keeps a defining block owned once, not just a heading', () => {
     // The heading census above only sees '## <name>' lines, so a RENAMED
-    // restatement is invisible to it — which is exactly how the usage-class
-    // table and the boundary-state menu came to exist in two documents while
-    // the prose claimed "no overlap". These anchors are the defining blocks
-    // themselves.
+    // restatement is invisible to it. These anchors are the defining blocks
+    // themselves: the work-class table lives in model-routing.md and nowhere else.
     const routed = [
       'skill/dsh-autopilot/SKILL.md',
       ...BUNDLED_SKILL_REFERENCES.map(name => 'skill/dsh-autopilot/' + SKILL_REFERENCES_DIR + '/' + name),
       'docs/reference.md',
     ]
-    const anchors = ['| class | what it must carry |', 'Boundary-state menu:']
+    const anchors = ['| class | dominant axis | default tiers | default roles |']
     for (const anchor of anchors) {
       const owners = routed.filter(file => readFileSync(join(root, file), 'utf8').includes(anchor))
-      expect({ anchor, owners }).toEqual({ anchor, owners: ['skill/dsh-autopilot/SKILL.md'] })
+      expect({ anchor, owners }).toEqual({ anchor, owners: ['skill/dsh-autopilot/' + SKILL_REFERENCES_DIR + '/model-routing.md'] })
     }
   })
 
@@ -128,10 +113,30 @@ describe('governance reference layer', () => {
     const skill = readFileSync(join(skillDir, 'SKILL.md'), 'utf8')
     expect(skill).toContain(`${SKILL_REFERENCES_DIR}/governance-invariants.md`)
     expect(skill).toContain(`${SKILL_REFERENCES_DIR}/refusals.md`)
+    expect(skill).toContain(`${SKILL_REFERENCES_DIR}/model-routing.md`)
     expect(skill).toContain('docs/reference.md')
-    // The risk and audit-mode TABLES are the reference's; the adapter names the
-    // fields but must not carry a second copy of the rules that fill them.
+    // The adapter binds the DSH tools; it must not carry the retired run shape.
+    expect(skill).toContain('autopilot_delegate')
+    expect(skill).toContain('update_goal')
+    expect(skill).not.toContain('autopilot_init')
     expect(skill).not.toContain('| level | shape |')
-    expect(skill).not.toContain('| mode | who reviews | legal when |')
+  })
+
+  it('does not name retired tools outside the history sections', () => {
+    const retired = [
+      'autopilot_submit_plan', 'autopilot_audit', 'autopilot_self_check', 'autopilot_usage',
+      'autopilot_submit_evidence', 'autopilot_submit_closeout', 'autopilot_submit_packet',
+      'autopilot_external_audit', 'autopilot_amend_plan',
+    ]
+    const current = [
+      'skill/dsh-autopilot/SKILL.md',
+      ...BUNDLED_SKILL_REFERENCES.map(name => 'skill/dsh-autopilot/' + SKILL_REFERENCES_DIR + '/' + name),
+      'README.md', 'README.zh-CN.md', 'docs/reference.md', 'docs/compatibility.md', 'docs/security.md',
+    ]
+    const text = new Map(current.map(file => [file, readFileSync(join(root, file), 'utf8')]))
+    // The matcher must be able to match: a name that is present has to be found.
+    expect([...text.values()].some(body => body.includes('autopilot_delegate'))).toBe(true)
+    const hits = current.flatMap(file => retired.filter(name => text.get(file)!.includes(name)).map(name => `${file}: ${name}`))
+    expect(hits).toEqual([])
   })
 })
