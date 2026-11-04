@@ -453,22 +453,34 @@ export class Delegator {
         updates.set(d.childId, { ...(read.observed === undefined ? {} : { observed: read.observed }), routeMatch })
       }
     }
+    if (updates.size > 0) {
+      // The snapshot above can be stale by the time this write runs (another refresh may have
+      // committed first), so decide against the committed record: never overwrite a decided
+      // match/mismatch, and never let a missing read replace an observed route already recorded.
+      await this.engine.mutate(rootId, current => {
+        let changed = false
+        const delegations = current.delegations.map(d => {
+          const update = updates.get(d.childId)
+          if (update === undefined || d.routeMatch === 'match' || d.routeMatch === 'mismatch') return d
+          if (update.observed === undefined && d.observed !== undefined) return d
+          changed = true
+          return { ...d, ...(update.observed === undefined ? {} : { observed: update.observed }), routeMatch: update.routeMatch }
+        })
+        return changed ? { ...current, delegations } : undefined
+      })
+    }
     // Release retained sessions once they can tell nothing more: the child settled and left the
-    // registry (this read was its last), or its route is already decided. A cold resume re-retains.
-    for (const d of ledger.delegations) {
+    // registry (this read was its last), or its route is already decided. Judged on the committed
+    // ledger and only after the write above landed, so a concurrent refresh can still read them.
+    // A cold resume re-retains.
+    const committed = this.engine.peekLedger(rootId)
+    if (committed === undefined) return
+    for (const d of committed.delegations) {
       if (!this.childSessions.has(d.childId)) continue
       const decided = d.routeMatch === 'match' || d.routeMatch === 'mismatch' || d.state === 'lost'
       const gone = d.state !== 'starting' && d.state !== 'running' && this.engine.agents.get(d.childId) === undefined
       if (decided || gone) this.childSessions.delete(d.childId)
     }
-    if (updates.size === 0) return
-    await this.engine.mutate(rootId, current => ({
-      ...current,
-      delegations: current.delegations.map(d => {
-        const update = updates.get(d.childId)
-        return update === undefined ? d : { ...d, ...(update.observed === undefined ? {} : { observed: update.observed }), routeMatch: update.routeMatch }
-      }),
-    }))
   }
 
   // ── wait ───────────────────────────────────────────────────────────────────
@@ -546,6 +558,9 @@ export class Delegator {
       outcome = { stopReason: 'error', diagnostic: errorMessage(error) }
     }
     const parsed = outcome.stopReason === 'completed' ? parseReviewVerdict(outcome.structured) : outcome.diagnostic ?? `the reviewer stopped with ${outcome.stopReason}`
+    // The reviewer's own route is recorded when its settlement lands; wait for it so the record
+    // carries the observed route rather than the selected one.
+    await this.settlements.get(base.childId)
     await this.refreshRoutes(caller.rootId)
     if (typeof parsed === 'string') {
       const code: RefusalCode = outcome.stopReason === 'completed' ? AP_ROLE_VERDICT_INVALID : AP_DISPATCH_FAILED

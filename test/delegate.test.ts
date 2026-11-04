@@ -402,6 +402,31 @@ describe('observed route when the host disposes the child before settling (dsh 0
     })
   })
 
+  it('two children settling together both end as a match (a refresh must not overwrite the other one)', async () => {
+    const h = delegationHost({ registered: REG, headerOnFirstRequest: true })
+    const a = await h.engine.delegate(h.root, { role: 'scout', task: 'a' })
+    const b = await h.engine.delegate(h.root, { role: 'scout', task: 'b' })
+    h.firstRequest(a.childId)
+    h.firstRequest(b.childId)
+    const waited = h.engine.wait(h.root, [a.childId, b.childId], 5)
+    h.settleDisposed(a.childId)
+    h.settleDisposed(b.childId)
+    await waited
+    for (const id of [a.childId, b.childId]) {
+      expect(ledgerOf(h).delegations.find(d => d.childId === id)).toMatchObject({ routeMatch: 'match', observed: { provider: 'host', model: 'default' } })
+    }
+  })
+
+  it('concurrent refreshes of an already-settled child keep its match', async () => {
+    const h = delegationHost({ registered: REG, headerOnFirstRequest: true })
+    const { childId } = await h.engine.delegate(h.root, { role: 'scout', task: 'a' })
+    h.firstRequest(childId)
+    h.settleDisposed(childId)
+    await Promise.all([h.engine.refreshRoutes('root-1'), h.engine.refreshRoutes('root-1')])
+    await h.engine.wait(h.root, [childId], 1)
+    expect(ledgerOf(h).delegations.find(d => d.childId === childId)?.routeMatch).toBe('match')
+  })
+
   it('a running child that has not sent its first request is pending, not unreadable', async () => {
     const h = delegationHost({ registered: REG, headerOnFirstRequest: true })
     const { childId } = await h.engine.delegate(h.root, { role: 'scout', task: 't' })
@@ -454,6 +479,18 @@ describe('the reviewer', () => {
     expect(ledger.delegations.find(d => d.role === 'reviewer')?.state).toBe('completed')
     // Read-only tools: restricted on creation.
     expect(h.restricts.get(start.childId!)).toEqual([allowListFor('reviewer', REG)])
+  })
+
+  it('records the reviewer\'s observed route, not the selected one, even when it is disposed', async () => {
+    const h = delegationHost({ registered: REG, models: MODELS, policy: policyOf(['alpha', 'm-a'], ['beta', 'm-b']), headerOnFirstRequest: true })
+    await h.engine.mutate('root-1', l => ({ ...l, delegations: [worker('alpha')] }))
+    const pending = h.engine.delegate(h.root, { role: 'reviewer', task: 'review the parser change' })
+    for (let i = 0; i < 50 && h.starts.length === 0; i += 1) await new Promise(r => setTimeout(r, 2))
+    const id = h.starts[0]!.childId!
+    ;(h.agents.get(id) as { session: { append(k: string, v: unknown): void } }).session.append('request/header', { header: { config: { provider: 'gamma', model: 'g-1' } }, reason: 'initial' })
+    h.settleDisposed(id, { stopReason: 'completed', structured: PASS })
+    await pending
+    expect(ledgerOf(h).reviews[0]?.reviewerRoute).toEqual({ provider: 'gamma', model: 'g-1' })
   })
 
   it('reduced independence, said so, when only the same family exists', async () => {
