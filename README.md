@@ -45,7 +45,7 @@ The tool parameters, the ledger and the configuration are in the [operator refer
 
 ## Status
 
-Developer preview. `0.3.0` is unreleased. The [verified list](./docs/compatibility.md#verified-on-a-real-host) is what was observed on Windows with dsh `0.2.1-rc.5`, headless profile and one provider family; the [not-verified list](./docs/compatibility.md#not-verified-on-a-real-host) is what was not (desktop card rendering, the next goal round after a stage, schedule reminders across a restart, a cross-family reviewer). Passing tests, mock runs and status reads are not counted as observation. The earlier measurements in [docs/compatibility.md](./docs/compatibility.md) are for plugin `0.2.x`.
+Developer preview. `0.3.0-rc.1` is on npm under the `next` tag; `latest` is still `0.2.0`. The [verified list](./docs/compatibility.md#verified-on-a-real-host) is what was observed with dsh `0.2.1-rc.5` on Windows: a headless profile, the owner's daily desktop app, and an isolated Web Session host, with one provider family. The [not-verified list](./docs/compatibility.md#not-verified-on-a-real-host) is what was not (among them the desktop card rendering after the turn-level fix, and a cross-family reviewer). Passing tests, mock runs and status reads are not counted as observation. The earlier measurements in [docs/compatibility.md](./docs/compatibility.md) are for plugin `0.2.x`.
 
 ## Documentation
 
