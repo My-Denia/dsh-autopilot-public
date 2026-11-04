@@ -288,6 +288,8 @@ export interface Ledger {
   readonly depth: DepthStatus
   /** Legacy run ids recorded for this session (summaries are served separately). */
   readonly legacyRunIds: readonly string[]
+  /** Outcome of the one-time lazy sandbox restore, per legacy run id (absent = not attempted yet). */
+  readonly legacyRestores?: Readonly<Record<string, SandboxRestoreRecord>>
   readonly updatedAt: string
 }
 
