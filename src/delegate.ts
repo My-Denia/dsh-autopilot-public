@@ -301,6 +301,9 @@ export class Delegator {
     why: readonly string[],
     extra: { readonly outputSchema?: object; readonly delivery?: 'parent' | 'caller' } = {},
   ): Promise<DelegateResult & { activation?: { result: Promise<{ stopReason: string; structured?: unknown; diagnostic?: string }> } }> {
+    // Mirror the goal first: its firstSeenAt must not be later than this dispatch's startedAt, or the
+    // reviewer's default window (since the goal's first sighting) would miss this dispatch.
+    await this.engine.syncGoal(this.engine.agents.get(caller.rootId) ?? caller.agent)
     const spec = ROLES[role]
     const depth = caller.depth + 1
     const cap = depth + spec.maxDepth - 1

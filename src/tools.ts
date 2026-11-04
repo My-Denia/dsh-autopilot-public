@@ -97,7 +97,7 @@ function delegateTool(engine: AutopilotEngine) {
       effort: { type: 'string', description: 'Explicit reasoning effort.' },
       workClass: { type: 'string', enum: [...WORK_CLASS_NAMES], description: 'Override the role default work class.' },
       replaces: { type: 'string', description: 'Child id this dispatch replaces (escalation): same role, generation + 1.' },
-      reviewedChildIds: { type: 'array', items: { type: 'string' }, description: 'Reviewer only: the delegations under review (default: every settled write delegation).' },
+      reviewedChildIds: { type: 'array', items: { type: 'string' }, description: 'Reviewer only: the delegations under review (default: all settled non-reviewer delegations of the current goal).' },
     },
     output: jsonOutput(JSON_VALUE),
     async execute(args, exec) {

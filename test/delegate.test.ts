@@ -12,6 +12,7 @@ import { pathsIntersect, findWriteConflict } from '../src/roles/paths.js'
 import { allowListFor } from '../src/roles/tools.js'
 import { REVIEW_VERDICT_SCHEMA, ROLES } from '../src/roles/index.js'
 import { routeMatchOf } from '../src/delegate.js'
+import type { NativeGoalView } from '../src/engine.js'
 import { emptyLedger } from '../src/store/ledger.js'
 import { catalogOf, delegation, delegationHost, policyOf } from './helpers.js'
 
@@ -545,6 +546,49 @@ describe('the reviewer', () => {
     expect(ledgerOf(h).reviews[0]).toMatchObject({ reviewedChildIds: ['s-1', 's-2'], independence: 'cross-family', excludedFamilies: ['alpha'] })
     expect(result.review?.excludedFamilies).toEqual(['alpha'])
     expect(h.starts[0]!.agentOptions?.['provider']).toBe('beta')
+  })
+
+  /** Dispatch a scout and let it settle, so it is a settled delegation of whatever goal is current. */
+  async function settledScout(h: ReturnType<typeof delegationHost>): Promise<string> {
+    const before = h.starts.length
+    const result = await h.engine.delegate(h.root, { role: 'scout', task: 'look around' })
+    h.settle(result.childId)
+    for (let i = 0; i < 50 && ledgerOf(h).delegations.find(d => d.childId === result.childId)?.state !== 'completed'; i += 1) await new Promise(r => setTimeout(r, 2))
+    expect(h.starts.length).toBe(before + 1)
+    return result.childId
+  }
+
+  it('without reviewedChildIds, a second goal in the same session links only its own settled work', async () => {
+    let view: NativeGoalView = { id: 'g-a', revision: 1, objective: 'goal A', phase: 'active', maxGoalRounds: 40, roundsStarted: 0, activation: 'disarmed' }
+    const h = delegationHost({ registered: REG, models: MODELS, policy: policyOf(['alpha', 'm-a'], ['beta', 'm-b']), goal: () => view, driver: () => true })
+    const inA = await settledScout(h)
+    view = { ...view, id: 'g-b', objective: 'goal B' }
+    await h.engine.syncGoal(h.root)
+    const inB = await settledScout(h)
+
+    const pending = h.engine.delegate(h.root, { role: 'reviewer', task: 'review goal B' })
+    for (let i = 0; i < 50 && h.starts.length < 3; i += 1) await new Promise(r => setTimeout(r, 2))
+    h.settle(h.starts[2]!.childId!, { stopReason: 'completed', structured: PASS })
+    await pending
+    const review = ledgerOf(h).reviews[0]!
+    expect(review.reviewedChildIds).toEqual([inB])
+    expect(review.reviewedChildIds).not.toContain(inA)
+  })
+
+  it('a goal first mirrored at the first dispatch still includes that dispatch', async () => {
+    const view: NativeGoalView = { id: 'g-1', revision: 1, objective: 'only goal', phase: 'active', maxGoalRounds: 40, roundsStarted: 0, activation: 'disarmed' }
+    const h = delegationHost({ registered: REG, models: MODELS, policy: policyOf(['alpha', 'm-a'], ['beta', 'm-b']), goal: () => view, driver: () => true })
+    expect(h.engine.peekLedger('root-1')).toBeUndefined()
+    const first = await settledScout(h)
+    const ledger = ledgerOf(h)
+    const record = ledger.delegations.find(d => d.childId === first)!
+    expect(ledger.goal!.firstSeenAt <= record.startedAt).toBe(true)
+
+    const pending = h.engine.delegate(h.root, { role: 'reviewer', task: 'review' })
+    for (let i = 0; i < 50 && h.starts.length < 2; i += 1) await new Promise(r => setTimeout(r, 2))
+    h.settle(h.starts[1]!.childId!, { stopReason: 'completed', structured: PASS })
+    await pending
+    expect(ledgerOf(h).reviews[0]!.reviewedChildIds).toEqual([first])
   })
 
   it('reviewedChildIds narrows what is excluded; an unknown id is refused', async () => {
