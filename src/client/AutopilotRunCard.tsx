@@ -33,7 +33,7 @@ import { gateSourceLines, routeStatusView, routingLines } from './definition.js'
 import { fetchLiveRun, overlayLive, pollDelayMs, pollKey, shouldPoll } from './live.js'
 import type { LiveFetch, LiveRun } from './live.js'
 import { GoalLedgerView } from './GoalLedgerView.js'
-import { fetchLedger, fetchLegacyRun, ledgerPollDelayMs } from './ledger.js'
+import { fetchLedger, fetchLegacyRun, ledgerPollDelayMs, ledgerSessionId } from './ledger.js'
 import { badge, muted, shell } from './styles.js'
 
 export { GoalLedgerView }
@@ -58,6 +58,12 @@ export interface AutopilotRunCardProps {
    * bundle harness construct it, where no slot kit exists.
    */
   readonly sessionId?: string
+  /**
+   * The ROOT session id, when the host knows it and this card renders in a
+   * child session. The ledger is keyed by root session, so it wins over
+   * `sessionId` for the ledger request. Absent, `sessionId` is the root.
+   */
+  readonly rootSessionId?: string
   /**
    * Injected fetch, for tests and for a host that has none. Production leaves
    * it absent and the hook uses the browser's own `fetch` — same origin, so no
@@ -552,11 +558,15 @@ function ArchivedRunFold({ node, sessionId, fetchJson }: AutopilotRunCardProps):
  * ledger and archived-run details.
  * @returns the card element.
  */
-export function AutopilotRunCard(props: AutopilotRunCardProps): JSX.Element {
+export function AutopilotRunCard(props: AutopilotRunCardProps): JSX.Element | null {
   const { node, sessionId, fetchJson } = props
-  const ledger = useLedger(sessionId, fetchJson, node.data.calls.length, props.ledger)
+  const ledger = useLedger(ledgerSessionId(props), fetchJson, node.data.calls.length, props.ledger)
   const v1 = holdsV1(node.data)
   const legacyRuns = useLegacyRuns(ledger, fetchJson, props.legacyRuns, v1 ? pollKey(node.data, sessionId) : undefined)
+  // A goal-only session (anchored by a native goal call, no autopilot traffic)
+  // whose ledger route answered 404 no-ledger, or has not answered yet, shows
+  // nothing rather than an empty "no ledger" shell.
+  if (ledger === undefined && node.data.calls.length === 0 && !v1 && (legacyRuns?.length ?? 0) === 0) return null
   return (
     <div style={shell} data-autopilot-run-card="">
       <GoalLedgerView

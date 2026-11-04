@@ -436,6 +436,52 @@ assert('A30 no ledger, real v1 fold: archived detail still renders with sandbox 
   && noLedgerV1.includes('data-autopilot-run-fold=""'),
   noLedgerV1.slice(0, 160))
 
-const TOTAL = 31
+// A32 — a goal-only session (native get_goal, no autopilot_* call), through the
+// SHIPPED bundle: the card anchors, asks the ledger route for the ROOT session
+// id, renders nothing on 404 no-ledger, and stays one card when an autopilot
+// call joins. (renderToStaticMarkup runs no effects, so the request is asserted
+// on the bundle's own fetchLedger/ledgerSessionId, which the card's hook calls.)
+const goalCall = (seq, name) => ({ type: 'tool/call', seq, time: seq, data: { name, callId: `g${seq}`, arguments: '{}' } })
+const foldEvents = (events) => {
+  let state
+  let starts = 0
+  const key = 'autopilot-run:run'
+  for (const event of events) {
+    const m = definition.match(event)
+    if (m === null) continue
+    if (m.role === 'start') { starts += 1; state = definition.start(); continue }
+    state = definition.update({ key, id: 'run', state, start: undefined, matches: [] },
+      { event, role: 'update', location: { kind: 'session' } })
+  }
+  return { starts, node: definition.buildViewNode({ key, id: 'run', state, start: undefined, matches: [] }) }
+}
+const turnOne = { type: 'turn/start', seq: 1, time: 1, data: { turn: 1 } }
+const goalOnly = foldEvents([turnOne, goalCall(4, 'get_goal')])
+const mixed = foldEvents([turnOne, goalCall(4, 'get_goal'), goalCall(6, 'autopilot_status')])
+const requested = []
+let goalLedger = 'unset'
+try {
+  goalLedger = await exports.fetchLedger(exports.ledgerSessionId({ sessionId: 'child-9', rootSessionId: 'root-1' }), async (url) => {
+    requested.push(url)
+    return { ok: false, status: 404, json: async () => ({ ok: false, error: 'no-ledger' }) }
+  })
+} catch (error) {
+  goalLedger = `threw: ${error.message}`
+}
+let goalMarkup = 'unset'
+try {
+  goalMarkup = renderToStaticMarkup(React.createElement(exports.AutopilotRunCard, { node: goalOnly.node, sessionId: 'root-1' }))
+} catch (error) {
+  goalMarkup = `render threw: ${error.message}`
+}
+assert('A32 a goal-only session (get_goal, no autopilot_*) anchors one card, requests the ledger for the root id, renders nothing on 404',
+  goalOnly.starts === 1 && goalOnly.node !== null && goalOnly.node.anchorSeq === 4
+  && goalOnly.node.data.calls.length === 0
+  && mixed.starts === 1 && mixed.node?.anchorSeq === 4 && mixed.node.data.calls.length === 1
+  && requested.length === 1 && requested[0].includes('session=root-1') && !requested[0].includes('child-9')
+  && goalLedger === undefined && goalMarkup === '',
+  JSON.stringify({ anchor: goalOnly.node?.anchorSeq ?? null, requested, goalLedger: String(goalLedger), goalMarkup }))
+
+const TOTAL = 32
 console.log(`\n${failures === 0 ? `ALL GREEN (${TOTAL} assertions)` : `${failures} RED of ${TOTAL}`}`)
 process.exitCode = failures === 0 ? 0 : 1

@@ -54,6 +54,12 @@ export function ledgerRouteUrl(sessionId: string): string {
   return `${LEDGER_ROUTE_PATH}?session=${encodeURIComponent(sessionId)}`
 }
 
+/** The session id the ledger request is made for: the root, else this session. */
+export function ledgerSessionId(props: { readonly sessionId?: string; readonly rootSessionId?: string }): string | undefined {
+  const root = props.rootSessionId
+  return root !== undefined && root.trim() !== '' ? root : props.sessionId
+}
+
 export function legacyRunUrl(runId: string): string {
   return `${LEGACY_RUN_ROUTE_PATH}?id=${encodeURIComponent(runId)}`
 }

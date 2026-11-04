@@ -702,6 +702,22 @@ interface PendingCall {
 /** Tool-name prefix that identifies this plugin's controller surface. */
 export const AUTOPILOT_PREFIX = 'autopilot_'
 
+/**
+ * The host's native goal tools (`dsh-tool-goal`: `name: "get_goal"`,
+ * `"create_goal"`, `"update_goal"`, verified in the installed package's
+ * `lib/index.js`). A goal-only session logs these and no `autopilot_*` call,
+ * yet the engine gives it a ledger on open, so a call to one of them anchors
+ * the card too. The host client (`dsh-client-ui-goal`) exposes no goal tool
+ * events beyond `goal/activation-changed`, which carries no session traffic to
+ * anchor on, so tool calls are the only anchor.
+ */
+export const GOAL_TOOL_NAMES: readonly string[] = ['create_goal', 'get_goal', 'update_goal']
+
+/** True for a native goal tool name. */
+export function isGoalToolName(name: string): boolean {
+  return GOAL_TOOL_NAMES.includes(name)
+}
+
 /** The card's kind — the chat renderer dispatch key and the slot registration key. */
 export const AUTOPILOT_RUN_KIND = 'autopilot-run'
 
@@ -800,7 +816,7 @@ export function readCall(event: CardEvent): CallFields | undefined {
   const name = str(event.data.name)
   const callId = str(event.data.callId)
   if (name === undefined || callId === undefined) return undefined
-  if (!name.startsWith(AUTOPILOT_PREFIX)) return undefined
+  if (!name.startsWith(AUTOPILOT_PREFIX) && !isGoalToolName(name)) return undefined
   return { name, callId, args: safeJsonObject(event.data.arguments) }
 }
 
@@ -870,7 +886,7 @@ export function readDispatchStart(event: CardEvent): DispatchCallFields | undefi
   const name = str(event.data.name)
   const subCallId = str(event.data.subCallId)
   if (name === undefined || subCallId === undefined) return undefined
-  if (!name.startsWith(AUTOPILOT_PREFIX)) return undefined
+  if (!name.startsWith(AUTOPILOT_PREFIX) && !isGoalToolName(name)) return undefined
   // NOT safeJsonObject: the host hands this over already parsed.
   return { name, subCallId, args: isPlainObject(event.data.arguments) ? event.data.arguments : undefined }
 }
@@ -1004,6 +1020,14 @@ export function applyCall(state: AutopilotRunState, match: CardMatch): Autopilot
     ? asCall(readDispatchStart(event))
     : readCall(event)
   if (call === undefined) return state
+
+  // A native goal call only ANCHORS the card (first one wins, like any first
+  // call). It is not an autopilot invocation: no pending entry, no call strip
+  // row, no v1 fold. The card for a goal-only session is the ledger view.
+  if (isGoalToolName(call.name)) {
+    if (state.firstSeq !== undefined) return state
+    return { ...state, firstSeq: event.seq, firstLocation: match.location }
+  }
 
   const pending = new Map(state.pending)
   pending.set(call.callId, { name: call.name, seq: event.seq, time: event.time, args: call.args })
