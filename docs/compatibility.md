@@ -5,8 +5,8 @@ This page records **measured** host and packaging bounds for
 
 ## 0.3.0 (unreleased)
 
-Source version `0.3.0`, the goal-workflow adapter. It is not published: npm
-`latest` is still `0.2.0`.
+Source version `0.3.0`, the goal-workflow adapter. Pre-releases up to
+`0.3.0-rc.3` are on npm `next`; `latest` is still `0.2.0`.
 
 - **Target host:** dsh `0.2.1-rc.5` only (npm `@deepseek-ai/dsh` `latest` was
   `0.2.1-rc.5` on 2026-10-29; that is the Windows desktop build). The plugin is
@@ -79,18 +79,49 @@ Owner's daily Windows desktop app, plugin `0.3.0-rc.1`: the native goal round
 started stage 2 by itself. The prompt was pasted into the desktop GUI by an
 agent, not typed by the owner.
 
+Owner's daily Windows desktop app, dsh `0.2.1-rc.5`, plugins `0.3.0-rc.2` and
+`0.3.0-rc.3`, one provider family (`deepseek-official`). In each run an agent
+pasted one prompt into the desktop GUI; the session holds exactly one
+human-turn message.
+
+- Scouts were dispatched through `autopilot_delegate` and their run intervals
+  overlapped (47.0 s on rc.2, 17.7 s on rc.3). Observed route equalled selected
+  route.
+- The reviewer was dispatched through `autopilot_delegate` and its structured
+  verdict was recorded in the ledger.
+- After stage 1 the native goal round started stage 2 with no human message,
+  and the goal completed.
+- The card renders at turn level (rc.2 fix confirmed) and its fields match the
+  ledger. On rc.3 the independence label is the recorded independence note.
+- rc.2 finding: a reviewer called without `reviewedChildIds` linked nothing,
+  because the scouts were read-only. Fixed in rc.3: the same call linked both
+  scouts by default. Independence stayed "reduced" with `excludedFamilies`
+  `[deepseek-official]`, because only one provider family is configured.
+- rc.3 finding, not fixed: the reviewer delegation's `routeWhy` and the
+  review's independence note give different reasons for falling back to the
+  unfiltered ladder.
+- Model config note for users: dsh `0.2.1-rc.5` rejects a `models` key under
+  `llm-deepseek-account`, and the desktop's account provider then fails to
+  load. Use `modelOverrides` or remove the key. With the key removed, the
+  "DeepSeek 账号" group appears in the model picker.
+
+npm: `0.3.0-rc.3` is on `next` (`0.3.0-rc.1` was published earlier); `latest`
+is still `0.2.0`. The registry integrity matched the audited tarball.
+
 ## Not verified on a real host
 
 None of the following has been observed on dsh `0.2.1-rc.5`.
 
-- The desktop app's rendering of the card (a person has to look at it; on rc.1
-  no card rendered, fixed in rc.2, re-check pending), and
-  installing the plugin from the desktop Plugins page.
-- A cross-family reviewer. The test machine had only one provider family
-  configured.
+- Installing the plugin from the desktop Plugins page (the rc.2 and rc.3
+  installs used `dsh plugin add` with a tarball).
+- A cross-family reviewer. It needs a second provider family; the test machine
+  had only one configured.
 - A session whose sandbox mode the user changed after the old clamp stays
   unchanged. The candidate session needs a preset that headless refuses.
 - A model task on WSL.
+- DSH-side Linear access.
+- Connector tools for `clerk`. They are not wired into delegation, so `clerk`
+  is read-only today.
 - The card in a live web client for a session whose only goal activity is a
   native goal call.
 - Whether children started by the plugin's runtime get native settlement

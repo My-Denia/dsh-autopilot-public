@@ -9,10 +9,11 @@ The plugin becomes the dsh adapter of the goal-workflow. It is **not**
 published: npm `latest` is still `dsh-goal-autopilot@0.2.0`. Target host is dsh
 `0.2.1-rc.5` only. See Verification below for what was observed on a real host.
 
-`0.3.0-rc.1` was published to npm `next` on 2026-11-04. `0.3.0-rc.2` contains
+`0.3.0-rc.1` and `0.3.0-rc.3` are on npm `next` (`latest` is `0.2.0`). The
+registry integrity of rc.3 matched the audited tarball. `0.3.0-rc.2` contains
 two desktop fixes: the tool probe for `scout` and `reviewer` is scoped to those
-roles, and the delegate card is shown at turn level. Neither fix has been
-verified on a real host yet.
+roles, and the delegate card is shown at turn level. Both were verified on the
+owner's Windows desktop (see Verification).
 
 `0.3.0-rc.3` fixes two findings from the rc.2 desktop run: a reviewer
 dispatched without `reviewedChildIds` now links every settled non-reviewer
@@ -40,9 +41,20 @@ verdict (independence "reduced"), observed route equal to selected route for
 every delegation, own-repo push and draft PR with no refusal, a goal kept active
 through a CI wait, restart recovery and "continue", goal A then B, two
 concurrent processes, and 47 legacy runs folded with 0 rejected. Later observations on an
-isolated web host and the desktop app are in the compatibility doc. Not verified:
-desktop card rendering, a cross-family reviewer, a user-changed sandbox mode after the
-old clamp, and any model task on WSL. Details:
+isolated web host and the desktop app are in the compatibility doc.
+
+Desktop, rc.2 and rc.3 (dsh `0.2.1-rc.5`, one provider family): scouts through
+`autopilot_delegate` with overlapping runs (47.0 s and 17.7 s), reviewer through
+`autopilot_delegate` with a recorded verdict, stage 2 started natively with no
+human message, goal complete, and the turn-level card matching the ledger. On
+rc.3 a reviewer without `reviewedChildIds` linked both scouts, independence was
+"reduced" with `excludedFamilies` `[deepseek-official]`, and the card label is
+the recorded note. Profile note: dsh `0.2.1-rc.5` rejects a `models` key under
+`llm-deepseek-account`; use `modelOverrides` or remove it.
+
+Not verified: a cross-family reviewer, a user-changed sandbox mode after the
+old clamp, any model task on WSL, DSH-side Linear, and connector tools for
+`clerk` (not wired). Details:
 [docs/compatibility.md](docs/compatibility.md#verified-on-a-real-host).
 
 ### Breaking changes
