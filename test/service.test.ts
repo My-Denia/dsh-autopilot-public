@@ -144,6 +144,16 @@ describe('the read-only view over a ledger store and the legacy reader', () => {
     expect(projection?.notes).toEqual(['n1'])
   })
 
+  it('serves the retired config keys on the single and the listed projections, read on every call', async () => {
+    const store = await storeWith('s1')
+    const keys: string[] = []
+    const service = createAutopilotService({ ledgers: store, sources: {}, legacy: stubLegacy([]), retiredKeys: () => keys })
+    expect(await service.ledger('s1')).not.toHaveProperty('retiredConfigKeys')
+    keys.push('storeKind')
+    expect((await service.ledger('s1'))?.retiredConfigKeys).toEqual(['storeKind'])
+    expect((await service.ledgers())[0]?.retiredConfigKeys).toEqual(['storeKind'])
+  })
+
   it('answers undefined for a session without a ledger, and lists every ledger', async () => {
     const store = await storeWith('a', 'b')
     const service = createAutopilotService({ ledgers: store, sources: {}, legacy: stubLegacy([]) })

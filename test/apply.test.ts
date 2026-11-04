@@ -621,6 +621,7 @@ describe('apply: retired settings', () => {
     expect(notes).toHaveLength(1)
     for (const key of RETIRED_CONFIG_KEYS) expect(notes[0]).toContain(key)
     expect(host.recorded.warnings.filter(w => w.includes('ignores retired settings'))).toEqual([notes[0]])
+    expect(notes[0]).toContain('can be deleted from your config')
     await dispose()
   })
 

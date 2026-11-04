@@ -7,8 +7,9 @@ import { describe, expect, it } from 'vitest'
 import {
   LEDGER_BUSY_POLL_MS, LEDGER_QUIET_POLL_MS, RESTART_NOTE, autoContinueView, delegationRows, fetchLedger,
   goalView, hostRestartLine, ledgerPollDelayMs, ledgerRouteUrl, legacyRunLines, legacySummaryRows,
-  linkRows, readLedgerBody, readLegacyRunBody, reviewRows, routeText,
+  goalDetailRows, linkRows, readLedgerBody, readLegacyRunBody, retiredNotice, reviewRows, routeText, truncateTitle, visibleNotes,
 } from '../../src/client/ledger.js'
+import { STRINGS, formatTime, langFromTag } from '../../src/client/i18n.js'
 import type { LedgerProjection } from '../../src/domain/ledger-types.js'
 
 function fixture(name: string): unknown {
@@ -142,10 +143,11 @@ describe('restart-lost', () => {
   })
 
   it('records the restart as history', () => {
-    const line = hostRestartLine(p)
+    // The instant is printed as local time now (the recorded ISO 2026-11-04T09:50:00Z); UTC pins it.
+    const line = hostRestartLine(p, 'en', 'UTC')
     expect(line).toContain('1 running child was lost')
     expect(line).toContain('not restarted automatically')
-    expect(line).toContain('2026-11-04T09:50:00Z')
+    expect(line).toContain('Nov 4, 2026, 09:50:00')
   })
 
   it('marks the lost child as an error with its diagnostic', () => {
@@ -258,6 +260,13 @@ describe('goal phases', () => {
     else goal.status = status
     return readLedgerBody(body) as LedgerProjection
   }
+
+  it('warns about unavailable auto-continue for an unrecognised status too', () => {
+    const a = autoContinueView(withStatus('blocked:round-limit'))
+    expect(a.warning).toContain('Will not auto-continue')
+    expect(autoContinueView(withStatus(undefined)).warning).toBeDefined()
+    expect(autoContinueView(withStatus('complete')).warning).toBeUndefined()
+  })
 
   it('blocked', () => {
     const g = goalView(withStatus('blocked'))
@@ -406,5 +415,334 @@ describe('reviewRows independence label renders the recorded reason', () => {
     const r = reviewRows(withReview({ independence: 'reduced', excludedFamilies: [], independenceNote: note }))[0]
     expect(r?.independence).toBe(`REDUCED INDEPENDENCE: ${note}`)
     expect(r?.independence).not.toContain('same provider family')
+  })
+})
+
+
+describe('i18n helpers', () => {
+  it('langFromTag', () => {
+    expect(langFromTag('zh-CN')).toBe('zh')
+    expect(langFromTag('zh')).toBe('zh')
+    expect(langFromTag('ZH-tw')).toBe('zh')
+    expect(langFromTag('en-US')).toBe('en')
+    expect(langFromTag('fr')).toBe('en')
+    expect(langFromTag('')).toBeUndefined()
+    expect(langFromTag(undefined)).toBeUndefined()
+  })
+
+  it('formatTime prints local time in the requested zone and returns junk verbatim', () => {
+    const iso = '2026-11-04T16:29:37.586Z'
+    expect(formatTime(iso, 'zh', 'Asia/Shanghai')).toBe('2026/11/05 00:29:37')
+    expect(formatTime(iso, 'zh', 'UTC')).toBe('2026/11/04 16:29:37')
+    expect(formatTime(iso, 'en', 'UTC')).toBe('Nov 4, 2026, 16:29:37')
+    expect(formatTime(iso, 'en', 'Asia/Shanghai')).toBe('Nov 5, 2026, 00:29:37')
+    expect(formatTime('not a time', 'zh', 'UTC')).toBe('not a time')
+  })
+
+  it('both languages define every key', () => {
+    expect(Object.keys(STRINGS.zh).sort()).toEqual(Object.keys(STRINGS.en).sort())
+  })
+})
+
+describe('goal text per phase, both languages', () => {
+  function withStatus(status: string | undefined, auto?: { available: boolean; reason: string }): LedgerProjection {
+    const body = raw('paused-no-driver')
+    const goal = body.ledger.goal as Record<string, unknown>
+    if (status === undefined) delete goal.status
+    else goal.status = status
+    if (auto !== undefined) body.ledger.autoContinue = auto
+    return readLedgerBody(body) as LedgerProjection
+  }
+  const driver = { available: true, reason: 'goal round driver present' }
+
+  it('zh status and next sentence', () => {
+    expect(goalView(withStatus('active', driver), 'zh').statusText).toBe('进行中')
+    expect(goalView(withStatus('paused'), 'zh').statusText).toBe('已暂停')
+    expect(goalView(withStatus('blocked'), 'zh').statusText).toBe('受阻')
+    expect(goalView(withStatus('complete'), 'zh').statusText).toBe('已完成')
+    expect(goalView(withStatus(undefined), 'zh').statusText).toBe('未读到状态')
+    expect(goalView(withStatus('complete'), 'zh').nextText).toBe('目标已完成，可以在本会话里开始新目标。')
+    expect(goalView(withStatus('paused'), 'zh').nextText).toBe('已暂停，只有你能恢复（说“继续”）。')
+    expect(goalView(withStatus('blocked'), 'zh').nextText).toContain('受阻')
+    expect(goalView(withStatus('active', driver), 'zh').nextText).toContain('自动继续')
+  })
+
+  it('en status and next sentence', () => {
+    expect(goalView(withStatus('paused'), 'en').statusText).toBe('paused')
+    expect(goalView(withStatus('complete'), 'en').nextText).toBe('Goal complete. You can start a new goal in this session.')
+    expect(goalView(withStatus('paused'), 'en').nextText).toContain('Only you can resume')
+  })
+
+  it('an unrecognised status is verbatim in both languages', () => {
+    for (const lang of ['zh', 'en'] as const) {
+      expect(goalView(withStatus('blocked:round-limit'), lang).statusText).toBe('blocked:round-limit')
+      expect(goalView(withStatus('blocked:round-limit'), lang).nextText).toBeUndefined()
+    }
+  })
+
+  it('an active goal without a driver leaves the sentence to the auto-continue warning', () => {
+    expect(goalView(withStatus('active', { available: false, reason: 'x' }), 'zh').nextText).toBeUndefined()
+  })
+
+  it('the details hold id, revision, first seen, last read (local) and the auto-continue line', () => {
+    const rows = goalDetailRows(load('active-parallel'), 'zh', 'UTC')
+    const by = (label: string) => rows.find(r => r.label === label)?.value
+    expect(by('目标 ID')).toBe(load('active-parallel').goal?.goalId)
+    expect(by('修订号')).toBeDefined()
+    expect(by('首次看到')).toMatch(/^\d{4}\/\d{2}\/\d{2} \d{2}:\d{2}:\d{2}$/)
+    expect(by('最近读取')).toMatch(/^\d{4}\/\d{2}\/\d{2} /)
+    expect(by('自动继续')).toBe('可用：goal round driver present')
+    expect(goalDetailRows(load('active-parallel'), 'en', 'UTC').find(r => r.label === 'Auto-continue')?.value)
+      .toBe('available: goal round driver present')
+  })
+
+  it('previous goals and non-default depth go to the details', () => {
+    const body = raw('reduced')
+    body.ledger.depth = { executorLead: 3, source: 'user-setting', note: 'raised' }
+    const rows = goalDetailRows(readLedgerBody(body) as LedgerProjection, 'zh')
+    expect(rows.find(r => r.label === '执行负责人层级深度')?.value).toBe('3 (user-setting) · raised')
+    expect(rows.find(r => r.label === '以往目标')?.value).toContain('goal-synth-prev')
+  })
+})
+
+describe('auto-continue warning only when it matters', () => {
+  it('active and unavailable: warns, in both languages with the recorded reason', () => {
+    const body = raw('paused-no-driver')
+    ;(body.ledger.goal as Record<string, unknown>).status = 'active'
+    const p = readLedgerBody(body) as LedgerProjection
+    expect(autoContinueView(p, 'zh').warning).toBe(`不会自动继续：${p.autoContinue.reason}`)
+    expect(autoContinueView(p, 'en').warning).toBe(`Will not auto-continue: ${p.autoContinue.reason}`)
+  })
+
+  it('paused and unavailable: warns', () => {
+    expect(autoContinueView(load('paused-no-driver'), 'zh').warning).toContain('不会自动继续：')
+  })
+
+  it('complete goal, or available driver: no warning', () => {
+    const body = raw('paused-no-driver')
+    ;(body.ledger.goal as Record<string, unknown>).status = 'complete'
+    expect(autoContinueView(readLedgerBody(body) as LedgerProjection, 'zh').warning).toBeUndefined()
+    expect(autoContinueView(load('active-parallel'), 'zh').warning).toBeUndefined()
+    expect(autoContinueView(load('active-parallel'), 'zh').restartNote).toBe(STRINGS.zh.restartNote)
+  })
+
+  it('the host restart line is localized and keeps the lost count', () => {
+    const line = hostRestartLine(load('restart-lost'), 'zh', 'Asia/Shanghai')
+    expect(line).toBe('宿主在 2026/11/04 17:50:00 重启：1 个运行中的子任务丢失（不会自动重启）')
+  })
+})
+
+describe('delegation rows in plain words', () => {
+  const rows = (lang: 'zh' | 'en') => delegationRows(load('mismatch'), lang)
+
+  it('warns only for the mismatch row', () => {
+    const [m, pending] = rows('en')
+    expect(m?.warning).toContain('mismatch')
+    expect(m?.warning).toContain('effort high')
+    expect(m?.warning).toContain('effort medium')
+    expect(pending?.warning).toBeUndefined()
+    for (const r of delegationRows(load('active-parallel'), 'en')) {
+      expect(r.warning).toBeUndefined()
+      expect(r.ok).toBe(r.match === 'match')
+    }
+  })
+
+  it('zh mismatch sentence and pending text', () => {
+    const [m, pending] = rows('zh')
+    expect(m?.warning).toMatch(/^实际模型与选定的不一致：选定 .+，实际 .+$/)
+    expect(m?.warning).toContain('推理强度 高')
+    expect(m?.warning).toContain('推理强度 中')
+    expect(pending?.modelUsed).toContain('尚未观测到')
+    expect(pending?.warning).toBeUndefined()
+  })
+
+  it('observed route is the model used when seen', () => {
+    const w = delegationRows(load('active-parallel'), 'en')[1]
+    expect(w?.modelUsed).toBe(w?.observed)
+    expect(w?.ok).toBe(true)
+  })
+
+  it('role and state words, zh and en', () => {
+    const zh = delegationRows(load('restart-lost'), 'zh')[0]
+    expect(zh?.stateText).toBe('已丢失')
+    expect(zh?.stateNote).toBe('宿主重启后丢失，不会自动重启')
+    const roles = delegationRows(load('active-parallel'), 'zh').map(r => r.roleText)
+    expect(roles).toContain('调研')
+    expect(roles).toContain('执行负责人')
+    expect(delegationRows(load('active-parallel'), 'en').map(r => r.roleText)).toContain('Executor lead')
+  })
+
+  it('details carry ids, generation, replaces, routes, sources and the match text', () => {
+    const m = rows('zh')[0]!
+    const values = Object.fromEntries(m.details.map(d => [d.label, d.value]))
+    expect(values['子任务 ID']).toBe(m.childId)
+    expect(values['代数']).toBe('2')
+    expect(values['接替']).toBeDefined()
+    expect(values['模型来源']).toBe('角色固定')
+    expect(values['推理强度来源']).toBe('调用参数')
+    expect(values['核对结果']).toContain('不一致')
+  })
+
+  it('long titles are cut for the line and kept whole in the details', () => {
+    expect(truncateTitle('a'.repeat(61))).toBe(`${'a'.repeat(60)}…`)
+    expect(truncateTitle('short')).toBe('short')
+    const body = raw('active-parallel')
+    ;(body.ledger.delegations as Record<string, unknown>[])[0]!.title = 'x'.repeat(100)
+    const r = delegationRows(readLedgerBody(body) as LedgerProjection, 'en')[0]!
+    expect(r.title).toHaveLength(100)
+    expect(r.taskText).toBe(`${'x'.repeat(60)}…`)
+    expect(r.details.find(d => d.label === 'Task')?.value).toHaveLength(100)
+  })
+})
+
+describe('review rows in plain words', () => {
+  function withReview(patch: Record<string, unknown>, findings?: unknown[]): LedgerProjection {
+    const body = raw('reduced')
+    const reviews = body.ledger['reviews'] as Record<string, unknown>[]
+    Object.assign(reviews[0]!, patch)
+    if (findings !== undefined) reviews[0]!['findings'] = findings
+    return readLedgerBody(body) as LedgerProjection
+  }
+  const minor = (n: number) => Array.from({ length: n }, (_, i) => ({ severity: 'minor', summary: `m${i}` }))
+
+  it('verdict plus counts', () => {
+    const p = withReview({ verdict: 'pass', independence: 'cross-family' }, minor(4))
+    const zh = reviewRows(p, 'zh')[0]!
+    expect(zh.verdictText).toBe('审阅通过')
+    expect(zh.findings).toBe('次要 4')
+    const en = reviewRows(p, 'en')[0]!
+    expect(en.verdictText).toBe('Review passed')
+    expect(en.findings).toBe('4 minor')
+    expect(reviewRows(withReview({ verdict: 'needs-fix' }, []), 'zh')[0]?.verdictText).toBe('需要修改')
+    expect(reviewRows(withReview({ verdict: 'blocked' }, [{ severity: 'blocker', summary: 'b' }, { severity: 'major', summary: 'c' }]), 'zh')[0]?.findings)
+      .toBe('阻断 1 · 主要 1')
+  })
+
+  it('cross-family is a muted plain line', () => {
+    const p = withReview({ independence: 'cross-family', excludedFamilies: ['alpha'] })
+    expect(reviewRows(p, 'zh')[0]?.independenceText).toBe('跨厂商独立审阅')
+    expect(reviewRows(p, 'zh')[0]?.independence).toBe('cross-family review (excluded: alpha)')
+  })
+
+  it('the known note shape maps to a plain reason; any other note never invents one', () => {
+    const known = withReview({ independence: 'reduced', independenceNote: 'no reviewer route outside provider families [alpha]' })
+    expect(reviewRows(known, 'zh')[0]?.independenceText).toBe('独立性降低：没有其他厂商的模型可选')
+    expect(reviewRows(known, 'en')[0]?.independenceText).toBe('Reduced independence: no model from another provider was available')
+    const other = withReview({ independence: 'reduced', independenceNote: 'HTTP 503 from the pool' })
+    expect(reviewRows(other, 'zh')[0]?.independenceText).toBe('独立性降低（原因见详情）')
+    expect(reviewRows(other, 'zh')[0]?.independenceText).not.toContain('503')
+    expect(reviewRows(other, 'zh')[0]?.details.find(d => d.label === '独立性说明')?.value).toBe('HTTP 503 from the pool')
+    const none = withReview({ independence: 'reduced' })
+    expect(reviewRows(none, 'en')[0]?.independenceText).toBe('Reduced independence (see details for the reason)')
+  })
+
+  it('details hold the reviewer, local time and excluded providers', () => {
+    const p = withReview({ independence: 'reduced', excludedFamilies: ['alpha', 'beta'] })
+    const d = Object.fromEntries(reviewRows(p, 'zh', 'UTC')[0]!.details.map(x => [x.label, x.value]))
+    expect(d['排除的厂商']).toBe('alpha, beta')
+    expect(d['审阅时间']).toMatch(/^\d{4}\/\d{2}\/\d{2} \d{2}:\d{2}:\d{2}$/)
+    expect(d['审阅者 ID']).toBeDefined()
+  })
+})
+
+describe('links', () => {
+  it('only the issue label is localized', () => {
+    const p = load('active-parallel')
+    expect(linkRows(p, 'zh').map(l => l.label)).toEqual(['Issue MY-195', 'PR #12', 'PR #13'])
+    expect(linkRows(p, 'en')[0]?.label).toBe('issue MY-195')
+  })
+})
+
+describe('retired settings notice', () => {
+  const NOTE = 'dsh-autopilot 0.3.0 ignores retired settings: governance.unattended, storeKind; they no longer have an effect and can be deleted from your config.'
+  function withKeys(keys: string[] | undefined): LedgerProjection {
+    const body = raw('active-parallel')
+    body.ledger.notes = [NOTE, 'another note']
+    if (keys !== undefined) body.ledger.retiredConfigKeys = keys
+    return readLedgerBody(body) as LedgerProjection
+  }
+
+  it('words the notice in both languages and hides the matching English note', () => {
+    const p = withKeys(['governance.unattended', 'storeKind'])
+    expect(retiredNotice(p, 'zh')).toBe('配置里有已废弃的设置：governance.unattended、storeKind，可以删除，不影响运行。')
+    expect(retiredNotice(p, 'en')).toBe('Your config has retired settings: governance.unattended, storeKind. You can delete them; they have no effect.')
+    expect(visibleNotes(p)).toEqual(['another note'])
+  })
+
+  it('an older host without the keys keeps its English note and shows no structured notice', () => {
+    const p = withKeys(undefined)
+    expect(p.retiredConfigKeys).toBeUndefined()
+    expect(retiredNotice(p, 'zh')).toBeUndefined()
+    expect(visibleNotes(p)).toEqual([NOTE, 'another note'])
+    expect(goalDetailRows(p, 'en').filter(r => r.value === NOTE)).toHaveLength(1)
+  })
+
+  it('an empty key list is no notice', () => {
+    expect(retiredNotice(withKeys([]), 'en')).toBeUndefined()
+  })
+})
+
+describe('zh plain wording: auto-continue code and effort values', () => {
+  function withAuto(auto: Record<string, unknown>): LedgerProjection {
+    const body = raw('paused-no-driver')
+    ;(body.ledger.goal as Record<string, unknown>).status = 'active'
+    body.ledger.autoContinue = auto
+    return readLedgerBody(body) as LedgerProjection
+  }
+  const plain: Record<string, string> = {
+    'driver-present': '会自动继续',
+    'no-driver-in-composition': '当前宿主没有目标轮次驱动',
+    'released-after-restart': '宿主重启后已释放',
+    'not-yet-observed': '还没检测到目标轮次驱动',
+    unknown: '无法检查宿主是否支持自动继续',
+  }
+
+  it('each known code is plain text in the zh warning; details keep the verbatim reason', () => {
+    for (const [code, text] of Object.entries(plain)) {
+      const p = withAuto({ available: false, code, reason: 'raw english reason' })
+      expect(autoContinueView(p, 'zh').warning).toBe(`不会自动继续：${text}`)
+      const row = goalDetailRows(p, 'zh', 'UTC').find(r => r.label === '自动继续')?.value
+      expect(row).toBe(`不可用：${text}（raw english reason）`)
+    }
+  })
+
+  it('no code or an unknown code falls back to the verbatim reason', () => {
+    for (const auto of [{ available: false, reason: 'raw english reason' }, { available: false, code: 'brand-new', reason: 'raw english reason' }]) {
+      const p = withAuto(auto)
+      expect(autoContinueView(p, 'zh').warning).toBe('不会自动继续：raw english reason')
+      expect(goalDetailRows(p, 'zh', 'UTC').find(r => r.label === '自动继续')?.value).toBe('不可用：raw english reason')
+    }
+  })
+
+  it('English keeps the verbatim reason whatever the code', () => {
+    const p = withAuto({ available: false, code: 'no-driver-in-composition', reason: 'raw english reason' })
+    expect(autoContinueView(p, 'en').warning).toBe('Will not auto-continue: raw english reason')
+    expect(goalDetailRows(p, 'en', 'UTC').find(r => r.label === 'Auto-continue')?.value).toBe('unavailable: raw english reason')
+  })
+
+  it('zh effort values are plain words in the body, with the raw id kept in details', () => {
+    const [m] = delegationRows(load('mismatch'), 'zh')
+    expect(m?.modelUsed).toContain('推理强度 中')
+    expect(m?.warning).toContain('推理强度 高')
+    expect(m?.warning).toContain('推理强度 中')
+    expect(m?.warning).not.toMatch(/\b(high|medium)\b/)
+    const values = Object.fromEntries((m?.details ?? []).map(d => [d.label, d.value]))
+    expect(values['选定的模型']).toContain('推理强度 高（high）')
+    expect(values['观测到的模型']).toContain('推理强度 中（medium）')
+    const [en] = delegationRows(load('mismatch'), 'en')
+    expect(en?.warning).toContain('effort high')
+    expect(Object.fromEntries((en?.details ?? []).map(d => [d.label, d.value]))['Selected route']).toContain('effort high')
+  })
+
+  it('every known effort maps, an unknown one stays verbatim', () => {
+    const e = STRINGS.zh.effortValue
+    expect(['minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'turbo'].map(e)).toEqual(['最低', '低', '中', '高', '很高', '最高', 'turbo'])
+    expect(STRINGS.zh.effortValueDetail('turbo')).toBe('turbo')
+    expect(STRINGS.en.effortValue('xhigh')).toBe('xhigh')
+  })
+
+  it('zh labels use the full-width colon', () => {
+    expect(STRINGS.zh.colon).toBe('：')
+    expect(STRINGS.zh.autoWarn('x')).toContain('：')
   })
 })

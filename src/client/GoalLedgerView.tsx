@@ -1,21 +1,31 @@
 /**
  * The v3 half of the card: what the ledger recorded about this session's goal.
  *
- * Pure presentation. Every string comes from the view-model in `./ledger.ts`;
- * this file only lays it out. There are no buttons: the goal belongs to the
- * host's native goal tool, and the owner acts there, not here.
+ * Pure presentation. Every string comes from the view-model in `./ledger.ts`
+ * and the table in `./i18n.ts`; this file only lays it out. Plain words in the
+ * body, technical lines inside native `<details>` (no state, no buttons: the
+ * goal belongs to the host's native goal tool, and the owner acts there).
  *
  * @module dsh-autopilot/client/GoalLedgerView
  */
 
+import { useSyncExternalStore } from 'react'
 import type { CSSProperties, ReactNode } from 'react'
 import type { LedgerProjection, LegacyRunProjection } from '../domain/ledger-types.js'
+import { currentLang, STRINGS, subscribeLang } from './i18n.js'
+import type { Lang } from './i18n.js'
 import {
   autoContinueView, delegationRows, goalView, hostRestartLine, legacyRunLines, legacySummaryRows,
-  LEGACY_NOTE, linkRows, reviewRows,
+  linkRows, retiredNotice, reviewRows,
 } from './ledger.js'
-import type { DelegationRow, ReviewRow } from './ledger.js'
+import type { DelegationRow, DetailRow, ReviewRow } from './ledger.js'
 import { badge, muted, toneColor } from './styles.js'
+
+/** The display language: the override if given, else the host's, following changes. */
+export function useLang(override?: Lang): Lang {
+  const host = useSyncExternalStore(subscribeLang, currentLang, currentLang)
+  return override ?? host
+}
 
 export interface GoalLedgerViewProps {
   /** The session's ledger, or undefined when none has been served yet. */
@@ -24,6 +34,10 @@ export interface GoalLedgerViewProps {
   readonly legacyRuns?: readonly LegacyRunProjection[] | undefined
   /** The archived v1 session-log rendering, shown inside the archived section. */
   readonly legacyFold?: ReactNode
+  /** Force a language (tests, previews). Default: the host's. */
+  readonly lang?: Lang | undefined
+  /** Force a time zone for printed times (tests, previews). Default: the viewer's. */
+  readonly timeZone?: string | undefined
 }
 
 const headRow: CSSProperties = {
@@ -32,7 +46,23 @@ const headRow: CSSProperties = {
 const sectionHead: CSSProperties = { fontWeight: 600, marginTop: 10 }
 const rowBox: CSSProperties = { marginTop: 4 }
 
-function DelegationItem({ row }: { readonly row: DelegationRow }): JSX.Element {
+/** A collapsed, muted label/value list; nothing when there is nothing to list. */
+function Details({ rows, label }: { readonly rows: readonly DetailRow[]; readonly label: string }): JSX.Element | null {
+  if (rows.length === 0) return null
+  return (
+    <details style={{ ...muted, fontSize: 11 }} data-autopilot-details="">
+      <summary style={{ cursor: 'pointer' }}>{label}</summary>
+      {rows.map((r, i) => (
+        <div key={`${r.label}:${i}`} style={{ paddingLeft: 12 }}>
+          {r.label === '' ? null : <span>{r.label} </span>}
+          <span style={{ color: 'var(--dsw-alias-label-primary)', overflowWrap: 'anywhere' }}>{r.value}</span>
+        </div>
+      ))}
+    </details>
+  )
+}
+
+function DelegationItem({ row, lang }: { readonly row: DelegationRow; readonly lang: Lang }): JSX.Element {
   return (
     <div
       style={{ ...rowBox, paddingLeft: row.indent * 16 }}
@@ -41,48 +71,40 @@ function DelegationItem({ row }: { readonly row: DelegationRow }): JSX.Element {
       data-autopilot-state={row.state}
     >
       <div>
-        <span>{row.role}</span>
-        <span style={muted} title={row.childId}> {row.shortId}</span>
-        {row.title !== '' ? <span> {row.title}</span> : null}
-        <span style={muted}> · gen {row.generation}</span>
-        {row.replaces !== undefined ? <span style={muted}> · replaces {row.replaces}</span> : null}
+        <span>{row.roleText}</span>
+        <span style={muted} title={row.childId}> {row.role}</span>
+        {row.title !== '' ? <span title={row.title}> {row.taskText}</span> : null}
         {' '}
-        <span style={badge(toneColor(row.stateTone))}>{row.state}</span>
+        <span style={badge(toneColor(row.stateTone))}>{row.stateText}</span>
         {row.stateNote !== undefined ? <span style={muted}> {row.stateNote}</span> : null}
       </div>
       <div style={muted}>
-        selected {row.selected} · observed {row.observed}
+        {STRINGS[lang].modelUsed}{STRINGS[lang].colon}{row.modelUsed}
+        {row.ok ? <span title={row.matchText}> ✓</span> : null}
+        {row.quietNote !== undefined ? <span> · {row.quietNote}</span> : null}
       </div>
-      <div style={muted}>{row.source}</div>
-      <div>
-        <span style={badge(toneColor(row.matchTone))}>{row.matchText}</span>
-      </div>
+      {row.warning !== undefined ? <div style={{ color: toneColor('error') }}>{row.warning}</div> : null}
       {row.diagnostic !== undefined ? <div style={muted}>{row.diagnostic}</div> : null}
       {row.escalation !== undefined ? <div style={badge(toneColor('warn'))}>{row.escalation}</div> : null}
+      <Details rows={row.details} label={STRINGS[lang].details} />
     </div>
   )
 }
 
-function ReviewItem({ row }: { readonly row: ReviewRow }): JSX.Element {
+function ReviewItem({ row, lang }: { readonly row: ReviewRow; readonly lang: Lang }): JSX.Element {
   return (
     <div
       style={rowBox}
       data-autopilot-review-independence={row.reduced ? 'reduced' : 'cross-family'}
     >
       <div>
-        <span style={badge(toneColor(row.verdictTone))}>{row.verdict}</span>
+        <span style={badge(toneColor(row.verdictTone))}>{row.verdictText}</span>
         {' '}
         <span>{row.subject}</span>
         <span style={muted}> · {row.findings}</span>
       </div>
-      <div style={muted}>reviewer {row.reviewer}</div>
-      <div>
-        {row.reduced
-          ? <span style={badge(toneColor('warn'))}>reduced independence</span>
-          : null}
-        {row.reduced ? ' ' : ''}
-        <span style={row.reduced ? undefined : muted}>{row.independence}</span>
-      </div>
+      <div style={row.reduced ? { color: toneColor('warn') } : muted}>{row.independenceText}</div>
+      <Details rows={row.details} label={STRINGS[lang].details} />
     </div>
   )
 }
@@ -102,13 +124,14 @@ function LegacyDetail({ run }: { readonly run: LegacyRunProjection }): JSX.Eleme
 }
 
 /** The archived-run section: summaries, fetched details, and any v1 fold content. */
-function LegacySection({ ledger, legacyRuns, legacyFold }: GoalLedgerViewProps): JSX.Element | null {
+function LegacySection({ ledger, legacyRuns, legacyFold, lang }: GoalLedgerViewProps & { readonly lang: Lang }): JSX.Element | null {
+  const S = STRINGS[lang]
   const summaries = ledger === undefined ? [] : legacySummaryRows(ledger.legacyRuns)
   if (summaries.length === 0 && legacyFold === undefined && (legacyRuns ?? []).length === 0) return null
   return (
     <div data-autopilot-legacy="" style={{ marginTop: 12, borderTop: '1px solid var(--dsw-alias-border-l2)', paddingTop: 6 }}>
-      <div style={sectionHead}>Autopilot run <span style={muted}>(archived, read-only)</span></div>
-      <div style={muted}>{LEGACY_NOTE}</div>
+      <div style={sectionHead}>{S.legacyHeading} <span style={muted}>{S.legacyHeadingNote}</span></div>
+      <div style={muted}>{S.legacyNote}</div>
       {summaries.map(s => (
         <div key={s.runId} style={rowBox} data-autopilot-legacy-run={s.runId}>
           <div>
@@ -139,66 +162,43 @@ function LegacySection({ ledger, legacyRuns, legacyFold }: GoalLedgerViewProps):
  * @param props.legacyFold - optional archived v1 content for the legacy section.
  */
 export function GoalLedgerView(props: GoalLedgerViewProps): JSX.Element {
-  const { ledger } = props
+  const { ledger, timeZone } = props
+  const lang = useLang(props.lang)
+  const S = STRINGS[lang]
   if (ledger === undefined) {
     return (
       <div data-autopilot-ledger="">
-        <div style={headRow}><span style={{ fontWeight: 600 }}>Goal autopilot</span></div>
-        <div style={muted}>no goal ledger recorded for this session</div>
-        <LegacySection {...props} />
+        <div style={headRow}><span style={{ fontWeight: 600 }}>{S.title}</span></div>
+        <div style={muted}>{S.noLedger}</div>
+        <LegacySection {...props} lang={lang} />
       </div>
     )
   }
-  const goal = goalView(ledger)
-  const auto = autoContinueView(ledger)
-  const restart = hostRestartLine(ledger)
-  const delegations = delegationRows(ledger)
-  const reviews = reviewRows(ledger)
-  const links = linkRows(ledger)
+  const goal = goalView(ledger, lang, timeZone)
+  const auto = autoContinueView(ledger, lang)
+  const restart = hostRestartLine(ledger, lang, timeZone)
+  const delegations = delegationRows(ledger, lang)
+  const reviews = reviewRows(ledger, lang, timeZone)
+  const links = linkRows(ledger, lang)
+  const retired = retiredNotice(ledger, lang)
   return (
     <div data-autopilot-ledger="">
       <div style={headRow}>
-        <span style={{ fontWeight: 600 }}>Goal autopilot</span>
-        <span style={badge(toneColor(goal.tone))} data-autopilot-goal-phase={goal.phase}>{goal.label}</span>
+        <span style={{ fontWeight: 600 }}>{S.title}</span>
+        <span style={badge(toneColor(goal.tone))} data-autopilot-goal-phase={goal.phase}>{goal.statusText}</span>
       </div>
       {goal.objective !== undefined ? <div style={{ marginBottom: 4 }}>{goal.objective}</div> : null}
-      {goal.next !== undefined ? <div>{goal.next}</div> : null}
-      {goal.seen !== undefined ? <div style={muted}>{goal.seen}</div> : null}
-
-      <div style={{ marginTop: 6 }}>
-        <span style={{ color: toneColor(auto.tone) }}>{auto.text}</span>
-      </div>
+      {goal.nextText !== undefined ? <div>{goal.nextText}</div> : null}
+      {auto.warning !== undefined ? <div style={{ color: toneColor(auto.tone) }}>{auto.warning}</div> : null}
       {auto.restartNote !== undefined ? <div>{auto.restartNote}</div> : null}
       {restart !== undefined ? <div style={muted}>{restart}</div> : null}
-      {ledger.depth.source !== 'plugin-default'
-        ? (
-          <div style={muted}>
-            executor-lead depth {ledger.depth.executorLead} ({ledger.depth.source})
-            {ledger.depth.note !== undefined ? ` · ${ledger.depth.note}` : ''}
-          </div>
-          )
-        : null}
-      {ledger.notes.map((n, i) => <div key={`${i}:${n}`} style={muted}>{n}</div>)}
-
-      {ledger.previousGoals.length > 0
-        ? (
-          <div style={{ ...muted, marginTop: 6 }} data-autopilot-previous-goals="">
-            <div>previous goals</div>
-            {ledger.previousGoals.map(g => (
-              <div key={g.goalId}>
-                {g.goalId}{g.status !== undefined ? ` · ${g.status}` : ''}
-                {g.objective !== undefined ? ` · ${g.objective}` : ''}
-              </div>
-            ))}
-          </div>
-          )
-        : null}
+      <Details rows={goal.details} label={S.details} />
 
       {delegations.length > 0
         ? (
           <div data-autopilot-delegations="">
-            <div style={sectionHead}>Delegations</div>
-            {delegations.map(r => <DelegationItem key={r.childId} row={r} />)}
+            <div style={sectionHead}>{S.delegations}</div>
+            {delegations.map(r => <DelegationItem key={r.childId} row={r} lang={lang} />)}
           </div>
           )
         : null}
@@ -206,8 +206,8 @@ export function GoalLedgerView(props: GoalLedgerViewProps): JSX.Element {
       {reviews.length > 0
         ? (
           <div data-autopilot-reviews="">
-            <div style={sectionHead}>Reviews</div>
-            {reviews.map(r => <ReviewItem key={r.key} row={r} />)}
+            <div style={sectionHead}>{S.reviews}</div>
+            {reviews.map(r => <ReviewItem key={r.key} row={r} lang={lang} />)}
           </div>
           )
         : null}
@@ -215,7 +215,7 @@ export function GoalLedgerView(props: GoalLedgerViewProps): JSX.Element {
       {links.length > 0
         ? (
           <div data-autopilot-links="">
-            <div style={sectionHead}>Links</div>
+            <div style={sectionHead}>{S.links}</div>
             {links.map(l => (
               <div key={l.key} data-autopilot-link="">
                 {l.href !== undefined
@@ -227,7 +227,9 @@ export function GoalLedgerView(props: GoalLedgerViewProps): JSX.Element {
           )
         : null}
 
-      <LegacySection {...props} />
+      {retired !== undefined ? <div style={{ ...muted, fontSize: 11, marginTop: 8 }} data-autopilot-retired="">{retired}</div> : null}
+
+      <LegacySection {...props} lang={lang} />
     </div>
   )
 }

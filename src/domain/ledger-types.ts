@@ -329,6 +329,11 @@ export interface LedgerProjection {
   readonly legacyRuns: readonly LegacyRunSummary[]
   /** One-time notes (e.g. deprecated config keys ignored). */
   readonly notes: readonly string[]
+  /**
+   * Retired config keys the host ignored, as data (the card words the notice in the viewer's
+   * language). Absent from older hosts; `notes` still carries the English sentence for the tool.
+   */
+  readonly retiredConfigKeys?: readonly string[]
   readonly updatedAt: string
 }
 

@@ -15,6 +15,11 @@ two desktop fixes: the tool probe for `scout` and `reviewer` is scoped to those
 roles, and the delegate card is shown at turn level. Both were verified on the
 owner's Windows desktop (see Verification).
 
+The session card follows the host UI language (Chinese or English) and leads with plain
+wording in the main body; technical fields (ids, routes, sources) sit under collapsed
+details. Warnings appear only for a route mismatch or when auto-continue is unavailable,
+and a retired-settings notice tells you which settings to delete.
+
 `0.3.0-rc.3` fixes two findings from the rc.2 desktop run: a reviewer
 dispatched without `reviewedChildIds` now links every settled non-reviewer
 delegation of the current goal (it used to cover write delegations only, so a

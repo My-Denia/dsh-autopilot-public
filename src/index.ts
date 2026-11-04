@@ -1389,7 +1389,8 @@ export async function apply(rawCtx: unknown, config?: ConfigInput): Promise<() =
   }
 
   // Retired settings are accepted and ignored; say so once, here and on the status surfaces.
-  const retiredNote = retiredConfigNote(retiredKeysIn(config))
+  const retiredKeys = retiredKeysIn(config)
+  const retiredNote = retiredConfigNote(retiredKeys)
   if (retiredNote !== undefined) warn(rawCtx, retiredNote)
 
   // EVERY registration below can throw, and until the disposer exists nothing
@@ -1505,6 +1506,7 @@ export async function apply(rawCtx: unknown, config?: ConfigInput): Promise<() =
       ledgers: resolution.ledgers,
       sources: resolution.sources,
       notes: () => (retiredNote === undefined ? [] : [retiredNote]),
+      retiredKeys: () => retiredKeys,
       // A goal-only session (create_goal, no autopilot_* call) has no ledger until its goal is mirrored.
       syncSession: async (sessionId) => {
         const live = ctx.agents.roots().find(agent => (agent as AgentRef).id === sessionId)

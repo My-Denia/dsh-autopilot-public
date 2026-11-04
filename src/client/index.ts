@@ -34,6 +34,8 @@ import type { ConversationNodeDefinition } from '@deepseek-ai/dsh-client-ui-conv
 import { AUTOPILOT_RUN_KIND, createAutopilotRunDefinition, isAppendSurfaceEventMirror } from './definition.js'
 import type { AutopilotRunState } from './definition.js'
 import { AutopilotRunCard } from './AutopilotRunCard.js'
+import { bindHostLocale } from './i18n.js'
+import type { HostLocaleLike } from './i18n.js'
 
 export type {
   AutopilotAuditRow, AutopilotCallRow, AutopilotRunChatData, AutopilotRunState,
@@ -64,7 +66,13 @@ export type { GoalLedgerViewProps } from './GoalLedgerView.js'
 // (`@deepseek-ai/dsh-client-ui-conversation`, `UiConversation`), which is the
 // idiom the in-tree ui-goal client uses. Measured on the real rc.1 host: the
 // old name left this entry `pending (waiting for service: conversationEvents)`.
-export const inject = ['slots', 'uiConversation']
+//
+// `locale` is the host's language service (`getLocale().active` is 'zh' | 'en',
+// `subscribe` fires on a switch). The installed ui-conversation bundle already
+// requires it, so naming it here adds no wait. cordis `inject` has no optional form
+// (an array or a name -> config map), so it is required in practice. The card follows it
+// through `./i18n.ts`; the document / browser language is only the fallback before it binds.
+export const inject = ['slots', 'uiConversation', 'locale']
 
 /** Cordis plugin name. */
 export const name = 'dsh-autopilot-client'
@@ -98,6 +106,12 @@ const definition = createAutopilotRunDefinition({
  */
 interface CardHost {
   uiConversation: { events: { register(definition: ConversationNodeDefinition<AutopilotRunState>): () => void } }
+  /**
+   * The host language service. Typed optional so `bindHostLocale` tolerates its absence, but
+   * `inject` requires it in practice (cordis has no optional-service form, and
+   * `uiConversation` already requires it).
+   */
+  locale?: HostLocaleLike
   slots: {
     inject(key: string, callback: () => (() => void)): () => void
     register(spec: { name: string; key: string }, component: unknown): () => void
@@ -117,6 +131,8 @@ interface CardHost {
 export function apply(ctx: ClientContext): void {
   const host = ctx as unknown as CardHost
   host.uiConversation.events.register(definition)
+  // Released with the plugin fiber, like the registrations around it.
+  ctx.effect(() => bindHostLocale(host.locale))
   host.slots.inject('conversation.chat.node', () => host.slots.register(
     { name: 'conversation.chat.node', key: AUTOPILOT_RUN_KIND },
     AutopilotRunCard,
