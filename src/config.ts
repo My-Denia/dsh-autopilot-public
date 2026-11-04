@@ -347,7 +347,7 @@ const ConfigShape = Schema.object({
     Schema.const('auto').description('Copy bundled SKILL.md into the skill-scan root if absent; warn on drift, never overwrite.'),
     Schema.const('off').description('Do not touch the skill-scan root.'),
   ]).default('auto').description('Whether apply() installs the bundled skill into $DSH_AGENTS_HOME/skills.'),
-}).description('dsh-autopilot: plan-execute-audit gates, usage evidence, outbound manifests.')
+}).description('dsh-autopilot: role delegation routing, review independence and the delegation ledger.')
 
 /**
  * A node in the known-key tree: `null` marks a leaf (any shape the schema above

@@ -50,6 +50,7 @@ import { toRoutePin } from './routing/identity.js'
 import { RouteCatalog } from './routing/catalog.js'
 import type { LlmRuntimeSubset } from './routing/catalog.js'
 import type { SessionPolicyState } from './routing/authorize.js'
+import type { ModelSelectionSetting } from './roles/route.js'
 import { errorMessage } from './domain/types.js'
 import type { AuditRole, Risk } from './domain/types.js'
 
@@ -908,6 +909,48 @@ export function goalDriverPresentIn(rawCtx: unknown): boolean | undefined {
   }
 }
 
+/**
+ * The user's `subagentModelSelection` setting, read live from the host's
+ * `ctx.subagentModelSelection` service (`current()` returns
+ * `{ enabled, allowedModels }`). The setting is only ever a RESTRICTION on
+ * delegation routing (see `roles/route.ts`); it is never selection authority.
+ * `undefined` when the service is absent, throws (the host rejects an enabled
+ * list with no routes), or answers a malformed shape: routing then behaves as
+ * if the setting did not exist. `onUnreadable` fires only for a throw or a
+ * malformed answer, never for a plainly absent service.
+ */
+export function modelSelectionSettingOf(rawCtx: unknown, onUnreadable: (message: string) => void = () => {}): ModelSelectionSetting | undefined {
+  let service: unknown
+  try {
+    service = lookupService(rawCtx, 'subagentModelSelection')
+  } catch {
+    return undefined
+  }
+  if (service === null || typeof service !== 'object') return undefined
+  const current = (service as { current?: unknown }).current
+  if (typeof current !== 'function') return undefined
+  try {
+    const value = (current as () => unknown).call(service) as { enabled?: unknown; allowedModels?: unknown } | null | undefined
+    if (value === null || typeof value !== 'object' || typeof value.enabled !== 'boolean' || !Array.isArray(value.allowedModels)) {
+      onUnreadable('dsh-autopilot: the subagentModelSelection setting answered an unexpected shape; delegation routing ignores it')
+      return undefined
+    }
+    const allowedModels: Array<{ provider: string; model: string }> = []
+    for (const entry of value.allowedModels as unknown[]) {
+      const route = entry as { provider?: unknown; model?: unknown } | null
+      if (route === null || typeof route !== 'object' || typeof route.provider !== 'string' || typeof route.model !== 'string') {
+        onUnreadable('dsh-autopilot: the subagentModelSelection setting lists a malformed route; delegation routing ignores it')
+        return undefined
+      }
+      allowedModels.push({ provider: route.provider, model: route.model })
+    }
+    return { enabled: value.enabled, allowedModels }
+  } catch (error) {
+    onUnreadable(`dsh-autopilot: the subagentModelSelection setting is unreadable (${describeError(error)}); delegation routing ignores it`)
+    return undefined
+  }
+}
+
 export function sandboxDefaultModeOf(rawCtx: unknown): string | undefined {
   try {
     const policy = lookupService(rawCtx, 'sandboxPolicy') as { defaultMode?: unknown } | undefined | null
@@ -1347,6 +1390,13 @@ export async function apply(rawCtx: unknown, config?: ConfigInput): Promise<() =
   let onboardingRefreshForFailure: (() => void) | undefined
   try {
     const routing = createRoutingWiring(rawCtx, message => warn(rawCtx, message))
+    // The setting is read per dispatch; an unreadable one is warned once, not per call.
+    let settingWarned = false
+    const warnSettingOnce = (message: string): void => {
+      if (settingWarned) return
+      settingWarned = true
+      warn(rawCtx, message)
+    }
     wiringForFailure = routing
     // The planner installer port is a dynamic import away; settle it here so the
     // engine is never exposed before it is known. The promise never rejects.
@@ -1367,6 +1417,7 @@ export async function apply(rawCtx: unknown, config?: ConfigInput): Promise<() =
           sandboxDefaultMode: () => sandboxDefaultModeOf(rawCtx),
           registeredToolNames: () => registeredToolNamesOf(rawCtx),
           subagentMaxDepth: () => subagentMaxDepthOf(rawCtx),
+          modelSelection: () => modelSelectionSettingOf(rawCtx, warnSettingOnce),
           readGoal: root => readNativeGoal(rawCtx, root),
           goalDriverPresent: () => goalDriverPresentIn(rawCtx),
         },
