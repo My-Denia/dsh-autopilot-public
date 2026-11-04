@@ -381,15 +381,21 @@ assert('A23m only a mismatching row renders the mismatch warning (match and pend
   && count(renderView('active-parallel', 'zh'), '实际模型与选定的不一致') === 0)
 
 const reduced = renderView('reduced')
-assert('A24 reduced: reduced independence is marked and the 503 note is shown',
+assert('A24 same-vendor review: neutral vendor row, the recorded 503 note in details, no warning wording',
   reduced.includes('data-autopilot-review-independence="reduced"')
-  && reduced.includes('Reduced independence')
-  && reduced.includes('HTTP 503'))
+  && reduced.includes('Reviewer vendor')
+  && reduced.includes('same as the reviewed work')
+  && reduced.includes('Routing note')
+  && reduced.includes('HTTP 503')
+  && !/[Rr]educed independence/.test(reduced))
 const reducedZh = renderView('reduced', 'zh')
-assert('A24z reduced (zh): 独立性降低 in the body, the recorded note verbatim in the details',
+assert('A24z same-vendor review (zh): neutral vendor row, the recorded note verbatim in the details, no 降低',
   reducedZh.includes('data-autopilot-review-independence="reduced"')
-  && reducedZh.includes('独立性降低（原因见详情）')
-  && reducedZh.includes('HTTP 503'))
+  && reducedZh.includes('审阅模型厂商')
+  && reducedZh.includes('与被审工作相同')
+  && reducedZh.includes('路由记录')
+  && reducedZh.includes('HTTP 503')
+  && !reducedZh.includes('降低'))
 
 const paused = renderView('paused-no-driver')
 assert('A25 paused-no-driver: says there is no driver and only the owner can resume',

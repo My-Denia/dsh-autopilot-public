@@ -102,8 +102,8 @@ delegation decision).**
 A reviewer reports what breaks, what gets lost, what leaks and what is reported
 wrongly. Those are blockers; every other note is non-blocking and goes to the
 backlog. The reviewer is independent: a fresh context, given the diff and the
-claim, from a different model family than the change's author. When no other
-family is reachable, the verdict says "reduced independence" and why. The main
+claim, preferably from a different model family than the change's author. A
+same-vendor review is normal and is not reported as a defect. The main
 agent fixes blockers and verifies the fix itself; it does not go another round
 unless the fix was large. **enforced: discipline (the verdict is returned by the
 reviewer child and recorded in the ledger).**

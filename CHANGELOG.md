@@ -9,6 +9,8 @@ The plugin becomes the dsh adapter of the goal-workflow. It is **not**
 published: npm `latest` is still `dsh-goal-autopilot@0.2.0`. Target host is dsh
 `0.2.1-rc.5` only. See Verification below for what was observed on a real host.
 
+The session card no longer labels a same-vendor review as reduced independence: the vendor relation is a neutral row in the review details, and the recorded ledger values are unchanged.
+
 `0.3.0-rc.1`, `0.3.0-rc.3`, `0.3.0-rc.4` and `0.3.0-rc.5` are on npm `next` (`latest` is `0.2.0`). The
 registry integrity of rc.3, rc.4 and rc.5 matched the audited tarballs. `0.3.0-rc.2` contains
 two desktop fixes: the tool probe for `scout` and `reviewer` is scoped to those

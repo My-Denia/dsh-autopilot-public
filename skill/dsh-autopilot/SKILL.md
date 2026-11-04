@@ -92,11 +92,9 @@ Escalation never widens what the role may do.
 ## Review
 
 Every change that is not trivial gets one independent review from `reviewer`,
-given the diff and the claim, not your reasoning. Use a different model family
-from the one that produced the change. If no other family is reachable (a
-provider is down), a same-family reviewer is allowed, but record "reduced
-independence" with the reason on the issue or PR. Never present it as
-independent.
+given the diff and the claim, not your reasoning. A different model family from
+the one that produced the change is preferred when one is available. A
+same-vendor review is normal and is not reported as a defect.
 
 The reviewer looks for normal work breaking, work being lost, a secret leaking
 and a result reported wrongly. Those block; other notes go to the backlog. Fix

@@ -71,8 +71,8 @@ the user changed after the clamp stays. A clamped legacy session was restored to
   tool allow-lists, the `writePaths` overlap refusal, the direct-human-turn
   check on ledger owner actions, the read-only tool set of the reviewer.
 - *Discipline* means the skill asks and a reviewer may catch it: redaction
-  before outbound, completing a goal only when Done holds, recording "reduced
-  independence", keeping to a brief.
+  before outbound, completing a goal only when Done holds, keeping to a
+  brief.
 - The ledger's selected and observed routes are what the plugin and the host
   report. They show which model ran; they do not prove the work is right.
 - A reviewer verdict is evidence of an independent look, not proof of

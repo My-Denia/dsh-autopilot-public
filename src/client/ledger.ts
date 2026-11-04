@@ -672,17 +672,15 @@ export interface ReviewRow {
   readonly subject: string
   readonly reviewer: string
   readonly reduced: boolean
-  /** `cross-family` text, or the reduced-independence explanation (English reference wording). */
-  readonly independence: string
-  /** Plain-words independence line for the body. */
-  readonly independenceText: string
+  /** The reviewer's vendor relative to the reviewed work, as a neutral fact (details only). */
+  readonly vendorText: string
   readonly findings: string
   readonly at: string
   readonly details: readonly DetailRow[]
 }
 
-/** The one independence note shape the card knows how to say in plain words. */
-const KNOWN_REDUCED_NOTE = /no reviewer route outside provider families/
+/** Notes that mean the reviewer's vendor could not be observed, so "same vendor" would be a guess. */
+const UNOBSERVED_NOTE = /not observable|no observed provider family/
 
 export function reviewRows(p: LedgerProjection, lang: Lang = 'en', timeZone?: string): readonly ReviewRow[] {
   const S = STRINGS[lang]
@@ -691,14 +689,13 @@ export function reviewRows(p: LedgerProjection, lang: Lang = 'en', timeZone?: st
       .map(sev => [sev, r.findings.filter(f => f.severity === sev).length] as const)
       .filter(([, n]) => n > 0)
       .map(([sev, n]) => S.findingCount(n, S.severities[sev]))
-    const excluded = r.excludedFamilies.length > 0 ? ` (excluded: ${r.excludedFamilies.join(', ')})` : ''
     const reduced = r.independence === 'reduced'
     const note = r.independenceNote
-    const independenceText = !reduced
-      ? S.crossFamily
-      : note !== undefined && KNOWN_REDUCED_NOTE.test(note)
-        ? `${S.reducedPrefix}${S.reducedKnown}`
-        : S.reducedUnknown
+    const vendorText = !reduced
+      ? S.vendorDifferent
+      : r.excludedFamilies.length === 0 || (note !== undefined && UNOBSERVED_NOTE.test(note))
+        ? S.vendorUnknown
+        : S.vendorSame(r.excludedFamilies.join(', '))
     return {
       key: `${r.reviewerChildId}:${r.at}:${i}`,
       verdict: r.verdict,
@@ -707,10 +704,7 @@ export function reviewRows(p: LedgerProjection, lang: Lang = 'en', timeZone?: st
       subject: r.subject,
       reviewer: `${shortId(r.reviewerChildId)} · ${routeText(r.reviewerRoute, 'observed', lang)}`,
       reduced,
-      independence: reduced
-        ? `REDUCED INDEPENDENCE${note === undefined ? '' : `: ${note}`}${excluded}`
-        : `cross-family review${excluded}`,
-      independenceText,
+      vendorText,
       findings: counts.length === 0 ? S.noFindings : counts.join(S.listSeparator),
       at: r.at,
       details: [
@@ -718,7 +712,8 @@ export function reviewRows(p: LedgerProjection, lang: Lang = 'en', timeZone?: st
         { label: S.reviewerId, value: r.reviewerChildId },
         { label: S.reviewer, value: routeText(r.reviewerRoute, 'observed', lang, true) },
         { label: S.reviewedAt, value: formatTime(r.at, lang, timeZone) },
-        { label: S.independenceNote, value: note ?? S.noneRecorded },
+        { label: S.vendor, value: vendorText },
+        { label: S.routingNote, value: note ?? S.noneRecorded },
         { label: S.excludedFamilies, value: r.excludedFamilies.length > 0 ? r.excludedFamilies.join(', ') : S.noneRecorded },
       ],
     }

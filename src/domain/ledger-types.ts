@@ -143,7 +143,7 @@ export interface ReviewRecord {
   readonly independence: ReviewIndependence
   /** Families excluded for independence (provider names). */
   readonly excludedFamilies: readonly string[]
-  /** Why independence is reduced, when it is. */
+  /** Routing note for a same-vendor or unobserved-vendor review, when there is one. */
   readonly independenceNote?: string
   readonly at: string
 }

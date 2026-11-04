@@ -103,7 +103,7 @@ function ReviewItem({ row, lang }: { readonly row: ReviewRow; readonly lang: Lan
         <span>{row.subject}</span>
         <span style={muted}> · {row.findings}</span>
       </div>
-      <div style={row.reduced ? { color: toneColor('warn') } : muted}>{row.independenceText}</div>
+      <div style={muted}>{STRINGS[lang].reviewer} {row.reviewer}</div>
       <Details rows={row.details} label={STRINGS[lang].details} />
     </div>
   )
