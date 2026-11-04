@@ -293,6 +293,12 @@ export async function routeForDelegation(input: RouteForDelegationInput): Promis
       }
       selected = { provider: selected.provider, model: selected.model, reasoningEffort: argEffort }
     }
+    if (isReviewer) {
+      // The core is called with risk 'low' (see `select`), so its own independence line says "constraint not required" and would contradict the review's independence note. Replace it with the real reason.
+      for (let i = why.length - 1; i >= 0; i -= 1) if (why[i]!.startsWith('independence: risk ')) why.splice(i, 1)
+      if (ladderNote !== undefined) why.push(`independence: ${ladderNote}`)
+      else if (excluded.length === 0) why.push('independence: no reviewed provider family known; unfiltered ladder')
+    }
     const reasoningEffort = selected?.reasoningEffort ?? argEffort
     if (selected === undefined && argEffort !== undefined) {
       why.push(`effort: "${argEffort}" named by the call, sent with the inherited model; no route to preflight it against`)

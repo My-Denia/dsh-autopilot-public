@@ -28,6 +28,14 @@ driver queue about one no-op round per second. After the owner says "continue"
 following a restart or pause, the agent calls `get_goal` and then `update_goal`
 resume before proceeding.
 
+Two review fixes: `autopilot_delegate` for the reviewer now mirrors the goal
+before it takes its ledger snapshot, so a goal switched without a goal event no
+longer leaves the previous goal's delegations in the default review window; and
+the reviewer's recorded routing reasons no longer carry the core's "constraint
+not required" independence line, which contradicted the independence note. They
+now state the real reason (fallback to the unfiltered ladder, or no reviewed
+provider family known).
+
 Docs correction: `clerk` is read-only today (same tools as `scout`); connector
 tools are not wired into delegation yet, and earlier text that said otherwise
 is fixed.

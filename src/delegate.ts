@@ -533,6 +533,8 @@ export class Delegator {
   // ── reviewer ───────────────────────────────────────────────────────────────
 
   private async review(caller: Caller, args: DelegateArgs): Promise<DelegateResult> {
+    // Mirror the goal first: a host with no goal-event listener may still hold the previous goal's window.
+    await this.engine.syncGoal(this.engine.agents.get(caller.rootId) ?? caller.agent)
     // ONE ledger snapshot at the start of the decision (MY-25 #2): exclusions come from it and
     // from nothing read later, so a dispatch that lands during routing cannot change them.
     const snapshot = this.engine.ledgerFor(caller.rootId)
