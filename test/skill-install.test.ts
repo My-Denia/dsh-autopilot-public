@@ -5,6 +5,7 @@
  * return value. Injected IO means none of these tests touch ~/.agents.
  */
 
+import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
 import {
   BUNDLED_SKILL_REFERENCES,
@@ -307,11 +308,14 @@ describe('SKILL_RELATIVE', () => {
   })
 })
 
-const TREE_ROOT = '/pkg/skill/dsh-autopilot'
-const TREE_DEST = '/agents/skills/dsh-autopilot'
-const GOV_REF_REL = `${SKILL_REFERENCES_DIR}/governance-invariants.md`
-const GOV_REF_DEST = `${TREE_DEST}/${GOV_REF_REL}`
-const REFUSALS_REF_DEST = `${TREE_DEST}/${SKILL_REFERENCES_DIR}/refusals.md`
+// The installer builds every path with `join`, so the fake IO store must use the
+// same spelling or these tests fail on Windows only (the tree paths came out as
+// `\pkg\...` while the fixtures were keyed `pkg/...`).
+const TREE_ROOT = join('/pkg', 'skill', 'dsh-autopilot')
+const TREE_DEST = join('/agents', 'skills', 'dsh-autopilot')
+const TREE_SKILL_DEST = join(TREE_DEST, 'SKILL.md')
+const GOV_REF_DEST = join(TREE_DEST, SKILL_REFERENCES_DIR, 'governance-invariants.md')
+const REFUSALS_REF_DEST = join(TREE_DEST, SKILL_REFERENCES_DIR, 'refusals.md')
 
 /**
  * Source tree for a fully installable skill, DERIVED from the shipped list.
@@ -323,9 +327,9 @@ const REFUSALS_REF_DEST = `${TREE_DEST}/${SKILL_REFERENCES_DIR}/refusals.md`
  * installer. One list, one owner — a second hand-kept copy is the defect.
  */
 function treeSources(): Record<string, string> {
-  const sources: Record<string, string> = { [`${TREE_ROOT}/SKILL.md`]: BUNDLED }
+  const sources: Record<string, string> = { [join(TREE_ROOT, 'SKILL.md')]: BUNDLED }
   for (const name of BUNDLED_SKILL_REFERENCES) {
-    sources[`${TREE_ROOT}/${SKILL_REFERENCES_DIR}/${name}`] = `# ${name}\n`
+    sources[join(TREE_ROOT, SKILL_REFERENCES_DIR, name)] = `# ${name}\n`
   }
   return sources
 }
@@ -333,9 +337,9 @@ function treeSources(): Record<string, string> {
 /** A destination tree whose every file already matches the bundle. */
 function installedDest(): Record<string, string> {
   const sources = treeSources()
-  const dest: Record<string, string> = { [DEST]: BUNDLED }
+  const dest: Record<string, string> = { [TREE_SKILL_DEST]: BUNDLED }
   for (const name of BUNDLED_SKILL_REFERENCES) {
-    dest[`${TREE_DEST}/${SKILL_REFERENCES_DIR}/${name}`] = sources[`${TREE_ROOT}/${SKILL_REFERENCES_DIR}/${name}`] as string
+    dest[join(TREE_DEST, SKILL_REFERENCES_DIR, name)] = sources[join(TREE_ROOT, SKILL_REFERENCES_DIR, name)] as string
   }
   return dest
 }
@@ -350,14 +354,14 @@ describe('syncBundledSkillTree', () => {
     const store = treeSources()
     const result = syncBundledSkillTree({ enabled: true, root: TREE_ROOT, destRoot: TREE_DEST, io: io(store) })
     expect(result.status).toBe('copied')
-    expect(result.dest).toBe(DEST)
+    expect(result.dest).toBe(TREE_SKILL_DEST)
     expect(result.files.map(file => file.relative)).toEqual([
       'SKILL.md',
       ...BUNDLED_SKILL_REFERENCES.map(name => `${SKILL_REFERENCES_DIR}/${name}`),
     ])
     expect(result.files.map(file => file.status)).toEqual(perFile('copied'))
     // The whole point: a SKILL.md whose links resolve.
-    expect(store[DEST]).toBe(BUNDLED)
+    expect(store[TREE_SKILL_DEST]).toBe(BUNDLED)
     expect(store[GOV_REF_DEST]).toBeDefined()
     expect(store[REFUSALS_REF_DEST]).toBeDefined()
   })
@@ -373,7 +377,7 @@ describe('syncBundledSkillTree', () => {
 
   it('upgrades a 0.1.x single-file install by adding only the missing references', () => {
     // SKILL.md present and identical, references absent — the real upgrade path.
-    const store: Record<string, string> = { ...treeSources(), [DEST]: BUNDLED }
+    const store: Record<string, string> = { ...treeSources(), [TREE_SKILL_DEST]: BUNDLED }
     const result = syncBundledSkillTree({ enabled: true, root: TREE_ROOT, destRoot: TREE_DEST, io: io(store) })
     expect(result.status).toBe('copied')
     expect(result.files.map(file => file.status)).toEqual(perFile('unchanged', ...BUNDLED_SKILL_REFERENCES.map(() => 'copied')))
@@ -386,8 +390,8 @@ describe('syncBundledSkillTree', () => {
     expect(result.status).toBe('drift')
     // SKILL.md was published first, then rolled back: a half-installed skill
     // whose adapter expects references that were refused is worse than none.
-    expect(store[DEST]).toBeUndefined()
-    expect(unlinks).toContain(DEST)
+    expect(store[TREE_SKILL_DEST]).toBeUndefined()
+    expect(unlinks).toContain(TREE_SKILL_DEST)
     expect(result.detail).toContain('undid 1 of 1 file(s)')
     // refusals.md was never reached at all.
     expect(store[REFUSALS_REF_DEST]).toBeUndefined()
@@ -407,8 +411,8 @@ describe('syncBundledSkillTree', () => {
     expect(result.status).toBe('drift')
     expect(result.detail).toContain('undid 0 of 1 file(s)')
     expect(result.detail).toContain('FAILED to remove')
-    expect(result.detail).toContain(DEST)
-    expect(store[DEST]).toBeDefined()
+    expect(result.detail).toContain(TREE_SKILL_DEST)
+    expect(store[TREE_SKILL_DEST]).toBeDefined()
   })
 
   it('writes nothing when the filesystem cannot hard-link a reference', () => {
@@ -419,8 +423,8 @@ describe('syncBundledSkillTree', () => {
       io: io(store, { unlinks, linkErrors: { [GOV_REF_DEST]: 'ENOTSUP' } }),
     })
     expect(result.status).toBe('unsupported')
-    expect(store[DEST]).toBeUndefined()
-    expect(unlinks).toContain(DEST)
+    expect(store[TREE_SKILL_DEST]).toBeUndefined()
+    expect(unlinks).toContain(TREE_SKILL_DEST)
   })
 
   it('skips without touching IO when disabled', () => {
