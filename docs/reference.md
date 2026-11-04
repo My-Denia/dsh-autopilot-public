@@ -187,9 +187,12 @@ These belong to the host, not the plugin.
 | `schedule_create` | set a delayed reminder (`after_seconds` and related). Only the main agent may call it; a child is refused (`subagent_session`) |
 
 A goal stays disarmed after a session resume, fork or host restart until the
-owner says "continue" (`update_goal` with `action: resume`). A reminder from
-`schedule_create` is delivered into the session after a restart but does not
-re-arm the goal. The goal round cap defaults to 256 and ends in the blocker
+owner says "continue" (`update_goal` with `action: resume`; the agent must
+call `get_goal` first and then resume, a text reply does not re-arm it). A
+reminder from `schedule_create` is delivered into the session after a restart
+but does not re-arm the goal, and it is not pending work for the goal driver:
+ending a turn to wait for one while the goal is armed queues a round about once
+a second. Inside an active goal, wait with `job_output` / `autopilot_agents`. The goal round cap defaults to 256 and ends in the blocker
 code `round-limit`.
 
 ## Configuration

@@ -109,14 +109,28 @@ the blockers and verify them yourself.
   `wait: true` for a background command or CI watcher, at most 10 minutes per
   wait (the host clamps longer waits). Ending the turn early only spends goal
   rounds, and the round cap ends in a blocker.
-- Only the main agent may set a reminder with `schedule_create` (children are
-  refused). A reminder delivers a message into the session after a restart; it
-  does not re-arm a paused or disarmed goal.
-- After a host restart running children are gone, and the goal stays disarmed
-  until the owner says "continue". Then call `get_goal`, resume with
-  `update_goal` (`action: resume`, exact `goal_id` and `revision`), and start a
-  new `executor-lead` or `worker` from the brief on the issue and the PR. Do not
-  take over its work in the main context, and do not ask the owner to start over.
+- While the goal is active and armed, never end the turn to wait for a
+  `schedule_create` reminder. A pending reminder is not pending work: the goal
+  driver queues a new round about once a second whenever the main agent is idle
+  and the goal is armed, so the turn-end burns rounds toward the 256-round cap
+  (a `round-limit` blocker). Wait inside the turn instead, repeating the
+  10-minute waits above for as long as CI or children need. If a wait is longer
+  than in-turn waiting reasonably allows, tell the owner so and let them pause
+  the goal (pausing needs the owner's direct turn); do not spend rounds.
+- Reminders are for waits outside an active goal, or after the owner has paused
+  it. Only the main agent may set one (children are refused). A reminder
+  delivers a message into the session after a restart; it does not re-arm a
+  paused or disarmed goal.
+- After a host restart running children are gone, and the goal stays disarmed.
+  When the owner says "continue" (or "继续") after a restart or a pause, do not
+  just answer in text: call `get_goal`, then `update_goal` with
+  `action: resume` and the exact current `goal_id` and `revision` (the owner's
+  message is the direct turn it needs). Then start a new `executor-lead` or
+  `worker` from the brief on the issue and the PR. Do not take over its work in
+  the main context, and do not ask the owner to start over.
+- End the turn after a stage only when nothing is pending (no child, no
+  background job, no CI you are waiting on), so the driver can start the next
+  round.
 
 ## Authority and outbound
 
