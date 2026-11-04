@@ -1,3 +1,4 @@
+// Copyright (c) 2026 DeepSeek. MIT License (the @deepseek-ai/dsh-client-ui-chat package LICENSE).
 // Verbatim excerpt of the Chat grouping rule shipped in
 // @deepseek-ai/dsh-client-ui-chat 0.2.1-rc.5, lib/client.js
 // (sha256 fdc48656f914c503e59ed45612c09be296634bfaf5318df2ba5930566a2a8820,

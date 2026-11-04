@@ -561,21 +561,23 @@ describe('§4 role allow-lists against a preset composition', () => {
     expect(() => allowListFor('scout', registered)).toThrowError(/does not register "read"/)
   })
 
-  it('autopilot_delegate(scout) through the mounted plugin is not refused for read', async () => {
-    const bed = await presetBed()
-    bed.mounted.provide('agents', { get: () => undefined, list: () => [bed.root], roots: () => [bed.root] })
-    bed.mounted.provide('subagents', {})
-    await bed.mounted.plugin(autopilotPlugin, { storeRoot: mkdtempSync(join(tmpdir(), 'dsh-autopilot-preset-')) })
-    openDirectHumanTurn(bed.root)
-    const result = await bed.mounted.ctx.tools.execute({
-      signal: new AbortController().signal,
-      callId: ToolCallId('boundary-preset-scout'),
-      name: 'autopilot_delegate',
-      arguments: { role: 'scout', task: 'list the callers of parse()' },
-      agent: bed.root as never,
+  for (const role of ['scout', 'reviewer'] as const) {
+    it(`autopilot_delegate(${role}) through the mounted plugin is not refused for read`, async () => {
+      const bed = await presetBed()
+      bed.mounted.provide('agents', { get: () => undefined, list: () => [bed.root], roots: () => [bed.root] })
+      bed.mounted.provide('subagents', {})
+      await bed.mounted.plugin(autopilotPlugin, { storeRoot: mkdtempSync(join(tmpdir(), 'dsh-autopilot-preset-')) })
+      openDirectHumanTurn(bed.root)
+      const result = await bed.mounted.ctx.tools.execute({
+        signal: new AbortController().signal,
+        callId: ToolCallId(`boundary-preset-${role}`),
+        name: 'autopilot_delegate',
+        arguments: { role, task: 'list the callers of parse()' },
+        agent: bed.root as never,
+      })
+      const text = JSON.stringify(result)
+      expect(text).not.toMatch(/does not register/)
+      expect(text).not.toMatch(/AP_TOOL_SURFACE_INCOMPLETE/)
     })
-    const text = JSON.stringify(result)
-    expect(text).not.toMatch(/does not register/)
-    expect(text).not.toMatch(/AP_TOOL_SURFACE_INCOMPLETE/)
-  })
+  }
 })
