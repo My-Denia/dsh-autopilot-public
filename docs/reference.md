@@ -149,7 +149,25 @@ judgement. Each delegation record holds:
 | links | the issue and PR the goal belongs to |
 
 The ledger also carries the goal id and revision it was started under and
-markers for legacy runs.
+markers for legacy runs. The goal fields follow the native goal: the plugin
+listens to the host's `goal/changed` and `goal/activation-changed` events for
+root sessions, and also re-reads the goal when a root session opens and on each
+ledger read.
+
+Each root session's ledger is its own file,
+`<storeRoot>/ledgers/<session id>.json`. The default `storeRoot` is
+`$DSH_HOME/storages/dsh-autopilot`, the same directory as the legacy `runs/`.
+A write takes a `.lock` file next to the ledger, re-reads the stored revision
+from disk, and replaces the file with an atomic rename. A second dsh process on
+the same profile therefore gets a revision conflict, which is retried, instead
+of overwriting the ledger. Reads come from disk, so each process sees the other
+process's sessions. The plugin no longer writes the storage domain
+(`$DSH_HOME/storages/dsh_autopilot.json` on the JSON backend). That file holds
+the 0.2.x runs, and the backend rewrites the whole file on every write, so two
+processes writing it lost each other's rows. A ledger an earlier 0.3.0 build
+wrote to the domain's `ledgers` table is still read. It is copied to its file
+the first time that session is loaded. After that the file takes precedence, and
+the table is left as it was.
 
 Legacy runs written by plugin 0.2.x stay readable. They are shown read-only on
 the card, are not continued, and no new event is written to their streams. The
@@ -204,8 +222,9 @@ Some 0.2.x keys are still read (`LEGACY_KEYS_STILL_READ`):
 - `auditors.<plan|execution|rules>.agentOptions.{provider,model,reasoningEffort}`
   becomes the matching auditor lock, so it pins the `reviewer` route.
 
-Legacy `storeKind` file and domain backends stay readable for history: the
-ledger goes to the domain when the host mounts one, else to files.
+Legacy `storeKind` file and domain backends stay readable for history. The
+ledger always goes to files (see [Ledger](#ledger)), whether or not the host
+mounts a storage domain.
 
 For a web profile, include the web app bundle and the npm package name:
 

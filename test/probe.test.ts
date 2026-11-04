@@ -1,6 +1,6 @@
 /**
  * The deployment probes the 0.3.0 plugin still keeps, each a bearer for a claim it
- * makes: the storage-domain facility (where the ledger goes), the sandbox policy's
+ * makes: the storage-domain facility (legacy history and ledger migration), the sandbox policy's
  * default mode (what the lazy clamp restore may write), and the store resolution.
  * Every probe has a fixture where it says yes and one where it says no.
  *
@@ -8,12 +8,12 @@
  * (they fed the `Enforcement` record) and the egress-channel resolver.
  */
 
-import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
 import { probeStorageDomain, resolveStore, sandboxDefaultModeOf } from '../src/index.js'
-import { DomainLedgerStore, FileLedgerStore, emptyLedger } from '../src/store/ledger.js'
+import { FileLedgerStore, emptyLedger } from '../src/store/ledger.js'
 import { listLegacyRuns } from '../src/legacy/index.js'
 import { AUTOPILOT_DOMAIN_SPEC } from '../src/store/domain.js'
 
@@ -90,11 +90,71 @@ describe('resolveStore', () => {
 
   const freshRoot = (): string => mkdtempSync(join(tmpdir(), 'dsh-autopilot-store-'))
 
-  it('with a facility the ledger goes to the domain, and nothing degraded', async () => {
+  // Changed with the cross-process fix: the domain's JSON backend republishes one whole file per put,
+  // so two processes writing ledger rows there lost rows. The ledger now always goes to its own file.
+  it('with a facility the ledger still goes to files under the root, and nothing degraded', async () => {
     const resolution = await resolveStore({ storageDomain: fakeFacility() }, freshRoot())
-    expect(resolution.ledgers).toBeInstanceOf(DomainLedgerStore)
-    expect(resolution.ledgers.kind).toBe('domain')
+    expect(resolution.ledgers).toBeInstanceOf(FileLedgerStore)
+    expect(resolution.ledgers.kind).toBe('file')
     expect(resolution.degraded).toBeUndefined()
+  })
+
+  /**
+   * A facility over a REAL single-file JSON medium, the shape of the host's `single`
+   * layout (`dsh-storage-json` `SingleJsonUnit`): the whole domain is one document,
+   * read at open and republished whole on every put. So any put, of any table,
+   * rewrites the bytes of the file that also holds the legacy v1 runs.
+   */
+  function fileFacility(path: string) {
+    return {
+      open: async () => {
+        const doc = JSON.parse(readFileSync(path, 'utf8')) as { version: number; tables: Record<string, Record<string, unknown>> }
+        return {
+          table: (name: string) => {
+            const rows = (doc.tables[name] ??= {})
+            return {
+              get: (key: string) => rows[key],
+              entries: () => Object.entries(rows)[Symbol.iterator](),
+              keys: () => Object.keys(rows)[Symbol.iterator](),
+              put: async (key: string, value: unknown) => {
+                rows[key] = value
+                writeFileSync(path, JSON.stringify(doc))
+              },
+            }
+          },
+          close: async () => {},
+        }
+      },
+    }
+  }
+
+  it('the domain file (legacy runs and an earlier ledger row) stays byte-equal through migration, writes, legacy reads and close', async () => {
+    const root = freshRoot()
+    const storages = freshRoot()
+    const domainFile = join(storages, 'dsh_autopilot.json')
+    const legacyEvent = (runId: string) => ({ v: 1, op: 'init', revision: 1, time: '2026-03-01T09:01:00.000Z', snapshot: {
+      runId, revision: 1, plan: { revision: 0, text: '' }, phase: 'planning', planGate: 'pending', executionGate: 'pending',
+      audits: [], residualRisks: [], logCount: 0, consecutiveReplans: 0, enforcement: { sandbox: 'off', reminders: 0, ownerApprovals: [] },
+      triage: { objective: 'o', scope: [], nonGoals: [], acceptanceCriteria: ['a'], risk: 'low', size: 'lightweight', executionMode: 'inline', auditMode: 'self-check', touchesOperatingLayer: false, baseline: {} },
+    } })
+    const earlier = { ...emptyLedger('old-session', '2026-11-01T00:00:00.000Z'), revision: 3 }
+    writeFileSync(domainFile, JSON.stringify({ version: 1, tables: {
+      events: { 'run-1#000000000001': legacyEvent('run-1'), 'run-2#000000000001': legacyEvent('run-2') },
+      runs: { 'run-1': { runId: 'run-1' }, 'run-2': { runId: 'run-2' } },
+      ledgers: { 'old-session': earlier },
+    } }))
+    const before = readFileSync(domainFile)
+
+    const resolution = await resolveStore({ storageDomain: fileFacility(domainFile) }, root)
+    expect(resolution.ledgers.load('old-session')).toEqual(earlier) // migrated to its file
+    expect(existsSync(join(root, 'ledgers', 'old-session.json'))).toBe(true)
+    await resolution.ledgers.write(earlier, 3)
+    await resolution.ledgers.write(emptyLedger('new-session', '2026-11-04T00:00:00.000Z'), 0)
+    expect((await listLegacyRuns(resolution.sources)).map(run => run.runId).sort()).toEqual(['run-1', 'run-2'])
+    await resolution.close()
+
+    expect(readFileSync(domainFile).equals(before)).toBe(true)
+    expect(resolution.ledgers.list().map(l => [l.sessionId, l.revision]).sort()).toEqual([['new-session', 1], ['old-session', 4]])
   })
 
   it('without a facility the ledger goes to files under the root, and says why', async () => {
@@ -139,7 +199,7 @@ describe('resolveStore', () => {
     const facility = fakeFacility({ events: [['domain-run#000000000001', event('domain-run')]] })
 
     const withDomain = await resolveStore({ storageDomain: facility }, root)
-    expect(withDomain.ledgers.kind).toBe('domain')
+    expect(withDomain.ledgers.kind).toBe('file')
     expect((await listLegacyRuns(withDomain.sources)).map(run => [run.runId, run.backend])).toEqual([['domain-run', 'domain'], ['file-run', 'file']])
 
     const filesOnly = await resolveStore({}, root)

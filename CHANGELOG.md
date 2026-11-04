@@ -72,6 +72,16 @@ in [docs/compatibility.md](docs/compatibility.md#not-yet-verified-on-a-real-host
   recorded as "reduced independence".
 - Model routing, executor generations and rotation are kept and generalized to
   any number of children.
+- Each root session's ledger is now its own file under
+  `<storeRoot>/ledgers/`, even on hosts that mount a storage domain. A write
+  holds a lock file while it checks the revision on disk and renames the new file
+  into place. Earlier builds wrote the ledger into the domain's single JSON file,
+  and two dsh processes on one profile overwrote each other's rows there. On
+  Windows, one session's ledger never appeared. The domain file is no longer
+  written, so its 0.2.x runs stay as they were.
+- The ledger's goal follows `goal/changed` and `goal/activation-changed` as they
+  happen. Before, it kept the old revision and status after `update_goal` until
+  the next ledger read.
 
 ### Migration
 
@@ -79,6 +89,9 @@ in [docs/compatibility.md](docs/compatibility.md#not-yet-verified-on-a-real-host
   and ignored; `autopilot_status` notes this once. `routing.*` keeps working.
 - Legacy runs stay readable. They are shown read-only on the card and are not
   continued; no new event is written to their streams.
+- A ledger already in the storage domain's `ledgers` table is still read. It is
+  copied to its own file the first time that session is loaded. The table
+  itself is not changed.
 - A session a legacy run left read-only gets its sandbox mode restored when it
   is opened or resumed, only if the current mode is still read-only and the last
   sandbox event is the plugin's own clamp. A mode the user changed after the

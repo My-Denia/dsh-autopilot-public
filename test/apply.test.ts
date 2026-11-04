@@ -14,7 +14,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { Context } from '@deepseek-ai/cordis'
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import { apply, RETIRED_CONFIG_KEYS } from '../src/index.js'
 import * as autopilotModule from '../src/index.js'
 import { FileLedgerStore, emptyLedger } from '../src/store/ledger.js'
@@ -47,6 +47,8 @@ interface FakeOptions {
   rootLiveAtMount?: boolean
   /** Ids the host still holds as live agents (children that survived). */
   residentIds?: readonly string[]
+  /** `ctx.goals`, the native goal service (`get(agent)` returns the current goal view). */
+  goals?: unknown
 }
 
 function fakeCtx(storeRoot: string, options: FakeOptions = {}) {
@@ -83,11 +85,14 @@ function fakeCtx(storeRoot: string, options: FakeOptions = {}) {
   const disposedListeners: Array<(payload: { agent: unknown }) => void> = []
   /** Every `ctx.on` subscription with its disposal count (F19 observes the wiring's listener through it). */
   const subscriptions: Array<{ event: string; disposals: number }> = []
+  /** Every listener by event, so a test can emit a host event the plugin subscribed to. */
+  const listeners: Array<{ event: string; listener: (payload: never) => unknown; subscription: { disposals: number } }> = []
   const resident = new Set(options.residentIds ?? [])
 
   const ctx = {
     ...(options.storageDomain === undefined ? {} : { storageDomain: options.storageDomain }),
     ...(options.llm === undefined ? {} : { llm: options.llm }),
+    ...(options.goals === undefined ? {} : { goals: options.goals }),
     ...(options.sandboxDefaultMode === undefined ? {} : { sandboxPolicy: { defaultMode: options.sandboxDefaultMode } }),
     agents: {
       get: (id: string) => (
@@ -123,6 +128,7 @@ function fakeCtx(storeRoot: string, options: FakeOptions = {}) {
       if (event === 'agent/disposed') disposedListeners.push(listener as never)
       const subscription = { event, disposals: 0 }
       subscriptions.push(subscription)
+      listeners.push({ event, listener: listener as never, subscription })
       return () => { subscription.disposals += 1 }
     },
   }
@@ -159,6 +165,10 @@ function fakeCtx(storeRoot: string, options: FakeOptions = {}) {
     dispose: (agent: unknown) => { for (const listener of disposedListeners) listener({ agent }) },
     subscriptionDisposals: (event: string) => subscriptions.filter(s => s.event === event).map(s => s.disposals),
     liveSubscriptions: (event: string) => subscriptions.filter(s => s.event === event && s.disposals === 0).length,
+    /** A host `ctx.emit` to every live listener of `event`, as the host's emit does (results not awaited). */
+    emit: (event: string, payload: unknown) => {
+      for (const entry of listeners) if (entry.event === event && entry.subscription.disposals === 0) void entry.listener(payload as never)
+    },
   }
 }
 
@@ -271,7 +281,10 @@ describe('apply', () => {
     expect(host.recorded.provided.autopilot).toBeUndefined()
   })
 
-  it('opens the domain backend exactly ONCE, and the ledger store reports "domain"', async () => {
+  // The ledger used to go into the domain's `ledgers` table when a facility was mounted. The host's
+  // JSON backend republishes that whole domain file on every put, so two processes lost each other's
+  // rows; the ledger now always goes to its own file, and the domain is opened only to read.
+  it('opens the domain exactly ONCE, to read; the ledger store reports "file" even with a facility', async () => {
     const root = tmp()
     const counter = countingFacility()
     const host = fakeCtx(root, { storageDomain: counter.facility })
@@ -280,7 +293,7 @@ describe('apply', () => {
 
     const dispose = await mount
     expect(counter.opens()).toBe(1)
-    expect((host.recorded.provided.autopilot as { storeKind: string }).storeKind).toBe('domain')
+    expect((host.recorded.provided.autopilot as { storeKind: string }).storeKind).toBe('file')
     await dispose()
     expect(counter.opens()).toBe(1)
   })
@@ -469,6 +482,65 @@ describe('apply: a degraded store says why', () => {
  * - the parentSession guard stops a CHILD agent from receiving the root surface;
  * - the roots() guard stops the same for an agent the host does not consider a root.
  */
+/**
+ * The ledger follows the native goal as it changes. Before this, `update_goal`
+ * complete left the persisted ledger at the old revision and `active` until the
+ * next route read or session open (observed on a real host).
+ */
+describe('apply: native goal changes reach the ledger file without a route read', () => {
+  function goalHost() {
+    const views = new Map<unknown, Record<string, unknown>>()
+    const goals = { get: (agent: unknown) => views.get(agent) }
+    const root = tmp('goal')
+    const host = fakeCtx(root, { goals, rootLiveAtMount: true })
+    const ledgerOnDisk = (id: string): { revision: number; goal?: { revision: number; status: string; activation: string } } | undefined => {
+      const path = join(root, 'ledgers', `${id}.json`)
+      return existsSync(path) ? JSON.parse(readFileSync(path, 'utf8')) : undefined
+    }
+    return { host, root, views, ledgerOnDisk }
+  }
+  const view = (over: Record<string, unknown> = {}) => ({
+    id: 'g-1', revision: 1, objective: 'ship', phase: 'active', maxGoalRounds: 10, roundsStarted: 0, activation: 'disarmed', ...over,
+  })
+
+  it('goal/changed of a root writes the new goal status and revision at once', async () => {
+    const { host, views, ledgerOnDisk } = goalHost()
+    views.set(host.rootAgent, view())
+    const dispose = await apply(host.ctx, { storeRoot: host.storeRoot, skillInstall: 'off' })
+    expect(ledgerOnDisk('root-session-1')?.goal).toMatchObject({ revision: 1, status: 'active' })
+
+    views.set(host.rootAgent, view({ revision: 2, phase: 'complete' }))
+    host.emit('goal/changed', { agent: host.rootAgent, change: { operation: 'complete', ref: { id: 'g-1', revision: 2 } } })
+    await vi.waitFor(() => expect(ledgerOnDisk('root-session-1')?.goal).toMatchObject({ revision: 2, status: 'complete' }))
+    await dispose()
+  })
+
+  it('goal/activation-changed (keyed by session id) mirrors the activation', async () => {
+    const { host, views, ledgerOnDisk } = goalHost()
+    views.set(host.rootAgent, view())
+    const dispose = await apply(host.ctx, { storeRoot: host.storeRoot, skillInstall: 'off' })
+    views.set(host.rootAgent, view({ activation: 'armed' }))
+    host.emit('goal/activation-changed', { sessionId: 'root-session-1', goal: { id: 'g-1', revision: 1, activation: 'armed' } })
+    await vi.waitFor(() => expect(ledgerOnDisk('root-session-1')?.goal?.activation).toBe('armed'))
+    await dispose()
+  })
+
+  it('a CHILD goal change writes nothing (no ledger keyed by a child id), and dispose unsubscribes', async () => {
+    const { host, views, ledgerOnDisk } = goalHost()
+    const dispose = await apply(host.ctx, { storeRoot: host.storeRoot, skillInstall: 'off' })
+    views.set(host.childAgent, view())
+    host.emit('goal/changed', { agent: host.childAgent, change: { operation: 'create' } })
+    host.emit('goal/activation-changed', { sessionId: 'child-session-1' })
+    await new Promise(resolve => setTimeout(resolve, 20))
+    expect(ledgerOnDisk('child-session-1')).toBeUndefined()
+    expect(host.liveSubscriptions('goal/changed')).toBe(1)
+    expect(host.liveSubscriptions('goal/activation-changed')).toBe(1)
+    await dispose()
+    expect(host.liveSubscriptions('goal/changed')).toBe(0)
+    expect(host.liveSubscriptions('goal/activation-changed')).toBe(0)
+  })
+})
+
 describe('apply: which agents get the root surface', () => {
   async function mounted() {
     const root = tmp()

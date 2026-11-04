@@ -1,5 +1,5 @@
 /**
- * The v3 ledger store: one small JSON document per root session.
+ * The v3 ledger store: one small JSON file per root session.
  *
  * WHAT IT HOLDS. Execution, cancel, resume and history display (see
  * `../domain/ledger-types.ts`). It is not an approval record and nothing reads
@@ -7,11 +7,32 @@
  * revision counter and an atomic whole-document replace. There is no event
  * stream and no fold.
  *
- * TWO BACKENDS, same contract. `file` writes `<root>/ledgers/<id>.json` via
- * tmp+rename; `domain` keeps a `ledgers` table on the autopilot domain of
- * `ctx.storageDomain`. `load` and `list` are synchronous reads from an
- * in-memory cache filled when the store opens (the domain facility has already
- * materialized its records by then; the file store reads the directory once).
+ * ONE WRITER, ONE FILE PER ROOT. Ledgers live at `<root>/ledgers/<id>.json`,
+ * where `<root>` is the plugin store root (`defaultStoreRoot()`, by default
+ * `$DSH_HOME/storages/dsh-autopilot`, beside the legacy `runs/`). Until 0.3.0-rc
+ * the ledger went into the `ledgers` table of the autopilot storage domain when
+ * the host mounted one; the host's JSON backend keeps that whole domain in ONE
+ * file (`$DSH_HOME/storages/dsh_autopilot.json`) that each process loads at open
+ * and republishes whole on every put. Two dsh processes on one profile therefore
+ * overwrote each other's rows (observed on Windows: one session's ledger never
+ * appeared). A file per root session means two processes writing two sessions
+ * never touch the same file, and the domain file, which also holds the legacy
+ * v1 `events`/`runs`, is never written by this plugin again.
+ *
+ * CROSS-PROCESS CAS. `write` takes `<id>.lock` (exclusive create), re-reads the
+ * stored revision FROM DISK, compares, writes a temp file and renames it over the
+ * ledger, then drops the lock. So a second process's write is seen as a revision
+ * conflict, never overwritten. A lock older than {@link STALE_LOCK_MS} is a
+ * crashed writer and is taken over; a lock that stays busy past the wait bound
+ * is reported as `AP_LEDGER_CONFLICT`, which the engine already retries.
+ *
+ * READS COME FROM DISK. `load` and `list` read the directory every call: a
+ * cache filled at open would hide what another process wrote since.
+ *
+ * MIGRATION. A ledger an earlier build wrote into the domain `ledgers` table is
+ * still read (passed in as `migrateFrom`, read-only). The first `load` of that
+ * session copies it to its file under the lock, if the file is still absent; from
+ * then on the file wins. Nothing here ever calls `put` on a domain table.
  *
  * A DOCUMENT THAT CANNOT BE USED NEVER FAILS THE MOUNT. A file that does not
  * parse, or a record that is not a v3 ledger, is skipped and reported through
@@ -20,32 +41,31 @@
  * left in place, untouched.
  */
 
-import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
+import { closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
+import { randomUUID } from 'node:crypto'
 import { join } from 'node:path'
 import { LEDGER_VERSION } from '../domain/ledger-types.js'
 import type { Ledger } from '../domain/ledger-types.js'
 import { AP_LEDGER_CONFLICT } from '../domain/refusals.js'
 import { AutopilotError } from '../domain/types.js'
 import type { LegacyDomainReader, LegacySources } from '../legacy/index.js'
-import { AUTOPILOT_DOMAIN_SPEC, LEDGERS_TABLE } from './domain.js'
-import type { DomainFacilityLike, DomainLike, DomainSpecLike, KvTableLike } from './domain.js'
 
 export { AP_LEDGER_CONFLICT }
 
 /** Why a stored ledger was skipped. A code, never stored text. */
 export interface LedgerDiagnostic {
-  /** File name (file backend) or table key (domain backend). */
+  /** File name, or `ledgers:<key>` for a row of the legacy domain table. */
   readonly where: string
   readonly reason: 'unparseable' | 'not-a-ledger'
 }
 
 /** What the engine and the read-only service depend on. */
 export interface LedgerStoreLike {
-  /** Which backend this is, recorded rather than assumed. */
-  readonly kind: 'file' | 'domain'
-  /** The cached ledger for a root session, or `undefined` when it has none. */
+  /** Which backend this is, recorded rather than assumed. Always `file` since the domain table stopped being written. */
+  readonly kind: 'file'
+  /** The stored ledger for a root session, read now, or `undefined` when it has none. */
   load(sessionId: string): Ledger | undefined
-  /** Every cached ledger, unordered. */
+  /** Every stored ledger, read now, unordered. */
   list(): readonly Ledger[]
   /**
    * Compare-and-swap write. Stores `next` with `revision = expectedRevision + 1`
@@ -55,12 +75,11 @@ export interface LedgerStoreLike {
    */
   write(next: Ledger, expectedRevision: number): Promise<Ledger>
   /**
-   * Re-read one session's document from the medium into the cache, for a store
-   * another process can write. Called after a CAS conflict so the retry sees the
-   * other writer's revision. Optional: a single-process backend has nothing to re-read.
+   * Re-read one session's document after a CAS conflict. Optional: a store whose
+   * reads already come from the medium has nothing to do.
    */
   reload?(sessionId: string): void
-  /** Documents skipped when the store opened. */
+  /** Documents skipped by the latest directory scan (the open, or the last `list`). */
   readonly diagnostics: readonly LedgerDiagnostic[]
 }
 
@@ -104,11 +123,24 @@ function conflict(sessionId: string, expected: number, actual: number): Autopilo
   )
 }
 
-/** Options shared by both backends. */
+/** Read-only view of the legacy domain `ledgers` table: the part of `KvTableLike` migration reads. */
+export interface LegacyLedgerTable {
+  get(key: string): unknown
+  entries(): IterableIterator<[string, unknown]>
+}
+
+/** Options of {@link FileLedgerStore.open}. */
 export interface LedgerStoreOptions {
   /** ISO-8601 clock; tests inject one. */
   readonly now?: () => string
+  /** The domain `ledgers` table an earlier build wrote, read and migrated, never written. */
+  readonly migrateFrom?: LegacyLedgerTable
+  /** How long `write` waits for another writer's lock before reporting a conflict. Default 2000 ms. */
+  readonly lockWaitMs?: number
 }
+
+/** A lock older than this belongs to a writer that died inside the critical section. */
+export const STALE_LOCK_MS = 30_000
 
 const isoNow = (): string => new Date().toISOString()
 
@@ -125,164 +157,210 @@ export function ledgerFileName(sessionId: string): string {
   return `${out}.json`
 }
 
-/** File-backed ledger store under `<root>/ledgers/`. */
+const sleep = (ms: number): Promise<void> => new Promise(resolve => setTimeout(resolve, ms))
+
+/** Windows can refuse a rename for a moment while another process has the target open. */
+function renameWithRetry(from: string, to: string): void {
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      renameSync(from, to)
+      return
+    } catch (error: unknown) {
+      const code = (error as NodeJS.ErrnoException).code
+      if (attempt >= 5 || (code !== 'EPERM' && code !== 'EBUSY' && code !== 'EACCES')) throw error
+      const until = Date.now() + 10 * (attempt + 1)
+      while (Date.now() < until) { /* brief synchronous back-off: the lock is held */ }
+    }
+  }
+}
+
+type Read =
+  | { readonly kind: 'absent' }
+  | { readonly kind: 'ledger'; readonly ledger: Ledger }
+  | { readonly kind: 'skipped'; readonly reason: LedgerDiagnostic['reason'] }
+
+/** File-backed ledger store under `<root>/ledgers/`; the only ledger writer. */
 export class FileLedgerStore implements LedgerStoreLike {
   readonly kind = 'file' as const
-  readonly diagnostics: readonly LedgerDiagnostic[]
-  private readonly cache = new Map<string, Ledger>()
+  private scanned: readonly LedgerDiagnostic[] = []
   private readonly now: () => string
+  private readonly dir: string
+  private readonly legacy: LegacyLedgerTable | undefined
+  private readonly lockWaitMs: number
 
-  private constructor(private readonly root: string, options: LedgerStoreOptions) {
+  private constructor(root: string, options: LedgerStoreOptions) {
     this.now = options.now ?? isoNow
+    this.dir = join(root, 'ledgers')
+    this.legacy = options.migrateFrom
+    this.lockWaitMs = options.lockWaitMs ?? 2000
+    this.list()
+  }
+
+  /** Scan once for diagnostics and return the store. Never throws on a damaged ledger. */
+  static open(root: string, options: LedgerStoreOptions = {}): FileLedgerStore {
+    return new FileLedgerStore(root, options)
+  }
+
+  get diagnostics(): readonly LedgerDiagnostic[] {
+    return this.scanned
+  }
+
+  private pathOf(sessionId: string): string {
+    return join(this.dir, ledgerFileName(sessionId))
+  }
+
+  /** One ledger file, read now. `name` must be the file name of the id it claims. */
+  private readFile(name: string): Read {
+    let text: string
+    try {
+      text = readFileSync(join(this.dir, name), 'utf8')
+    } catch (error: unknown) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { kind: 'absent' }
+      return { kind: 'skipped', reason: 'unparseable' }
+    }
+    let parsed: unknown
+    try {
+      parsed = JSON.parse(text)
+    } catch {
+      return { kind: 'skipped', reason: 'unparseable' }
+    }
+    // A file whose own sessionId does not map back to its name is not ours to trust.
+    if (!isLedger(parsed) || ledgerFileName(parsed.sessionId) !== name) return { kind: 'skipped', reason: 'not-a-ledger' }
+    return { kind: 'ledger', ledger: parsed }
+  }
+
+  /** The legacy domain row for a session, when it is a usable ledger. */
+  private legacyRow(sessionId: string): Ledger | undefined {
+    if (this.legacy === undefined) return undefined
+    let value: unknown
+    try { value = this.legacy.get(sessionId) } catch { return undefined }
+    return isLedger(value) && value.sessionId === sessionId ? value : undefined
+  }
+
+  load(sessionId: string): Ledger | undefined {
+    const read = this.readFile(ledgerFileName(sessionId))
+    if (read.kind === 'ledger') return read.ledger.sessionId === sessionId ? read.ledger : undefined
+    if (read.kind === 'skipped') return undefined
+    const row = this.legacyRow(sessionId)
+    if (row === undefined) return undefined
+    this.migrate(row)
+    const after = this.readFile(ledgerFileName(sessionId))
+    return after.kind === 'ledger' ? after.ledger : row
+  }
+
+  list(): readonly Ledger[] {
     const skipped: LedgerDiagnostic[] = []
-    const dir = join(root, 'ledgers')
+    const found = new Map<string, Ledger>()
     let names: string[] = []
-    if (existsSync(dir)) {
+    if (existsSync(this.dir)) {
       try {
-        names = readdirSync(dir).filter(name => name.endsWith('.json'))
+        names = readdirSync(this.dir).filter(name => name.endsWith('.json'))
       } catch {
         names = []
       }
     }
     for (const name of names) {
-      let parsed: unknown
+      const read = this.readFile(name)
+      if (read.kind === 'ledger') found.set(read.ledger.sessionId, read.ledger)
+      else if (read.kind === 'skipped') skipped.push({ where: name, reason: read.reason })
+    }
+    // Rows only the legacy table holds stay listed (read-only) until their session is opened.
+    if (this.legacy !== undefined) {
+      let rows: Array<[string, unknown]> = []
+      try { rows = [...this.legacy.entries()] } catch { rows = [] }
+      for (const [key, value] of rows) {
+        if (!isLedger(value) || value.sessionId !== key) {
+          skipped.push({ where: `ledgers:${key}`, reason: 'not-a-ledger' })
+          continue
+        }
+        if (!found.has(key) && !names.includes(ledgerFileName(key))) found.set(key, value)
+      }
+    }
+    this.scanned = skipped
+    return [...found.values()]
+  }
+
+  reload(_sessionId: string): void {
+    // Reads already come from disk.
+  }
+
+  /** Copy a legacy domain row to its file, under the lock and only while the file is still absent. Best effort. */
+  private migrate(row: Ledger): void {
+    let release: (() => void) | undefined
+    try {
+      release = this.tryLock(row.sessionId)
+      if (release === undefined) return // another writer is on it; the next read sees its file
+      if (this.readFile(ledgerFileName(row.sessionId)).kind !== 'absent') return
+      this.publish(row)
+    } catch {
+      // A failed copy leaves the row readable from the table; the next load tries again.
+    } finally {
+      release?.()
+    }
+  }
+
+  /** Take `<id>.lock` by exclusive create, taking over a stale one. `undefined` when another writer holds it. */
+  private tryLock(sessionId: string): (() => void) | undefined {
+    mkdirSync(this.dir, { recursive: true })
+    const lock = `${this.pathOf(sessionId)}.lock`
+    for (let attempt = 0; attempt < 2; attempt += 1) {
       try {
-        parsed = JSON.parse(readFileSync(join(dir, name), 'utf8'))
-      } catch {
-        skipped.push({ where: name, reason: 'unparseable' })
-        continue
+        closeSync(openSync(lock, 'wx'))
+        return () => {
+          try { unlinkSync(lock) } catch { /* already gone */ }
+        }
+      } catch (error: unknown) {
+        if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error
+        let age: number
+        try { age = Date.now() - statSync(lock).mtimeMs } catch { continue } // released meanwhile: try again
+        if (age < STALE_LOCK_MS) return undefined
+        try { unlinkSync(lock) } catch { /* someone else took it over first */ }
       }
-      // A file whose own sessionId does not map back to its name is not ours to trust.
-      if (!isLedger(parsed) || ledgerFileName(parsed.sessionId) !== name) {
-        skipped.push({ where: name, reason: 'not-a-ledger' })
-        continue
-      }
-      this.cache.set(parsed.sessionId, parsed)
     }
-    this.diagnostics = skipped
+    return undefined
   }
 
-  /** Read the directory once and return the store. Never throws on a damaged ledger. */
-  static open(root: string, options: LedgerStoreOptions = {}): FileLedgerStore {
-    return new FileLedgerStore(root, options)
-  }
-
-  load(sessionId: string): Ledger | undefined {
-    return this.cache.get(sessionId)
-  }
-
-  list(): readonly Ledger[] {
-    return [...this.cache.values()]
-  }
-
-  reload(sessionId: string): void {
+  /** Atomic replace: temp file (not `*.json`, so a scan never reads it), then rename. Caller holds the lock. */
+  private publish(ledger: Ledger): void {
+    const path = this.pathOf(ledger.sessionId)
+    const tmp = `${path}.${process.pid}.${randomUUID()}.tmp`
+    writeFileSync(tmp, `${JSON.stringify(ledger, null, 2)}\n`, 'utf8')
     try {
-      const parsed: unknown = JSON.parse(readFileSync(join(this.root, 'ledgers', ledgerFileName(sessionId)), 'utf8'))
-      if (isLedger(parsed) && parsed.sessionId === sessionId) this.cache.set(sessionId, parsed)
-    } catch {
-      // Missing or unreadable: keep what this process holds.
+      renameWithRetry(tmp, path)
+    } catch (error: unknown) {
+      try { unlinkSync(tmp) } catch { /* nothing to clean */ }
+      throw error
     }
-  }
-
-  /** The revision on disk right now, so a second process is seen; falls back to the cache. */
-  private storedRevision(sessionId: string): number {
-    try {
-      const parsed: unknown = JSON.parse(readFileSync(join(this.root, 'ledgers', ledgerFileName(sessionId)), 'utf8'))
-      if (isLedger(parsed)) return parsed.revision
-    } catch {
-      // Missing or unreadable: fall through to what this process holds.
-    }
-    return this.cache.get(sessionId)?.revision ?? 0
   }
 
   async write(next: Ledger, expectedRevision: number): Promise<Ledger> {
-    // Everything from the check to the rename is synchronous, so nothing in this
-    // process can interleave between them.
-    const actual = this.storedRevision(next.sessionId)
-    if (actual !== expectedRevision) throw conflict(next.sessionId, expectedRevision, actual)
-    const stored: Ledger = { ...next, v: LEDGER_VERSION, revision: expectedRevision + 1, updatedAt: this.now() }
-    const dir = join(this.root, 'ledgers')
-    mkdirSync(dir, { recursive: true })
-    const path = join(dir, ledgerFileName(next.sessionId))
-    const tmp = `${path}.${process.pid}.tmp`
-    writeFileSync(tmp, `${JSON.stringify(stored, null, 2)}\n`, 'utf8')
-    renameSync(tmp, path)
-    this.cache.set(stored.sessionId, stored)
-    return stored
-  }
-}
-
-/** Ledger store over the `ledgers` table of the autopilot domain. */
-export class DomainLedgerStore implements LedgerStoreLike {
-  readonly kind = 'domain' as const
-  readonly diagnostics: readonly LedgerDiagnostic[]
-  private readonly cache = new Map<string, Ledger>()
-  private readonly now: () => string
-  /** Serializes writes: the domain `put` is asynchronous, so check-then-put needs a lane. */
-  private lane: Promise<unknown> = Promise.resolve()
-
-  private constructor(
-    private readonly domain: DomainLike,
-    private readonly table: KvTableLike,
-    options: LedgerStoreOptions,
-  ) {
-    this.now = options.now ?? isoNow
-    const skipped: LedgerDiagnostic[] = []
-    for (const [key, value] of this.table.entries()) {
-      if (!isLedger(value) || value.sessionId !== key) {
-        skipped.push({ where: key, reason: 'not-a-ledger' })
-        continue
+    const sessionId = next.sessionId
+    const deadline = Date.now() + this.lockWaitMs
+    let release = this.tryLock(sessionId)
+    while (release === undefined) {
+      if (Date.now() >= deadline) {
+        throw new AutopilotError(
+          `ledger ${JSON.stringify(sessionId)}: another writer held the lock for more than ${this.lockWaitMs} ms`,
+          AP_LEDGER_CONFLICT,
+        )
       }
-      this.cache.set(key, value)
+      await sleep(5 + Math.floor(Math.random() * 10))
+      release = this.tryLock(sessionId)
     }
-    this.diagnostics = skipped
-  }
-
-  /**
-   * Open the autopilot domain and bind its `ledgers` table. The caller owns the
-   * returned store and must {@link close} it.
-   */
-  static async open(
-    facility: DomainFacilityLike,
-    spec: DomainSpecLike = AUTOPILOT_DOMAIN_SPEC,
-    options: LedgerStoreOptions = {},
-  ): Promise<DomainLedgerStore> {
-    return DomainLedgerStore.fromDomain(await facility.open(spec), options)
-  }
-
-  /**
-   * Bind the `ledgers` table of a domain the caller already opened. The facility
-   * refuses a name that is open twice, so the plugin opens the domain ONCE and
-   * hands the same handle to this store and to the legacy reader.
-   */
-  static fromDomain(domain: DomainLike, options: LedgerStoreOptions = {}): DomainLedgerStore {
-    return new DomainLedgerStore(domain, domain.table(LEDGERS_TABLE), options)
-  }
-
-  async close(): Promise<void> {
-    await this.domain.close()
-  }
-
-  load(sessionId: string): Ledger | undefined {
-    return this.cache.get(sessionId)
-  }
-
-  list(): readonly Ledger[] {
-    return [...this.cache.values()]
-  }
-
-  write(next: Ledger, expectedRevision: number): Promise<Ledger> {
-    const run = async (): Promise<Ledger> => {
-      const actual = this.cache.get(next.sessionId)?.revision ?? 0
-      if (actual !== expectedRevision) throw conflict(next.sessionId, expectedRevision, actual)
+    try {
+      // Inside the lock and synchronous: the revision read here is the one the rename replaces.
+      const read = this.readFile(ledgerFileName(sessionId))
+      const actual =
+        read.kind === 'ledger' ? read.ledger.revision
+          : read.kind === 'absent' ? (this.legacyRow(sessionId)?.revision ?? 0)
+            : 0
+      if (actual !== expectedRevision) throw conflict(sessionId, expectedRevision, actual)
       const stored: Ledger = { ...next, v: LEDGER_VERSION, revision: expectedRevision + 1, updatedAt: this.now() }
-      await this.table.put(stored.sessionId, stored)
-      this.cache.set(stored.sessionId, stored)
+      this.publish(stored)
       return stored
+    } finally {
+      release()
     }
-    const result = this.lane.then(run)
-    this.lane = result.catch(() => undefined)
-    return result
   }
 }
 

@@ -150,13 +150,17 @@ describe('mutate: single writer with compare-and-swap', () => {
   it('a writer outside this process: reload, re-run the function, keep the other writer\'s change', async () => {
     const h = makeHarness()
     const other = FileLedgerStore.open(h.storeDir)
-    await other.write({ ...emptyLedger('root-1', NOW), links: [{ kind: 'issue', ref: 'MY-195', at: NOW }] }, 0)
     let calls = 0
+    let otherWrite: Promise<unknown> | undefined
 
+    // Reads come from disk, so the other writer must land BETWEEN this engine's read and its
+    // write to force a conflict. Its uncontended write commits synchronously (lock, check, rename).
     const stored = await h.engine.mutate('root-1', (ledger) => {
       calls += 1
+      if (calls === 1) otherWrite = other.write({ ...emptyLedger('root-1', NOW), links: [{ kind: 'issue', ref: 'MY-195', at: NOW }] }, 0)
       return { ...ledger, links: [...ledger.links, { kind: 'pr', ref: '#9', at: NOW }] }
     })
+    await otherWrite
 
     expect(calls).toBe(2)
     expect(stored?.links.map(l => l.ref)).toEqual(['MY-195', '#9'])

@@ -32,9 +32,9 @@ import { createAutopilotService, registerAutopilotService } from './service.js'
 import { installAutopilotRoutes } from './web.js'
 import type { ProvideHost } from './service.js'
 import { defaultStoreRoot } from './store/file.js'
-import { AUTOPILOT_DOMAIN_SPEC, legacyDomainReaderOf } from './store/domain.js'
-import type { DomainFacilityLike, DomainLike } from './store/domain.js'
-import { DomainLedgerStore, FileLedgerStore, legacySourcesOf } from './store/ledger.js'
+import { AUTOPILOT_DOMAIN_SPEC, LEDGERS_TABLE, legacyDomainReaderOf } from './store/domain.js'
+import type { DomainFacilityLike, DomainLike, KvTableLike } from './store/domain.js'
+import { FileLedgerStore, legacySourcesOf } from './store/ledger.js'
 import type { LedgerStoreLike } from './store/ledger.js'
 import type { LegacySources } from './legacy/index.js'
 import { installRootTools } from './tools.js'
@@ -63,7 +63,7 @@ export type { EnginePorts, EnvironmentProbes, NativeGoalView, ResolvedConfig, Re
 export { defaultStoreRoot } from './store/file.js'
 export { AUTOPILOT_DOMAIN_SPEC, legacyDomainReaderOf } from './store/domain.js'
 export type { DomainFacilityLike } from './store/domain.js'
-export { DomainLedgerStore, FileLedgerStore, emptyLedger } from './store/ledger.js'
+export { FileLedgerStore, emptyLedger } from './store/ledger.js'
 export type { LedgerStoreLike } from './store/ledger.js'
 export { installChildTools } from './tools.js'
 export { Delegator, autoContinueFor, routeMatchOf } from './delegate.js'
@@ -204,8 +204,8 @@ export interface ConfigInput {
   }
   /**
    * RETIRED in 0.3.0 and ignored (reported once as a status note). The ledger
-   * always goes to `ctx.storageDomain` when the host mounts one and to files
-   * otherwise; legacy runs are read from BOTH regardless.
+   * always goes to one file per root session under `<storeRoot>/ledgers/`;
+   * legacy runs are read from the file root AND `ctx.storageDomain` regardless.
    */
   readonly storeKind?: 'auto' | 'file' | 'domain'
   readonly storeRoot?: string
@@ -1294,15 +1294,15 @@ export function createRoutingWiring(rawCtx: unknown, onWarn: (message: string) =
  * What {@link resolveStore} chose, and what it opened.
  *
  * The domain is opened AT MOST ONCE: upstream `DomainFacility.open` refuses a
- * name that is already open, so the ledger store and the legacy reader share one
- * handle, and `close` releases it exactly once.
+ * name that is already open, so the legacy reader and the ledger migration share
+ * one handle, and `close` releases it exactly once.
  */
 export interface StoreResolution {
-  /** Where NEW ledgers are written: the domain when the host mounts one, files otherwise. */
+  /** Where ledgers are written: always one file per root session under `<root>/ledgers/`. */
   readonly ledgers: LedgerStoreLike
   /** Where the frozen legacy reader looks: the file root AND the domain when there is one, always. */
   readonly sources: LegacySources
-  /** Why the domain backend was not used, when a facility was expected to give it. Absent when nothing degraded. */
+  /** Why the domain could not be read (legacy history and ledger migration), when a facility was expected to give it. */
   readonly degraded?: string
   /** Release what was opened. Idempotent. */
   readonly close: () => Promise<void>
@@ -1312,14 +1312,15 @@ export interface StoreResolution {
 const NO_FACILITY_REASON = 'ctx.storageDomain is not observable on this deployment (it is mounted by the web-app bundle only)'
 
 /**
- * Choose where ledgers are written and where legacy runs are read.
+ * Open the ledger store and the legacy sources.
  *
- * The old `storeKind` choice is retired. The ledger goes to the domain when a
- * facility opens and to `<root>/ledgers/` otherwise (the old `auto` rule), and
- * the legacy sources always include both the file root and the domain when it is
- * there, so a history written under either backend is listed whichever one the
- * ledger uses. A facility that is present but cannot open falls back to files and
- * says why in `degraded`.
+ * Ledgers always go to `<root>/ledgers/<id>.json`. The domain is still opened
+ * when the host mounts one, READ-ONLY: its `events`/`runs` tables are legacy
+ * history, and its `ledgers` table is what earlier 0.3.0 builds wrote, migrated
+ * to files on first load of each session. The host's JSON backend keeps the whole
+ * domain in one file that each process republishes on any put, so writing it from
+ * two processes lost rows; nothing here writes it any more. A facility that is
+ * present but cannot open says why in `degraded`; the ledgers are unaffected.
  */
 export async function resolveStore(rawCtx: unknown, root: string): Promise<StoreResolution> {
   const facility = probeStorageDomain(rawCtx)
@@ -1341,10 +1342,12 @@ export async function resolveStore(rawCtx: unknown, root: string): Promise<Store
     closed = true
     await domain.close()
   }
-  if (domain === undefined) {
-    return { ledgers: FileLedgerStore.open(root), sources, ...(degraded === undefined ? {} : { degraded }), close }
+  let migrateFrom: KvTableLike | undefined
+  if (domain !== undefined) {
+    try { migrateFrom = domain.table(LEDGERS_TABLE) } catch { migrateFrom = undefined }
   }
-  return { ledgers: DomainLedgerStore.fromDomain(domain), sources, close }
+  const ledgers = FileLedgerStore.open(root, migrateFrom === undefined ? {} : { migrateFrom })
+  return { ledgers, sources, ...(degraded === undefined ? {} : { degraded }), close }
 }
 
 /**
@@ -1371,7 +1374,7 @@ export async function apply(rawCtx: unknown, config?: ConfigInput): Promise<() =
   // nothing (`ctx.autopilot.storeKind` already reads "file"). A facility that is present but cannot
   // open is a real degrade, and only the thrown reason tells the two apart afterwards.
   if (resolution.degraded !== undefined && probeStorageDomain(rawCtx) !== undefined) {
-    warn(rawCtx, `dsh-autopilot: the ledger store is "${resolution.ledgers.kind}": ${resolution.degraded}`)
+    warn(rawCtx, `dsh-autopilot: legacy history and ledger migration from the storage domain are unavailable: ${resolution.degraded}`)
   }
 
   // Retired settings are accepted and ignored; say so once, here and on the status surfaces.
@@ -1388,6 +1391,7 @@ export async function apply(rawCtx: unknown, config?: ConfigInput): Promise<() =
   // throw would leave that listener behind and every retry would stack another.
   let wiringForFailure: RoutingWiring | undefined
   let onboardingRefreshForFailure: (() => void) | undefined
+  let goalListenersForFailure: (() => void) | undefined
   try {
     const routing = createRoutingWiring(rawCtx, message => warn(rawCtx, message))
     // The setting is read per dispatch; an unreadable one is warned once, not per call.
@@ -1544,6 +1548,35 @@ export async function apply(rawCtx: unknown, config?: ConfigInput): Promise<() =
       }
       if (installRoot(payload.agent)) await engine.onRootOpened(agent)
     })
+    // ── Native goal changes: mirror them now, not at the next route read ──
+    // dsh-goal emits `goal/changed` (agent-scoped, after the `goal/change` session
+    // event committed) for every accepted mutation, and app-level
+    // `goal/activation-changed` when a round arms or disarms. Only a ROOT's goal is
+    // mirrored: a child's would create a ledger keyed by the child id. `syncGoal`
+    // never rejects; route reads still sync too.
+    const onGoalEvent = (rawCtx as { on?: (event: string, listener: (payload: unknown) => void) => () => void }).on
+    const syncRootGoal = (agent: unknown): void => {
+      const candidate = agent as AgentRef | undefined
+      if (candidate === undefined || candidate.session?.header?.parentSession !== undefined) return
+      if (!ctx.agents.roots().includes(agent)) return
+      void engine.syncGoal(candidate)
+    }
+    let disposeGoalChanged: () => void = () => {}
+    let disposeGoalActivation: () => void = () => {}
+    try {
+      disposeGoalChanged = onGoalEvent?.call(rawCtx, 'goal/changed', (payload) => {
+        syncRootGoal((payload as { agent?: unknown } | undefined)?.agent)
+      }) ?? (() => {})
+      disposeGoalActivation = onGoalEvent?.call(rawCtx, 'goal/activation-changed', (payload) => {
+        const sessionId = (payload as { sessionId?: unknown } | undefined)?.sessionId
+        if (typeof sessionId !== 'string') return
+        syncRootGoal(ctx.agents.roots().find(agent => (agent as AgentRef).id === sessionId))
+      }) ?? (() => {})
+    } catch {
+      // A host that cannot be subscribed keeps the open-time and route-read syncs.
+    }
+    goalListenersForFailure = () => { disposeGoalChanged(); disposeGoalActivation() }
+
     const disposeDisposed = ctx.on('agent/disposed', (payload: { agent: unknown }) => {
       installed.get(payload.agent)?.()
       installed.delete(payload.agent)
@@ -1598,6 +1631,8 @@ export async function apply(rawCtx: unknown, config?: ConfigInput): Promise<() =
       disposeSkillProvider?.()
       disposeCreated()
       disposeDisposed()
+      disposeGoalChanged()
+      disposeGoalActivation()
       for (const dispose of installed.values()) dispose()
       installed.clear()
       // Async tail: dispose waits (bounded) for in-flight session opens and ledger writes.
@@ -1612,6 +1647,7 @@ export async function apply(rawCtx: unknown, config?: ConfigInput): Promise<() =
     try {
       wiringForFailure?.dispose()
       onboardingRefreshForFailure?.()
+      goalListenersForFailure?.()
     } catch {
       // A wiring teardown failure must not mask the original error.
     }

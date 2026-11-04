@@ -29,7 +29,7 @@
  * guard, and this spec declares no global. If a future dsh version exercises
  * more of the zod surface, the fix is to add `zod` and swap one constant.
  *
- * 0.3.0 CHANGE. The `ledgers` table holds the v3 per-session ledger (see
+ * 0.3.0 CHANGE. The `ledgers` table is read-only migration input (see
  * `./ledger.ts`); `events` and `runs` are the 0.2.x run streams, kept only so
  * the frozen legacy reader (`src/legacy`) can show them. Nothing here writes
  * them any more, so the run store classes, the event-key writers and the `log.md`
@@ -127,11 +127,14 @@ export const EVENTS_TABLE = 'events'
 export const RUNS_TABLE = 'runs'
 
 /**
- * Table holding the v3 ledger per root session, keyed by session id.
+ * Table that held the v3 ledger per root session in earlier 0.3.0 builds, keyed by session id.
  *
- * Added to the SAME domain at the SAME version: tables are additive, so a medium
- * written by 0.2.x opens unchanged and simply starts with an empty `ledgers`
- * table. The `events` and `runs` tables are the legacy 0.2.x runs, now read-only
+ * READ-ONLY NOW. The host's JSON backend keeps the whole domain in one file that
+ * every process republishes on any put, so two processes writing ledgers here lost
+ * each other's rows. Ledgers moved to one file per session (`./ledger.ts`); rows
+ * found here are migrated to their file on first load and the table is never
+ * written again. It stays declared, at the same version, so those rows still
+ * materialize. The `events` and `runs` tables are the legacy 0.2.x runs, read-only
  * through `src/legacy`.
  */
 export const LEDGERS_TABLE = 'ledgers'
@@ -143,7 +146,7 @@ export const LEDGERS_TABLE = 'ledgers'
  * and table names against `UNIT_NAME_RE = /^[a-z][a-z0-9_]*$/`
  * (`packages/storage/storage/src/backend.ts:10`) because the name doubles as a
  * file name and a SQL identifier segment, so a hyphen is refused. WHERE it is
- * refused matters and was stated wrongly here: `DomainLedgerStore.open`
+ * refused matters and was stated wrongly here: `resolveStore` (`src/index.ts`)
  * calls `facility.open(spec)` DIRECTLY and never calls `defineDomain`, so the
  * enforcement site is the backend's own check at `KvFacet.open`, not
  * `defineDomain`. Bypassing `defineDomain` also skips its version guard and its
