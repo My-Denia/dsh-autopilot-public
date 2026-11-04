@@ -60,7 +60,7 @@ import type { WorkClassName } from './routing/work-class.js'
  * `terminal_send` / `terminal_read` / `terminal_signal` / `terminal_close`,
  * and substituting those here would GRANT a delegated child a capability it
  * never had. The rename went the other way instead: the gate's `SHELL_TOOLS`
- * scan (`./gate/decide.ts`) gained the terminal names, because widening what
+ * scan (`SHELL_TOOLS` in `./roles/tools.ts`, formerly the egress gate) gained the terminal names, because widening what
  * is SCANNED is the fail-closed direction and widening what is ALLOWED is not.
  * Nothing egress-capable belongs in this list, and `test/config.test.ts`
  * asserts both the exact array and that property — in BOTH directions, because
@@ -100,7 +100,7 @@ export const DEFAULT_EXECUTOR_TOOLS: readonly string[] = [
 const AgentOptions = Schema.object({
   provider: Schema.string().description('LLM provider id.'),
   model: Schema.string().description('Model id.'),
-  maxTokens: Schema.natural().description('Per-child output cap.'),
+  maxTokens: Schema.natural().description('Retired in 0.3.0 and ignored (the route grant is provider, model and reasoningEffort only).'),
   /**
    * Reasoning effort ([R2-P3-1]). Declared here so a legacy route may name
    * one; it is validated against exact model capability by the dispatch
@@ -113,7 +113,7 @@ const AgentOptions = Schema.object({
 
 /** Per-role auditor routing (the cross-family review matrix's landing point). */
 const AuditorRoute = Schema.object({
-  provider: Schema.string().description('Subagent transport provider for this role.'),
+  provider: Schema.string().description('Retired in 0.3.0 and ignored: the one-shot transport provider no longer exists. Reviews use the role route only.'),
   agentOptions: AgentOptions,
 })
 
@@ -298,12 +298,12 @@ export const StoreKindSchema = Schema.union([
   Schema.const('auto').description('Prefer the storageDomain backend when it is observable, else files.'),
   Schema.const('file').description('Always the file store under $DSH_HOME/storages/dsh-autopilot.'),
   Schema.const('domain').description('Require ctx.storageDomain; refuse to mount without it.'),
-]).default('auto').description('Which backend holds the canonical event stream.')
+]).description('RETIRED in 0.3.0 and ignored: the ledger goes to the domain when the host mounts one, else to files. No default is declared, so only a written key reads as retired.')
 
 /** Declared plugin configuration shape; mirrors `ConfigInput` in `./index.ts`. */
 const ConfigShape = Schema.object({
-  auditProvider: Schema.string().default('spawn').description('Subagent transport provider for one-shot auditors.'),
-  executorProvider: Schema.string().default('spawn').description('Subagent transport provider for the continuable executor.'),
+  auditProvider: Schema.string().description('Retired in 0.3.0 and ignored. No default is declared, so only a written key reads as retired.'),
+  executorProvider: Schema.string().description('Retired in 0.3.0 and ignored. No default is declared, so only a written key reads as retired.'),
   auditors: Schema.object({
     plan: AuditorRoute,
     execution: AuditorRoute,
@@ -311,38 +311,36 @@ const ConfigShape = Schema.object({
   }).description('Per-role auditor routing; omitted roles inherit the deployment default.'),
   executor: Schema.object({
     agentOptions: AgentOptions,
-    persona: Schema.string().default('').description('Executor Lead persona override.'),
-    toolAllowList: Schema.array(Schema.string())
-      .default([...DEFAULT_EXECUTOR_TOOLS])
-      .description('Tool names the executor child may call.'),
+    persona: Schema.string().description('Retired in 0.3.0 and ignored: the role personas are fixed in src/roles.'),
+    toolAllowList: Schema.array(Schema.string()).description('Retired in 0.3.0 and ignored: the role tool surfaces are fixed in src/roles.'),
   }),
   crossFamily: Schema.object({
-    enabled: Schema.boolean().default(true)
-      .description('Seek an auditor from a family the executor is not from, once risk reaches minRisk.'),
-    minRisk: Schema.union(['low', 'medium', 'high', 'critical'] as const).default('medium')
-      .description('Risk floor at which cross-family review is sought.'),
-    pool: Schema.array(AgentOptions).default([])
-      .description('Candidate auditor routes to draw an out-of-family reviewer from.'),
-  }).description('Cross-family review: a blind spot shared by one provider passes both gates unchallenged, so at risk the reviewer should not be from the builder family. A strategy, not a gate — the outcome is recorded per audit rather than enforced.'),
+    enabled: Schema.boolean().description('Retired in 0.3.0 and ignored: a reviewer always seeks a different provider family than the work it reviews.'),
+    minRisk: Schema.union(['low', 'medium', 'high', 'critical'] as const).description('Retired in 0.3.0 and ignored.'),
+    pool: Schema.array(AgentOptions).description('Retired in 0.3.0 and ignored: the reviewer draws from the ladder and the session policy.'),
+  }).description('Retired in 0.3.0 and ignored (see each key).'),
   routing: RoutingShape.description(
     'Role-true model routing over the live catalog. Every GAH-config-sourced explicit route (a lock, legacy role config, a legacy pool pick) is a plugin-config grant under one rule in every mode; a grant outside an existing session model-selection policy escalates to the owner instead of dispatching. In auto mode the routing core subsumes the legacy pool fallback: pool entries stay consultable as grants, never widen the session-authorized set, and never override a role lock.',
   ),
+  // RETIRED in 0.3.0 and ignored. NO defaults are declared on these leaves on purpose: the loader fills
+  // declared defaults before `apply()` sees the config, and a default here would make every mount read
+  // as having written a retired key (`retiredKeysIn`). `resolveConfig` supplies its own defaults.
   gate: Schema.object({
-    sandboxCoupling: Schema.boolean().default(true).description('Clamp standard runs read-only until the plan gate passes.'),
-    toolDeny: Schema.boolean().default(true).description('Deny write/edit/str_replace_editor pre-plan-gate and while usage is undeclared.'),
-    egressDeny: Schema.boolean().default(true).description('Enforce the owner-only egress boundary.'),
-    stopReminder: Schema.boolean().default(true).description('Emit the bounded turn-stop execution reminder.'),
-    strictShell: Schema.boolean().default(false).description('Deny shell pre-plan-gate when the sandbox is not active.'),
-    restoreMode: Schema.string().default('workspace-write').description('Sandbox mode restored on plan-gate pass when none was recorded.'),
+    sandboxCoupling: Schema.boolean().description('Retired, ignored: the plan-gate sandbox clamp is gone.'),
+    toolDeny: Schema.boolean().description('Retired, ignored: the pre-plan-gate tool deny is gone.'),
+    egressDeny: Schema.boolean().description('Retired, ignored: the egress boundary is gone.'),
+    stopReminder: Schema.boolean().description('Retired, ignored: the turn-stop reminder is gone.'),
+    strictShell: Schema.boolean().description('Retired, ignored: the shell gate is gone.'),
+    restoreMode: Schema.string().description('Retired, ignored: a clamped session is restored to the mode its run recorded.'),
   }),
   storeKind: StoreKindSchema,
   storeRoot: Schema.string().default('').description('Run store directory; empty means $DSH_HOME/storages/dsh-autopilot.'),
   governance: Schema.object({
     maxAuditRoundsPerRole: Schema.number().min(1).description(
-      'Brake on audit storms: refuse further same-role audit dispatches beyond this many rounds (AP_AUDIT_ROUND_CAP). Off when unset; escalation to the owner is never automatic.',
+      'Brake on audit storms: refuse further same-role audit dispatches beyond this many rounds. Retired in 0.3.0 and ignored. Off when unset; escalation to the owner is never automatic.',
     ),
     unattended: Schema.boolean().description(
-      'Unattended approval policy: when on, a validated egress returns an immediate, visible, recoverable DENY instead of an owner ask (which would wait forever with nobody to answer). The manifest stands; the owner later grants autopilot_signal owner-approve and the call is retried. Off by default preserves the ask arm.',
+      'Retired in 0.3.0 and ignored: the egress policy it tuned no longer exists.',
     ),
   }).description('Governance pragmatics knobs (all optional, all off by default).'),
   skillInstall: Schema.union([
@@ -506,4 +504,87 @@ export const Config: Schema<ConfigInput, ConfigInput> = ((raw: unknown, options?
   version: 1,
   vendor: 'dsh-autopilot',
   validate: (value: unknown) => validateConfig(value),
+}
+
+/**
+ * Settings whose mechanism 0.3.0 removed. The schema still ACCEPTS them, so a
+ * profile written for 0.2.x loads without error, but they have no effect.
+ *
+ * - `gate.*`: the sandbox clamp, tool deny, egress deny, stop reminder, strict
+ *   shell and restore mode belonged to the retired run state machine.
+ * - `governance.*`: audit-round cap and unattended egress policy likewise.
+ * - `storeKind`: history now reads both backends; the ledger follows what the
+ *   host offers.
+ *
+ * Still live (not listed): `routing.*` (child routing), `crossFamily.*`
+ * (reviewer independence), `storeRoot`, `skillInstall`. `auditors.*`,
+ * `auditProvider`, `executorProvider` and `executor.*` are accepted but are not
+ * yet listed here; whether 0.3.0 still reads them is the engine's call.
+ */
+export const RETIRED_CONFIG_KEYS: readonly string[] = [
+  'gate.sandboxCoupling',
+  'gate.toolDeny',
+  'gate.egressDeny',
+  'gate.stopReminder',
+  'gate.strictShell',
+  'gate.restoreMode',
+  'governance.maxAuditRoundsPerRole',
+  'governance.unattended',
+  'storeKind',
+  'auditProvider',
+  'executorProvider',
+  'executor.persona',
+  'executor.toolAllowList',
+  'executor.agentOptions.maxTokens',
+  'auditors.plan.provider',
+  'auditors.plan.agentOptions.maxTokens',
+  'auditors.execution.provider',
+  'auditors.execution.agentOptions.maxTokens',
+  'auditors.rules.provider',
+  'auditors.rules.agentOptions.maxTokens',
+  'crossFamily.enabled',
+  'crossFamily.minRisk',
+  'crossFamily.pool',
+]
+
+/**
+ * The legacy keys that are STILL READ, and by what. `executor.agentOptions`
+ * (provider, model, reasoningEffort) becomes the `routing.roles.executor` lock
+ * and so pins the worker and executor-lead route; `auditors.<role>.agentOptions`
+ * becomes the matching auditor lock and so pins the reviewer route (`legacyRouteFor`
+ * in `./index.ts`, read by `routeForDelegation`). Everything else of the 0.2.x
+ * surface is in {@link RETIRED_CONFIG_KEYS}.
+ */
+export const LEGACY_KEYS_STILL_READ: readonly string[] = [
+  'executor.agentOptions.provider',
+  'executor.agentOptions.model',
+  'executor.agentOptions.reasoningEffort',
+  'auditors.plan.agentOptions.provider',
+  'auditors.plan.agentOptions.model',
+  'auditors.plan.agentOptions.reasoningEffort',
+  'auditors.execution.agentOptions.provider',
+  'auditors.execution.agentOptions.model',
+  'auditors.execution.agentOptions.reasoningEffort',
+  'auditors.rules.agentOptions.provider',
+  'auditors.rules.agentOptions.model',
+  'auditors.rules.agentOptions.reasoningEffort',
+]
+
+/** The retired keys the user actually wrote in `input`, in {@link RETIRED_CONFIG_KEYS} order. */
+export function retiredKeysIn(input: unknown): readonly string[] {
+  return RETIRED_CONFIG_KEYS.filter(path => {
+    let node: unknown = input
+    for (const part of path.split('.')) {
+      if (typeof node !== 'object' || node === null || Array.isArray(node)) return false
+      node = (node as Record<string, unknown>)[part]
+    }
+    // An EMPTY array is what the loader fills in for an unwritten array leaf, so it is not a written key.
+    return node !== undefined && !(Array.isArray(node) && node.length === 0)
+  })
+}
+
+/** One plain status note naming the ignored keys, or `undefined` when there are none. */
+export function retiredConfigNote(keys: readonly string[]): string | undefined {
+  if (keys.length === 0) return undefined
+  return `dsh-autopilot 0.3.0 ignores retired settings: ${keys.join(', ')}; they no longer have an effect.`
 }

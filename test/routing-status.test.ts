@@ -24,7 +24,11 @@ import { describe, expect, it } from 'vitest'
 import { resolveConfig } from '../src/index.js'
 import { routingStatusOf, ROUTING_STATUS_ROLES } from '../src/routing/status.js'
 import type { SessionPolicyState } from '../src/routing/authorize.js'
-import { makeSnapshot } from './helpers.js'
+
+/** The only part of a run the status view reads: the roles' pinned routes. */
+function makeSnapshot(overrides: { routingPins?: Parameters<typeof routingStatusOf>[0]['routingPins'] } = {}) {
+  return { ...overrides }
+}
 
 /** Resolve a routing section exactly as the plugin does, then project it. */
 function status(

@@ -1,467 +1,234 @@
 /**
- * The host-side read-only HTTP surface (`src/web.ts`).
+ * The host-side read-only HTTP surface (`src/web.ts`), over a stub service.
  *
- * Two claims carry this file, and both are asserted against a LIVE engine
- * rather than a hand-written `StatusView`:
- *
- *  1. **The projection is an allow-list, and the denied fields are denied.**
- *     `AutopilotReadOnly.peek()` returns the whole `Snapshot` — plan text,
- *     execution packet, auditor notes, closeout, residual risks, baseline. The
- *     route never calls it, and the two free-text fields that survive into
- *     `StatusView` (`diagnostic`, and each `ownerApprovals[].target`) are
- *     dropped. The tests below drive a real run into the states that PRODUCE
- *     those values and then assert they do not appear anywhere in the served
- *     JSON — a substring search over the serialized body, so a field added by
- *     a future spread cannot pass.
- *
- *  2. **Absence of a web server is the default, not a branch.** The mount goes
- *     through `ctx.inject(['webServer'], …)`, so a host with no such service
- *     never runs the callback. Both shapes are exercised.
+ * Claims: the three routes answer the documented status codes and bodies; the
+ * ledger projection overlays the sandbox-restore outcome the ledger recorded
+ * onto the session's legacy runs; error bodies are codes, never store text;
+ * every mounted route sits behind the host's connection fence; and the absence
+ * of a web server is the default, not a branch.
  */
 
-import { readFileSync, writeFileSync } from 'node:fs'
-import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
-
-import { createAutopilotService } from '../src/service.js'
-import { RunStore } from '../src/store/file.js'
-import type { Snapshot } from '../src/domain/types.js'
-import {
-  AUTOPILOT_API_PREFIX, installAutopilotRoutes, makeAutopilotRoutes,
-  projectEnforcement, projectRun, projectRuns, queryParam,
-} from '../src/web.js'
-import type { AutopilotWebRoute, RouteResponse, WebServerScope } from '../src/web.js'
+import { LEDGER_ROUTE, LEGACY_RUN_ROUTE, LEGACY_RUNS_ROUTE } from '../src/domain/ledger-types.js'
+import type { LedgerProjection, LegacyRunProjection, LegacyRunSummary } from '../src/domain/ledger-types.js'
 import type { AutopilotReadOnly } from '../src/service.js'
-import { makeHarness, makeTriage } from './helpers.js'
+import { emptyLedger } from '../src/store/ledger.js'
+import { installAutopilotRoutes, makeAutopilotRoutes, projectLedger, queryParam } from '../src/web.js'
+import type { AutopilotWebRoute, RouteResponse, WebServerScope } from '../src/web.js'
 
-/** Capture one handler's response. */
-interface Captured {
-  status: number
-  body: unknown
-  raw: string
-  headers: Record<string, string>
+const T0 = '2026-11-04T00:00:00.000Z'
+
+function summary(runId: string, sessionId: string | undefined, over: Partial<LegacyRunSummary> = {}): LegacyRunSummary {
+  return { runId, ...(sessionId === undefined ? {} : { sessionId }), backend: 'file', fold: 'ok', eventCount: 2, sandboxRestore: { state: 'pending' }, ...over }
 }
 
-function call(route: AutopilotWebRoute, url: string, method = 'GET'): Captured {
-  const out: Captured = { status: 0, body: undefined, raw: '', headers: {} }
-  const res: RouteResponse = {
-    writeHead(status, headers) { out.status = status; out.headers = headers },
-    end(body) { out.raw = body ?? ''; out.body = body === undefined ? undefined : JSON.parse(body) },
+const RUN = { runId: 'r1', phase: 'completed', archived: true, sandboxRestore: { state: 'not-clamped' } } as unknown as LegacyRunProjection
+
+/** A stub service; the web layer must work from this alone. */
+function stubService(over: Partial<AutopilotReadOnly> = {}): AutopilotReadOnly {
+  const ledger = { ...emptyLedger('s1', T0), revision: 3, legacyRestores: { r1: { state: 'restored' as const, mode: 'workspace-write' } } }
+  const runs = [summary('r1', 's1'), summary('r2', 's2')]
+  return {
+    ledger: async (id) => (id === 's1' ? projectLedger(ledger, runs, ['note']) : undefined),
+    ledgers: async () => [],
+    legacyRuns: async () => runs,
+    legacyRun: async (id) => (id === 'r1' ? RUN : undefined),
+    notes: () => ['note'],
+    storeKind: 'file',
+    ...over,
   }
-  route.handler({ method, url }, res)
-  return out
 }
 
-/** Like `call`, but keeps the raw body (the fence answers plain text, not JSON). */
-function callRaw(route: AutopilotWebRoute, url: string, method = 'GET'): { status: number; raw: string } {
-  const out = { status: 0, raw: '' }
-  const res: RouteResponse = {
-    writeHead(status) { out.status = status },
-    end(body) { out.raw = body ?? '' },
-  }
-  route.handler({ method, url }, res)
-  return out
-}
+interface Captured { status: number; body: unknown; raw: string; headers: Record<string, string> }
 
-function routesOf(service: AutopilotReadOnly): { runs: AutopilotWebRoute; run: AutopilotWebRoute } {
-  const routes = makeAutopilotRoutes(service)
-  const runs = routes.find(r => r.path === `${AUTOPILOT_API_PREFIX}/runs`)!
-  const run = routes.find(r => r.path === `${AUTOPILOT_API_PREFIX}/run`)!
-  return { runs, run }
-}
-
-/**
- * AC1. The GET path must answer with the revision the MEDIUM holds, not with
- * the first revision this process happened to fold.
- *
- * WHY THIS SHAPE. The defect is invisible to any test that uses one engine:
- * the engine that wrote the run has the newest snapshot in its own memo by
- * construction. It only appears when something ELSE advances the run — which
- * is the real deployment (a headless process drives the run; the web process
- * serves it). A second `RunStore` over the same root is exactly that other
- * writer, reduced to its essentials.
- *
- * MUTATION CONTROL (watched, 2026-08-27): reverting `createAutopilotService`
- * to `engine.peek` — i.e. the memoized `current()` the code shipped with —
- * turns the first two cases red and leaves the rest green.
- */
-describe('AC1 — the read-only path serves the store, not this process’s memo', () => {
-  /** Advance a run from OUTSIDE the engine, the way another dsh process would. */
-  async function advanceOutOfBand(storeDir: string, runId: string, times = 1): Promise<Snapshot> {
-    const foreign = new RunStore(storeDir)
-    let snapshot = foreign.load(runId)
-    if (snapshot === undefined) throw new Error(`no run ${runId} on disk`)
-    for (let i = 0; i < times; i++) {
-      snapshot = { ...snapshot, revision: snapshot.revision + 1, logCount: snapshot.logCount + 1 }
-      await foreign.commit(runId, 'log', snapshot)
+/** Drive a handler and wait for its (asynchronous) response. */
+function call(route: AutopilotWebRoute, url: string, method = 'GET'): Promise<Captured> {
+  return new Promise((resolve) => {
+    const out: Captured = { status: 0, body: undefined, raw: '', headers: {} }
+    const res: RouteResponse = {
+      writeHead(status, headers) { out.status = status; out.headers = headers },
+      end(body) {
+        out.raw = body ?? ''
+        try { out.body = body === undefined ? undefined : JSON.parse(body) } catch { out.body = undefined }
+        resolve(out)
+      },
     }
-    return snapshot
+    route.handler({ method, url }, res)
+  })
+}
+
+function routeAt(service: AutopilotReadOnly, path: string): AutopilotWebRoute {
+  return makeAutopilotRoutes(service).find(r => r.path === path)!
+}
+
+describe('projectLedger', () => {
+  const ledger = {
+    ...emptyLedger('s1', T0),
+    revision: 4,
+    legacyRunIds: ['r4'],
+    legacyRestores: { r1: { state: 'restored' as const, mode: 'read-only', at: T0 } },
   }
+  const runs = [
+    summary('r1', 's1'),
+    summary('r2', 's1', { sandboxRestore: { state: 'not-clamped' } }),
+    summary('r3', 's2'),
+    summary('r4', undefined),
+  ]
 
-  it('returns an out-of-band revision written by a second RunStore', async () => {
-    const h = makeHarness()
-    await h.engine.init(h.root, makeTriage())
-    const service = createAutopilotService(h.engine)
-    const { run } = routesOf(service)
-    const url = `${AUTOPILOT_API_PREFIX}/run?id=${h.root.id}`
-
-    const before = call(run, url)
-    expect(before.status).toBe(200)
-    expect((before.body as { run: { revision: number } }).run.revision).toBe(1)
-
-    await advanceOutOfBand(h.storeDir, h.root.id, 2)
-
-    const after = call(run, url)
-    expect(after.status).toBe(200)
-    const served = (after.body as { run: { revision: number; logCount: number } }).run
-    expect(served.revision).toBe(3)
-    expect(served.logCount).toBe(2)
+  it('keeps this session’s runs (by session id or recorded id) and drops the rest', () => {
+    expect(projectLedger(ledger, runs, []).legacyRuns.map(r => r.runId)).toEqual(['r1', 'r2', 'r4'])
   })
 
-  it('the /runs list is fresh too, not only the single-run route', async () => {
-    const h = makeHarness()
-    await h.engine.init(h.root, makeTriage())
-    const service = createAutopilotService(h.engine)
-    const { runs } = routesOf(service)
-    await advanceOutOfBand(h.storeDir, h.root.id)
-    const body = call(runs, `${AUTOPILOT_API_PREFIX}/runs`).body as { runs: Array<{ revision: number }> }
-    expect(body.runs).toHaveLength(1)
-    expect(body.runs[0]?.revision).toBe(2)
+  it('overlays the ledger’s recorded restore, and leaves runs without a record as the reader summarized them', () => {
+    const projected = projectLedger(ledger, runs, [])
+    expect(projected.legacyRuns.find(r => r.runId === 'r1')?.sandboxRestore).toEqual({ state: 'restored', mode: 'read-only', at: T0 })
+    expect(projected.legacyRuns.find(r => r.runId === 'r2')?.sandboxRestore).toEqual({ state: 'not-clamped' })
+    expect(projected.legacyRuns.find(r => r.runId === 'r4')?.sandboxRestore).toEqual({ state: 'pending' })
   })
 
-  it('the WRITE path is deliberately NOT revalidated — single-writer semantics stand', async () => {
-    // `engine.peek` is what every mutating path reads inside `transact` before
-    // validating a transition. If it imported another process's writes
-    // mid-transaction, a single-writer design would become a lost-update race.
-    // So the asymmetry below is the design, asserted rather than assumed.
-    const h = makeHarness()
-    await h.engine.init(h.root, makeTriage())
-    await advanceOutOfBand(h.storeDir, h.root.id)
-    expect(h.engine.peek(h.root.id)?.revision).toBe(1)
-    expect(h.engine.peekFresh(h.root.id)?.revision).toBe(2)
+  it('carries the ledger fields, notes and updatedAt, and omits absent optionals', () => {
+    const projected = projectLedger(ledger, [], ['n1', 'n2'])
+    expect(projected).toEqual({
+      v: 3, sessionId: 's1', revision: 4, previousGoals: [], delegations: [], reviews: [], links: [],
+      autoContinue: { available: false, code: 'not-yet-observed', reason: 'not yet observed' },
+      depth: { executorLead: 2, source: 'plugin-default' },
+      legacyRuns: [], notes: ['n1', 'n2'], updatedAt: T0,
+    })
+    expect('goal' in projected).toBe(false)
+    expect('hostRestart' in projected).toBe(false)
+    // The raw ledger's own bookkeeping does not ride along.
+    expect('legacyRestores' in projected).toBe(false)
+    expect('legacyRunIds' in projected).toBe(false)
   })
 
-  it('reloads on the PUBLISHED revision, so a half-written stream is never served', async () => {
-    // `RunStore.commit` appends the canonical event FIRST and renames the
-    // projection SECOND, and `currentRevision` reads the projection. So the
-    // freshness signal fires only after the writer has published — which is
-    // what lets a reader reload with no lock. Here the event is appended but
-    // the projection is held back, i.e. the writer's crash window: the reader
-    // must keep serving the last published revision rather than a stream it
-    // was never told was complete.
-    const h = makeHarness()
-    await h.engine.init(h.root, makeTriage())
-    const service = createAutopilotService(h.engine)
-    const { run } = routesOf(service)
-    const url = `${AUTOPILOT_API_PREFIX}/run?id=${h.root.id}`
-    call(run, url)
-
-    const dir = h.engine.runDirOf(h.root.id)
-    const published = readFileSync(join(dir, 'snapshot.json'), 'utf8')
-    await advanceOutOfBand(h.storeDir, h.root.id)
-    writeFileSync(join(dir, 'snapshot.json'), published, 'utf8') // un-publish
-
-    expect((call(run, url).body as { run: { revision: number } }).run.revision).toBe(1)
-
-    // Control: republish, and the very same reader moves. Without this the
-    // assertion above would also pass on a reader that never refreshes at all.
-    const foreign = new RunStore(h.storeDir)
-    const current = foreign.load(h.root.id)!
-    writeFileSync(join(dir, 'snapshot.json'), JSON.stringify(current, null, 2), 'utf8')
-    expect((call(run, url).body as { run: { revision: number } }).run.revision).toBe(2)
+  it('does not mutate its inputs', () => {
+    const before = JSON.stringify([ledger, runs])
+    projectLedger(ledger, runs, ['x'])
+    expect(JSON.stringify([ledger, runs])).toBe(before)
   })
 })
 
-describe('the no-run case is a normal answer, not an error', () => {
-  it('serves an empty list plus the observed store kind', () => {
-    const service = createAutopilotService(makeHarness().engine)
-    expect(projectRuns(service)).toEqual({ ok: true, storeKind: 'file', runs: [] })
-    const { runs } = routesOf(service)
-    const answer = call(runs, `${AUTOPILOT_API_PREFIX}/runs`)
-    expect(answer.status).toBe(200)
-    expect(answer.body).toEqual({ ok: true, storeKind: 'file', runs: [] })
+describe('GET ledger', () => {
+  it('serves the projection with the legacy overlay for a known session', async () => {
+    const out = await call(routeAt(stubService(), LEDGER_ROUTE), `${LEDGER_ROUTE}?session=s1`)
+    expect(out.status).toBe(200)
+    expect(out.headers['content-type']).toBe('application/json; charset=utf-8')
+    const ledger = (out.body as { ok: true; ledger: LedgerProjection }).ledger
+    expect(ledger.sessionId).toBe('s1')
+    expect(ledger.revision).toBe(3)
+    expect(ledger.legacyRuns.map(r => [r.runId, r.sandboxRestore.state])).toEqual([['r1', 'restored']])
+    expect(ledger.notes).toEqual(['note'])
   })
 
-  it('answers 404 for an id with no run, and 400 for no id at all', () => {
-    const { run } = routesOf(createAutopilotService(makeHarness().engine))
-    expect(call(run, `${AUTOPILOT_API_PREFIX}/run?id=nope`)).toMatchObject({
-      status: 404, body: { ok: false, error: 'no-run' },
-    })
-    expect(call(run, `${AUTOPILOT_API_PREFIX}/run`)).toMatchObject({
-      status: 400, body: { ok: false, error: 'missing-id' },
-    })
-    expect(call(run, `${AUTOPILOT_API_PREFIX}/run?id=`)).toMatchObject({ status: 400 })
+  it('answers 400 missing-session without a session parameter, 404 no-ledger for an unknown one', async () => {
+    const route = routeAt(stubService(), LEDGER_ROUTE)
+    expect(await call(route, LEDGER_ROUTE)).toMatchObject({ status: 400, body: { ok: false, error: 'missing-session' } })
+    expect(await call(route, `${LEDGER_ROUTE}?session=`)).toMatchObject({ status: 400, body: { ok: false, error: 'missing-session' } })
+    expect(await call(route, `${LEDGER_ROUTE}?session=nope`)).toMatchObject({ status: 404, body: { ok: false, error: 'no-ledger' } })
   })
 
-  it('skips a run id list() reports but status() cannot project', () => {
-    // The half-filled row is the failure this guard prevents; a stub is the
-    // only way to reach it, because a live engine never produces the shape.
-    const service: AutopilotReadOnly = {
-      peek: () => undefined,
-      status: () => undefined,
-      list: () => ['ghost-run'],
-      storeKind: 'domain',
-    }
-    expect(projectRuns(service)).toEqual({ ok: true, storeKind: 'domain', runs: [] })
+  it('decodes the session id', async () => {
+    let seen: string | undefined
+    const route = routeAt(stubService({ ledger: async (id) => { seen = id; return undefined } }), LEDGER_ROUTE)
+    await call(route, `${LEDGER_ROUTE}?session=a%2Fb%3A1`)
+    expect(seen).toBe('a/b:1')
   })
 })
 
-describe('the projection is read-only and GET-only', () => {
-  it('answers 405 on any other method rather than treating it as a read', () => {
-    const { runs, run } = routesOf(createAutopilotService(makeHarness().engine))
-    for (const method of ['POST', 'PUT', 'DELETE', 'PATCH']) {
-      expect(call(runs, `${AUTOPILOT_API_PREFIX}/runs`, method).status).toBe(405)
-      expect(call(run, `${AUTOPILOT_API_PREFIX}/run?id=x`, method).status).toBe(405)
+describe('GET legacy runs', () => {
+  it('lists every legacy run, not only one session’s', async () => {
+    const out = await call(routeAt(stubService(), LEGACY_RUNS_ROUTE), LEGACY_RUNS_ROUTE)
+    expect(out.status).toBe(200)
+    expect((out.body as { runs: LegacyRunSummary[] }).runs.map(r => r.runId)).toEqual(['r1', 'r2'])
+    expect((out.body as { ok: boolean }).ok).toBe(true)
+  })
+
+  it('serves an empty list when there are no legacy runs', async () => {
+    const out = await call(routeAt(stubService({ legacyRuns: async () => [] }), LEGACY_RUNS_ROUTE), LEGACY_RUNS_ROUTE)
+    expect(out).toMatchObject({ status: 200, body: { ok: true, runs: [] } })
+  })
+})
+
+describe('GET legacy run', () => {
+  it('serves one run, 400 missing-id without an id, 404 no-run for an unknown one', async () => {
+    const route = routeAt(stubService(), LEGACY_RUN_ROUTE)
+    expect(await call(route, `${LEGACY_RUN_ROUTE}?id=r1`)).toMatchObject({ status: 200, body: { ok: true, run: { runId: 'r1', archived: true } } })
+    expect(await call(route, LEGACY_RUN_ROUTE)).toMatchObject({ status: 400, body: { ok: false, error: 'missing-id' } })
+    expect(await call(route, `${LEGACY_RUN_ROUTE}?id=zzz`)).toMatchObject({ status: 404, body: { ok: false, error: 'no-run' } })
+  })
+})
+
+describe('every route is read-only and never leaks store text', () => {
+  const paths = [LEDGER_ROUTE, LEGACY_RUNS_ROUTE, LEGACY_RUN_ROUTE]
+
+  it('answers 405 on any method other than GET', async () => {
+    for (const path of paths) {
+      for (const method of ['POST', 'PUT', 'DELETE', 'PATCH']) {
+        expect(await call(routeAt(stubService(), path), `${path}?session=s1&id=r1`, method)).toMatchObject({
+          status: 405, body: { ok: false, error: 'method-not-allowed' },
+        })
+      }
     }
   })
 
-  it('declares JSON with an explicit charset', () => {
-    const { runs } = routesOf(createAutopilotService(makeHarness().engine))
-    expect(call(runs, `${AUTOPILOT_API_PREFIX}/runs`).headers['content-type'])
-      .toBe('application/json; charset=utf-8')
+  it('answers 500 internal with a code only, when the service throws', async () => {
+    const boom = (): never => { throw new Error('ENOENT /home/secret/.dsh/ledgers/x.json') }
+    const service = stubService({
+      ledger: async () => boom(),
+      legacyRuns: async () => boom(),
+      legacyRun: async () => boom(),
+    })
+    for (const path of paths) {
+      const out = await call(routeAt(service, path), `${path}?session=s1&id=r1`)
+      expect(out.status).toBe(500)
+      expect(out.body).toEqual({ ok: false, error: 'internal' })
+      expect(out.raw).not.toContain('secret')
+    }
   })
 
-  it('reads the id parameter, URL-decoded, first occurrence winning', () => {
-    expect(queryParam('/x?id=a%2Fb', 'id')).toBe('a/b')
-    expect(queryParam('/x?other=1&id=first&id=second', 'id')).toBe('first')
+  it('reads query parameters URL-decoded, first occurrence winning', () => {
+    expect(queryParam('/x?id=a%2Fb&id=c', 'id')).toBe('a/b')
     expect(queryParam('/x', 'id')).toBeUndefined()
     expect(queryParam('/x?id=%E0%A4%A', 'id')).toBeUndefined()
   })
 })
 
-describe('a LIVE run projects to exactly the allow-listed fields', () => {
-  it('serves phase, gates and counts — and nothing the snapshot holds privately', async () => {
-    const h = makeHarness()
-    const service = createAutopilotService(h.engine)
-    await h.engine.init(h.root, makeTriage({ objective: 'expose run state to the web UI' }))
-    await h.engine.submitPlan(h.root, 'PLAN-BODY-SECRET: rewrite the widget')
-
-    const body = projectRuns(service)
-    expect(body.runs).toHaveLength(1)
-    const run = body.runs[0]!
-    expect(run.runId).toBe(h.root.id)
-    expect(run.phase).toBe('planning')
-    expect(run.planGate).toBe('pending')
-    expect(run.planRevision).toBe(1)
-    expect(run.objective).toBe('expose run state to the web UI')
-
-    // The plan text IS in the snapshot the service can reach…
-    expect(service.peek(h.root.id)?.plan.text).toContain('PLAN-BODY-SECRET')
-    // …and is nowhere in what the route serves.
-    expect(JSON.stringify(body)).not.toContain('PLAN-BODY-SECRET')
-
-    // The served key set is closed. A field added to StatusView cannot appear
-    // here without someone naming it in projectRun.
-    expect(Object.keys(run).sort()).toEqual([
-      'auditCount', 'auditMode', 'closeoutSubmitted', 'enforcement', 'executionGate',
-      'executionMode', 'gateSources', 'latestVerdicts', 'logCount', 'objective', 'phase',
-      'planGate', 'planRevision', 'replanBudgetRemaining', 'requiredRoles', 'revision',
-      'risk', 'routing', 'runId', 'size',
-    ])
-    // …and the field is the engine's own projection, not a second opinion: this
-    // run has recorded no gate decision yet, and the route says exactly that.
-    expect(run.gateSources).toEqual({
-      plan: { source: 'pending', planRevision: 1 },
-      execution: { source: 'pending', planRevision: 1 },
-    })
-  })
-
-  it('forwards the routing status when the run routes (M12): mode, policy state, and per-role class', async () => {
-    const h = makeHarness({ config: { routing: { mode: 'auto', ladder: { tiers: { economy: ['alpha/m-a'] } } } } })
-    const service = createAutopilotService(h.engine)
-    await h.engine.init(h.root, makeTriage())
-
-    const served = projectRuns(service)
-    expect(served.runs).toHaveLength(1)
-    const routing = served.runs[0]?.routing
-    expect(routing?.mode).toBe('auto')
-    // The HTTP path has no session to read a policy for: it must say so rather
-    // than claim `absent`, which would be a finding it never observed.
-    expect(routing?.policyState).toBe('unobserved')
-    expect(routing?.dispatch).toBe('unobserved')
-    const roles = routing?.roles as ReadonlyArray<{ role: string; workClass?: { name: string } }>
-    expect(roles.find(entry => entry.role === 'executor')?.workClass?.name).toBe('simple')
-    expect(roles.find(entry => entry.role === 'plan-auditor')?.workClass?.name).toBe('audit')
-    // Through the real route handler, not only the pure projection.
-    const { run: route } = routesOf(service)
-    const answer = call(route, `${AUTOPILOT_API_PREFIX}/run?id=${h.root.id}`)
-    expect(answer.status).toBe(200)
-    const body = answer.body as { run?: { routing?: { mode?: string } } }
-    expect(body.run?.routing?.mode).toBe('auto')
-  })
-
-  it('serves the CANDIDATE-COVERAGE report separately from routing (M13)', async () => {
-    // Two fields, two claims: `routing` is the configuration and the run's own
-    // pins; `routingReachability` is which OBSERVED models a tier-bound work
-    // class can reach. The card labels the second as coverage, and it can only
-    // do that if the route serves it as its own value — a route that folded it
-    // into the routing block would have the card calling coverage a dispatch.
-    //
-    // The catalog port is a STUB on purpose: this file is about what crosses the
-    // HTTP boundary, and a real adapter listing would make it a test of the
-    // provider. The report's own content is asserted by the coverage suites.
-    const catalog = {
-      snapshot: async () => ({
-        catalogStatus: 'live' as const,
-        providers: [],
-        listedModels: [{ provider: 'alpha', id: 'm-a' }, { provider: 'alpha', id: 'm-b' }],
-        providerErrors: new Map<string, string>(),
-      }),
-    }
-    const h = makeHarness({
-      config: { routing: { mode: 'auto', ladder: { tiers: { economy: ['alpha/m-a'], standard: ['alpha/m-b'] } } } },
-      routing: { catalog: catalog as never },
-    })
-    const service = createAutopilotService(h.engine)
-    await h.engine.init(h.root, makeTriage())
-    await h.engine.refreshReachability()
-
-    const served = projectRuns(service)
-    expect(served.runs[0]?.routing?.mode).toBe('auto')
-    const report = served.runs[0]?.routingReachability
-    expect(report?.kind).toBe('work-class-reachability')
-    expect([...(report?.reachable ?? [])].sort()).toEqual(['alpha/m-a', 'alpha/m-b'])
-    expect(report?.unreachable).toEqual([])
-
-    // And through the real route handler, not only the pure projection.
-    const { run: route } = routesOf(service)
-    const answer = call(route, `${AUTOPILOT_API_PREFIX}/run?id=${h.root.id}`)
-    expect(answer.status).toBe(200)
-    const body = answer.body as { run?: { routingReachability?: { kind?: string } } }
-    expect(body.run?.routingReachability?.kind).toBe('work-class-reachability')
-  })
-
-  it('DROPS `diagnostic`, which the engine aliases onto an auditor note', async () => {
-    const h = makeHarness()
-    const service = createAutopilotService(h.engine)
-    await h.engine.init(h.root, makeTriage())
-    await h.engine.submitPlan(h.root, 'the plan')
-    await h.engine.selfCheck(h.root, {
-      role: 'plan', verdict: 'blocked', note: 'AUDITOR-NOTE-LEAK: the plan omits rollback',
-    })
-
-    // The engine really does put the note in `diagnostic` — `applyVerdict`'s
-    // 'blocked' and 'needs-owner-decision' arms both commit
-    // `diagnostic: outcome.note` verbatim (src/engine.ts). This is the
-    // measurement the drop exists for, not an assumption about it.
-    const status = service.status(h.root.id)!
-    expect(status.diagnostic).toContain('AUDITOR-NOTE-LEAK')
-
-    const projected = projectRun(status)
-    expect((projected as unknown as Record<string, unknown>).diagnostic).toBeUndefined()
-    expect(JSON.stringify(projectRuns(service))).not.toContain('AUDITOR-NOTE-LEAK')
-  })
-
-  it('replaces ownerApprovals with counts, keeping the fact and dropping the destination', () => {
-    const projected = projectEnforcement({
-      sandbox: 'active',
-      reminders: 0,
-      store: 'file',
-      approval: 'signal-only',
-      egress: 'guard-deny',
-      service: 'registered',
-      ownerApprovals: [
-        { seq: 0, target: 'EGRESS-TARGET-LEAK: push to git@github.com:acme/private.git', grantedAtRevision: 3, consumedBy: 'git push' },
-        { seq: 1, target: 'EGRESS-TARGET-LEAK: curl https://internal.example', grantedAtRevision: 5 },
-      ],
-    })
-    expect(projected.ownerApprovalsGranted).toBe(2)
-    expect(projected.ownerApprovalsConsumed).toBe(1)
-    expect(projected.sandbox).toBe('active')
-    expect(projected.egress).toBe('guard-deny')
-    expect(JSON.stringify(projected)).not.toContain('EGRESS-TARGET-LEAK')
-    expect(JSON.stringify(projected)).not.toContain('ownerApprovals"')
-  })
-
-  it('forwards only the named enforcement keys, so a new one cannot ride along', () => {
-    const projected = projectEnforcement({
-      sandbox: 'off', reminders: 1, ownerApprovals: [],
-      // A field a future Enforcement might add.
-      futureSecretPath: 'C:/Users/someone/.dsh/storages',
-    } as never)
-    expect(Object.keys(projected).sort()).toEqual([
-      'ownerApprovalsConsumed', 'ownerApprovalsGranted', 'reminders', 'sandbox',
-    ])
-  })
-
-  it('serves one run by id, and the executor summary when there is one', async () => {
-    const h = makeHarness()
-    const service = createAutopilotService(h.engine)
-    await h.engine.init(h.root, makeTriage())
-    const { run } = routesOf(service)
-    const answer = call(run, `${AUTOPILOT_API_PREFIX}/run?id=${encodeURIComponent(h.root.id)}`)
-    expect(answer.status).toBe(200)
-    expect(answer.body).toMatchObject({ ok: true, run: { runId: h.root.id, phase: 'planning' } })
-  })
-
-  it('answers 500 with a stable code, never an exception message, when the engine throws', () => {
-    const service: AutopilotReadOnly = {
-      peek: () => undefined,
-      status: () => { throw new Error('ENOENT C:/Users/someone/.dsh/storages/dsh-autopilot/runs') },
-      list: () => ['x'],
-      storeKind: 'file',
-    }
-    const { runs, run } = routesOf(service)
-    const listAnswer = call(runs, `${AUTOPILOT_API_PREFIX}/runs`)
-    expect(listAnswer).toMatchObject({ status: 500, body: { ok: false, error: 'projection-failed' } })
-    expect(listAnswer.raw).not.toContain('storages')
-    expect(call(run, `${AUTOPILOT_API_PREFIX}/run?id=x`)).toMatchObject({ status: 500 })
-  })
-})
-
 describe('mounting degrades to nothing without a web server', () => {
+  const PATHS = [LEDGER_ROUTE, LEGACY_RUNS_ROUTE, LEGACY_RUN_ROUTE]
+
   it('is a no-op on a context with no ctx.inject at all (headless)', () => {
-    const service = createAutopilotService(makeHarness().engine)
-    const dispose = installAutopilotRoutes({}, service)
-    expect(typeof dispose).toBe('function')
+    const dispose = installAutopilotRoutes({}, stubService())
     expect(() => dispose()).not.toThrow()
   })
 
   it('never registers when the inject callback is not invoked (webServer absent)', () => {
     let injected: readonly string[] | undefined
-    const host = {
-      // cordis's lazy inject: the callback runs only once the service exists.
-      inject: (names: readonly string[]) => { injected = names; return () => {} },
-    }
-    const dispose = installAutopilotRoutes(host, createAutopilotService(makeHarness().engine))
+    const host = { inject: (names: readonly string[]) => { injected = names; return () => {} } }
+    const dispose = installAutopilotRoutes(host, stubService())
     expect(injected).toEqual(['webServer'])
     expect(() => dispose()).not.toThrow()
   })
 
-  it('registers both routes through the scoped effect, and releases them on unload', () => {
+  it('registers all three routes through the scoped effect, and releases them on unload', () => {
     const registered: string[] = []
     const disposed: string[] = []
     let teardown: (() => void) | undefined
     const host = {
-      inject: (
-        _names: readonly string[],
-        callback: (scoped: {
-          webServer: { register(route: AutopilotWebRoute): () => void }
-          effect?: (setup: () => () => void, label?: string) => unknown
-        }) => void,
-      ) => {
+      inject: (_names: readonly string[], callback: (scoped: WebServerScope) => void) => {
         callback({
-          webServer: {
-            register: (route) => {
-              registered.push(route.path)
-              return () => { disposed.push(route.path) }
-            },
-          },
+          webServer: { register: (route) => { registered.push(route.path); return () => { disposed.push(route.path) } } },
           effect: (setup) => { teardown = setup() },
         })
         return () => {}
       },
     }
-    installAutopilotRoutes(host, createAutopilotService(makeHarness().engine))
-    expect(registered).toEqual([`${AUTOPILOT_API_PREFIX}/runs`, `${AUTOPILOT_API_PREFIX}/run`])
+    installAutopilotRoutes(host, stubService())
+    expect(registered).toEqual(PATHS)
     teardown?.()
-    expect(disposed.sort()).toEqual([`${AUTOPILOT_API_PREFIX}/run`, `${AUTOPILOT_API_PREFIX}/runs`])
+    expect(disposed.sort()).toEqual([...PATHS].sort())
   })
 
-  it('fences every registered route through the scoped connection service, looked up per request', () => {
-    // dsh 0.1.2 (A1-08): `webServer.register` applies no auth; the plugin
-    // must ask `connection.requestRejection(req)` itself. The lookup happens
-    // on each request, so a `connection` that appears AFTER mount is honoured.
+  it('fences every registered route through the connection service, looked up per request', async () => {
     const registered: AutopilotWebRoute[] = []
     let rejection: number | undefined = 401
     let present = false
@@ -474,30 +241,49 @@ describe('mounting degrades to nothing without a web server', () => {
         return () => {}
       },
     }
-    installAutopilotRoutes(host, createAutopilotService(makeHarness().engine))
-    const runs = registered.find(r => r.path === `${AUTOPILOT_API_PREFIX}/runs`)!
-    // No connection service yet → fail closed.
-    expect(callRaw(runs, `${AUTOPILOT_API_PREFIX}/runs`)).toEqual({ status: 503, raw: JSON.stringify({ ok: false, error: 'no-connection-service' }) })
+    installAutopilotRoutes(host, stubService())
+    expect(registered.map(r => r.path)).toEqual(PATHS)
+    for (const route of registered) {
+      const url = `${route.path}?session=s1&id=r1`
+      // No connection service yet: fail closed, and the service is never asked.
+      expect(await call(route, url)).toMatchObject({ status: 503, raw: JSON.stringify({ ok: false, error: 'no-connection-service' }) })
+    }
     present = true
-    expect(callRaw(runs, `${AUTOPILOT_API_PREFIX}/runs`)).toEqual({ status: 401, raw: 'unauthorized' })
+    for (const route of registered) expect((await call(route, `${route.path}?session=s1&id=r1`)).status).toBe(401)
     rejection = 403
-    expect(callRaw(runs, `${AUTOPILOT_API_PREFIX}/runs`)).toEqual({ status: 403, raw: 'forbidden' })
+    for (const route of registered) expect((await call(route, `${route.path}?session=s1&id=r1`)).status).toBe(403)
     rejection = undefined
-    expect(callRaw(runs, `${AUTOPILOT_API_PREFIX}/runs`).status).toBe(200)
+    for (const route of registered) expect((await call(route, `${route.path}?session=s1&id=r1`)).status).toBe(200)
+  })
+
+  it('does not reach the service when the fence rejects', async () => {
+    let reads = 0
+    const service = stubService({ legacyRuns: async () => { reads += 1; return [] } })
+    const registered: AutopilotWebRoute[] = []
+    const host = {
+      inject: (_n: readonly string[], callback: (scoped: WebServerScope) => void) => {
+        callback({
+          webServer: { register: (route) => { registered.push(route); return () => {} } },
+          get: () => ({ requestRejection: () => 403 }),
+        })
+        return () => {}
+      },
+    }
+    installAutopilotRoutes(host, service)
+    const runs = registered.find(r => r.path === LEGACY_RUNS_ROUTE)!
+    expect((await call(runs, LEGACY_RUNS_ROUTE)).status).toBe(403)
+    expect(reads).toBe(0)
   })
 
   it('still mounts on a scoped context that exposes no effect', () => {
     const registered: string[] = []
     const host = {
-      inject: (
-        _names: readonly string[],
-        callback: (scoped: { webServer: { register(route: AutopilotWebRoute): () => void } }) => void,
-      ) => {
+      inject: (_n: readonly string[], callback: (scoped: WebServerScope) => void) => {
         callback({ webServer: { register: (route) => { registered.push(route.path); return () => {} } } })
         return undefined
       },
     }
-    installAutopilotRoutes(host, createAutopilotService(makeHarness().engine))
-    expect(registered).toHaveLength(2)
+    installAutopilotRoutes(host, stubService())
+    expect(registered).toHaveLength(3)
   })
 })

@@ -45,6 +45,7 @@
  * injected), no state held between calls.
  */
 
+import { AP_ROUTE_NO_REACHABLE_WORK_CLASS } from '../domain/refusals.js'
 import { errorMessage } from '../domain/types.js'
 import type { Risk } from '../domain/types.js'
 import { catalogRank, providerIsLive } from './catalog.js'
@@ -370,6 +371,12 @@ interface RetainedRouteFields {
   readonly reasoningEffort?: string
   /** True iff the resolved config carried an effort the walk never sent — the F29 defect class. */
   readonly effortMaterialized: boolean
+  /**
+   * MY-25 #1: set only when an EXPLICIT (owner-named) effort was kept and the
+   * resolved config carried a DIFFERENT one. Recorded as an observation; it
+   * never changes the dispatched effort.
+   */
+  readonly preflightEffortObserved?: string
 }
 
 /**
@@ -404,9 +411,20 @@ interface RetainedRouteFields {
  *
  * @param candidate the route the checks authorized (already the trimmed pin).
  * @param unsent the effort the selector itself had to send, if any (`effortFor`).
+ * MY-25 #1: when `explicitEffort` is given (the owner's lock named it), it
+ * WINS over any effort the resolved config carries; a differing carried value
+ * is reported as `preflightEffortObserved` only. A catalog-declared default
+ * (`unsent` without `explicitEffort`) keeps the F29 behavior above.
+ *
  * @param resolved the retained successful `resolveCallConfig` result, if the walk kept one.
+ * @param explicitEffort the effort an owner lock named, if any (a subset of `unsent`).
  */
-function retainedRouteFields(candidate: RoutePin, unsent: string | undefined, resolved: LlmCallConfig | undefined): RetainedRouteFields {
+function retainedRouteFields(
+  candidate: RoutePin,
+  unsent: string | undefined,
+  resolved: LlmCallConfig | undefined,
+  explicitEffort?: string,
+): RetainedRouteFields {
   const resolvedPin = resolved === undefined ? undefined : toRoutePin(resolved)
   if (resolvedPin === undefined || !sameRoute(resolvedPin, candidate)) {
     return {
@@ -418,12 +436,13 @@ function retainedRouteFields(candidate: RoutePin, unsent: string | undefined, re
   }
   const carried = resolved?.reasoningEffort
   const effort = typeof carried === 'string' && carried.trim().length > 0 ? carried : undefined
-  const effective = effort ?? unsent
+  const effective = explicitEffort ?? effort ?? unsent
   return {
     provider: resolvedPin.provider,
     model: resolvedPin.model,
     ...(effective !== undefined ? { reasoningEffort: effective } : {}),
     effortMaterialized: effort !== undefined && unsent === undefined,
+    ...(explicitEffort !== undefined && effort !== undefined && effort !== explicitEffort ? { preflightEffortObserved: effort } : {}),
   }
 }
 
@@ -536,7 +555,12 @@ async function selectLocked(input: RouteSelectionInput): Promise<SelectionDecisi
   let resolved: LlmCallConfig | undefined
   try {
     resolved = await input.catalog.preflight(config)
-    const retained = retainedRouteFields(pin, effort, resolved)
+    const retained = retainedRouteFields(pin, effort, resolved, input.roleRouting.reasoningEffort)
+    if (retained.preflightEffortObserved !== undefined) {
+      why.push(
+        `effort: preflight carried "${retained.preflightEffortObserved}" but the role lock named "${retained.reasoningEffort}" — the owner's explicit effort stands; the preflight value is recorded as an observation only`,
+      )
+    }
     if (retained.effortMaterialized) {
       why.push(
         `effort: "${retained.reasoningEffort}" materialized by the adapter at preflight — ` +
@@ -734,7 +758,7 @@ async function selectAutoRanked(
         return {
           kind: 'blocked',
           reason:
-            `AP_ROUTE_NO_REACHABLE_WORK_CLASS: work class "${workClass.name}" maps to ladder tier(s) ${workClass.tiers.join(' + ')}` +
+            `${AP_ROUTE_NO_REACHABLE_WORK_CLASS}: work class "${workClass.name}" maps to ladder tier(s) ${workClass.tiers.join(' + ')}` +
             (workClass.tierOverride !== undefined ? ` (the owner's routing.ladder.auditTier override)` : '') +
             (workClass.members.length === 0
               ? ', but those tiers declare no members'

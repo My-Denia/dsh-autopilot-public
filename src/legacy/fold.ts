@@ -58,19 +58,19 @@ function fail(message: string, code: string): never {
 function assertStartExecutor(prior: Snapshot, next: Snapshot): void {
   const prev = prior.executor
   const folded = next.executor
-  if (folded === undefined) fail('start-executor must carry an executor', 'AP_EXECUTOR_OP')
+  if (folded === undefined) fail('start-executor must carry an executor', 'LEGACY_EXECUTOR_OP')
   if (prev === undefined || prev.state === 'completed' || prev.state === 'revoked') {
-    if (folded.executionRevision !== 1) fail('start-executor executionRevision must be 1', 'AP_EXECUTOR_REVISION')
-    if (folded.state !== 'starting') fail('start-executor from a predecessor must land in starting', 'AP_EXECUTOR_REVISION')
+    if (folded.executionRevision !== 1) fail('start-executor executionRevision must be 1', 'LEGACY_EXECUTOR_REVISION')
+    if (folded.state !== 'starting') fail('start-executor from a predecessor must land in starting', 'LEGACY_EXECUTOR_REVISION')
     const expectedGen = prev === undefined ? 1 : prev.generation + 1
     if (folded.generation !== expectedGen) {
       fail(
         `start-executor generation ${String(folded.generation)} is not ${String(expectedGen)}`,
-        'AP_EXECUTOR_REVISION',
+        'LEGACY_EXECUTOR_REVISION',
       )
     }
     if (prev !== undefined && folded.childId === prev.childId) {
-      fail('start-executor must not reuse a predecessor childId', 'AP_EXECUTOR_REVISION')
+      fail('start-executor must not reuse a predecessor childId', 'LEGACY_EXECUTOR_REVISION')
     }
     return
   }
@@ -82,15 +82,15 @@ function assertStartExecutor(prior: Snapshot, next: Snapshot): void {
     ) {
       fail(
         'start-executor starting transition must keep child identity and executionRevision',
-        'AP_EXECUTOR_REVISION',
+        'LEGACY_EXECUTOR_REVISION',
       )
     }
     if (folded.state !== 'running' && folded.state !== 'revoked') {
-      fail(`start-executor from starting landed in ${folded.state}`, 'AP_EXECUTOR_REVISION')
+      fail(`start-executor from starting landed in ${folded.state}`, 'LEGACY_EXECUTOR_REVISION')
     }
     return
   }
-  fail(`start-executor cannot replace a live executor in state ${prev.state}`, 'AP_EXECUTOR_EXISTS')
+  fail(`start-executor cannot replace a live executor in state ${prev.state}`, 'LEGACY_EXECUTOR_EXISTS')
 }
 
 function assertExecutorLifecycle(prior: Snapshot, next: Snapshot, op: Operation): void {
@@ -98,7 +98,7 @@ function assertExecutorLifecycle(prior: Snapshot, next: Snapshot, op: Operation)
   const folded = next.executor
   if (prev === undefined && folded === undefined) return
   if (prev === undefined || folded === undefined) {
-    fail('executor appeared or disappeared', 'AP_EXECUTOR_MUTATED')
+    fail('executor appeared or disappeared', 'LEGACY_EXECUTOR_MUTATED')
   }
   if (
     folded.childId !== prev.childId
@@ -106,25 +106,25 @@ function assertExecutorLifecycle(prior: Snapshot, next: Snapshot, op: Operation)
     || folded.executionRevision !== prev.executionRevision
     || JSON.stringify(folded.route) !== JSON.stringify(prev.route)
   ) {
-    fail('executor identity mutated', 'AP_EXECUTOR_MUTATED')
+    fail('executor identity mutated', 'LEGACY_EXECUTOR_MUTATED')
   }
   if (folded.state !== prev.state) {
     if (prev.state === 'completed' || prev.state === 'revoked') {
       fail(
         `executor state ${prev.state} is terminal and must not change to ${folded.state}`,
-        'AP_EXECUTOR_MUTATED',
+        'LEGACY_EXECUTOR_MUTATED',
       )
     }
     if (folded.state !== 'completed' && folded.state !== 'revoked') {
       fail(
         `executor state ${prev.state} -> ${folded.state} is not a lifecycle terminal`,
-        'AP_EXECUTOR_MUTATED',
+        'LEGACY_EXECUTOR_MUTATED',
       )
     }
     if (op === 'replan' && folded.state !== 'revoked') {
       fail(
         `replan cannot move executor ${prev.state} to ${folded.state}`,
-        'AP_EXECUTOR_MUTATED',
+        'LEGACY_EXECUTOR_MUTATED',
       )
     }
     if (
@@ -136,7 +136,7 @@ function assertExecutorLifecycle(prior: Snapshot, next: Snapshot, op: Operation)
       if (latest === undefined || latest.role !== 'execution' || latest.verdict !== 'pass') {
         fail(
           `executor completed without an execution-pass ${op}`,
-          'AP_EXECUTOR_MUTATED',
+          'LEGACY_EXECUTOR_MUTATED',
         )
       }
     }
@@ -299,7 +299,7 @@ function routingDecisionOf(op: Operation, detail: unknown): RoutingDecisionDetai
   const where = `${op} detail.routing`
   const problems: string[] = []
   if (routing === null || typeof routing !== 'object' || Array.isArray(routing)) {
-    fail(`${where} must be an object, got ${typeof routing}`, 'AP_ROUTING_DETAIL')
+    fail(`${where} must be an object, got ${typeof routing}`, 'LEGACY_ROUTING_DETAIL')
   }
   const record = routing as Record<string, unknown>
   const known: readonly string[] = ['role', 'pin', 'why', 'authorizationSource', 'fallbackFrom', 'repinFrom', 'candidates', 'costMatch']
@@ -534,7 +534,7 @@ function routingDecisionOf(op: Operation, detail: unknown): RoutingDecisionDetai
     problems.push(`${where}.costMatch must be one of ${ROUTING_COST_MATCHES.join('|')}, got ${JSON.stringify(costMatch)}`)
   }
   if (problems.length > 0) {
-    fail(`${where} is malformed: ${problems.join('; ')}`, 'AP_ROUTING_DETAIL')
+    fail(`${where} is malformed: ${problems.join('; ')}`, 'LEGACY_ROUTING_DETAIL')
   }
   return record as unknown as RoutingDecisionDetail
 }
@@ -605,7 +605,7 @@ function bindRoutingDetailToRecords(
     if (routing.pin !== undefined && route.selected !== undefined && sameRoutePin(routing.pin, route.selected)) return
     fail(
       `${op} detail.routing pins role "${routing.role}" to ${JSON.stringify(routing.pin)} but the appended ${label}'s route record carries selected ${JSON.stringify(route.selected)} — the decision and the record it stamps must name the same route, present on both or neither`,
-      'AP_ROUTING_RECORD_MISMATCH',
+      'LEGACY_ROUTING_RECORD_MISMATCH',
     )
   }
   if (op === 'audit') {
@@ -616,7 +616,7 @@ function bindRoutingDetailToRecords(
       if (expectedRole === undefined || expectedRole !== record.role) {
         fail(
           `audit detail.routing names role "${routing.role}" but appended audit record ${i} has role "${record.role}" — one dispatch, one role: the decision must bind the record it appends`,
-          'AP_ROUTING_RECORD_MISMATCH',
+          'LEGACY_ROUTING_RECORD_MISMATCH',
         )
       }
       pinEqualsSelected(`audit record ${i}`, record.route)
@@ -810,33 +810,33 @@ export function applyGateLedger(
 
 /** Assert one event is a legal successor of the prior snapshot; returns the new snapshot. */
 export function applyEvent(prior: Snapshot | undefined, event: RunEvent): Snapshot {
-  if (event.v !== 1) fail(`unsupported event version ${String((event as { v: unknown }).v)}`, 'AP_EVENT_VERSION')
+  if (event.v !== 1) fail(`unsupported event version ${String((event as { v: unknown }).v)}`, 'LEGACY_EVENT_VERSION')
   const next = event.snapshot
 
   if (prior === undefined) {
-    if (event.op !== 'init') fail(`first event must be init, got ${event.op}`, 'AP_FIRST_NOT_INIT')
-    if (event.revision !== 1 || next.revision !== 1) fail('init revision must be 1', 'AP_INIT_REVISION')
-    if (next.phase !== 'planning') fail(`init phase must be planning, got ${next.phase}`, 'AP_INIT_PHASE')
-    if (next.planGate !== 'pending' || next.executionGate !== 'pending') fail('init gates must be pending', 'AP_INIT_GATES')
-    if (next.audits.length !== 0) fail('init audits must be empty', 'AP_INIT_AUDITS')
-    if (next.executor !== undefined) fail('init executor must be absent', 'AP_INIT_EXECUTOR')
+    if (event.op !== 'init') fail(`first event must be init, got ${event.op}`, 'LEGACY_FIRST_NOT_INIT')
+    if (event.revision !== 1 || next.revision !== 1) fail('init revision must be 1', 'LEGACY_INIT_REVISION')
+    if (next.phase !== 'planning') fail(`init phase must be planning, got ${next.phase}`, 'LEGACY_INIT_PHASE')
+    if (next.planGate !== 'pending' || next.executionGate !== 'pending') fail('init gates must be pending', 'LEGACY_INIT_GATES')
+    if (next.audits.length !== 0) fail('init audits must be empty', 'LEGACY_INIT_AUDITS')
+    if (next.executor !== undefined) fail('init executor must be absent', 'LEGACY_INIT_EXECUTOR')
     if (next.routingPins !== undefined) {
-      fail('init routingPins must be absent — pins derive from dispatch detail.routing only', 'AP_INIT_ROUTING_PINS')
+      fail('init routingPins must be absent — pins derive from dispatch detail.routing only', 'LEGACY_INIT_ROUTING_PINS')
     }
     // Gate provenance (DESIGN §9 item 8) is presence-gated the same way: a
     // legacy init carries none and reads `no-source` forever; an init that
     // carries it must carry exactly the pending reading of both gates (a
     // decision cannot predate the run).
     if (next.gateSources !== undefined && !sameGateSources(next.gateSources, pendingGateSources(next))) {
-      fail('init gateSources must be exactly the pending reading of both gates, or absent on a legacy stream', 'AP_GATE_SOURCE_INVALID')
+      fail('init gateSources must be exactly the pending reading of both gates, or absent on a legacy stream', 'LEGACY_GATE_SOURCE_INVALID')
     }
     if (next.executorDispatches !== undefined) {
-      fail('init must not carry executorDispatches — the first start-executor writes it', 'AP_EXECUTOR_DISPATCH_COUNT')
+      fail('init must not carry executorDispatches — the first start-executor writes it', 'LEGACY_EXECUTOR_DISPATCH_COUNT')
     }
     if (next.bearerBase !== undefined) {
-      if (next.bearerBase.length === 0) fail('init bearerBase must not be empty when present', 'AP_BEARER_BASE_EMPTY')
+      if (next.bearerBase.length === 0) fail('init bearerBase must not be empty when present', 'LEGACY_BEARER_BASE_EMPTY')
       if (!isAbsoluteShapedBearer(next.bearerBase)) {
-        fail('init bearerBase must be absolute-shaped when present', 'AP_BEARER_BASE_RELATIVE')
+        fail('init bearerBase must be absolute-shaped when present', 'LEGACY_BEARER_BASE_RELATIVE')
       }
     }
     // Carryover shape (presence-gated): whether the predecessor run really
@@ -846,29 +846,29 @@ export function applyEvent(prior: Snapshot | undefined, event: RunEvent): Snapsh
     if (next.triage.carryover !== undefined) {
       const carry = next.triage.carryover as { fromRunId?: unknown; note?: unknown; inherits?: unknown }
       if (typeof carry.fromRunId !== 'string' || carry.fromRunId.trim().length === 0) {
-        fail('init carryover.fromRunId must be a non-empty string when present', 'AP_CARRYOVER_INVALID')
+        fail('init carryover.fromRunId must be a non-empty string when present', 'LEGACY_CARRYOVER_INVALID')
       }
       if (typeof carry.note !== 'string' || carry.note.trim().length === 0) {
-        fail('init carryover.note must be a non-empty string when present', 'AP_CARRYOVER_INVALID')
+        fail('init carryover.note must be a non-empty string when present', 'LEGACY_CARRYOVER_INVALID')
       }
       if (!Array.isArray(carry.inherits) || carry.inherits.length < 1
         || carry.inherits.some((item: unknown) => typeof item !== 'string' || (item as string).trim().length === 0)) {
-        fail('init carryover.inherits must be a non-empty array of non-empty strings when present', 'AP_CARRYOVER_INVALID')
+        fail('init carryover.inherits must be a non-empty array of non-empty strings when present', 'LEGACY_CARRYOVER_INVALID')
       }
     }
     return next
   }
 
-  if (event.op === 'init') fail('run is already initialized', 'AP_ALREADY_INITIALIZED')
-  if (TERMINAL_PHASES.includes(prior.phase)) fail(`no events after terminal phase ${prior.phase}`, 'AP_AFTER_TERMINAL')
+  if (event.op === 'init') fail('run is already initialized', 'LEGACY_ALREADY_INITIALIZED')
+  if (TERMINAL_PHASES.includes(prior.phase)) fail(`no events after terminal phase ${prior.phase}`, 'LEGACY_AFTER_TERMINAL')
   if (event.revision !== prior.revision + 1 || next.revision !== event.revision) {
-    fail(`non-monotonic revision: prior ${prior.revision}, event ${event.revision}, snapshot ${next.revision}`, 'AP_REVISION')
+    fail(`non-monotonic revision: prior ${prior.revision}, event ${event.revision}, snapshot ${next.revision}`, 'LEGACY_REVISION')
   }
-  if (next.runId !== prior.runId) fail('runId changed mid-stream', 'AP_RUN_ID')
-  if (JSON.stringify(next.triage) !== JSON.stringify(prior.triage)) fail('triage is immutable after init', 'AP_TRIAGE_MUTATED')
-  if (prior.bearerBase !== next.bearerBase) fail('bearerBase mutated', 'AP_BEARER_BASE_MUTATED')
+  if (next.runId !== prior.runId) fail('runId changed mid-stream', 'LEGACY_RUN_ID')
+  if (JSON.stringify(next.triage) !== JSON.stringify(prior.triage)) fail('triage is immutable after init', 'LEGACY_TRIAGE_MUTATED')
+  if (prior.bearerBase !== next.bearerBase) fail('bearerBase mutated', 'LEGACY_BEARER_BASE_MUTATED')
   if (!LEGAL_OPS[prior.phase].includes(event.op)) {
-    fail(`op ${event.op} is illegal in phase ${prior.phase}`, 'AP_ILLEGAL_OP')
+    fail(`op ${event.op} is illegal in phase ${prior.phase}`, 'LEGACY_ILLEGAL_OP')
   }
 
   // Routing pins derive from dispatch-op `detail.routing` ONLY (plan "Route
@@ -889,21 +889,21 @@ export function applyEvent(prior: Snapshot | undefined, event: RunEvent): Snapsh
         dispatchRouting !== undefined
           ? `routingPins do not match detail.routing for role "${dispatchRouting.role}" (expected ${JSON.stringify(expected)}, got ${JSON.stringify(next.routingPins)})`
           : `routingPins mutated without a routing decision (expected ${JSON.stringify(prior.routingPins)}, got ${JSON.stringify(next.routingPins)})`,
-        'AP_ROUTING_PINS',
+        'LEGACY_ROUTING_PINS',
       )
     }
   } else if (!sameRoutingPins(prior.routingPins, next.routingPins)) {
     fail(
       `routingPins mutated via op ${event.op} (pins derive from audit/start-executor detail.routing only)`,
-      'AP_ROUTING_PINS_MUTATED',
+      'LEGACY_ROUTING_PINS_MUTATED',
     )
   }
 
   // Audit history is append-only.
-  if (next.audits.length < prior.audits.length) fail('audit history shrank', 'AP_AUDITS_SHRANK')
+  if (next.audits.length < prior.audits.length) fail('audit history shrank', 'LEGACY_AUDITS_SHRANK')
   for (let i = 0; i < prior.audits.length; i++) {
     if (JSON.stringify(next.audits[i]) !== JSON.stringify(prior.audits[i])) {
-      fail(`audit record ${i} was modified`, 'AP_AUDITS_MODIFIED')
+      fail(`audit record ${i} was modified`, 'LEGACY_AUDITS_MODIFIED')
     }
   }
 
@@ -933,7 +933,7 @@ export function applyEvent(prior: Snapshot | undefined, event: RunEvent): Snapsh
   if (dispatchesRecorded && next.executorDispatches !== ledger.executorDispatches) {
     fail(
       `executorDispatches must be ${String(ledger.executorDispatches)} (derived from this run's own start-executor ops, and only that op may first write it), got ${String(next.executorDispatches)}`,
-      'AP_EXECUTOR_DISPATCH_COUNT',
+      'LEGACY_EXECUTOR_DISPATCH_COUNT',
     )
   }
   // A WITHDRAWAL IS FINAL FOR ITS GENERATION: nothing but a NEW owner decision
@@ -952,7 +952,7 @@ export function applyEvent(prior: Snapshot | undefined, event: RunEvent): Snapsh
       if ((after.ownerDecision ?? 0) <= (before.ownerDecision ?? 0)) {
         fail(
           `gate [${gate}] carries an owner pass at ordinal ${String(after.ownerDecision ?? 0)} after the owner WITHDREW ordinal ${String(before.ownerDecision ?? 0)} — a withdrawal is an appended record, and no ordinary reset or pass may resurrect it; only a new owner decision with a higher ordinal can`,
-          'AP_OWNER_GATE_RESURRECTED',
+          'LEGACY_OWNER_GATE_RESURRECTED',
         )
       }
     }
@@ -965,17 +965,17 @@ export function applyEvent(prior: Snapshot | undefined, event: RunEvent): Snapsh
   if (event.op === 'owner-gate-pass') {
     const gate = gateTargetOf(event.detail)
     if (gate === undefined) {
-      fail('owner-gate-pass must name the gate it passes (detail.gate plan|execution)', 'AP_OWNER_GATE_INVALID')
+      fail('owner-gate-pass must name the gate it passes (detail.gate plan|execution)', 'LEGACY_OWNER_GATE_INVALID')
     }
     if (gate === 'plan') {
-      if (next.planGate !== 'pass') fail('owner-gate-pass plan must set planGate to pass', 'AP_OWNER_GATE_INVALID')
+      if (next.planGate !== 'pass') fail('owner-gate-pass plan must set planGate to pass', 'LEGACY_OWNER_GATE_INVALID')
       if (next.executionGate !== prior.executionGate) {
-        fail('owner-gate-pass plan must not touch the execution gate — one owner decision, one gate', 'AP_OWNER_GATE_INVALID')
+        fail('owner-gate-pass plan must not touch the execution gate — one owner decision, one gate', 'LEGACY_OWNER_GATE_INVALID')
       }
     } else {
-      if (next.executionGate !== 'pass') fail('owner-gate-pass execution must set executionGate to pass', 'AP_OWNER_GATE_INVALID')
+      if (next.executionGate !== 'pass') fail('owner-gate-pass execution must set executionGate to pass', 'LEGACY_OWNER_GATE_INVALID')
       if (next.planGate !== prior.planGate) {
-        fail('owner-gate-pass execution must not touch the plan gate — one owner decision, one gate', 'AP_OWNER_GATE_INVALID')
+        fail('owner-gate-pass execution must not touch the plan gate — one owner decision, one gate', 'LEGACY_OWNER_GATE_INVALID')
       }
     }
   }
@@ -988,19 +988,19 @@ export function applyEvent(prior: Snapshot | undefined, event: RunEvent): Snapsh
   if (event.op === 'owner-gate-withdraw') {
     const gate = gateTargetOf(event.detail)
     if (gate === undefined) {
-      fail('owner-gate-withdraw must name the gate it withdraws (detail.gate plan|execution)', 'AP_OWNER_GATE_INVALID')
+      fail('owner-gate-withdraw must name the gate it withdraws (detail.gate plan|execution)', 'LEGACY_OWNER_GATE_INVALID')
     }
     const history = prior.gateSources?.[gate]
     if (history === undefined || history.source !== 'owner' || history.withdrawn === true) {
       fail(
         `owner-gate-withdraw ${gate}: no owner pass is in force for this gate (an audit-derived gate is not the owner's to withdraw, and a decision already withdrawn has nothing left to take back)`,
-        'AP_OWNER_GATE_NOT_PASSED',
+        'LEGACY_OWNER_GATE_NOT_PASSED',
       )
     }
     if (history.planRevision !== prior.plan.revision) {
       fail(
         `owner-gate-withdraw ${gate}: the owner's pass belongs to plan revision ${String(history.planRevision ?? 0)} while plan revision ${prior.plan.revision} is current — a superseded pass is already out of force`,
-        'AP_OWNER_GATE_NOT_PASSED',
+        'LEGACY_OWNER_GATE_NOT_PASSED',
       )
     }
     // ONE GATE, the same rule the pass carries: withdrawing one gate must not
@@ -1009,10 +1009,10 @@ export function applyEvent(prior: Snapshot | undefined, event: RunEvent): Snapsh
     // ledger's per-gate derivation cannot catch because it only touches the
     // named gate).
     if (gate === 'plan' && next.executionGate !== prior.executionGate) {
-      fail('owner-gate-withdraw plan must not touch the execution gate — one owner decision, one gate', 'AP_OWNER_GATE_INVALID')
+      fail('owner-gate-withdraw plan must not touch the execution gate — one owner decision, one gate', 'LEGACY_OWNER_GATE_INVALID')
     }
     if (gate === 'execution' && next.planGate !== prior.planGate) {
-      fail('owner-gate-withdraw execution must not touch the plan gate — one owner decision, one gate', 'AP_OWNER_GATE_INVALID')
+      fail('owner-gate-withdraw execution must not touch the plan gate — one owner decision, one gate', 'LEGACY_OWNER_GATE_INVALID')
     }
   }
 
@@ -1025,13 +1025,13 @@ export function applyEvent(prior: Snapshot | undefined, event: RunEvent): Snapsh
   if (prior.gateSources !== undefined && next.gateSources === undefined) {
     fail(
       'gateSources disappeared after being recorded — a stream that recorded provenance keeps it; only a gate decision, a plan reset or a logout of the run could clear it, and none of them removes the field',
-      'AP_GATE_SOURCE_SHRANK',
+      'LEGACY_GATE_SOURCE_SHRANK',
     )
   }
   if (!sameGateSources(ledger.gateSources, next.gateSources)) {
     fail(
       `gateSources do not match the fold's derivation — expected ${JSON.stringify(ledger.gateSources)}, got ${JSON.stringify(next.gateSources)}: a gate's source is derived (owner decisions by generation and ordinal, audit/self-check verdicts otherwise), never chosen by the writer`,
-      'AP_GATE_SOURCE_INVALID',
+      'LEGACY_GATE_SOURCE_INVALID',
     )
   }
 
@@ -1064,7 +1064,7 @@ export function applyEvent(prior: Snapshot | undefined, event: RunEvent): Snapsh
       if (before !== after) {
         fail(
           `gate [${gate}] moved ${before} -> ${after} while an owner pass is in force (plan revision ${String(history.planRevision ?? 0)}): the owner's pass takes precedence over a later audit objection, which is recorded rather than erased — withdraw it explicitly (autopilot_signal owner-gate-withdraw) to let the run's own reviews decide again`,
-          'AP_OWNER_GATE_PRECEDENCE',
+          'LEGACY_OWNER_GATE_PRECEDENCE',
         )
       }
     }
@@ -1082,11 +1082,11 @@ export function applyEvent(prior: Snapshot | undefined, event: RunEvent): Snapsh
     if (next.triage.auditMode !== 'external') {
       fail(
         `audit record ${i} carries an external countersign but auditMode is ${next.triage.auditMode}`,
-        'AP_EXTERNAL_WRONG_MODE',
+        'LEGACY_EXTERNAL_WRONG_MODE',
       )
     }
     const problems = validateExternalReview(record.external)
-    if (problems.length > 0) fail(`audit record ${i}: ${problems.join('; ')}`, 'AP_EXTERNAL_INVALID')
+    if (problems.length > 0) fail(`audit record ${i}: ${problems.join('; ')}`, 'LEGACY_EXTERNAL_INVALID')
   }
 
   // Structured findings (governance pragmatics v1), PRESENCE-GATED like the
@@ -1101,17 +1101,17 @@ export function applyEvent(prior: Snapshot | undefined, event: RunEvent): Snapsh
     if (record?.findings === undefined) continue
     const findings = record.findings
     if (!Array.isArray(findings) || findings.length === 0) {
-      fail(`audit record ${i} carries an empty findings array; absent is the legacy arm, present must grade at least one finding`, 'AP_AUDIT_FINDINGS_INVALID')
+      fail(`audit record ${i} carries an empty findings array; absent is the legacy arm, present must grade at least one finding`, 'LEGACY_AUDIT_FINDINGS_INVALID')
     }
     for (const finding of Array.isArray(findings) ? findings : []) {
       if (typeof finding?.summary !== 'string' || finding.summary.trim().length === 0) {
-        fail(`audit record ${i} carries a finding with an empty summary`, 'AP_AUDIT_FINDINGS_INVALID')
+        fail(`audit record ${i} carries a finding with an empty summary`, 'LEGACY_AUDIT_FINDINGS_INVALID')
       }
       if (finding?.severity !== 'blocking' && finding?.severity !== 'non-blocking') {
-        fail(`audit record ${i} carries a finding whose severity is not blocking|non-blocking ("${String(finding?.severity)}")`, 'AP_AUDIT_FINDINGS_INVALID')
+        fail(`audit record ${i} carries a finding whose severity is not blocking|non-blocking ("${String(finding?.severity)}")`, 'LEGACY_AUDIT_FINDINGS_INVALID')
       }
       if (finding?.layer !== 'plan' && finding?.layer !== 'execution' && finding?.layer !== 'rules') {
-        fail(`audit record ${i} carries a finding whose layer is not plan|execution|rules ("${String(finding?.layer)}")`, 'AP_AUDIT_FINDINGS_INVALID')
+        fail(`audit record ${i} carries a finding whose layer is not plan|execution|rules ("${String(finding?.layer)}")`, 'LEGACY_AUDIT_FINDINGS_INVALID')
       }
     }
     const blockingPlan = Array.isArray(findings)
@@ -1119,26 +1119,26 @@ export function applyEvent(prior: Snapshot | undefined, event: RunEvent): Snapsh
     if (record?.verdict === 'needs-replan' && !blockingPlan) {
       fail(
         `audit record ${i} returns needs-replan without a blocking plan-layer finding; an execution- or rules-layer defect is executor-fixable (needs-fix)`,
-        'AP_AUDIT_FINDINGS_INVALID',
+        'LEGACY_AUDIT_FINDINGS_INVALID',
       )
     }
     if (record?.verdict === 'blocked' && !(Array.isArray(findings) && findings.some(finding => finding?.severity === 'blocking'))) {
-      fail(`audit record ${i} returns blocked without a blocking finding`, 'AP_AUDIT_FINDINGS_INVALID')
+      fail(`audit record ${i} returns blocked without a blocking finding`, 'LEGACY_AUDIT_FINDINGS_INVALID')
     }
   }
 
   // Plan revision is monotonic.
-  if (next.plan.revision < prior.plan.revision) fail('plan revision decreased', 'AP_PLAN_REVISION')
+  if (next.plan.revision < prior.plan.revision) fail('plan revision decreased', 'LEGACY_PLAN_REVISION')
 
   // Usage evidence is append-or-replace, never subtractive. An id that was
   // once declared names a real user-visible change; letting it vanish would
   // let a run answer the usage question by deleting the question. Replacement
   // (last-wins on the same id) is the legal way to upgrade a declaration.
   if (prior.usage !== undefined) {
-    if (next.usage === undefined) fail('usage evidence disappeared', 'AP_USAGE_SHRANK')
+    if (next.usage === undefined) fail('usage evidence disappeared', 'LEGACY_USAGE_SHRANK')
     const ids = new Set(next.usage.entries.map(entry => entry.id))
     for (const entry of prior.usage.entries) {
-      if (!ids.has(entry.id)) fail(`usage entry ${entry.id} was dropped`, 'AP_USAGE_SHRANK')
+      if (!ids.has(entry.id)) fail(`usage entry ${entry.id} was dropped`, 'LEGACY_USAGE_SHRANK')
     }
   }
 
@@ -1146,14 +1146,14 @@ export function applyEvent(prior: Snapshot | undefined, event: RunEvent): Snapsh
   // measured against. Restamping it would silently re-validate artifacts that
   // predate the gate, so it is write-once for the life of the run.
   if (prior.planGatePassedAt !== undefined && next.planGatePassedAt !== prior.planGatePassedAt) {
-    fail('planGatePassedAt was restamped', 'AP_GATE_STAMP_MUTATED')
+    fail('planGatePassedAt was restamped', 'LEGACY_GATE_STAMP_MUTATED')
   }
 
   // A new plan submission must not carry stale execution evidence or gate
   // values into the next round (evidence chains restart per plan revision).
   if (event.op === 'submit-plan') {
-    if (next.executionPacket !== undefined) fail('submit-plan must clear the execution packet', 'AP_STALE_EVIDENCE')
-    if (next.executionGate !== 'pending') fail('submit-plan must reset executionGate to pending', 'AP_STALE_EVIDENCE')
+    if (next.executionPacket !== undefined) fail('submit-plan must clear the execution packet', 'LEGACY_STALE_EVIDENCE')
+    if (next.executionGate !== 'pending') fail('submit-plan must reset executionGate to pending', 'LEGACY_STALE_EVIDENCE')
   }
 
   // Amend-plan (governance pragmatics v1): a plan revision that PRESERVES
@@ -1168,24 +1168,24 @@ export function applyEvent(prior: Snapshot | undefined, event: RunEvent): Snapsh
     if (next.plan.revision !== prior.plan.revision + 1) {
       fail(
         `amend-plan must advance plan revision by exactly 1 (prior ${prior.plan.revision}, next ${next.plan.revision})`,
-        'AP_AMEND_PLAN_INVALID',
+        'LEGACY_AMEND_PLAN_INVALID',
       )
     }
     if (prior.planGate !== 'pass' || next.planGate !== 'pass') {
-      fail('amend-plan requires planGate pass on both sides (a failed plan is replanned, not amended)', 'AP_AMEND_PLAN_INVALID')
+      fail('amend-plan requires planGate pass on both sides (a failed plan is replanned, not amended)', 'LEGACY_AMEND_PLAN_INVALID')
     }
     if (next.executionGate !== prior.executionGate) {
-      fail('amend-plan must not reset executionGate', 'AP_AMEND_PLAN_INVALID')
+      fail('amend-plan must not reset executionGate', 'LEGACY_AMEND_PLAN_INVALID')
     }
     if (next.executionPacket !== prior.executionPacket) {
-      fail('amend-plan must preserve the execution packet', 'AP_AMEND_PLAN_INVALID')
+      fail('amend-plan must preserve the execution packet', 'LEGACY_AMEND_PLAN_INVALID')
     }
     if (next.planAmendedAtRevision !== next.plan.revision) {
-      fail('amend-plan must arm the delta re-audit at the new plan revision', 'AP_AMEND_PLAN_INVALID')
+      fail('amend-plan must arm the delta re-audit at the new plan revision', 'LEGACY_AMEND_PLAN_INVALID')
     }
   } else if (event.op === 'submit-plan' || event.op === 'replan') {
     if (next.planAmendedAtRevision !== undefined) {
-      fail(`${event.op} must clear planAmendedAtRevision (the amendment cycle is superseded)`, 'AP_AMEND_PLAN_INVALID')
+      fail(`${event.op} must clear planAmendedAtRevision (the amendment cycle is superseded)`, 'LEGACY_AMEND_PLAN_INVALID')
     }
   } else if (event.op === 'audit' || event.op === 'self-check' || event.op === 'external-audit') {
     // A plan-role PASS appended by THIS commit, captured at or after the
@@ -1200,7 +1200,7 @@ export function applyEvent(prior: Snapshot | undefined, event: RunEvent): Snapsh
     if (next.planAmendedAtRevision !== expectedPlanAmended) {
       fail(
         'planAmendedAtRevision must follow the fold derivation (armed by amend-plan, cleared only by a plan-role pass at or after the amended revision)',
-        'AP_AMEND_STATE_INVALID',
+        'LEGACY_AMEND_STATE_INVALID',
       )
     }
   } else if (event.op === 'owner-resolve') {
@@ -1209,23 +1209,23 @@ export function applyEvent(prior: Snapshot | undefined, event: RunEvent): Snapsh
     if (next.planAmendedAtRevision !== expectedPlanAmended) {
       fail(
         'planAmendedAtRevision must be preserved by owner-resolve(resume-execution) and cleared by resume-planning/block',
-        'AP_AMEND_STATE_INVALID',
+        'LEGACY_AMEND_STATE_INVALID',
       )
     }
   } else if (event.op === 'submit-evidence' || event.op === 'submit-closeout') {
     if (prior.planAmendedAtRevision !== undefined) {
       fail(
         `plan amended at revision ${prior.planAmendedAtRevision} without a delta re-audit pass; ${event.op} requires a plan-role pass at or after the amended revision`,
-        'AP_AMEND_REAUDIT_REQUIRED',
+        'LEGACY_AMEND_REAUDIT_REQUIRED',
       )
     }
     if (next.planAmendedAtRevision !== undefined) {
-      fail(`${event.op} cannot arm planAmendedAtRevision`, 'AP_AMEND_STATE_INVALID')
+      fail(`${event.op} cannot arm planAmendedAtRevision`, 'LEGACY_AMEND_STATE_INVALID')
     }
   } else if (next.planAmendedAtRevision !== prior.planAmendedAtRevision) {
     fail(
       `planAmendedAtRevision mutated via op ${event.op} (derives from amend-plan and plan-role passes only)`,
-      'AP_AMEND_STATE_MUTATED',
+      'LEGACY_AMEND_STATE_MUTATED',
     )
   }
 
@@ -1240,21 +1240,21 @@ export function applyEvent(prior: Snapshot | undefined, event: RunEvent): Snapsh
       || (prior.pausedFrom !== 'executing' && prior.pausedFrom !== 'execution-reviewing')) {
       fail(
         'owner-resolve(resume-execution) requires pausedFrom executing|execution-reviewing; pre-pause-tracking streams keep the resume-planning-only reading',
-        'AP_OWNER_RESUME_INVALID',
+        'LEGACY_OWNER_RESUME_INVALID',
       )
     }
     const pausedFrom = prior.pausedFrom
     if (next.phase !== pausedFrom) {
-      fail(`owner-resolve(resume-execution) must restore phase ${pausedFrom}, got ${next.phase}`, 'AP_OWNER_RESUME_INVALID')
+      fail(`owner-resolve(resume-execution) must restore phase ${pausedFrom}, got ${next.phase}`, 'LEGACY_OWNER_RESUME_INVALID')
     }
     if (next.planGate !== prior.planGate || next.executionGate !== prior.executionGate) {
-      fail('owner-resolve(resume-execution) must not touch the gates', 'AP_OWNER_RESUME_INVALID')
+      fail('owner-resolve(resume-execution) must not touch the gates', 'LEGACY_OWNER_RESUME_INVALID')
     }
     if (next.executionPacket !== prior.executionPacket) {
-      fail('owner-resolve(resume-execution) must preserve the execution packet', 'AP_OWNER_RESUME_INVALID')
+      fail('owner-resolve(resume-execution) must preserve the execution packet', 'LEGACY_OWNER_RESUME_INVALID')
     }
     if (JSON.stringify(next.executor) !== JSON.stringify(prior.executor)) {
-      fail('owner-resolve(resume-execution) must preserve the executor record', 'AP_OWNER_RESUME_INVALID')
+      fail('owner-resolve(resume-execution) must preserve the executor record', 'LEGACY_OWNER_RESUME_INVALID')
     }
   }
 
@@ -1264,16 +1264,16 @@ export function applyEvent(prior: Snapshot | undefined, event: RunEvent): Snapsh
     if (next.phase === 'needs-owner-decision') {
       if (prior.phase === 'needs-owner-decision') {
         if (next.pausedFrom !== prior.pausedFrom) {
-          fail('pausedFrom mutated while paused', 'AP_PAUSE_STATE_INVALID')
+          fail('pausedFrom mutated while paused', 'LEGACY_PAUSE_STATE_INVALID')
         }
       } else if (next.pausedFrom !== prior.phase) {
         fail(
           `entering needs-owner-decision from ${prior.phase} must stamp pausedFrom=${prior.phase}`,
-          'AP_PAUSE_STATE_INVALID',
+          'LEGACY_PAUSE_STATE_INVALID',
         )
       }
     } else if (next.pausedFrom !== undefined) {
-      fail(`leaving needs-owner-decision must clear pausedFrom (phase ${next.phase})`, 'AP_PAUSE_STATE_INVALID')
+      fail(`leaving needs-owner-decision must clear pausedFrom (phase ${next.phase})`, 'LEGACY_PAUSE_STATE_INVALID')
     }
   }
 
@@ -1288,18 +1288,18 @@ export function applyEvent(prior: Snapshot | undefined, event: RunEvent): Snapsh
       if (stamp.field === 'executionRevision') {
         fail(
           `submit-packet executionRevision is not an integer: ${String(stamp.raw)}`,
-          'AP_PACKET_REVISION_REQUIRED',
+          'LEGACY_PACKET_REVISION_REQUIRED',
         )
       }
       fail(
         `submit-packet ${stamp.field} is not valid: ${String(stamp.raw)}`,
-        'AP_PACKET_REVISION_REQUIRED',
+        'LEGACY_PACKET_REVISION_REQUIRED',
       )
     }
     if (stamp.kind === 'absent' && prior.bearerBase !== undefined) {
       fail(
         'submit-packet executionRevision is required on current-format streams',
-        'AP_PACKET_REVISION_REQUIRED',
+        'LEGACY_PACKET_REVISION_REQUIRED',
       )
     }
     if (stamp.kind === 'ok') {
@@ -1307,13 +1307,13 @@ export function applyEvent(prior: Snapshot | undefined, event: RunEvent): Snapsh
         if (stamp.generation === undefined) {
           fail(
             'submit-packet generation is required on current-format streams',
-            'AP_PACKET_REVISION_REQUIRED',
+            'LEGACY_PACKET_REVISION_REQUIRED',
           )
         }
         if (stamp.childId === undefined) {
           fail(
             'submit-packet childId is required on current-format streams',
-            'AP_PACKET_REVISION_REQUIRED',
+            'LEGACY_PACKET_REVISION_REQUIRED',
           )
         }
       }
@@ -1321,26 +1321,26 @@ export function applyEvent(prior: Snapshot | undefined, event: RunEvent): Snapsh
       if (liveRev !== stamp.executionRevision) {
         fail(
           `submit-packet executionRevision ${String(stamp.executionRevision)} does not match live ${String(liveRev)}`,
-          'AP_PACKET_REVISION_MISMATCH',
+          'LEGACY_PACKET_REVISION_MISMATCH',
         )
       }
       const foldedRev = next.executor?.executionRevision
       if (foldedRev !== stamp.executionRevision) {
         fail(
           `submit-packet snapshot executionRevision ${String(foldedRev)} does not retain stamped live ${String(stamp.executionRevision)}`,
-          'AP_PACKET_REVISION_MUTATED',
+          'LEGACY_PACKET_REVISION_MUTATED',
         )
       }
       if (stamp.generation !== undefined && stamp.generation !== prior.executor?.generation) {
         fail(
           `submit-packet generation ${String(stamp.generation)} does not match live ${String(prior.executor?.generation)}`,
-          'AP_PACKET_REVISION_MISMATCH',
+          'LEGACY_PACKET_REVISION_MISMATCH',
         )
       }
       if (stamp.childId !== undefined && stamp.childId !== prior.executor?.childId) {
         fail(
           `submit-packet childId ${stamp.childId} does not match live ${String(prior.executor?.childId)}`,
-          'AP_PACKET_REVISION_MISMATCH',
+          'LEGACY_PACKET_REVISION_MISMATCH',
         )
       }
     }
@@ -1348,30 +1348,30 @@ export function applyEvent(prior: Snapshot | undefined, event: RunEvent): Snapsh
 
   // No executor before the plan gate has ever passed (start-executor requires it right now).
   if (event.op === 'start-executor' && prior.planGate !== 'pass') {
-    fail('executor before planGate pass', 'AP_EXECUTOR_BEFORE_GATE')
+    fail('executor before planGate pass', 'LEGACY_EXECUTOR_BEFORE_GATE')
   }
   if (next.executor !== undefined && prior.executor === undefined && event.op !== 'start-executor') {
-    fail(`executor appeared via op ${event.op}`, 'AP_EXECUTOR_OP')
+    fail(`executor appeared via op ${event.op}`, 'LEGACY_EXECUTOR_OP')
   }
   if (event.op === 'resume-executor') {
     const prev = prior.executor
     const folded = next.executor
     if (prev === undefined || folded === undefined) {
-      fail('resume-executor requires a live running executor', 'AP_EXECUTOR_REVISION')
+      fail('resume-executor requires a live running executor', 'LEGACY_EXECUTOR_REVISION')
     }
     if (prev.state !== 'running' || folded.state !== 'running') {
       fail(
         `resume-executor state ${prev.state} -> ${folded.state} is not running -> running`,
-        'AP_EXECUTOR_REVISION',
+        'LEGACY_EXECUTOR_REVISION',
       )
     }
     if (folded.childId !== prev.childId || folded.generation !== prev.generation) {
-      fail('resume-executor must keep childId and generation', 'AP_EXECUTOR_REVISION')
+      fail('resume-executor must keep childId and generation', 'LEGACY_EXECUTOR_REVISION')
     }
     if (folded.executionRevision !== prev.executionRevision + 1) {
       fail(
         `resume-executor executionRevision ${String(folded.executionRevision)} is not prior ${String(prev.executionRevision)} + 1`,
-        'AP_EXECUTOR_REVISION',
+        'LEGACY_EXECUTOR_REVISION',
       )
     }
   } else if (event.op === 'start-executor') {
@@ -1384,7 +1384,7 @@ export function applyEvent(prior: Snapshot | undefined, event: RunEvent): Snapsh
   ) {
     assertExecutorLifecycle(prior, next, event.op)
   } else if (JSON.stringify(prior.executor) !== JSON.stringify(next.executor)) {
-    fail('executor mutated', 'AP_EXECUTOR_MUTATED')
+    fail('executor mutated', 'LEGACY_EXECUTOR_MUTATED')
   }
 
   // Plan gate pass requires the usage question to have been answered. The
@@ -1397,7 +1397,7 @@ export function applyEvent(prior: Snapshot | undefined, event: RunEvent): Snapsh
   if (next.planGate === 'pass' && prior.planGate !== 'pass') {
     const undeclared = usageDeclarationProblems(next.usage)
     if (undeclared.length > 0) {
-      fail(`planGate pass with unanswered usage evidence: ${undeclared.join('; ')}`, 'AP_GATE_WITH_UNDECLARED_USAGE')
+      fail(`planGate pass with unanswered usage evidence: ${undeclared.join('; ')}`, 'LEGACY_GATE_WITH_UNDECLARED_USAGE')
     }
   }
 
@@ -1424,13 +1424,13 @@ export function applyEvent(prior: Snapshot | undefined, event: RunEvent): Snapsh
     const ownerInForce = owner?.source === 'owner' && owner.withdrawn !== true
       && owner.planRevision === prior.plan.revision
     if (!ownerInForce && (latest === undefined || latest.verdict !== 'pass')) {
-      fail('executionGate pass without a latest execution-audit pass (or an in-force owner pass for this generation)', 'AP_GATE_WITHOUT_AUDIT')
+      fail('executionGate pass without a latest execution-audit pass (or an in-force owner pass for this generation)', 'LEGACY_GATE_WITHOUT_AUDIT')
     }
   }
 
   // Evidence kinds, BEFORE the completion re-check below. Order is the point:
   // a kind-less proven entry also fails `evaluateCompletion`, and if that ran
-  // first the stream would be rejected as AP_INCOMPLETE_COMPLETION — true but
+  // first the stream would be rejected as LEGACY_INCOMPLETE_COMPLETION — true but
   // useless. The specific code is what tells a reader which rule was broken.
   if (event.op === 'submit-closeout') {
     const stamp = evidenceKindStamp(event.detail)
@@ -1438,7 +1438,7 @@ export function applyEvent(prior: Snapshot | undefined, event: RunEvent): Snapsh
       const raw = (event.detail as { evidenceKinds?: unknown }).evidenceKinds
       fail(
         `submit-closeout evidenceKinds stamp is not the integer 1: ${String(raw)}`,
-        'AP_EVIDENCE_KIND_STAMP_INVALID',
+        'LEGACY_EVIDENCE_KIND_STAMP_INVALID',
       )
     }
     if (stamp === 'v1') {
@@ -1460,7 +1460,7 @@ export function applyEvent(prior: Snapshot | undefined, event: RunEvent): Snapsh
       const raw = (event.detail as { closeoutHandoff?: unknown }).closeoutHandoff
       fail(
         `submit-closeout closeoutHandoff stamp is not the integer 1: ${String(raw)}`,
-        'AP_HANDOFF_STAMP_INVALID',
+        'LEGACY_HANDOFF_STAMP_INVALID',
       )
     }
     if (handoffStamp === 'v1') {
@@ -1475,7 +1475,7 @@ export function applyEvent(prior: Snapshot | undefined, event: RunEvent): Snapsh
         drift: '',
       }, next.triage.acceptanceCriteria)
       if (problems.length > 0) {
-        fail(`submit-closeout stamped closeoutHandoff 1: ${problems.join('; ')}`, 'AP_HANDOFF_INVALID')
+        fail(`submit-closeout stamped closeoutHandoff 1: ${problems.join('; ')}`, 'LEGACY_HANDOFF_INVALID')
       }
     }
   }
@@ -1484,7 +1484,7 @@ export function applyEvent(prior: Snapshot | undefined, event: RunEvent): Snapsh
   if (next.phase === 'completed') {
     const check = evaluateCompletion(next)
     if (!check.ok) {
-      fail(`completed snapshot fails completion check: ${check.problems.join('; ')}`, 'AP_INCOMPLETE_COMPLETION')
+      fail(`completed snapshot fails completion check: ${check.problems.join('; ')}`, 'LEGACY_INCOMPLETE_COMPLETION')
     }
   }
 

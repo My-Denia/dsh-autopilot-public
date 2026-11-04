@@ -56,7 +56,7 @@ describe('apply() with a skill home that cannot be published to', () => {
     const root = mkdtempSync(join(tmpdir(), 'dsh-autopilot-skill-unsupported-'))
     const host = tinyCtx()
 
-    const dispose = await apply(host.ctx, { storeRoot: root, storeKind: 'file' })
+    const dispose = await apply(host.ctx, { storeRoot: root })
 
     // Mounted: the failure to install a skill never fails the mount.
     expect(typeof dispose).toBe('function')
@@ -76,7 +76,7 @@ describe('apply() with a skill home that cannot be published to', () => {
     const root = mkdtempSync(join(tmpdir(), 'dsh-autopilot-skill-unsupported-off-'))
     const host = tinyCtx()
 
-    const dispose = await apply(host.ctx, { storeRoot: root, storeKind: 'file', skillInstall: 'off' })
+    const dispose = await apply(host.ctx, { storeRoot: root, skillInstall: 'off' })
 
     expect(host.warnings).toEqual([])
     await dispose()

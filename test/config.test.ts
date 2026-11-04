@@ -12,8 +12,8 @@
  */
 
 import { describe, expect, it } from 'vitest'
-import { Config, DEFAULT_EXECUTOR_TOOLS } from '../src/config.js'
-import { SHELL_TOOLS, isEgressCommand } from '../src/gate/decide.js'
+import { Config, DEFAULT_EXECUTOR_TOOLS, LEGACY_KEYS_STILL_READ, RETIRED_CONFIG_KEYS, retiredConfigNote, retiredKeysIn } from '../src/config.js'
+import { SHELL_TOOLS } from '../src/roles/tools.js'
 import { resolveConfig, volatileRoutingAccess } from '../src/index.js'
 import type { ConfigInput, ResolvedRouting } from '../src/index.js'
 import { DEFAULT_ROLE_MIN_CONTEXT } from '../src/routing/select.js'
@@ -79,10 +79,10 @@ describe('Config — the loader path', () => {
     expect(routed.auditors.execution).toBeUndefined()
   })
 
-  it('still honours an explicitly empty allow-list (the default is a default, not a floor)', () => {
-    const result = loaded({ executor: { toolAllowList: [] } })
+  it('executor.toolAllowList is retired: whatever it says, the resolved list is the shipped one', () => {
+    const result = loaded({ executor: { toolAllowList: ['read'] } })
     expect(result.issues).toBeUndefined()
-    expect(resolveConfig(result.value).executor.toolAllowList).toEqual([])
+    expect(resolveConfig(result.value).executor.toolAllowList).toEqual([...DEFAULT_EXECUTOR_TOOLS])
   })
 
   it('accepts a fully specified profile (positive control for every negative below)', () => {
@@ -484,15 +484,12 @@ describe('resolveConfig — legacy explicit routes map to locked (documented, te
     expect(resolved.executor.agentOptions).toEqual({ maxTokens: 8192 })
   })
 
-  it('crossFamily.pool entries are NOT mapped into locks (E3 handles pool as grants in off mode only)', () => {
+  it('crossFamily.pool is retired: it maps into no lock and is not carried', () => {
     const resolved = resolveConfig({
       crossFamily: { pool: [{ provider: 'openai', model: 'gpt-6.1-sol' }, { provider: 'anthropic', model: 'claude-x' }] },
     })
     expect(resolved.routing).toEqual(resolveConfig({}).routing)
-    expect(resolved.crossFamily.pool).toEqual([
-      { provider: 'openai', model: 'gpt-6.1-sol' },
-      { provider: 'anthropic', model: 'claude-x' },
-    ])
+    expect(resolved.crossFamily.pool).toEqual([])
   })
 
   it('the legacy→locked mapping agrees between the loader path and the plain path', () => {
@@ -549,10 +546,9 @@ describe('DEFAULT_EXECUTOR_TOOLS is pinned by value, in both directions', () => 
     for (const tool of ['terminal_open', 'terminal_send', 'terminal_read', 'terminal_signal', 'terminal_close']) {
       expect(DEFAULT_EXECUTOR_TOOLS).not.toContain(tool)
     }
-    // The GATE went the other way: it scans the terminal channel it cannot allow.
+    // The shell-name list names the terminal channel the allow-list does not grant.
     expect(SHELL_TOOLS).toContain('terminal_send')
-    expect(isEgressCommand('git push origin main')).toBe(true)
-    // The shell the executor DOES get is still the shell the gate scans.
+    // The shell the executor DOES get is still one of the shell names.
     expect(DEFAULT_EXECUTOR_TOOLS.filter(tool => SHELL_TOOLS.includes(tool))).toEqual(['bash', 'pwsh'])
   })
 })
@@ -695,5 +691,115 @@ describe("resolveConfig — routing.preference 'axis'", () => {
     expect(['balanced', 'economy', 'quality', 'axis']).not.toContain(bogus)
     const preference = loaded({ routing: { preference: bogus } })
     expect(preference.issues?.some(issue => issue.message.includes('routing.preference'))).toBe(true)
+  })
+})
+
+describe('retired 0.2.x settings', () => {
+  /** A 0.2.x profile with every retired key written. */
+  const oldProfile = {
+    gate: {
+      sandboxCoupling: false,
+      toolDeny: false,
+      egressDeny: false,
+      stopReminder: false,
+      strictShell: true,
+      restoreMode: 'read-only',
+    },
+    governance: { maxAuditRoundsPerRole: 2, unattended: true },
+    storeKind: 'file',
+    auditProvider: 'spawn',
+    executorProvider: 'spawn',
+    executor: { persona: 'lead', toolAllowList: ['read'], agentOptions: { maxTokens: 100 } },
+    auditors: {
+      plan: { provider: 'spawn', agentOptions: { maxTokens: 100 } },
+      execution: { provider: 'spawn', agentOptions: { maxTokens: 100 } },
+      rules: { provider: 'spawn', agentOptions: { maxTokens: 100 } },
+    },
+    crossFamily: { enabled: true, minRisk: 'high', pool: [{ provider: 'openai', model: 'gpt-6.1-sol' }] },
+  }
+
+  it('an old profile with every retired key set loads with no issue, through the schema and the plain path', () => {
+    const result = loaded(oldProfile)
+    expect(result.issues).toBeUndefined()
+    expect(result.value).toBeDefined()
+    expect(() => resolveConfig(result.value)).not.toThrow()
+    expect(() => resolveConfig(oldProfile as never)).not.toThrow()
+  })
+
+  it('a profile that writes NO retired key reads as having written none, AFTER the loader has filled its defaults', () => {
+    // The loader fills declared defaults before apply() sees the config. A default on a retired leaf
+    // would make every real mount report "ignores retired settings", a false status note.
+    const result = loaded({})
+    expect(result.issues).toBeUndefined()
+    expect(retiredKeysIn(result.value)).toEqual([])
+    expect(retiredKeysIn(loaded({ routing: { mode: 'off' }, storeRoot: '/tmp/x' }).value)).toEqual([])
+  })
+
+  it('through the loader, a retired key that IS written still reads as written (the check can fail)', () => {
+    expect(retiredKeysIn(loaded({ gate: { toolDeny: false }, storeKind: 'file' }).value)).toEqual(['gate.toolDeny', 'storeKind'])
+  })
+
+  it('retiredKeysIn returns exactly the retired keys written, in table order', () => {
+    expect([...retiredKeysIn(oldProfile)].sort()).toEqual([...RETIRED_CONFIG_KEYS].sort())
+    expect(retiredKeysIn({ gate: { toolDeny: true }, governance: { unattended: false }, routing: { mode: 'off' } }))
+      .toEqual(['gate.toolDeny', 'governance.unattended'])
+    // A key whose value is false is still written.
+    expect(retiredKeysIn({ gate: { egressDeny: false } })).toEqual(['gate.egressDeny'])
+  })
+
+  it('live settings are not reported, and a malformed input does not throw', () => {
+    expect(retiredKeysIn({ routing: { mode: 'off' }, storeRoot: '/x', skillInstall: 'off', executor: { agentOptions: { provider: 'p' } } })).toEqual([])
+    expect(retiredKeysIn(undefined)).toEqual([])
+    expect(retiredKeysIn(null)).toEqual([])
+    expect(retiredKeysIn('gate')).toEqual([])
+    expect(retiredKeysIn({ gate: 'x', governance: [] })).toEqual([])
+  })
+
+  it('an empty config gives no note; a written one gives one plain note naming the keys', () => {
+    expect(retiredConfigNote(retiredKeysIn({}))).toBeUndefined()
+    expect(retiredConfigNote(retiredKeysIn(undefined))).toBeUndefined()
+    const note = retiredConfigNote(['gate.toolDeny', 'governance.unattended'])
+    expect(note).toBe('dsh-autopilot 0.3.0 ignores retired settings: gate.toolDeny, governance.unattended; they no longer have an effect.')
+  })
+
+  it('every retired key is still declared by the schema (it must keep loading)', () => {
+    const valueFor = (leaf: string): unknown => {
+      if (leaf === 'restoreMode' || leaf === 'persona' || leaf.endsWith('Provider') || leaf === 'provider' || leaf === 'storeKind') return leaf === 'storeKind' ? 'file' : 'x'
+      if (leaf === 'maxAuditRoundsPerRole' || leaf === 'maxTokens') return 2
+      if (leaf === 'toolAllowList') return ['read']
+      if (leaf === 'pool') return [{ provider: 'p', model: 'm' }]
+      if (leaf === 'minRisk') return 'high'
+      return true
+    }
+    for (const path of RETIRED_CONFIG_KEYS) {
+      const parts = path.split('.')
+      let raw: unknown = valueFor(parts[parts.length - 1]!)
+      for (let i = parts.length - 1; i >= 0; i -= 1) raw = { [parts[i]!]: raw }
+      expect(loaded(raw).issues, path).toBeUndefined()
+      expect(retiredKeysIn((loaded(raw).value))).toContain(path)
+    }
+  })
+
+  it('the final list: what is retired, and what the 0.2.x agentOptions surface still feeds', () => {
+    expect([...RETIRED_CONFIG_KEYS].sort()).toEqual([
+      'auditProvider', 'auditors.execution.agentOptions.maxTokens', 'auditors.execution.provider',
+      'auditors.plan.agentOptions.maxTokens', 'auditors.plan.provider', 'auditors.rules.agentOptions.maxTokens',
+      'auditors.rules.provider', 'crossFamily.enabled', 'crossFamily.minRisk', 'crossFamily.pool',
+      'executor.agentOptions.maxTokens', 'executor.persona', 'executor.toolAllowList', 'executorProvider',
+      'gate.egressDeny', 'gate.restoreMode', 'gate.sandboxCoupling', 'gate.stopReminder', 'gate.strictShell', 'gate.toolDeny',
+      'governance.maxAuditRoundsPerRole', 'governance.unattended', 'storeKind',
+    ].sort())
+    expect(LEGACY_KEYS_STILL_READ.filter(key => RETIRED_CONFIG_KEYS.includes(key))).toEqual([])
+  })
+
+  it('the keys still read really do pin the role routes: executor.agentOptions locks the executor, auditors.<role> lock the auditors', () => {
+    const resolved = resolveConfig({
+      executor: { agentOptions: { provider: 'e', model: 'em', reasoningEffort: 'high' } },
+      auditors: { plan: { agentOptions: { provider: 'a', model: 'am' } }, execution: { agentOptions: { provider: 'b', model: 'bm' } }, rules: { agentOptions: { provider: 'c', model: 'cm' } } },
+    })
+    expect(resolved.routing.roles.executor).toMatchObject({ mode: 'locked', provider: 'e', model: 'em', reasoningEffort: 'high' })
+    expect(resolved.routing.roles['plan-auditor']).toMatchObject({ mode: 'locked', provider: 'a', model: 'am' })
+    expect(resolved.routing.roles['execution-auditor']).toMatchObject({ mode: 'locked', provider: 'b' })
+    expect(resolved.routing.roles['rules-auditor']).toMatchObject({ mode: 'locked', provider: 'c' })
   })
 })

@@ -22,8 +22,12 @@
 
 import { describe, expect, it } from 'vitest'
 import { createAutopilotService, registerAutopilotService } from '../src/service.js'
-import type { ProvideHost } from '../src/service.js'
-import { makeHarness, makeTriage } from './helpers.js'
+import type { LegacyReader, ProvideHost } from '../src/service.js'
+import { FileLedgerStore, emptyLedger } from '../src/store/ledger.js'
+import type { LegacyRunProjection, LegacyRunSummary } from '../src/domain/ledger-types.js'
+import { mkdtempSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 
 const CORDIS_TRACKER = Symbol.for('cordis.tracker')
 
@@ -37,7 +41,7 @@ describe('registerAutopilotService: every branch of the registration surface', (
         return () => { disposed += 1 }
       },
     }
-    const service = createAutopilotService(makeHarness().engine)
+    const service = quietService()
     const result = registerAutopilotService(host, service)
     expect(result.registered).toBe(true)
     expect(result.diagnostic).toBeUndefined()
@@ -48,7 +52,7 @@ describe('registerAutopilotService: every branch of the registration surface', (
 
   it('tolerates a ctx.provide that returns nothing (the disposer is a no-op, not a crash)', () => {
     const host: ProvideHost = { provide: () => undefined }
-    const result = registerAutopilotService(host, createAutopilotService(makeHarness().engine))
+    const result = registerAutopilotService(host, quietService())
     expect(result.registered).toBe(true)
     expect(() => result.dispose()).not.toThrow()
   })
@@ -67,7 +71,7 @@ describe('registerAutopilotService: every branch of the registration surface', (
         },
       },
     }
-    const service = createAutopilotService(makeHarness().engine)
+    const service = quietService()
     const result = registerAutopilotService(host, service)
     expect(result.registered).toBe(true)
     expect(provided.autopilot).toBe(service)
@@ -76,7 +80,7 @@ describe('registerAutopilotService: every branch of the registration surface', (
   })
 
   it('reports registered:false — with a reason — when the host exposes NO provide surface', () => {
-    const result = registerAutopilotService({}, createAutopilotService(makeHarness().engine))
+    const result = registerAutopilotService({}, quietService())
     expect(result.registered).toBe(false)
     expect(result.diagnostic).toContain('neither ctx.provide nor ctx.reflect.provide')
     expect(() => result.dispose()).not.toThrow()
@@ -86,7 +90,7 @@ describe('registerAutopilotService: every branch of the registration surface', (
     const host: ProvideHost = {
       provide: () => { throw new Error('service autopilot is already provided') },
     }
-    const result = registerAutopilotService(host, createAutopilotService(makeHarness().engine))
+    const result = registerAutopilotService(host, quietService())
     expect(result.registered).toBe(false)
     expect(result.diagnostic).toContain('already provided')
     // The plugin deliberately survives this: a harness that refuses to load
@@ -95,52 +99,109 @@ describe('registerAutopilotService: every branch of the registration surface', (
   })
 })
 
-describe('the read-only view, asserted against a LIVE run', () => {
-  it('peek, status and list track the engine rather than answering emptily', async () => {
-    const h = makeHarness()
-    const service = createAutopilotService(h.engine)
-    // Vacuous half first, so the live half is not the only observation.
-    expect(service.peek(h.root.id)).toBeUndefined()
-    expect(service.status(h.root.id)).toBeUndefined()
-    expect(service.list()).toEqual([])
 
-    await h.engine.init(h.root, makeTriage({ objective: 'ship the read-only surface' }))
-    expect(service.peek(h.root.id)?.phase).toBe('planning')
-    expect(service.peek(h.root.id)?.revision).toBe(1)
-    expect(service.status(h.root.id)?.objective).toBe('ship the read-only surface')
-    expect(service.status(h.root.id)?.planGate).toBe('pending')
-    expect(service.list()).toEqual([h.root.id])
+const T0 = '2026-11-04T00:00:00.000Z'
 
-    await h.engine.submitPlan(h.root, 'the plan')
-    expect(service.peek(h.root.id)?.plan.revision).toBe(1)
-    expect(service.status(h.root.id)?.planRevision).toBe(1)
-    // An unknown id is still undefined: the surface is per-run, not a dump.
-    expect(service.peek('no-such-run')).toBeUndefined()
+function summary(runId: string, sessionId: string | undefined, over: Partial<LegacyRunSummary> = {}): LegacyRunSummary {
+  return {
+    runId,
+    ...(sessionId === undefined ? {} : { sessionId }),
+    backend: 'file',
+    fold: 'ok',
+    eventCount: 3,
+    sandboxRestore: { state: 'pending' },
+    ...over,
+  }
+}
+
+function stubLegacy(runs: readonly LegacyRunSummary[], projections: Record<string, LegacyRunProjection> = {}): LegacyReader & { calls: number } {
+  const reader = {
+    calls: 0,
+    list: async () => { reader.calls += 1; return runs },
+    read: async (_sources: unknown, runId: string) => projections[runId],
+  }
+  return reader
+}
+
+async function storeWith(...sessions: string[]): Promise<FileLedgerStore> {
+  const store = FileLedgerStore.open(mkdtempSync(join(tmpdir(), 'dsh-autopilot-service-')), { now: () => T0 })
+  for (const id of sessions) await store.write(emptyLedger(id, T0), 0)
+  return store
+}
+
+describe('the read-only view over a ledger store and the legacy reader', () => {
+  it('serves a session ledger with only its own legacy runs and the restore the ledger recorded', async () => {
+    const store = await storeWith('s1')
+    const first = store.load('s1')!
+    await store.write({ ...first, legacyRestores: { r1: { state: 'restored', mode: 'workspace-write', at: T0 } } }, 1)
+    const legacy = stubLegacy([summary('r1', 's1'), summary('r2', 's2'), summary('r3', undefined)])
+    const service = createAutopilotService({ ledgers: store, sources: { fileRoot: '/x' }, legacy, notes: () => ['n1'] })
+    const projection = await service.ledger('s1')
+    expect(projection?.sessionId).toBe('s1')
+    expect(projection?.revision).toBe(2)
+    expect(projection?.legacyRuns.map(r => r.runId)).toEqual(['r1'])
+    expect(projection?.legacyRuns[0]?.sandboxRestore).toEqual({ state: 'restored', mode: 'workspace-write', at: T0 })
+    expect(projection?.notes).toEqual(['n1'])
   })
 
-  it('records the backend kind it was built over', () => {
-    expect(createAutopilotService(makeHarness().engine).storeKind).toBe('file')
+  it('answers undefined for a session without a ledger, and lists every ledger', async () => {
+    const store = await storeWith('a', 'b')
+    const service = createAutopilotService({ ledgers: store, sources: {}, legacy: stubLegacy([]) })
+    expect(await service.ledger('missing')).toBeUndefined()
+    expect((await service.ledgers()).map(l => l.sessionId).sort()).toEqual(['a', 'b'])
+    expect(service.notes()).toEqual([])
   })
 
-  it('exposes no mutator: single-writer authority has no service-shaped hole', () => {
-    const service = createAutopilotService(makeHarness().engine) as unknown as Record<string, unknown>
-    for (const name of ['init', 'submitPlan', 'declareUsage', 'audit', 'submitCloseout', 'consumeApproval']) {
-      expect(service[name]).toBeUndefined()
+  it('reads legacy runs through the injected reader with the sources it was given', async () => {
+    const projection = { runId: 'r1' } as unknown as LegacyRunProjection
+    let seen: unknown
+    const legacy: LegacyReader = {
+      list: async (sources) => { seen = sources; return [summary('r1', 's1')] },
+      read: async (_s, id) => (id === 'r1' ? projection : undefined),
     }
-    expect(Object.keys(service).sort()).toEqual(['list', 'peek', 'status', 'storeKind'])
+    const sources = { fileRoot: '/root' }
+    const service = createAutopilotService({ ledgers: await storeWith(), sources, legacy })
+    expect((await service.legacyRuns()).map(r => r.runId)).toEqual(['r1'])
+    expect(seen).toBe(sources)
+    expect(await service.legacyRun('r1')).toBe(projection)
+    expect(await service.legacyRun('nope')).toBeUndefined()
   })
 
-  it('carries the cordis tracker symbol, non-enumerably, with the value a Service would attach', () => {
-    // One of the three stated reasons this is not `class extends Service`:
+  it('reads notes on every call, so a note added after mount still shows', async () => {
+    const notes: string[] = []
+    const service = createAutopilotService({ ledgers: await storeWith(), sources: {}, legacy: stubLegacy([]), notes: () => notes })
+    expect(service.notes()).toEqual([])
+    notes.push('later')
+    expect(service.notes()).toEqual(['later'])
+  })
+
+  it('records the backend kind it was built over', async () => {
+    expect(createAutopilotService({ ledgers: await storeWith(), sources: {}, legacy: stubLegacy([]) }).storeKind).toBe('file')
+  })
+
+  it('exposes no mutator: the ledger has one writer and it is not this handle', async () => {
+    const service = createAutopilotService({ ledgers: await storeWith(), sources: {}, legacy: stubLegacy([]) }) as unknown as Record<string, unknown>
+    for (const name of ['write', 'init', 'commit', 'save', 'put']) expect(service[name]).toBeUndefined()
+    expect(Object.keys(service).sort()).toEqual(['ledger', 'ledgers', 'legacyRun', 'legacyRuns', 'notes', 'storeKind'])
+  })
+
+  it('carries the cordis tracker symbol, non-enumerably, with the value a Service would attach', async () => {
     // cordis's symbols are `Symbol.for(...)`, so the tracker metadata can be
-    // attached by key from outside without a runtime cordis import. Wrapping
-    // the definition in `if (false)` was invisible to the suite.
-    const service = createAutopilotService(makeHarness().engine) as unknown as Record<symbol, unknown>
+    // attached by key from outside without a runtime cordis import.
+    const service = createAutopilotService({ ledgers: await storeWith(), sources: {}, legacy: stubLegacy([]) }) as unknown as Record<symbol, unknown>
     expect(service[CORDIS_TRACKER]).toEqual({ associate: 'autopilot', property: 'ctx' })
     const descriptor = Object.getOwnPropertyDescriptor(service, CORDIS_TRACKER)
     expect(descriptor?.enumerable).toBe(false)
     expect(descriptor?.writable).toBe(false)
-    // and it does not leak into the enumerable surface asserted above
     expect(Object.keys(service as object)).not.toContain('cordis.tracker')
   })
 })
+
+/** A service over an empty store, for the registration tests that only need a handle. */
+function quietService(): ReturnType<typeof createAutopilotService> {
+  return createAutopilotService({
+    ledgers: FileLedgerStore.open(mkdtempSync(join(tmpdir(), 'dsh-autopilot-service-'))),
+    sources: {},
+    legacy: { list: async () => [], read: async () => undefined },
+  })
+}
