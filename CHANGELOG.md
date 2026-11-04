@@ -3,6 +3,74 @@
 Host and packaging bounds that outlive a single release are in
 [docs/compatibility.md](docs/compatibility.md).
 
+## 0.3.0 (unreleased)
+
+The plugin becomes the dsh adapter of the goal-workflow. It is **not**
+published: npm `latest` is still `dsh-goal-autopilot@0.2.0`. Target host is dsh
+`0.2.1-rc.5` only. None of this is yet observed on a real host; the open list is
+in [docs/compatibility.md](docs/compatibility.md#not-yet-verified-on-a-real-host).
+
+### Breaking changes
+
+- Removed tools: `autopilot_submit_plan`, `autopilot_audit`,
+  `autopilot_self_check`, `autopilot_usage`, `autopilot_submit_evidence`,
+  `autopilot_submit_closeout`, `autopilot_submit_packet`,
+  `autopilot_external_audit`, `autopilot_amend_plan`, `autopilot_signal` and
+  `autopilot_executor`. `autopilot_init` is no longer a required first step;
+  there is no init step.
+- Removed mechanisms: run phases and gates (plan gate, execution gate, closing,
+  replan budget); triage (size, risk, executionMode, auditMode); usage ids;
+  the read-only sandbox clamp and tool deny; the closeout packet, handoff,
+  partial delivery and carryover; the egress gate and unattended mode; the
+  outbound manifest; external audit; owner-gate-pass and owner-gate-withdraw
+  with `gateSources`; the turn-stopping reminder.
+- Plan, execution and rules auditors are replaced by one one-shot read-only
+  `reviewer`.
+- `engines.dsh` narrows to `>=0.2.1-rc.5 <0.3.0-0` (set at integration). Hosts
+  on `0.1.x` and `0.2.0` stay on `dsh-goal-autopilot@0.2.0`, the last version
+  for them.
+- The skill and its reference files are replaced.
+
+### Added
+
+- `autopilot_delegate`: start a `scout`, `clerk`, `worker`, `executor-lead`,
+  `planner` or `reviewer` child with an explicit model and effort.
+- `autopilot_agents`: list, wait for, message, stop or escalate children. The
+  final action set depends on a real-host probe.
+- Parallel delegation in one turn, with a pre-dispatch refusal of workers whose
+  `writePaths` intersect. `executor-lead` children may start children (depth 2).
+- Native goal use: `get_goal`, `create_goal`, `update_goal`, continued by the
+  host's goal round driver; waits through `job_output` and `schedule_create`.
+- Ledger of role, child id, generation, selected and observed route with its
+  source, state, `writePaths`, reviewer verdict and issue and PR links.
+
+### Changed
+
+- The skill applies only when the owner states a goal, asks for autopilot or
+  gives sustained multi-stage work; simple work makes no tool call.
+- A stage ending (PR open, CI green, merge-ready) does not complete the goal.
+- Commit, push, pull request and merge in your own repository carry no plugin
+  gate; the host's approval settings still apply. Redaction before outbound is a
+  skill instruction.
+- The issue and the PR are the record; the ledger is a display aid.
+- Reviewer independence: a different model family when reachable, otherwise
+  recorded as "reduced independence".
+- Model routing, executor generations and rotation are kept and generalized to
+  any number of children.
+
+### Migration
+
+- `gate.*`, `governance.*`, `storeKind` and `crossFamily` are still accepted
+  and ignored; `autopilot_status` notes this once. `routing.*` keeps working.
+- Legacy runs stay readable. They are shown read-only on the card and are not
+  continued; no new event is written to their streams.
+- A session a legacy run left read-only gets its sandbox mode restored when it
+  is opened or resumed, only if the current mode is still read-only and the last
+  sandbox event is the plugin's own clamp. A mode the user changed after the
+  clamp stays.
+- Old hosts stay on `0.2.0`. Refresh the installed skill copy by hand if it
+  drifted, since the reference files were replaced.
+
 ## 0.2.1-rc.1 — 2026-10-17
 
 Pre-release of this plugin. It is **not** npm `latest`. The published stable

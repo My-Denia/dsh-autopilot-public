@@ -6,12 +6,16 @@ separation between sufficiency thresholds and ranking axes, the owner's
 `routing.ladder`, the boundaries of what is actually implemented, and the
 provenance of the generated cost seed.
 
-It does NOT own the tool protocol, the phase machine or the refusal codes — those
-are in [reference.md](../../../docs/reference.md) and
-[refusals.md](./refusals.md) — nor the host-neutral governance rules in
-[governance-invariants.md](./governance-invariants.md). The engine's routing
-record and pin contract (what a `detail.routing` decision must look like, and
-when `routingPins` may move) is [refusals.md](./refusals.md) §10.
+It does NOT own the tool protocol or the refusal codes — those are in
+[reference.md](../../../docs/reference.md) and [refusals.md](./refusals.md) —
+nor the invariants in [governance-invariants.md](./governance-invariants.md).
+The roles are `scout`, `clerk`, `worker`, `executor-lead`, `planner` and
+`reviewer`; they are started with `autopilot_delegate`, and every dispatch
+carries an explicit model and effort (a missing value is never "inherit").
+
+Since 0.3.0 there are no run phases or auditors. The one-shot `reviewer`
+replaces the plan, execution and rules auditors; wherever this file says
+"independence class" it means the reviewer's different-family rule.
 
 ## Authority order
 
@@ -55,7 +59,7 @@ set is:
 | --- | --- |
 | effort permit set | the route must permit the effort the role needs |
 | modality | the route must accept the input modality the task carries |
-| context floor | the route's context window must cover the task's real need; the role `minContext` is the declared floor (executor and planner 131072, auditors 65536) |
+| context floor | the route's context window must cover the task's real need; the role `minContext` is the declared floor (executor-lead and planner 131072, reviewer 65536) |
 | owner tier | where the owner's ladder restricts a role to a tier, membership in that tier is a pass/fail gate |
 | ceiling | the route's ceiling must reach the task's difficulty; a route below it is out, not ranked low |
 
@@ -106,10 +110,11 @@ dropped: a silently ignored pricing instruction would leave the owner believing 
 route costs what it does not.
 
 `rotation: true` is an explicit owner opt-in to engine-level re-selection for
-AUDITOR roles: a healthy pin yields to a full re-selection at the next dispatch
-of the same role, offset by the audit-count ordinal within its independence
-class (rotation never overrides cross-family independence). The executor
-rotates too, by its own dispatch count — see boundary (b) below.
+the `reviewer` role: a healthy pin yields to a full re-selection at the next
+dispatch of the same role, offset by the review-count ordinal within its
+independence class (rotation never overrides cross-family independence).
+Executor-side roles rotate too, by their own dispatch count — see boundary (b)
+below.
 
 The resolved ladder is recorded so a decision can cite what the owner said. Its
 tiers feed the owner-tier threshold, work-class dispatch membership, and both
@@ -125,10 +130,17 @@ which ladder tiers it draws from. Five fixed classes:
 | class | dominant axis | default tiers | default roles |
 | --- | --- | --- | --- |
 | `mechanical` | speed (a real permitted `low` effort) | none — fact permit | — (no auto role defaults here) |
-| `simple` | price + speed | `economy` | executor, planner |
-| `hard` | try economy first, widened only when something ASKS (see "The escalation request" below) | `economy` | — |
-| `audit` | ceiling + independence | `standard` | audit-plan, audit-execution, audit-rules |
+| `simple` | price + speed | `economy` | scout, clerk, worker |
+| `hard` | try economy first, widened only when something ASKS (see "The escalation request" below) | `economy` | worker (when the task is hard) |
+| `audit` | ceiling + independence | `standard` | reviewer |
 | `extreme` | ceiling | `reserve` | — |
+
+Role intent: `scout` and `clerk` run on economy routes; `worker` on economy,
+standard when the piece is hard; `executor-lead`, `planner` and `reviewer` on
+standard, reserve when the chunk or the review needs the ceiling; the `reviewer`
+is always chosen from a different model family than the change's author when one
+is reachable. The role table in the engine (`src/roles/`) is authoritative for
+the shipped defaults; `routing.roles.<role>.workClass` overrides them.
 
 `routing.roles.<role>.workClass` overrides a role's class; `routing.workClasses`
 overrides a class's `tiers` mapping per class. A class not named there keeps
@@ -138,8 +150,8 @@ overrides the selection is recorded, not applied (0.2.0 parity).
 
 A tier-bound class whose mapped tiers leave ZERO reachable routes is a
 configuration error, not an empty answer: the dispatch blocks with
-`AP_ROUTE_NO_REACHABLE_WORK_CLASS` and the run pauses through the routing
-escalation path. `mechanical` is not tier-bound (its gate is the fact permit),
+`AP_ROUTE_NO_REACHABLE_WORK_CLASS` and reports it to the caller; the main agent
+decides what to do, no run state changes. `mechanical` is not tier-bound (its gate is the fact permit),
 so it cannot fire that code.
 
 ## Reasoning effort ceilings
@@ -159,69 +171,28 @@ route.
 ## The escalation request
 
 DESIGN §1.2 makes an upgrade a REQUEST, not a prediction: the pool stays economy
-until the model that is *working* reports that it could not proceed. That request
-is one call, and there are TWO entry points into the SAME channel:
+until the model that is *working* reports that it could not proceed. A child
+proposes, the main agent decides:
 
-```
-autopilot_log({ stance: 'escalate', escalationTarget: 'stronger-model', note: '<failure_kind> + the raw evidence' })
-```
-
-from the ROOT agent, and
-
-```
-autopilot_request_escalation({ text: '<what stalled>', note: '<failure_kind> + the raw evidence' })
-```
-
-from the EXECUTOR CHILD. The child entry exists because the root entry could not
-serve it: `autopilot_log` is registered into the root agent's scope and its
-engine path refuses any caller with a parent session (`AP_NOT_ROOT`), so a
-delegated executor — the agent actually doing the work — had no way to ask for
-anything at all. The child entry is deliberately NARROW: it is available only to
-the run's live, authorized executor while that executor is `running`
-(`AP_ESCALATION_NOT_EXECUTOR` otherwise), it fixes `stance` to `escalate` and
-`escalationTarget` to `stronger-model`, and a child can neither write arbitrary
-checkpoints nor request the governance exits (`owner`, `external-review`) that
-belong to the root. Both entries land at the same single register site, so this
-is one channel with two doors, never two escalation semantics.
-
-- **What it does.** The engine records the request against the run (the `note`
-  carries the evidence), and the next AUTO dispatch that runs a selection —
-  whatever brought it there: a first dispatch with no pin yet, a dead-pin
-  re-selection, rotation, or a healthy pin forced to re-select — widens its
+- A child (for example a worker or executor-lead) records the request with the
+  `escalate` action of `autopilot_agents`, saying what stalled and the raw
+  evidence. The main agent may also escalate on its own observation (repeated
+  failure on one layer, a stalled child) without waiting for the child.
+- **What it does.** The next AUTO dispatch that runs a selection widens its
   candidate pool to `economy + standard + reserve`, unless the owner wrote their
-  own `routing.workClasses.<class>.tiers`, which wins (owner-explicit is the
-  highest authority in the routing order). The dispatch that acts on it says so
-  in its `why` trace, names the request's sequence number, and records the pin it
-  replaced as `repinFrom`. A dispatch that runs NO selection (an `inherit` or
-  `locked` role, a degraded routing config) leaves the request open for the next
-  one rather than spending it.
-- **What it does NOT do.** It never widens an AUTHORIZATION. The candidate set
-  is still `session policy ∩ live providers`, still filtered by the class's tier
-  membership, still ordered by the auditor independence rules, and still
-  ranked by the class's dominant axis. A route the session policy does not
-  cover is never even considered, and a pool that widens to nothing blocks with
-  `AP_ROUTE_NO_REACHABLE_WORK_CLASS` exactly as it would without a request.
-- **Escalation is a new-context handoff, never a mid-run swap.** The widened
-  pool answers the request at the NEXT dispatch — a new child generation with
-  its own context. It never re-models the working context in place, and a
-  RESUME (`autopilot_executor` resume after needs-fix) that keeps the same
-  child at its recorded route is contract continuity, not escalation; the two
-  must not be conflated in logs or audits.
-- **The root may escalate on its own observation.** The `autopilot_log` door
-  is not only a relay for the worker's request: a root that sees the anomaly
-  itself — repeated needs-fix on one layer, a stall pattern in the execution
-  log — escalates the same way, without waiting for the worker to ask.
-- **Consumed once.** The request covers ONE dispatch; the dispatch after it
-  returns to the ordinary pin-stability rules (a healthy pin is reused).
-- **Engine-local, and this is recorded rather than hidden.** The request is
-  live intent, not authorization-bearing state, so it is deliberately not part
-  of the durable run snapshot: a process restart forgets an open request, and
-  the requester asks again. What the request CAUSED is durable like any other
-  dispatch — it rides `detail.routing` with its own `why` line.
-- **A request speaks for the run, not for a guessed role.** The
-  engine does not infer which role a stall belongs to (an `audit` class name
-  cannot even name which auditor was meant); one open request per run is
-  consumed by whichever auto dispatch comes next, whoever asked.
+  own `routing.workClasses.<class>.tiers`, which wins. That dispatch says so in
+  its `why` trace and records the pin it replaced as `repinFrom`.
+- **What it does NOT do.** It never widens an AUTHORIZATION or the role's
+  eligibility. The candidate set is still `session policy ∩ live providers`,
+  still filtered by the class's tier membership, ordered by the reviewer
+  independence rule, and ranked by the class's dominant axis. A pool that widens
+  to nothing blocks with `AP_ROUTE_NO_REACHABLE_WORK_CLASS`.
+- **Escalation is a new-context handoff, never a mid-run swap.** The wider pool
+  answers at the NEXT dispatch: a fresh child on the same contract. A message
+  to a live child that keeps its route is continuity, not escalation.
+- **Consumed once, engine-local.** The request covers one dispatch and is not
+  durable state; a process restart forgets an open request and the requester
+  asks again. What it caused is recorded with the dispatch.
 
 Coverage is two metrics. `coverageReport` (`kind: 'tier-coverage'`) answers "is
 every observed model claimed by some configured tier". The work-class
@@ -252,23 +223,21 @@ beyond the role `minContext` default, and the ceiling have no producer at a
 dispatch site. Effort beyond the mechanical licence is read from the adapter's
 declared facts.
 
-**(b) A role holding a live pin does not re-select by default; AUDITOR roles may
+**(b) A role holding a live pin does not re-select by default; the reviewer may
 opt into engine-level rotation.** The engine reuses a role's recorded pin while
 its provider is still live, its preflight still accepts and its authority still
 covers it — stability over re-selection — and re-selects only a dead pin, with
 `repinFrom` recorded. With `routing.ladder.rotation: true` (explicit owner
 opt-in, off by default) a role re-selects in full at the next dispatch of the
 same role: the why line names rotation as the cause, the ordinal comes from the
-run's own durable stream (replay-safe), and for an AUDITOR the offset lands
-within the audit independence class, so rotation never overrides independence.
-The EXECUTOR enters that branch too (2026-10-12): its ordinal is the run's own
-`executorDispatches` count — a NEW CHILD, because one dispatch writes two
-`start-executor` events — and the offset lands in the ranked survivor list,
-which is the whole list for a role that carries no independence constraint of
-its own. What stays bounded is CONTINUITY, and it is mechanical rather than
-incidental: `resolveRoleRoute('executor')` is called by `startExecutor` alone,
-so a LIVE child continued by `resumeExecutor` keeps the route it was dispatched
-with and never passes through the rotation branch at all.
+ledger's own dispatch count, and for the reviewer the offset lands
+within the independence class, so rotation never overrides independence.
+Executor-side roles enter that branch too (2026-10-12, generalized to N children
+in 0.3.0): the ordinal is the count of NEW children dispatched, and the offset
+lands in the ranked survivor list, which is the whole list for a role that
+carries no independence constraint of its own. What stays bounded is CONTINUITY:
+a LIVE child continued by a message keeps the route it was dispatched with and
+never passes through the rotation branch.
 
 **(c) The `balanced` default and an explicitly written `balanced` are still
 indistinguishable through the config's explicitness ceiling; the axis path is

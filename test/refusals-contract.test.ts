@@ -37,6 +37,16 @@ function codesIn(text: string): ReadonlySet<string> {
   return new Set([...text.matchAll(/AP_[A-Z0-9_]+/g)].map(match => match[0]))
 }
 
+/**
+ * refusals.md has an in-force part (the tables) and, after the \`## Retired codes\`
+ * heading, a list of codes that must no longer exist in the source.
+ */
+function splitRefusals(text: string): { readonly inForce: ReadonlySet<string>, readonly retired: ReadonlySet<string> } {
+  const marker = text.indexOf('\n## Retired codes')
+  if (marker < 0) throw new Error('refusals.md has no "## Retired codes" section')
+  return { inForce: codesIn(text.slice(0, marker)), retired: codesIn(text.slice(marker)) }
+}
+
 const files = sourceFiles()
 const fromSource = new Set<string>()
 for (const file of files) for (const code of codesIn(readFileSync(join(root, 'src', file), 'utf8'))) fromSource.add(code)
@@ -46,14 +56,24 @@ describe('refusal contract', () => {
     // Cardinality floor: if the walker returned nothing, both comparisons below
     // would pass on two empty sets and report a calm green.
     expect(files.length).toBeGreaterThan(20)
-    expect(fromSource.size).toBeGreaterThanOrEqual(60)
+    expect(fromSource.size).toBeGreaterThanOrEqual(10)
   })
 
-  it('states every code the engine can raise, and invents none', () => {
-    const documented = codesIn(readFileSync(refusalsPath, 'utf8'))
-    expect(documented.size).toBeGreaterThanOrEqual(60)
-    const missing = [...fromSource].filter(code => !documented.has(code)).sort()
-    const orphaned = [...documented].filter(code => !fromSource.has(code)).sort()
+  it('states every code the source can raise, and invents none', () => {
+    const { inForce } = splitRefusals(readFileSync(refusalsPath, 'utf8'))
+    expect(inForce.size).toBeGreaterThanOrEqual(10)
+    const missing = [...fromSource].filter(code => !inForce.has(code)).sort()
+    const orphaned = [...inForce].filter(code => !fromSource.has(code)).sort()
     expect({ missing, orphaned }).toEqual({ missing: [], orphaned: [] })
+  })
+
+  it('keeps retired codes out of the source', () => {
+    const { inForce, retired } = splitRefusals(readFileSync(refusalsPath, 'utf8'))
+    // The list is the record of what 0.3.0 removed; an empty one would make the
+    // checks below vacuous.
+    expect(retired.size).toBeGreaterThanOrEqual(1)
+    const stillRaised = [...retired].filter(code => fromSource.has(code)).sort()
+    const listedTwice = [...retired].filter(code => inForce.has(code)).sort()
+    expect({ stillRaised, listedTwice }).toEqual({ stillRaised: [], listedTwice: [] })
   })
 })
