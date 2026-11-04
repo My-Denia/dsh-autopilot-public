@@ -1,0 +1,64 @@
+{
+ "ok": true,
+ "ledger": {
+  "v": 3,
+  "sessionId": "session-synthetic-0001",
+  "revision": 7,
+  "previousGoals": [
+   {
+    "goalId": "goal-synth-prev",
+    "revision": 3,
+    "status": "complete",
+    "objective": "Earlier goal A",
+    "firstSeenAt": "2026-11-04T09:00:00Z",
+    "lastSeenAt": "2026-11-04T10:00:00Z"
+   }
+  ],
+  "delegations": [],
+  "reviews": [
+   {
+    "reviewerChildId": "reviewer-12345678-9999",
+    "reviewedChildIds": [
+     "worker-99999999-7777"
+    ],
+    "subject": "commit 58b0ffa",
+    "verdict": "needs-fix",
+    "findings": [
+     {
+      "severity": "major",
+      "summary": "missing lost state"
+     }
+    ],
+    "reviewerRoute": {
+     "provider": "deepseek",
+     "model": "deepseek-v3.2",
+     "reasoningEffort": "high"
+    },
+    "independence": "reduced",
+    "excludedFamilies": [],
+    "independenceNote": "kimi and zai returned HTTP 503; same family used",
+    "at": "2026-11-04T09:55:00Z"
+   }
+  ],
+  "links": [],
+  "autoContinue": {
+   "available": true,
+   "reason": "goal round driver present"
+  },
+  "depth": {
+   "executorLead": 2,
+   "source": "plugin-default"
+  },
+  "legacyRuns": [],
+  "notes": [],
+  "updatedAt": "2026-11-04T10:00:00Z",
+  "goal": {
+   "goalId": "goal-synth-a",
+   "revision": 3,
+   "status": "complete",
+   "objective": "Ship the synthetic card fixture goal",
+   "firstSeenAt": "2026-11-04T09:00:00Z",
+   "lastSeenAt": "2026-11-04T10:00:00Z"
+  }
+ }
+}
