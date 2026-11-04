@@ -56,9 +56,9 @@ talks to the owner. Start every other role with `autopilot_delegate`
 `executor-lead` may call it):
 
 - `scout`: read-only search, inventory, log reading. Returns compressed findings.
-- `clerk`: external reads and writes through the connector tools that exist in
-  this session; returns a digest or a write readback and decides nothing. With
-  no connector present it says so instead of guessing.
+- `clerk`: read-only today, with the same tools as `scout`. Connector tools are
+  not wired into delegation yet, so reads and writes of external systems stay
+  with you; do not delegate them to a clerk.
 - `worker`: one bounded piece with explicit `writePaths`. Give it the outcome,
   the files, what it may not touch and a checkable result.
 - `executor-lead`: owns one chunk end to end; may start scout, clerk and worker

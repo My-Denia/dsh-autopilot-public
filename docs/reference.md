@@ -66,7 +66,7 @@ Roles (from `src/roles`):
 | role | what it is | tools | default work class |
 | --- | --- | --- | --- |
 | `scout` | search, inventory, log reading; returns compressed findings | `read`, `glob`, `grep`, `read_image`, `web_fetch`, `web_search` | `mechanical` |
-| `clerk` | external reads and writes through connector tools present in the session; says so when none are | the scout set plus the connector tools that exist | `mechanical` |
+| `clerk` | read-only today, same tools as `scout`; connector tools are not wired yet, so external reads and writes stay with the main agent | the scout set | `mechanical` |
 | `worker` | one bounded piece; `writePaths` required | no allow-list (inherits the profile's tools) | `simple` |
 | `executor-lead` | owns one chunk end to end; may start `scout`, `clerk` and `worker` only | no allow-list, plus `autopilot_delegate` and `autopilot_agents` | `hard` |
 | `planner` | read-only plan or diagnosis | `read`, `glob`, `grep`, `read_image` | `hard` |

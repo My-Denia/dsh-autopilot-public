@@ -22,8 +22,9 @@ Deeper design and measurements: [DESIGN.md](../DESIGN.md).
   write one.
 - **Delegated children** have a tool allow-list per role: scout, planner and
   reviewer get only `read`, `glob`, `grep` and `read_image` (scout also
-  `web_fetch` and `web_search`); a clerk gets the scout set plus the connector
-  tools present in the session, so it can write to external systems. A worker
+  `web_fetch` and `web_search`); a clerk gets the same set as a scout
+  today. Connector tools are not wired into delegation yet, so reads and writes
+  of external systems stay with the main agent. A worker
   and an executor-lead have no allow-list. `writePaths` is a conflict guard,
   not a permission system: a worker is not stopped from writing outside its
   declared paths, but a dispatch whose `writePaths` intersect those of a
