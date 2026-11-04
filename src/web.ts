@@ -141,11 +141,13 @@ export function fenceRoute(route: AutopilotWebRoute, lookup: ((name: string) => 
  * @param ledger - the session's ledger.
  * @param legacyRuns - every legacy run summary; the others are ignored.
  * @param notes - one-time notes to show.
+ * @param retiredConfigKeys - retired config keys the host ignored, as data for the card's own wording.
  */
 export function projectLedger(
   ledger: Ledger,
   legacyRuns: readonly LegacyRunSummary[],
   notes: readonly string[],
+  retiredConfigKeys: readonly string[] = [],
 ): LedgerProjection {
   const recorded = new Set(ledger.legacyRunIds)
   const runs = legacyRuns
@@ -168,6 +170,7 @@ export function projectLedger(
     depth: ledger.depth,
     legacyRuns: runs,
     notes: [...notes],
+    ...(retiredConfigKeys.length === 0 ? {} : { retiredConfigKeys: [...retiredConfigKeys] }),
     updatedAt: ledger.updatedAt,
   }
 }

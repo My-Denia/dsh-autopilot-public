@@ -98,6 +98,8 @@ export interface AutopilotServiceInput {
   readonly sources: LegacySources
   /** Notes are read on every call so a note added after mount still shows. */
   readonly notes?: () => readonly string[]
+  /** The retired config keys behind the note, read on every call like `notes`. */
+  readonly retiredKeys?: () => readonly string[]
   readonly legacy?: LegacyReader
   /**
    * Called before a single-session ledger read: lets the owner of the live sessions mirror the
@@ -110,6 +112,7 @@ export interface AutopilotServiceInput {
 export function createAutopilotService(input: AutopilotServiceInput): AutopilotReadOnly {
   const legacy = input.legacy ?? frozenLegacyReader
   const notes = (): readonly string[] => input.notes?.() ?? []
+  const retiredKeys = (): readonly string[] => input.retiredKeys?.() ?? []
   // The ledger is the only place the one-time sandbox restore outcome is kept, so it
   // wins over the reader's default (`pending`) for every run, whichever route asks.
   const restoreOf = (runId: string) => {
@@ -128,13 +131,13 @@ export function createAutopilotService(input: AutopilotServiceInput): AutopilotR
     try { await input.syncSession?.(sessionId) } catch { /* a failed sync never hides the stored ledger */ }
     const ledger = input.ledgers.load(sessionId)
     if (ledger === undefined) return undefined
-    return projectLedger(ledger, await listRuns(), notes())
+    return projectLedger(ledger, await listRuns(), notes(), retiredKeys())
   }
   const service: AutopilotReadOnly = {
     ledger: project,
     ledgers: async () => {
       const runs = await listRuns()
-      return input.ledgers.list().map(ledger => projectLedger(ledger, runs, notes()))
+      return input.ledgers.list().map(ledger => projectLedger(ledger, runs, notes(), retiredKeys()))
     },
     legacyRuns: listRuns,
     legacyRun: async (id) => {

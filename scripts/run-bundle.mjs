@@ -123,10 +123,12 @@ assert('A10 externals are exactly the declared set', JSON.stringify(externals) =
 
 /** Minimal stand-ins for the two client services `apply` touches. */
 function fakeCtx() {
-  const calls = { definitions: [], slots: [] }
+  const calls = { definitions: [], slots: [], effects: 0 }
   return {
     calls,
     ctx: {
+      // `locale` is left out on purpose: apply() must mount on a host without it.
+      effect: (fn) => { calls.effects += 1; return fn() },
       // dsh 0.1.2: the registry is `ctx.uiConversation.events` (ui-conversation), not `conversationEvents`.
       uiConversation: { events: { register: (d) => { calls.definitions.push(d); return () => {} } } },
       slots: {
@@ -315,9 +317,12 @@ assert('A19 the shipped bundle renders the gate-provenance row (owner vs auditor
 // A20+ — the v3 goal ledger view, through the SHIPPED bundle and the real react.
 const fixture = (name) => JSON.parse(readFileSync(resolve(root, `test/client/fixtures/${name}.json`), 'utf8'))
 const ledgerOf = (name) => fixture(name).ledger
-const renderView = (name) => {
+// The card reads the host language, then navigator.language when no host is bound. Pin the
+// fallback so the AutopilotRunCard renders below (no lang prop) are English on any machine.
+Object.defineProperty(globalThis.navigator, 'language', { value: 'en-US', configurable: true })
+const renderView = (name, lang = 'en') => {
   try {
-    return renderToStaticMarkup(React.createElement(exports.GoalLedgerView, { ledger: ledgerOf(name) }))
+    return renderToStaticMarkup(React.createElement(exports.GoalLedgerView, { ledger: ledgerOf(name), lang, timeZone: 'UTC' }))
   } catch (error) {
     return `render threw: ${error.message}`
   }
@@ -343,29 +348,57 @@ assert('A21 active-parallel: cross-family review, issue as text, https PR as hre
   && !/href="javascript:/i.test(parallel))
 
 const lost = renderView('restart-lost')
-assert('A22 restart-lost: unavailable auto-continue, lost row, not restarted automatically',
-  lost.includes('auto-continue unavailable: released after host restart')
+assert('A22 restart-lost: auto-continue warning with the reason, lost row, not restarted automatically',
+  lost.includes('Will not auto-continue: released after host restart')
   && lost.includes('data-autopilot-state="lost"')
   && lost.includes('not restarted automatically'))
+const lostZh = renderView('restart-lost', 'zh')
+assert('A22z restart-lost (zh): 不会自动继续 with the reason, lost row in plain words',
+  lostZh.includes('不会自动继续：released after host restart')
+  && lostZh.includes('data-autopilot-state="lost"')
+  && lostZh.includes('已丢失')
+  && lostZh.includes('不会自动重启'))
 
 const mismatch = renderView('mismatch')
 assert('A23 mismatch: the mismatching row is flagged with both efforts shown',
   mismatch.includes('data-autopilot-route-match="mismatch"')
-  && mismatch.includes('MISMATCH')
+  && mismatch.includes('Model mismatch')
   && mismatch.includes('effort high')
   && mismatch.includes('effort medium')
   && mismatch.includes('var(--dsw-alias-state-error-primary)'))
+const mismatchZh = renderView('mismatch', 'zh')
+assert('A23z mismatch (zh): plain warning with both efforts and the error tone',
+  mismatchZh.includes('data-autopilot-route-match="mismatch"')
+  && mismatchZh.includes('实际模型与选定的不一致')
+  && mismatchZh.includes('思考强度 高')
+  && mismatchZh.includes('思考强度 中')
+  && mismatchZh.includes('var(--dsw-alias-state-error-primary)'))
+assert('A23m only a mismatching row renders the mismatch warning (match and pending rows do not)',
+  count(mismatch, 'Model mismatch') === 1
+  && count(parallel, 'Model mismatch') === 0
+  && count(mismatchZh, '实际模型与选定的不一致') === 1
+  && count(renderView('active-parallel', 'zh'), '实际模型与选定的不一致') === 0)
 
 const reduced = renderView('reduced')
 assert('A24 reduced: reduced independence is marked and the 503 note is shown',
   reduced.includes('data-autopilot-review-independence="reduced"')
-  && reduced.includes('reduced independence')
+  && reduced.includes('Reduced independence')
   && reduced.includes('HTTP 503'))
+const reducedZh = renderView('reduced', 'zh')
+assert('A24z reduced (zh): 独立性降低 in the body, the recorded note verbatim in the details',
+  reducedZh.includes('data-autopilot-review-independence="reduced"')
+  && reducedZh.includes('独立性降低（原因见详情）')
+  && reducedZh.includes('HTTP 503'))
 
 const paused = renderView('paused-no-driver')
 assert('A25 paused-no-driver: says there is no driver and only the owner can resume',
   paused.includes('no goal round driver in this composition')
-  && paused.includes('only you can resume'))
+  && paused.includes('Only you can resume'))
+const pausedZh = renderView('paused-no-driver', 'zh')
+assert('A25z paused-no-driver (zh): no driver reason and only the owner can resume',
+  pausedZh.includes('no goal round driver in this composition')
+  && pausedZh.includes('只有你能恢复')
+  && pausedZh.includes('已暂停'))
 
 const legacyRun = fixture('legacy-run').run
 let legacyMarkup = ''
@@ -405,7 +438,7 @@ assert('A27 no ledger and no v1 data: only the placeholder line, no archived sec
   && emptyMarkup.includes('no goal ledger recorded for this session')
   && !emptyMarkup.includes('data-autopilot-legacy=""'))
 
-const rendered = [parallel, lost, mismatch, reduced, paused, legacyMarkup, emptyMarkup, markup, delegatedMarkup]
+const rendered = [parallel, lost, lostZh, mismatch, mismatchZh, reduced, reducedZh, paused, pausedZh, legacyMarkup, emptyMarkup, markup, delegatedMarkup]
 assert('A28 no rendered view has a button or a retired action',
   rendered.every(m => !/<button/i.test(m) && !/approve|submit closeout|pass gate/i.test(m)),
   JSON.stringify(rendered.map(m => /<button|approve|submit closeout|pass gate/i.exec(m)?.[0] ?? null)))
@@ -491,6 +524,6 @@ assert('A33 the shipped card node declares groupTree "turn" (outside the collaps
   goalOnly.node?.groupTree === 'turn' && mixed.node?.groupTree === 'turn',
   JSON.stringify({ goalOnly: goalOnly.node?.groupTree ?? null, mixed: mixed.node?.groupTree ?? null }))
 
-const TOTAL = 33
+const TOTAL = 38
 console.log(`\n${failures === 0 ? `ALL GREEN (${TOTAL} assertions)` : `${failures} RED of ${TOTAL}`}`)
 process.exitCode = failures === 0 ? 0 : 1

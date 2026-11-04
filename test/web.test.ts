@@ -86,6 +86,12 @@ describe('projectLedger', () => {
     expect(projected.legacyRuns.find(r => r.runId === 'r4')?.sandboxRestore).toEqual({ state: 'pending' })
   })
 
+  it('carries the retired config keys as data when given, and omits the field when none', () => {
+    expect(projectLedger(ledger, [], ['n'], ['governance.unattended', 'storeKind']).retiredConfigKeys).toEqual(['governance.unattended', 'storeKind'])
+    expect(projectLedger(ledger, [], ['n'], [])).not.toHaveProperty('retiredConfigKeys')
+    expect(projectLedger(ledger, [], ['n'])).not.toHaveProperty('retiredConfigKeys')
+  })
+
   it('carries the ledger fields, notes and updatedAt, and omits absent optionals', () => {
     const projected = projectLedger(ledger, [], ['n1', 'n2'])
     expect(projected).toEqual({

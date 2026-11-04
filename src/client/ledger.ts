@@ -35,6 +35,10 @@ import type {
   LEDGER_ROUTE as LedgerRouteConst, LEGACY_RUN_ROUTE as LegacyRunRouteConst,
 } from '../domain/ledger-types.js'
 import type { LiveFetch } from './live.js'
+import { STRINGS, formatTime } from './i18n.js'
+import type { Lang } from './i18n.js'
+
+export type { Lang }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Routes
@@ -248,6 +252,7 @@ export function readLedgerBody(body: unknown): LedgerProjection | undefined {
     links: rows(l.links, readLink),
     autoContinue: {
       available: ac.available === true,
+      ...opt('code', oneOf(ac.code, ['driver-present', 'no-driver-in-composition', 'released-after-restart', 'not-yet-observed', 'unknown'] as const)),
       reason: str(ac.reason) ?? 'not reported',
     },
     depth: {
@@ -257,6 +262,7 @@ export function readLedgerBody(body: unknown): LedgerProjection | undefined {
     },
     legacyRuns: rows(l.legacyRuns, readLegacySummary),
     notes: strList(l.notes),
+    ...(Array.isArray(l.retiredConfigKeys) ? { retiredConfigKeys: strList(l.retiredConfigKeys) } : {}),
     updatedAt: str(l.updatedAt) ?? '',
     ...opt('goal', readGoal(l.goal)),
     ...opt('hostRestart', restart),
@@ -333,6 +339,12 @@ export async function fetchLegacyRun(runId: string, fetchJson: LiveFetch): Promi
 
 // ─────────────────────────────────────────────────────────────────────────────
 // View model
+//
+// Every view function takes a trailing `lang` (default 'en'). Fields that existed
+// before keep their English values at the default language, so a caller that
+// passes nothing sees what it always saw; the `...Text` fields and the `details`
+// lists are the localized, plain-words presentation the card renders. Recorded
+// values (reasons, notes, titles, ids, model names) are never translated.
 // ─────────────────────────────────────────────────────────────────────────────
 
 /** Neutral display tone; the TSX maps it onto `--dsw-alias-*` colours. */
@@ -340,52 +352,119 @@ export type Tone = 'success' | 'warn' | 'error' | 'neutral'
 
 export type GoalPhaseView = 'active' | 'paused' | 'blocked' | 'complete' | 'no-goal' | 'unrecognised'
 
+/** One label/value line inside a collapsed details area. */
+export interface DetailRow {
+  readonly label: string
+  readonly value: string
+}
+
 export interface GoalView {
   readonly phase: GoalPhaseView
-  /** Badge text: the phase, or the verbatim status when unrecognised. */
+  /** English badge text: the phase, or the verbatim status when unrecognised. */
   readonly label: string
+  /** Localized badge text (verbatim when the status is unrecognised). */
+  readonly statusText: string
   readonly tone: Tone
   readonly objective?: string
-  /** Who can move it next, in plain words. */
+  /** Who can move it next, in plain English (reference wording). */
   readonly next?: string
-  /** Revision and when the plugin last read it. */
+  /** Localized plain sentence for the body; absent when the body has nothing to add. */
+  readonly nextText?: string
+  /** Revision and when the plugin last read it (English reference wording). */
   readonly seen?: string
+  /** Everything technical about the goal, for the collapsed area. */
+  readonly details: readonly DetailRow[]
 }
 
 const NATIVE_PHASES: readonly string[] = ['active', 'paused', 'blocked', 'complete']
+
+/** The host note `retiredConfigNote` builds; matched so the structured notice can replace it. */
+const RETIRED_NOTE_MARK = 'ignores retired settings'
+
+/** Notes the card lists; the retired-settings note is dropped once the structured keys are present. */
+export function visibleNotes(p: LedgerProjection): readonly string[] {
+  const structured = (p.retiredConfigKeys ?? []).length > 0
+  return structured ? p.notes.filter(n => !n.includes(RETIRED_NOTE_MARK)) : p.notes
+}
+
+/** The retired-settings sentence, or undefined when the config has none. */
+export function retiredNotice(p: LedgerProjection, lang: Lang = 'en'): string | undefined {
+  const keys = p.retiredConfigKeys ?? []
+  if (keys.length === 0) return undefined
+  const S = STRINGS[lang]
+  return S.retired(keys.join(S.keySeparator))
+}
+
+/** The goal's technical lines plus the other technical bits of the ledger (depth, previous goals, notes). */
+export function goalDetailRows(p: LedgerProjection, lang: Lang = 'en', timeZone?: string): readonly DetailRow[] {
+  const S = STRINGS[lang]
+  const rows: DetailRow[] = []
+  const g = p.goal
+  if (g !== undefined) {
+    rows.push({ label: S.goalId, value: g.goalId })
+    if (g.revision !== undefined) rows.push({ label: S.revision, value: String(g.revision) })
+    rows.push({ label: S.firstSeen, value: formatTime(g.firstSeenAt, lang, timeZone) })
+    rows.push({ label: S.lastRead, value: formatTime(g.lastSeenAt, lang, timeZone) })
+  }
+  rows.push({
+    label: S.autoContinue,
+    value: `${p.autoContinue.available ? S.autoAvailable : S.autoUnavailable}${S.colon}${S.autoReasonDetail(p.autoContinue.code, p.autoContinue.reason)}`,
+  })
+  if (p.depth.source !== 'plugin-default') {
+    rows.push({
+      label: S.depth,
+      value: `${p.depth.executorLead} (${p.depth.source})${p.depth.note === undefined ? '' : ` · ${p.depth.note}`}`,
+    })
+  }
+  p.previousGoals.forEach((pg, i) => {
+    rows.push({
+      label: i === 0 ? S.previousGoals : '',
+      value: `${pg.goalId}${pg.status === undefined ? '' : ` · ${pg.status}`}${pg.objective === undefined ? '' : ` · ${pg.objective}`}`,
+    })
+  })
+  visibleNotes(p).forEach((n, i) => rows.push({ label: i === 0 ? S.notes : '', value: n }))
+  return rows
+}
 
 /**
  * The goal line. `status` is shown verbatim when it is not one of the four
  * native phases, because the contract carries no reason field to parse.
  */
-export function goalView(p: LedgerProjection): GoalView {
+export function goalView(p: LedgerProjection, lang: Lang = 'en', timeZone?: string): GoalView {
+  const S = STRINGS[lang]
   const g = p.goal
+  const details = goalDetailRows(p, lang, timeZone)
   if (g === undefined) {
-    return { phase: 'no-goal', label: 'no goal recorded', tone: 'neutral', next: 'no dsh-goal has been seen in this session' }
+    return {
+      phase: 'no-goal', label: 'no goal recorded', statusText: S.noGoalLabel, tone: 'neutral',
+      next: 'no dsh-goal has been seen in this session', nextText: S.noGoalNext, details,
+    }
   }
   const status = g.status?.trim()
   const seen = `goal ${g.goalId}${g.revision === undefined ? '' : ` r${g.revision}`} · last read ${g.lastSeenAt}`
-  const base = { seen, ...opt('objective', g.objective) }
+  const base = { seen, details, ...opt('objective', g.objective) }
   if (status === undefined || status === '') {
-    return { ...base, phase: 'unrecognised', label: 'status not read', tone: 'neutral' }
+    return { ...base, phase: 'unrecognised', label: 'status not read', statusText: S.statusNotRead, tone: 'neutral' }
   }
   if (!NATIVE_PHASES.includes(status)) {
-    return { ...base, phase: 'unrecognised', label: status, tone: 'neutral' }
+    return { ...base, phase: 'unrecognised', label: status, statusText: status, tone: 'neutral' }
   }
   switch (status) {
     case 'active':
       return {
-        ...base, phase: 'active', label: 'active', tone: 'success',
+        ...base, phase: 'active', label: 'active', statusText: S.status.active, tone: 'success',
         next: p.autoContinue.available
           ? 'rounds continue automatically while the session is idle'
           : `auto-continue is not running: ${p.autoContinue.reason}`,
+        // Unavailable: the body's auto-continue warning already says it, with the reason.
+        ...opt('nextText', p.autoContinue.available ? S.nextActive : undefined),
       }
     case 'paused':
-      return { ...base, phase: 'paused', label: 'paused', tone: 'warn', next: 'paused; only you can resume it (say "continue")' }
+      return { ...base, phase: 'paused', label: 'paused', statusText: S.status.paused, tone: 'warn', next: 'paused; only you can resume it (say "continue")', nextText: S.nextPaused }
     case 'blocked':
-      return { ...base, phase: 'blocked', label: 'blocked', tone: 'error', next: 'blocked; the block reason is not recorded in the ledger — check the goal before resuming (a round-limit block needs a higher round cap first)' }
+      return { ...base, phase: 'blocked', label: 'blocked', statusText: S.status.blocked, tone: 'error', next: 'blocked; the block reason is not recorded in the ledger — check the goal before resuming (a round-limit block needs a higher round cap first)', nextText: S.nextBlocked }
     default:
-      return { ...base, phase: 'complete', label: 'complete', tone: 'success', next: 'complete; a new goal can be created in this session' }
+      return { ...base, phase: 'complete', label: 'complete', statusText: S.status.complete, tone: 'success', next: 'complete; a new goal can be created in this session', nextText: S.nextComplete }
   }
 }
 
@@ -395,6 +474,11 @@ export interface AutoContinueView {
   readonly text: string
   readonly tone: Tone
   /**
+   * The body line: present ONLY while the goal is active or paused and
+   * auto-continue is not available. Everything else lives in the goal details.
+   */
+  readonly warning?: string
+  /**
    * The B4 line, shown while a goal is active: continuing across a host
    * restart needs the owner's "continue"; a scheduled reminder does not re-arm
    * the goal.
@@ -402,51 +486,63 @@ export interface AutoContinueView {
   readonly restartNote?: string
 }
 
-export const RESTART_NOTE = 'After a host restart the goal does not continue on its own: say "continue" once to resume it. A scheduled reminder does not re-arm the goal.'
+export const RESTART_NOTE = STRINGS.en.restartNote
 
-export function autoContinueView(p: LedgerProjection): AutoContinueView {
-  const active = p.goal?.status?.trim() === 'active'
+export function autoContinueView(p: LedgerProjection, lang: Lang = 'en'): AutoContinueView {
+  const S = STRINGS[lang]
+  const status = p.goal?.status?.trim()
+  const active = status === 'active'
+  const live = active || status === 'paused'
   return {
     available: p.autoContinue.available,
     text: p.autoContinue.available
       ? `auto-continue available: ${p.autoContinue.reason}`
       : `auto-continue unavailable: ${p.autoContinue.reason}`,
     tone: p.autoContinue.available ? 'success' : 'warn',
-    ...opt('restartNote', active ? RESTART_NOTE : undefined),
+    ...opt('warning', live && !p.autoContinue.available ? S.autoWarn(S.autoReason(p.autoContinue.code, p.autoContinue.reason)) : undefined),
+    ...opt('restartNote', active ? S.restartNote : undefined),
   }
 }
 
 /** The host-restart marker as history, never as a live instruction. */
-export function hostRestartLine(p: LedgerProjection): string | undefined {
+export function hostRestartLine(p: LedgerProjection, lang: Lang = 'en', timeZone?: string): string | undefined {
   const r = p.hostRestart
   if (r === undefined) return undefined
-  const n = r.lostChildIds.length
-  return `host restart at ${r.at}: ${n} running ${n === 1 ? 'child was' : 'children were'} lost (not restarted automatically)`
+  return STRINGS[lang].hostRestart(formatTime(r.at, lang, timeZone), r.lostChildIds.length)
 }
 
 export function shortId(id: string): string {
   return id.length > 8 ? `${id.slice(0, 8)}…` : id
 }
 
-/** `provider/model · effort high`, or `… · no effort sent` / `no effort observed`. */
-export function routeText(route: LedgerRoute | undefined, side: 'selected' | 'observed'): string {
-  if (route === undefined) return side === 'selected' ? 'nothing sent (host default)' : 'not observed yet'
+/** `provider/model · effort high` (zh: `思考强度 高`; `keepRaw` adds `（high）` for details), or `… · no effort sent` / `no effort observed`. */
+export function routeText(route: LedgerRoute | undefined, side: 'selected' | 'observed', lang: Lang = 'en', keepRaw = false): string {
+  const S = STRINGS[lang]
+  if (route === undefined) return side === 'selected' ? S.selectedNothing : S.observedNothing
   const effort = route.reasoningEffort === undefined
-    ? (side === 'selected' ? 'no effort sent' : 'no effort observed')
-    : `effort ${route.reasoningEffort}`
+    ? (side === 'selected' ? S.noEffortSent : S.noEffortObserved)
+    : `${S.effort} ${keepRaw ? S.effortValueDetail(route.reasoningEffort) : S.effortValue(route.reasoningEffort)}`
   return `${route.provider}/${route.model} · ${effort}`
 }
 
 export interface DelegationRow {
   readonly childId: string
   readonly shortId: string
+  /** The role id (`scout`, `executor-lead`, …). */
   readonly role: string
+  /** The role in plain words. */
+  readonly roleText: string
+  /** The full recorded title. */
   readonly title: string
+  /** The title cut to a line (full title stays in `title` and the details). */
+  readonly taskText: string
   /** 0-based indentation level (depth - 1). */
   readonly indent: number
   readonly generation: number
   readonly replaces?: string
   readonly state: DelegationState
+  /** The state in plain words. */
+  readonly stateText: string
   readonly stateTone: Tone
   /** Extra state text, e.g. lost: `lost — not restarted automatically`. */
   readonly stateNote?: string
@@ -454,21 +550,35 @@ export interface DelegationRow {
   readonly observed: string
   /** `model from pin · effort from arg`. */
   readonly source: string
+  readonly modelSource: string
+  readonly effortSource: string
   readonly match: 'match' | 'mismatch' | 'pending' | 'unreadable'
   /** Human text for the match cell. */
   readonly matchText: string
   readonly matchTone: Tone
+  /** The route the child ran on if seen, else the selected one marked "not observed yet". */
+  readonly modelUsed: string
+  /** Error-tone line, set ONLY when the observed route differs from the selected one. */
+  readonly warning?: string
+  /** A match: the body shows at most a muted check mark. */
+  readonly ok: boolean
+  /** Muted body note for a child whose session could not be read. */
+  readonly quietNote?: string
   readonly diagnostic?: string
   readonly escalation?: string
+  readonly details: readonly DetailRow[]
 }
 
-const SOURCE_TEXT: Readonly<Record<string, string>> = {
-  arg: 'call argument',
-  pin: 'role pin',
-  ladder: 'routing ladder',
-  inherit: 'host default',
-  'catalog-default': 'model catalog default',
-  'host-default': 'host default',
+const TITLE_CUT = 60
+
+/** Cut to `max` code points with an ellipsis. */
+export function truncateTitle(title: string, max: number = TITLE_CUT): string {
+  const chars = [...title]
+  return chars.length > max ? `${chars.slice(0, max).join('')}…` : title
+}
+
+function sourceText(key: string, lang: Lang): string {
+  return STRINGS[lang].sources[key] ?? key
 }
 
 function stateTone(state: DelegationState): Tone {
@@ -485,7 +595,8 @@ function stateTone(state: DelegationState): Tone {
  * under its executor-lead), siblings by start time. Orphans (parent not in the
  * list and not the root) are appended at their own depth rather than dropped.
  */
-export function delegationRows(p: LedgerProjection): readonly DelegationRow[] {
+export function delegationRows(p: LedgerProjection, lang: Lang = 'en'): readonly DelegationRow[] {
+  const S = STRINGS[lang]
   const byStart = [...p.delegations].sort((a, b) => a.startedAt.localeCompare(b.startedAt))
   const ids = new Set(byStart.map(d => d.childId))
   const ordered: DelegationRecord[] = []
@@ -499,68 +610,117 @@ export function delegationRows(p: LedgerProjection): readonly DelegationRow[] {
   for (const d of byStart) if (!ids.has(d.parentId)) visit(d)
   for (const d of byStart) visit(d)
   return ordered.map((d) => {
-    const matchText = d.routeMatch === 'match'
-      ? 'observed matches selected'
-      : d.routeMatch === 'mismatch'
-        ? 'MISMATCH: observed differs from selected'
-        : d.routeMatch === 'pending'
-          ? 'not observed yet (child has not sent a request)'
-          : 'could not read the child session'
+    const matchText = S.match[d.routeMatch]
+    const selected = routeText(d.selected, 'selected', lang)
+    const observed = routeText(d.observed, 'observed', lang)
+    const modelSource = sourceText(d.modelSource, lang)
+    const effortSource = sourceText(d.effortSource, lang)
+    const roleText = S.roles[d.role] ?? d.role
+    const stateNote = d.state === 'lost' ? S.lostNote : undefined
+    const details: DetailRow[] = [
+      { label: S.roleId, value: d.role },
+      { label: S.childId, value: d.childId },
+      { label: S.generation, value: String(d.generation) },
+      ...(d.replaces === undefined ? [] : [{ label: S.replaces, value: d.replaces }]),
+      ...(d.title === '' ? [] : [{ label: S.task, value: d.title }]),
+      { label: S.selectedRoute, value: routeText(d.selected, 'selected', lang, true) },
+      { label: S.observedRoute, value: routeText(d.observed, 'observed', lang, true) },
+      { label: S.modelSource, value: modelSource },
+      { label: S.effortSource, value: effortSource },
+      { label: S.matchResult, value: matchText },
+    ]
     return {
       childId: d.childId,
       shortId: shortId(d.childId),
       role: d.role,
+      roleText,
       title: d.title,
+      taskText: truncateTitle(d.title),
       indent: Math.max(0, d.depth - 1),
       generation: d.generation,
       state: d.state,
+      stateText: S.states[d.state] ?? d.state,
       stateTone: stateTone(d.state),
-      selected: routeText(d.selected, 'selected'),
-      observed: routeText(d.observed, 'observed'),
-      source: `model from ${SOURCE_TEXT[d.modelSource] ?? d.modelSource} · effort from ${SOURCE_TEXT[d.effortSource] ?? d.effortSource}`,
+      selected,
+      observed,
+      source: S.sourceLine(modelSource, effortSource),
+      modelSource,
+      effortSource,
       match: d.routeMatch,
       matchText,
       matchTone: d.routeMatch === 'match' ? 'success' : d.routeMatch === 'mismatch' ? 'error' : 'neutral',
+      modelUsed: d.observed !== undefined ? observed : `${selected} · ${S.notObserved}`,
+      ok: d.routeMatch === 'match',
+      details,
+      ...opt('warning', d.routeMatch === 'mismatch' ? S.mismatchWarn(selected, observed) : undefined),
+      ...opt('quietNote', d.routeMatch === 'unreadable' ? S.cannotRead : undefined),
       ...opt('replaces', d.replaces === undefined ? undefined : shortId(d.replaces)),
-      ...opt('stateNote', d.state === 'lost' ? 'lost after host restart, not restarted automatically' : undefined),
+      ...opt('stateNote', stateNote),
       ...opt('diagnostic', d.diagnostic),
-      ...opt('escalation', d.escalation === undefined ? undefined : `asked to escalate: ${d.escalation.reason}`),
+      ...opt('escalation', d.escalation === undefined ? undefined : S.escalated(d.escalation.reason)),
     }
   })
 }
 
 export interface ReviewRow {
   readonly key: string
+  /** The recorded verdict (`pass`, `needs-fix`, `blocked`). */
   readonly verdict: string
+  /** The verdict in plain words. */
+  readonly verdictText: string
   readonly verdictTone: Tone
   readonly subject: string
   readonly reviewer: string
   readonly reduced: boolean
-  /** `cross-family` text, or the reduced-independence explanation. */
+  /** `cross-family` text, or the reduced-independence explanation (English reference wording). */
   readonly independence: string
+  /** Plain-words independence line for the body. */
+  readonly independenceText: string
   readonly findings: string
   readonly at: string
+  readonly details: readonly DetailRow[]
 }
 
-export function reviewRows(p: LedgerProjection): readonly ReviewRow[] {
+/** The one independence note shape the card knows how to say in plain words. */
+const KNOWN_REDUCED_NOTE = /no reviewer route outside provider families/
+
+export function reviewRows(p: LedgerProjection, lang: Lang = 'en', timeZone?: string): readonly ReviewRow[] {
+  const S = STRINGS[lang]
   return p.reviews.map((r, i) => {
     const counts = (['blocker', 'major', 'minor'] as const)
       .map(sev => [sev, r.findings.filter(f => f.severity === sev).length] as const)
       .filter(([, n]) => n > 0)
-      .map(([sev, n]) => `${n} ${sev}`)
+      .map(([sev, n]) => S.findingCount(n, S.severities[sev]))
     const excluded = r.excludedFamilies.length > 0 ? ` (excluded: ${r.excludedFamilies.join(', ')})` : ''
+    const reduced = r.independence === 'reduced'
+    const note = r.independenceNote
+    const independenceText = !reduced
+      ? S.crossFamily
+      : note !== undefined && KNOWN_REDUCED_NOTE.test(note)
+        ? `${S.reducedPrefix}${S.reducedKnown}`
+        : S.reducedUnknown
     return {
       key: `${r.reviewerChildId}:${r.at}:${i}`,
       verdict: r.verdict,
+      verdictText: S.verdicts[r.verdict],
       verdictTone: r.verdict === 'pass' ? 'success' : r.verdict === 'blocked' ? 'error' : 'warn',
       subject: r.subject,
-      reviewer: `${shortId(r.reviewerChildId)} · ${routeText(r.reviewerRoute, 'observed')}`,
-      reduced: r.independence === 'reduced',
-      independence: r.independence === 'reduced'
-        ? `REDUCED INDEPENDENCE${r.independenceNote === undefined ? '' : `: ${r.independenceNote}`}${excluded}`
+      reviewer: `${shortId(r.reviewerChildId)} · ${routeText(r.reviewerRoute, 'observed', lang)}`,
+      reduced,
+      independence: reduced
+        ? `REDUCED INDEPENDENCE${note === undefined ? '' : `: ${note}`}${excluded}`
         : `cross-family review${excluded}`,
-      findings: counts.length === 0 ? 'no findings' : counts.join(', '),
+      independenceText,
+      findings: counts.length === 0 ? S.noFindings : counts.join(S.listSeparator),
       at: r.at,
+      details: [
+        ...(r.subject === '' ? [] : [{ label: S.subject, value: r.subject }]),
+        { label: S.reviewerId, value: r.reviewerChildId },
+        { label: S.reviewer, value: routeText(r.reviewerRoute, 'observed', lang, true) },
+        { label: S.reviewedAt, value: formatTime(r.at, lang, timeZone) },
+        { label: S.independenceNote, value: note ?? S.noneRecorded },
+        { label: S.excludedFamilies, value: r.excludedFamilies.length > 0 ? r.excludedFamilies.join(', ') : S.noneRecorded },
+      ],
     }
   })
 }
@@ -577,10 +737,10 @@ export function safeHref(url: string | undefined): string | undefined {
   return /^https?:\/\//i.test(url.trim()) ? url.trim() : undefined
 }
 
-export function linkRows(p: LedgerProjection): readonly LinkRow[] {
+export function linkRows(p: LedgerProjection, lang: Lang = 'en'): readonly LinkRow[] {
   return p.links.map((l, i) => ({
     key: `${l.kind}:${l.ref}:${i}`,
-    label: `${l.kind === 'pr' ? 'PR' : 'issue'} ${l.ref}`,
+    label: `${STRINGS[lang].linkKind[l.kind]} ${l.ref}`,
     ...opt('href', safeHref(l.url ?? l.ref)),
   }))
 }
@@ -649,7 +809,7 @@ export function legacyRunLines(r: LegacyRunProjection): readonly { readonly labe
 }
 
 /** Shown above every legacy block: these runs no longer need anything. */
-export const LEGACY_NOTE = 'Archived run from an earlier plugin version, shown read-only. Its gates and closeout are history; nothing here needs action.'
+export const LEGACY_NOTE = STRINGS.en.legacyNote
 
 const LIVE_STATES: readonly DelegationState[] = ['starting', 'running']
 

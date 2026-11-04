@@ -759,7 +759,7 @@ describe('retired 0.2.x settings', () => {
     expect(retiredConfigNote(retiredKeysIn({}))).toBeUndefined()
     expect(retiredConfigNote(retiredKeysIn(undefined))).toBeUndefined()
     const note = retiredConfigNote(['gate.toolDeny', 'governance.unattended'])
-    expect(note).toBe('dsh-autopilot 0.3.0 ignores retired settings: gate.toolDeny, governance.unattended; they no longer have an effect.')
+    expect(note).toBe('dsh-autopilot 0.3.0 ignores retired settings: gate.toolDeny, governance.unattended; they no longer have an effect and can be deleted from your config.')
   })
 
   it('every retired key is still declared by the schema (it must keep loading)', () => {

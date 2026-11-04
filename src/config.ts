@@ -586,5 +586,5 @@ export function retiredKeysIn(input: unknown): readonly string[] {
 /** One plain status note naming the ignored keys, or `undefined` when there are none. */
 export function retiredConfigNote(keys: readonly string[]): string | undefined {
   if (keys.length === 0) return undefined
-  return `dsh-autopilot 0.3.0 ignores retired settings: ${keys.join(', ')}; they no longer have an effect.`
+  return `dsh-autopilot 0.3.0 ignores retired settings: ${keys.join(', ')}; they no longer have an effect and can be deleted from your config.`
 }
