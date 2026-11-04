@@ -505,13 +505,13 @@ async function selectLocked(input: RouteSelectionInput): Promise<SelectionDecisi
   // blocks with the existing reason shape.
   if (snapshot.catalogStatus === 'live' && !providerIsLive(snapshot, grant.provider)) {
     // Plan "Route records and stability": a locked route whose provider is
-    // gone blocks dispatch and escalates needs-owner-decision. The lock is an
+    // gone blocks dispatch and escalates to the owner's decision. The lock is an
     // owner grant; only the owner can re-decide it.
     return {
       kind: 'escalate-owner',
       reason:
         `locked route ${grant.provider}/${grant.model} has no live provider in the catalog — ` +
-        'dispatch blocked, run escalates needs-owner-decision',
+        'dispatch blocked; re-deciding the lock needs the owner (nothing pauses the run)',
     }
   }
   const catalogOutage =

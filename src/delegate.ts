@@ -107,7 +107,6 @@ interface Armed {
   readonly allow: readonly string[] | 'inherit'
 }
 
-const ACTIVE: ReadonlySet<DelegationState> = new Set<DelegationState>(['starting', 'running', 'idle'])
 const WRITE_ROLES: ReadonlySet<string> = new Set(ROLE_NAMES.filter(name => ROLES[name].write))
 
 const fail = (message: string, code: RefusalCode): never => { throw new AutopilotError(message, code) }
@@ -133,9 +132,6 @@ export function routeMatchOf(
 export class Delegator {
   /** Allow-lists armed before `startActivation`, keyed by the pre-minted child id (never by parent). */
   private readonly armed = new Map<string, Armed>()
-  /** Fallback when the backend would not take a pre-minted id: one slot per parent, dispatches serialized. */
-  private readonly armedByParent = new Map<string, Armed>()
-  private readonly parentLanes = new Map<string, Promise<unknown>>()
   /** Settlement of each tracked child, resolved after the ledger write. */
   private readonly settlements = new Map<string, Promise<void>>()
   private readonly childSurfaces = new Map<string, () => void>()
@@ -277,7 +273,7 @@ export class Delegator {
     if (writePaths.length === 0) return
     const conflict = findWriteConflict(writePaths, ledger.delegations, ancestors)
     if (conflict !== undefined) {
-      fail(`writePaths ${conflict.path} intersects ${conflict.with}, which active child ${conflict.childId} may write; give concurrent writers disjoint paths, or wait for it`, AP_WRITE_PATHS_CONFLICT)
+      fail(`writePaths ${conflict.path} intersects ${conflict.with}, which child ${conflict.childId} may write while it is still running; give concurrent writers disjoint paths, or wait for it to finish`, AP_WRITE_PATHS_CONFLICT)
     }
   }
 
@@ -340,17 +336,8 @@ export class Delegator {
     try {
       activation = await this.engine.subagents.startActivation({ provider: LOCAL_PROVIDER, label, childId, request, signal: this.engine.signal, delivery })
     } catch (error: unknown) {
-      const message = errorMessage(error)
-      if (/child ?id|local backend/i.test(message)) {
-        // The backend would not take a pre-minted id: serialize this parent's dispatches and arm by parent.
-        try {
-          activation = await this.startWithoutId(caller, armed, { provider: LOCAL_PROVIDER, label, request, signal: this.engine.signal, delivery })
-        } catch (second: unknown) {
-          return await this.failStart(caller.rootId, childId, second)
-        }
-      } else {
-        return await this.failStart(caller.rootId, childId, error)
-      }
+      // No fallback: a host that rejects a pre-minted id fails the dispatch rather than arming by parent.
+      return await this.failStart(caller.rootId, childId, error)
     }
     const realId = String(activation.childId)
     if (realId !== childId) {
@@ -396,25 +383,6 @@ export class Delegator {
       'Task:',
       task.trim(),
     ].filter((line, index, all) => !(line === '' && all[index - 1] === '')).join('\n')
-  }
-
-  private async startWithoutId(
-    caller: Caller,
-    armed: Armed,
-    spec: Omit<Parameters<AutopilotEngine['subagents']['startActivation']>[0], 'childId'>,
-  ) {
-    const tail = this.parentLanes.get(caller.agent.id) ?? Promise.resolve()
-    const run = async () => {
-      this.armedByParent.set(caller.agent.id, armed)
-      try {
-        return await this.engine.subagents.startActivation(spec)
-      } finally {
-        this.armedByParent.delete(caller.agent.id)
-      }
-    }
-    const next = tail.then(run, run)
-    this.parentLanes.set(caller.agent.id, next.then(() => undefined, () => undefined))
-    return await next
   }
 
   private async failStart(rootId: string, childId: string, error: unknown): Promise<never> {
@@ -617,8 +585,7 @@ export class Delegator {
     const parentId = agent.session.header.parentSession
     if (parentId === undefined) return
     const rootId = this.rootIdOf(agent)
-    let armed = this.armed.get(agent.id) ?? this.armedByParent.get(parentId)
-    if (this.armed.get(agent.id) === undefined && armed !== undefined) this.armedByParent.delete(parentId)
+    let armed = this.armed.get(agent.id)
     if (armed === undefined) {
       const record = this.engine.peekLedger(rootId)?.delegations.find(d => d.childId === agent.id)
       if (record === undefined) return

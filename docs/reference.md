@@ -83,8 +83,8 @@ the ledger records whether the host setting was readable.
 
 Delegation is refused (not queued) when the caller may not dispatch the role
 (`AP_ROLE_NOT_DISPATCHABLE`), a `worker` has no `writePaths`
-(`AP_WRITE_PATHS_REQUIRED`), or the `writePaths` intersect those of an active
-writer under the same root (`AP_WRITE_PATHS_CONFLICT`). The overlap check is a
+(`AP_WRITE_PATHS_REQUIRED`), or the `writePaths` intersect those of a writer
+still running (`starting` or `running`) under the same root (`AP_WRITE_PATHS_CONFLICT`). The overlap check is a
 conflict guard between concurrent writers, not a permission system: a worker has
 no tool filter, so staying inside its `writePaths` is up to the brief.
 

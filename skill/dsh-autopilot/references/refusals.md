@@ -27,7 +27,6 @@ Exactly the 20 codes of the registry in `src/domain/refusals.ts`, in registry or
 | `AP_LEDGER_BUSY` | the ledger stops changing under the write; the bounded retries ran out, so retry the call later |
 | `AP_DISPOSED` | the plugin is not shutting down; no new ledger writes are accepted once it is |
 | `AP_NO_AGENT` | the tool call carries a calling agent; the host supplied none |
-| `AP_OWNER_AUTHORITY_REQUIRED` | an owner-only action (such as clearing a legacy archive) runs on a direct human turn of the top-level agent |
 | `AP_ROLE_ROUTE_NOT_ALLOWED` | the route named by the call or by an owner pin is inside the allowed model set |
 | `AP_ROLE_ROUTE_INCOMPLETE` | `provider` and `model` are given together, or neither |
 | `AP_ROLE_ROUTE_PREFLIGHT_FAILED` | the host preflight accepts the named route and effort; pick a route or effort it accepts |
@@ -40,7 +39,7 @@ Exactly the 20 codes of the registry in `src/domain/refusals.ts`, in registry or
 | `AP_INVALID_ARGUMENT` | every tool argument is present, well-formed and names something that exists |
 | `AP_ROLE_NOT_DISPATCHABLE` | only the root agent or an executor-lead dispatches, and an executor-lead dispatches only `scout`, `clerk` and `worker` |
 | `AP_WRITE_PATHS_REQUIRED` | a `worker` dispatch declares the paths it may write (`writePaths`) |
-| `AP_WRITE_PATHS_CONFLICT` | the declared `writePaths` do not intersect those of another active writer under the same root |
+| `AP_WRITE_PATHS_CONFLICT` | the declared `writePaths` do not intersect those of another writer still running (`starting` or `running`) under the same root; a writer that has settled, idle included, frees its paths |
 | `AP_UNKNOWN_CHILD` | the child id names a delegation that exists under this root |
 | `AP_DISPATCH_FAILED` | the host starts the child; if it refuses, the delegation is recorded as `failed` with the host reason |
 

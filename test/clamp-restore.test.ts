@@ -20,6 +20,7 @@ import type { FakeAgent } from './helpers.js'
 
 const SESSION = 'syn-session-a'
 const CLAMPED = 'independent-clamped-completed.jsonl'
+const RESTORED_AT_GATE = 'independent-restored-at-gate.jsonl'
 const NO_PRIOR_SESSION = 'syn-clamped-no-prior'
 const NO_PRIOR = 'clamped-no-prior-mode.jsonl'
 
@@ -72,12 +73,20 @@ describe('restore with a recorded prior mode', () => {
     expect(h.engine.peekLedger(SESSION)!.legacyRestores?.[SESSION]).toMatchObject({ state: 'untouched-user-changed' })
   })
 
-  it('(2b) KNOWN LIMIT of the positional rule: a user read-only that directly follows the recorded prior mode looks like the clamp', async () => {
-    // [workspace-write, read-only(clamp), workspace-write(lifted), read-only(user)]: the last two events
-    // are shaped exactly like a fresh clamp (read-only, no source, right after the prior mode), and the
-    // log carries nothing else to tell them apart. The rule restores here. Pinned so a change is deliberate.
-    const h = open({ rootId: SESSION, fixtures: [CLAMPED] })
+  it('(2b) a run that restored at its plan gate is never pending: the user\'s own later read-only is left alone', async () => {
+    // [workspace-write, read-only(clamp), workspace-write(lifted at the gate), read-only(user)]: the last two
+    // events look like a fresh clamp, but the run passed its plan gate without a recorded restore failure, so
+    // 0.2.x had already lifted its clamp and the plugin owns no read-only on this session.
+    const h = open({ rootId: SESSION, fixtures: [RESTORED_AT_GATE] })
     script(h.root, [mode('workspace-write'), mode('read-only'), mode('workspace-write'), mode('read-only')])
+    const outcome = await h.engine.onRootOpened(h.root)
+    expect(appendedModes(h.root)).toHaveLength(4)
+    expect(outcome.restoredRunIds).toEqual([])
+  })
+
+  it('(2b\') a run whose restore failed at the gate stays pending, and its trailing clamp is restored', async () => {
+    const h = open({ rootId: SESSION, fixtures: [CLAMPED] })
+    script(h.root, [mode('workspace-write'), mode('read-only')])
     await h.engine.onRootOpened(h.root)
     expect(appendedModes(h.root).slice(-1)).toEqual([{ mode: 'workspace-write' }])
   })

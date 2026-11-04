@@ -43,7 +43,7 @@ export interface WriteConflict {
   readonly with: string
 }
 
-const ACTIVE = new Set<string>(['starting', 'running', 'idle'])
+const ACTIVE = new Set<string>(['starting', 'running'])
 
 /**
  * The first conflict between `paths` and the active writers of `delegations`,

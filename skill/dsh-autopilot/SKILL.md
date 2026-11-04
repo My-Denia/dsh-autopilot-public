@@ -13,7 +13,7 @@ description: >-
 A goal has an owner, roles, an independent review and a record on the issue and
 the PR. There is no run state machine, plan gate, sign-off or closeout packet.
 This file binds that workflow to DSH tool names; the plugin adds only role
-delegation with explicit model and effort, and a small ledger of who was
+delegation with explicit model and effort (inheriting the host route, recorded as such, when routing is off or has no catalog), and a small ledger of who was
 started, with what route, and how it ended.
 
 | read this | it owns |

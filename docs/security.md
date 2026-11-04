@@ -26,8 +26,8 @@ Deeper design and measurements: [DESIGN.md](../DESIGN.md).
   tools present in the session, so it can write to external systems. A worker
   and an executor-lead have no allow-list. `writePaths` is a conflict guard,
   not a permission system: a worker is not stopped from writing outside its
-  declared paths, but a dispatch whose `writePaths` intersect those of an
-  active writer under the same root is refused before it starts, and a worker
+  declared paths, but a dispatch whose `writePaths` intersect those of a
+  writer that is still running (`starting` or `running`) under the same root is refused before it starts, and a worker
   dispatch without `writePaths` is refused. Only an executor-lead gets the
   delegation tools, and it may start only scout, clerk and worker.
   *Mechanical*: the allow-lists, the dispatch rule and the overlap check.
@@ -84,7 +84,7 @@ routes under `/api/autopilot`:
 
 | route | answers |
 | --- | --- |
-| `GET /api/autopilot/ledger?session=<id>` | `200 {ok:true, ledger}`; `400 {ok:false, error:'missing-session'}` without `session`; `404 {ok:false, error:'no-ledger'}` when that session has no ledger |
+| `GET /api/autopilot/ledger?session=<id>` | `200 {ok:true, ledger}`; `400 {ok:false, error:'missing-session'}` without `session`; `404 {ok:false, error:'no-ledger'}` when that session has no ledger and, if it is live, no native goal (a live session's goal is mirrored into a ledger on this read) |
 | `GET /api/autopilot/runs` | `200 {ok:true, runs}`: every legacy 0.2.x run, from both backends |
 | `GET /api/autopilot/run?id=<id>` | `200 {ok:true, run}`; `400 {ok:false, error:'missing-id'}` without `id`; `404 {ok:false, error:'no-run'}`. `id` is a run id, or a session id: then the last legacy run listed for that session is served |
 

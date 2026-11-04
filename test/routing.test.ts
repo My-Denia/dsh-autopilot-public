@@ -698,7 +698,8 @@ describe('select: F14 (PR #2 round 6) — a catalog outage is not "provider gone
     expect(decision.kind).toBe('escalate-owner')
     if (decision.kind === 'escalate-owner') {
       expect(decision.reason).toContain('no live provider in the catalog')
-      expect(decision.reason).toContain('needs-owner-decision')
+      expect(decision.reason).toContain('needs the owner')
+      expect(decision.reason).not.toContain('needs-owner-decision')
     }
   })
 })

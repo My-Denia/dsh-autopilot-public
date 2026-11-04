@@ -393,9 +393,17 @@ async function loadDomainRuns(domain: LegacyDomainReader, only?: string): Promis
 // Public reads
 // ─────────────────────────────────────────────────────────────────────────────
 
-/** The restore state before the one-time lazy restore has run: clamped runs are `pending`, the rest `not-clamped`. */
+/**
+ * The restore state before the one-time lazy restore has run. A run is `pending` only when its clamp can
+ * still be on the session: the mode event was appended AND the plan gate never passed (0.2.x restored the
+ * prior mode at the gate pass), or the run recorded that its restore failed. Anything else is `not-clamped`,
+ * so a read-only the user set later is never mistaken for the plugin's clamp.
+ */
 function defaultRestore(result: LegacyFoldResult): SandboxRestoreRecord {
-  return result.ok && legacyClampOf(result.snapshot).modeAppended ? { state: 'pending' } : { state: 'not-clamped' }
+  if (!result.ok) return { state: 'not-clamped' }
+  const snapshot = result.snapshot
+  const restoredAtGate = snapshot.planGatePassedAt !== undefined && !/sandbox restore failed/i.test(snapshot.enforcement.diagnostic ?? '')
+  return legacyClampOf(snapshot).modeAppended && !restoredAtGate ? { state: 'pending' } : { state: 'not-clamped' }
 }
 
 function summarize(loaded: LoadedRun, sessionOf: ReadonlyMap<string, string>): LegacyRunSummary {

@@ -65,7 +65,7 @@ export { AUTOPILOT_DOMAIN_SPEC, legacyDomainReaderOf } from './store/domain.js'
 export type { DomainFacilityLike } from './store/domain.js'
 export { DomainLedgerStore, FileLedgerStore, emptyLedger } from './store/ledger.js'
 export type { LedgerStoreLike } from './store/ledger.js'
-export { hasDirectHumanTurn, installChildTools, requireDirectHumanTurn } from './tools.js'
+export { installChildTools } from './tools.js'
 export { Delegator, autoContinueFor, routeMatchOf } from './delegate.js'
 export { findWriteConflict, pathsIntersect } from './roles/paths.js'
 export { renderRootPolicy } from './policy.js'
@@ -1490,6 +1490,11 @@ export async function apply(rawCtx: unknown, config?: ConfigInput): Promise<() =
       ledgers: resolution.ledgers,
       sources: resolution.sources,
       notes: () => (retiredNote === undefined ? [] : [retiredNote]),
+      // A goal-only session (create_goal, no autopilot_* call) has no ledger until its goal is mirrored.
+      syncSession: async (sessionId) => {
+        const live = ctx.agents.roots().find(agent => (agent as AgentRef).id === sessionId)
+        if (live !== undefined) await engine.syncGoal(live as AgentRef)
+      },
     })
     const registration = registerAutopilotService(rawCtx as ProvideHost, service)
     if (!registration.registered && registration.diagnostic !== undefined) {

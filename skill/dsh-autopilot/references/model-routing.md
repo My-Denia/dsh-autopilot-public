@@ -10,8 +10,10 @@ It does NOT own the tool protocol or the refusal codes — those are in
 [reference.md](../../../docs/reference.md) and [refusals.md](./refusals.md) —
 nor the invariants in [governance-invariants.md](./governance-invariants.md).
 The roles are `scout`, `clerk`, `worker`, `executor-lead`, `planner` and
-`reviewer`; they are started with `autopilot_delegate`, and every dispatch
-carries an explicit model and effort (a missing value is never "inherit").
+`reviewer`; they are started with `autopilot_delegate`, and a dispatch
+carries an explicit model and effort whenever routing selected a route. The
+exception is routing off or no catalog: the dispatch then names nothing, the
+child inherits the host route, and the ledger records it as inherit/host-default.
 
 Since 0.3.0 there are no run phases or auditors. The one-shot `reviewer`
 replaces the plan, execution and rules auditors; wherever this file says

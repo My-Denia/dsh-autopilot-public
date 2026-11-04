@@ -2,7 +2,7 @@
 
 # dsh-autopilot
 
-The [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (dsh) adapter of the goal-workflow. When the owner states a goal, the main agent keeps the decisions and the conversation, hands other work to role children started with an explicit model and effort, gets an independent review, and keeps the goal going until its Done checks hold. The issue and the pull request are the record; the plugin keeps only a small ledger of who was started, on what route, and how it ended.
+The [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (dsh) adapter of the goal-workflow. When the owner states a goal, the main agent keeps the decisions and the conversation, hands other work to role children started with an explicit model and effort (or, with routing off or no catalog, the host route, recorded as inherited), gets an independent review, and keeps the goal going until its Done checks hold. The issue and the pull request are the record; the plugin keeps only a small ledger of who was started, on what route, and how it ended.
 
 [![npm](https://img.shields.io/npm/v/dsh-goal-autopilot?style=flat-square)](https://www.npmjs.com/package/dsh-goal-autopilot)
 [![CI](https://img.shields.io/github/actions/workflow/status/My-Denia/dsh-autopilot-public/ci.yml?branch=main&style=flat-square)](https://github.com/My-Denia/dsh-autopilot-public/actions/workflows/ci.yml)

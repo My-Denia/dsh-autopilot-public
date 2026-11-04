@@ -41,7 +41,9 @@ in [docs/compatibility.md](docs/compatibility.md#not-yet-verified-on-a-real-host
 ### Added
 
 - `autopilot_delegate`: start a `scout`, `clerk`, `worker`, `executor-lead`,
-  `planner` or `reviewer` child with an explicit model and effort.
+  `planner` or `reviewer` child with an explicit model and effort (when routing is
+  off or has no catalog, the child inherits the host route and the ledger
+  records inherit/host-default).
 - `autopilot_agents`: wait for children (`action: wait`, default 300 s, at most
   600 s). Listing, messaging and stopping children use the host's own
   `list_agents`, `send_message` and `interrupt_agent`; whether they reach

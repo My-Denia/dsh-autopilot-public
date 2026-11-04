@@ -72,7 +72,7 @@ describe('refusal contract', () => {
     const { inForce } = splitRefusals(readFileSync(refusalsPath, 'utf8'))
     const registry = Object.keys(REFUSALS).sort()
     // The registry is the one list a code can be thrown from, so it must not be empty.
-    expect(registry.length).toBeGreaterThanOrEqual(20)
+    expect(registry.length).toBeGreaterThanOrEqual(19)
     expect([...inForce].sort()).toEqual(registry)
   })
 

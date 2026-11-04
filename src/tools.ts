@@ -15,9 +15,9 @@
 
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import type { InferValue, ValueSchemaSpec } from '@deepseek-ai/dsh-tools'
-import { AP_NO_AGENT, AP_OWNER_AUTHORITY_REQUIRED } from './domain/refusals.js'
+import { AP_NO_AGENT } from './domain/refusals.js'
 import { AutopilotError } from './domain/types.js'
-import type { AgentRef, AutopilotEngine, SessionReadRef } from './engine.js'
+import type { AgentRef, AutopilotEngine } from './engine.js'
 import { ROLE_NAMES } from './roles/index.js'
 import type { DelegationRoleName } from './domain/ledger-types.js'
 import { WORK_CLASS_NAMES } from './routing/work-class.js'
@@ -41,40 +41,6 @@ function callingAgent(agent: unknown, toolName: string): AgentRef {
   if (agent === undefined) throw new AutopilotError(`${toolName} requires a calling Agent`, AP_NO_AGENT)
   return agent as AgentRef
 }
-
-/**
- * Direct-human-turn authority: the current open turn window of the ROOT agent
- * must contain a user/message whose source kind is 'user'
- * (dsh goal-tool authority pattern, reimplemented).
- */
-export function hasDirectHumanTurn(agent: { readonly session: SessionReadRef }): boolean {
-  // Whole-log snapshot (dsh 0.1.2: `Session.events` is gone). Taken fresh on
-  // every call; never cached, because `append` invalidates it.
-  const events = agent.session.snapshotEvents()
-  let turnStart = -1
-  for (let i = events.length - 1; i >= 0; i--) {
-    const type = events[i]?.type
-    if (type === 'turn/start') { turnStart = i; break }
-    if (type === 'turn/end') return false
-  }
-  if (turnStart < 0) return false
-  for (let i = turnStart; i < events.length; i++) {
-    const event = events[i]
-    if (event?.type !== 'user/message') continue
-    const data = event.data as { source?: { kind?: string } } | undefined
-    if (data?.source?.kind === 'user') return true
-  }
-  return false
-}
-
-export function requireDirectHumanTurn(agent: AgentRef, action: string): void {
-  if (hasDirectHumanTurn(agent)) return
-  throw new AutopilotError(
-    `${action} is owner-only: it requires a direct human turn on the top-level agent (not an agent-generated turn)`,
-    AP_OWNER_AUTHORITY_REQUIRED,
-  )
-}
-
 
 /**
  * The body of `autopilot_status`: the session's ledger projection, its legacy run

@@ -100,6 +100,11 @@ export interface AutopilotServiceInput {
   /** Notes are read on every call so a note added after mount still shows. */
   readonly notes?: () => readonly string[]
   readonly legacy?: LegacyReader
+  /**
+   * Called before a single-session ledger read: lets the owner of the live sessions mirror the
+   * session's native goal into its ledger, so a goal-only session has a ledger to show. Must not throw.
+   */
+  readonly syncSession?: (sessionId: string) => Promise<void>
 }
 
 /** Build the read-only view over a ledger store and the legacy sources. */
@@ -121,6 +126,7 @@ export function createAutopilotService(input: AutopilotServiceInput): AutopilotR
       return restore === undefined ? run : { ...run, sandboxRestore: restore }
     })
   const project = async (sessionId: string): Promise<LedgerProjection | undefined> => {
+    try { await input.syncSession?.(sessionId) } catch { /* a failed sync never hides the stored ledger */ }
     const ledger = input.ledgers.load(sessionId)
     if (ledger === undefined) return undefined
     return projectLedger(ledger, await listRuns(), notes())

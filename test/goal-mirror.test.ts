@@ -219,6 +219,20 @@ describe('what the card can anchor on', () => {
     expect(out.body).toMatchObject({ ok: true, ledger: { sessionId: 'root-1', goal: { goalId: 'g-1', activation: 'armed' }, delegations: [] } })
   })
 
+  it('a live session with a native goal and no autopilot_* call gets its ledger created by the ledger route read', async () => {
+    const h = delegationHost({ goal: () => goal({ activation: 'armed' }), driver: () => true })
+    expect(h.ledgers.load('root-1')).toBeUndefined()
+    const sync = async (id: string) => { if (id === h.root.id) await h.engine.syncGoal(h.root) }
+    const service = createAutopilotService({ ledgers: h.ledgers, sources: {}, syncSession: sync })
+    const out = await call(`${LEDGER_ROUTE}?session=root-1`, service)
+    expect(out.status).toBe(200)
+    expect(out.body).toMatchObject({ ok: true, ledger: { sessionId: 'root-1', goal: { goalId: 'g-1' } } })
+    // A session that is not live is still just no-ledger, and a throwing sync never breaks the read.
+    expect(await call(`${LEDGER_ROUTE}?session=gone`, service)).toEqual({ status: 404, body: { ok: false, error: 'no-ledger' } })
+    const throwing = createAutopilotService({ ledgers: h.ledgers, sources: {}, syncSession: async () => { throw new Error('boom') } })
+    expect((await call(`${LEDGER_ROUTE}?session=root-1`, throwing)).status).toBe(200)
+  })
+
   it('the legacy run route serves a pre-upgrade SESSION id as its legacy run; an unknown id is still no-run', async () => {
     const h = makeHarness({ legacyFixtures: ['amend-plan.jsonl', 'external-audit.jsonl'] })
     const service = createAutopilotService({ ledgers: h.ledgers, sources: h.sources })

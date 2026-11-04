@@ -13,7 +13,6 @@ export const REFUSALS = {
   AP_LEDGER_BUSY: 'The ledger kept changing under this write and the bounded retries ran out.',
   AP_DISPOSED: 'The plugin is shutting down; no new ledger writes are accepted.',
   AP_NO_AGENT: 'The tool needs the calling agent and the host supplied none.',
-  AP_OWNER_AUTHORITY_REQUIRED: 'The action is owner-only and needs a direct human turn on the top-level agent.',
   AP_ROLE_ROUTE_NOT_ALLOWED: 'The route named by the call or an owner pin is outside the allowed model set.',
   AP_ROLE_ROUTE_INCOMPLETE: 'The call named only one of provider and model.',
   AP_ROLE_ROUTE_PREFLIGHT_FAILED: 'Preflight rejected the named route or effort.',
@@ -38,7 +37,6 @@ export const AP_LEDGER_CONFLICT = 'AP_LEDGER_CONFLICT' satisfies RefusalCode
 export const AP_LEDGER_BUSY = 'AP_LEDGER_BUSY' satisfies RefusalCode
 export const AP_DISPOSED = 'AP_DISPOSED' satisfies RefusalCode
 export const AP_NO_AGENT = 'AP_NO_AGENT' satisfies RefusalCode
-export const AP_OWNER_AUTHORITY_REQUIRED = 'AP_OWNER_AUTHORITY_REQUIRED' satisfies RefusalCode
 export const AP_ROLE_ROUTE_NOT_ALLOWED = 'AP_ROLE_ROUTE_NOT_ALLOWED' satisfies RefusalCode
 export const AP_ROLE_ROUTE_INCOMPLETE = 'AP_ROLE_ROUTE_INCOMPLETE' satisfies RefusalCode
 export const AP_ROLE_ROUTE_PREFLIGHT_FAILED = 'AP_ROLE_ROUTE_PREFLIGHT_FAILED' satisfies RefusalCode

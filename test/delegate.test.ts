@@ -78,14 +78,14 @@ describe('autopilot_delegate: the flow', () => {
     expect(record.diagnostic).toBe('subagent depth 2 exceeds maxDepth 1')
   })
 
-  it('a backend that will not take a pre-minted id is retried without it, serialized, and the record keeps the host id', async () => {
+  it('a backend that rejects a pre-minted id records failed with AP_DISPATCH_FAILED; there is no retry without it', async () => {
     const h = delegationHost({ registered: REG })
     h.failNextStart.error = new Error('a reserved childId requires a local backend')
-    const result = await h.engine.delegate(h.root, { role: 'scout', task: 't' })
-    expect(h.starts).toHaveLength(1)
-    expect(h.starts[0]!.childId).toBeUndefined()
-    expect(result.childId).toBe('auto-child-1')
-    expect(ledgerOf(h).delegations.map(d => [d.childId, d.state])).toEqual([['auto-child-1', 'running']])
+    expect(await codeOf(h.engine.delegate(h.root, { role: 'scout', task: 't' }))).toBe('AP_DISPATCH_FAILED')
+    expect(h.starts).toHaveLength(0)
+    const record = ledgerOf(h).delegations[0]!
+    expect(record.state).toBe('failed')
+    expect(record.diagnostic).toBe('a reserved childId requires a local backend')
   })
 
   it('validation: unknown role, empty task, worker without writePaths', async () => {
@@ -201,7 +201,9 @@ describe('write paths', () => {
   it('findWriteConflict ignores settled children and the given ancestors', () => {
     const active = delegation('w1', 'running', { writePaths: ['src/**'] })
     const done = delegation('w2', 'completed', { writePaths: ['lib/**'] })
+    const idle = delegation('w3', 'idle', { writePaths: ['docs/**'] })
     expect(findWriteConflict(['src/a.ts'], [active, done], new Set())?.childId).toBe('w1')
+    expect(findWriteConflict(['docs/a.md'], [active, done, idle], new Set())).toBeUndefined()
     expect(findWriteConflict(['lib/a.ts'], [active, done], new Set())).toBeUndefined()
     expect(findWriteConflict(['src/a.ts'], [active, done], new Set(['w1']))).toBeUndefined()
   })
@@ -225,12 +227,17 @@ describe('write paths', () => {
     expect(ledgerOf(h).delegations).toHaveLength(1)
   })
 
-  it('a settled worker frees its paths', async () => {
+  it('a settled worker frees its paths: after a failure, and after a normal completion', async () => {
     const h = delegationHost({ registered: REG })
-    const first = await h.engine.delegate(h.root, { role: 'worker', task: 'a', writePaths: ['src/x.ts'] })
-    h.settle(first.childId, { stopReason: 'error', diagnostic: 'died' })
-    await h.engine.wait(h.root, [first.childId], 5)
-    await expect(h.engine.delegate(h.root, { role: 'worker', task: 'b', writePaths: ['src/x.ts'] })).resolves.toMatchObject({ state: 'running' })
+    const failed = await h.engine.delegate(h.root, { role: 'worker', task: 'a', writePaths: ['src/x.ts'] })
+    h.settle(failed.childId, { stopReason: 'error', diagnostic: 'died' })
+    await h.engine.wait(h.root, [failed.childId], 5)
+    const second = await h.engine.delegate(h.root, { role: 'worker', task: 'b', writePaths: ['src/x.ts'] })
+    expect(second.state).toBe('running')
+    h.settle(second.childId)
+    await h.engine.wait(h.root, [second.childId], 5)
+    expect(ledgerOf(h).delegations.find(d => d.childId === second.childId)?.state).not.toBe('running')
+    await expect(h.engine.delegate(h.root, { role: 'worker', task: 'c', writePaths: ['src/x.ts'] })).resolves.toMatchObject({ state: 'running' })
   })
 
   it('a lead\'s own paths may contain its workers\'; a worker is checked against its siblings, not its lead', async () => {
