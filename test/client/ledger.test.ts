@@ -261,6 +261,13 @@ describe('goal phases', () => {
     return readLedgerBody(body) as LedgerProjection
   }
 
+  it('warns about unavailable auto-continue for an unrecognised status too', () => {
+    const a = autoContinueView(withStatus('blocked:round-limit'))
+    expect(a.warning).toContain('Will not auto-continue')
+    expect(autoContinueView(withStatus(undefined)).warning).toBeDefined()
+    expect(autoContinueView(withStatus('complete')).warning).toBeUndefined()
+  })
+
   it('blocked', () => {
     const g = goalView(withStatus('blocked'))
     expect(g.phase).toBe('blocked')
@@ -493,7 +500,7 @@ describe('goal text per phase, both languages', () => {
     const body = raw('reduced')
     body.ledger.depth = { executorLead: 3, source: 'user-setting', note: 'raised' }
     const rows = goalDetailRows(readLedgerBody(body) as LedgerProjection, 'zh')
-    expect(rows.find(r => r.label === '执行负责人嵌套深度')?.value).toBe('3 (user-setting) · raised')
+    expect(rows.find(r => r.label === '执行负责人层级深度')?.value).toBe('3 (user-setting) · raised')
     expect(rows.find(r => r.label === '以往目标')?.value).toContain('goal-synth-prev')
   })
 })
@@ -543,8 +550,8 @@ describe('delegation rows in plain words', () => {
   it('zh mismatch sentence and pending text', () => {
     const [m, pending] = rows('zh')
     expect(m?.warning).toMatch(/^实际模型与选定的不一致：选定 .+，实际 .+$/)
-    expect(m?.warning).toContain('思考强度 高')
-    expect(m?.warning).toContain('思考强度 中')
+    expect(m?.warning).toContain('推理强度 高')
+    expect(m?.warning).toContain('推理强度 中')
     expect(pending?.modelUsed).toContain('尚未观测到')
     expect(pending?.warning).toBeUndefined()
   })
@@ -560,7 +567,7 @@ describe('delegation rows in plain words', () => {
     expect(zh?.stateText).toBe('已丢失')
     expect(zh?.stateNote).toBe('宿主重启后丢失，不会自动重启')
     const roles = delegationRows(load('active-parallel'), 'zh').map(r => r.roleText)
-    expect(roles).toContain('侦察')
+    expect(roles).toContain('调研')
     expect(roles).toContain('执行负责人')
     expect(delegationRows(load('active-parallel'), 'en').map(r => r.roleText)).toContain('Executor lead')
   })
@@ -569,10 +576,10 @@ describe('delegation rows in plain words', () => {
     const m = rows('zh')[0]!
     const values = Object.fromEntries(m.details.map(d => [d.label, d.value]))
     expect(values['子任务 ID']).toBe(m.childId)
-    expect(values['第几代']).toBe('2')
+    expect(values['代数']).toBe('2')
     expect(values['接替']).toBeDefined()
     expect(values['模型来源']).toBe('角色固定')
-    expect(values['思考强度来源']).toBe('调用参数')
+    expect(values['推理强度来源']).toBe('调用参数')
     expect(values['核对结果']).toContain('不一致')
   })
 
@@ -602,13 +609,13 @@ describe('review rows in plain words', () => {
     const p = withReview({ verdict: 'pass', independence: 'cross-family' }, minor(4))
     const zh = reviewRows(p, 'zh')[0]!
     expect(zh.verdictText).toBe('审阅通过')
-    expect(zh.findings).toBe('4 条次要意见')
+    expect(zh.findings).toBe('次要 4')
     const en = reviewRows(p, 'en')[0]!
     expect(en.verdictText).toBe('Review passed')
     expect(en.findings).toBe('4 minor')
     expect(reviewRows(withReview({ verdict: 'needs-fix' }, []), 'zh')[0]?.verdictText).toBe('需要修改')
     expect(reviewRows(withReview({ verdict: 'blocked' }, [{ severity: 'blocker', summary: 'b' }, { severity: 'major', summary: 'c' }]), 'zh')[0]?.findings)
-      .toBe('1 条阻断意见、1 条主要意见')
+      .toBe('阻断 1 · 主要 1')
   })
 
   it('cross-family is a muted plain line', () => {
@@ -641,7 +648,7 @@ describe('review rows in plain words', () => {
 describe('links', () => {
   it('only the issue label is localized', () => {
     const p = load('active-parallel')
-    expect(linkRows(p, 'zh').map(l => l.label)).toEqual(['议题 MY-195', 'PR #12', 'PR #13'])
+    expect(linkRows(p, 'zh').map(l => l.label)).toEqual(['Issue MY-195', 'PR #12', 'PR #13'])
     expect(linkRows(p, 'en')[0]?.label).toBe('issue MY-195')
   })
 })
@@ -686,7 +693,7 @@ describe('zh plain wording: auto-continue code and effort values', () => {
     'driver-present': '会自动继续',
     'no-driver-in-composition': '当前宿主没有目标轮次驱动',
     'released-after-restart': '宿主重启后已释放',
-    'not-yet-observed': '还没检测到',
+    'not-yet-observed': '还没检测到目标轮次驱动',
     unknown: '无法检查宿主是否支持自动继续',
   }
 
@@ -715,13 +722,13 @@ describe('zh plain wording: auto-continue code and effort values', () => {
 
   it('zh effort values are plain words in the body, with the raw id kept in details', () => {
     const [m] = delegationRows(load('mismatch'), 'zh')
-    expect(m?.modelUsed).toContain('思考强度 中')
-    expect(m?.warning).toContain('思考强度 高')
-    expect(m?.warning).toContain('思考强度 中')
+    expect(m?.modelUsed).toContain('推理强度 中')
+    expect(m?.warning).toContain('推理强度 高')
+    expect(m?.warning).toContain('推理强度 中')
     expect(m?.warning).not.toMatch(/\b(high|medium)\b/)
     const values = Object.fromEntries((m?.details ?? []).map(d => [d.label, d.value]))
-    expect(values['选定的模型']).toContain('思考强度 高（high）')
-    expect(values['观测到的模型']).toContain('思考强度 中（medium）')
+    expect(values['选定的模型']).toContain('推理强度 高（high）')
+    expect(values['观测到的模型']).toContain('推理强度 中（medium）')
     const [en] = delegationRows(load('mismatch'), 'en')
     expect(en?.warning).toContain('effort high')
     expect(Object.fromEntries((en?.details ?? []).map(d => [d.label, d.value]))['Selected route']).toContain('effort high')

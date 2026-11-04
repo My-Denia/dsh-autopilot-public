@@ -127,7 +127,8 @@ function fakeCtx() {
   return {
     calls,
     ctx: {
-      // `locale` is left out on purpose: apply() must mount on a host without it.
+      // `locale` is left out on purpose: apply()'s bindHostLocale tolerates its absence, although
+      // `inject` requires it in practice (uiConversation already does).
       effect: (fn) => { calls.effects += 1; return fn() },
       // dsh 0.1.2: the registry is `ctx.uiConversation.events` (ui-conversation), not `conversationEvents`.
       uiConversation: { events: { register: (d) => { calls.definitions.push(d); return () => {} } } },
@@ -370,8 +371,8 @@ const mismatchZh = renderView('mismatch', 'zh')
 assert('A23z mismatch (zh): plain warning with both efforts and the error tone',
   mismatchZh.includes('data-autopilot-route-match="mismatch"')
   && mismatchZh.includes('实际模型与选定的不一致')
-  && mismatchZh.includes('思考强度 高')
-  && mismatchZh.includes('思考强度 中')
+  && mismatchZh.includes('推理强度 高')
+  && mismatchZh.includes('推理强度 中')
   && mismatchZh.includes('var(--dsw-alias-state-error-primary)'))
 assert('A23m only a mismatching row renders the mismatch warning (match and pending rows do not)',
   count(mismatch, 'Model mismatch') === 1

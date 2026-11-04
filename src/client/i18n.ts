@@ -331,7 +331,7 @@ const AUTO_CODE_ZH: Readonly<Record<string, string>> = {
   'driver-present': '会自动继续',
   'no-driver-in-composition': '当前宿主没有目标轮次驱动',
   'released-after-restart': '宿主重启后已释放',
-  'not-yet-observed': '还没检测到',
+  'not-yet-observed': '还没检测到目标轮次驱动',
   unknown: '无法检查宿主是否支持自动继续',
 }
 
@@ -375,7 +375,7 @@ const zh: Strings = {
   effortValueDetail: v => (EFFORT_ZH[v] === undefined ? v : `${EFFORT_ZH[v]}（${v}）`),
   restartNote: '宿主重启后目标不会自己继续：说一次“继续”即可恢复。定时提醒不会重新启动目标。',
   hostRestart: (at, n) => `宿主在 ${at} 重启：${n} 个运行中的子任务丢失（不会自动重启）`,
-  depth: '执行负责人嵌套深度',
+  depth: '执行负责人层级深度',
   previousGoals: '以往目标',
   notes: '备注',
   retired: keys => `配置里有已废弃的设置：${keys}，可以删除，不影响运行。`,
@@ -383,7 +383,7 @@ const zh: Strings = {
   colon: '：',
 
   roles: {
-    scout: '侦察', clerk: '资料', worker: '执行', 'executor-lead': '执行负责人', planner: '规划', reviewer: '审阅',
+    scout: '调研', clerk: '事务', worker: '执行', 'executor-lead': '执行负责人', planner: '规划', reviewer: '审阅',
   },
   states: {
     starting: '启动中', running: '运行中', idle: '空闲', completed: '已完成', failed: '失败', cancelled: '已取消', lost: '已丢失',
@@ -394,15 +394,15 @@ const zh: Strings = {
   notObserved: '尚未观测到',
   mismatchWarn: (selected, used) => `实际模型与选定的不一致：选定 ${selected}，实际 ${used}`,
   cannotRead: '读不到子会话',
-  roleId: '角色标识',
+  roleId: '角色 ID',
   childId: '子任务 ID',
-  generation: '第几代',
+  generation: '代数',
   replaces: '接替',
   task: '任务',
   selectedRoute: '选定的模型',
   observedRoute: '观测到的模型',
   modelSource: '模型来源',
-  effortSource: '思考强度来源',
+  effortSource: '推理强度来源',
   matchResult: '核对结果',
   match: {
     match: '观测到的与选定的一致',
@@ -411,23 +411,23 @@ const zh: Strings = {
     unreadable: '读不到子会话',
   },
   sources: {
-    arg: '调用参数', pin: '角色固定', ladder: '路由梯队', inherit: '宿主默认',
+    arg: '调用参数', pin: '角色固定', ladder: '路由阶梯', inherit: '宿主默认',
     'catalog-default': '模型目录默认', 'host-default': '宿主默认',
   },
-  sourceLine: (model, effort) => `模型取自${model} · 思考强度取自${effort}`,
+  sourceLine: (model, effort) => `模型取自${model} · 推理强度取自${effort}`,
   generationShort: n => `第 ${n} 代`,
   replacesShort: id => `接替 ${id}`,
   selectedNothing: '未发送（用宿主默认）',
   observedNothing: '尚未观测到',
-  noEffortSent: '未指定思考强度',
-  noEffortObserved: '未观测到思考强度',
-  effort: '思考强度',
+  noEffortSent: '未指定推理强度',
+  noEffortObserved: '未观测到推理强度',
+  effort: '推理强度',
 
-  verdicts: { pass: '审阅通过', 'needs-fix': '需要修改', blocked: '审阅受阻' },
+  verdicts: { pass: '审阅通过', 'needs-fix': '需要修改', blocked: '审阅未通过（阻断）' },
   severities: { blocker: '阻断', major: '主要', minor: '次要' },
-  findingCount: (n, sev) => `${n} 条${sev}意见`,
+  findingCount: (n, sev) => `${sev} ${n}`,
   noFindings: '没有意见',
-  listSeparator: '、',
+  listSeparator: ' · ',
   crossFamily: '跨厂商独立审阅',
   reducedKnown: '没有其他厂商的模型可选',
   reducedUnknown: '独立性降低（原因见详情）',
@@ -440,7 +440,7 @@ const zh: Strings = {
   noneRecorded: '未记录',
   subject: '审阅对象',
 
-  linkKind: { issue: '议题', pr: 'PR' },
+  linkKind: { issue: 'Issue', pr: 'PR' },
 }
 
 export const STRINGS: Record<Lang, Strings> = { en, zh }

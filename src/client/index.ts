@@ -69,8 +69,9 @@ export type { GoalLedgerViewProps } from './GoalLedgerView.js'
 //
 // `locale` is the host's language service (`getLocale().active` is 'zh' | 'en',
 // `subscribe` fires on a switch). The installed ui-conversation bundle already
-// requires it, so naming it here adds no wait. The card follows it through
-// `./i18n.ts`; without it the card falls back to the document / browser language.
+// requires it, so naming it here adds no wait. cordis `inject` has no optional form
+// (an array or a name -> config map), so it is required in practice. The card follows it
+// through `./i18n.ts`; the document / browser language is only the fallback before it binds.
 export const inject = ['slots', 'uiConversation', 'locale']
 
 /** Cordis plugin name. */
@@ -105,7 +106,11 @@ const definition = createAutopilotRunDefinition({
  */
 interface CardHost {
   uiConversation: { events: { register(definition: ConversationNodeDefinition<AutopilotRunState>): () => void } }
-  /** The host language service; optional so a host without it still mounts the card. */
+  /**
+   * The host language service. Typed optional so `bindHostLocale` tolerates its absence, but
+   * `inject` requires it in practice (cordis has no optional-service form, and
+   * `uiConversation` already requires it).
+   */
   locale?: HostLocaleLike
   slots: {
     inject(key: string, callback: () => (() => void)): () => void

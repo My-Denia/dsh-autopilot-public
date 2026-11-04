@@ -492,7 +492,7 @@ export function autoContinueView(p: LedgerProjection, lang: Lang = 'en'): AutoCo
   const S = STRINGS[lang]
   const status = p.goal?.status?.trim()
   const active = status === 'active'
-  const live = active || status === 'paused'
+  const live = active || status === 'paused' || goalView(p, lang).phase === 'unrecognised'
   return {
     available: p.autoContinue.available,
     text: p.autoContinue.available
@@ -515,7 +515,7 @@ export function shortId(id: string): string {
   return id.length > 8 ? `${id.slice(0, 8)}…` : id
 }
 
-/** `provider/model · effort high` (zh: `思考强度 高`; `keepRaw` adds `（high）` for details), or `… · no effort sent` / `no effort observed`. */
+/** `provider/model · effort high` (zh: `推理强度 高`; `keepRaw` adds `（high）` for details), or `… · no effort sent` / `no effort observed`. */
 export function routeText(route: LedgerRoute | undefined, side: 'selected' | 'observed', lang: Lang = 'en', keepRaw = false): string {
   const S = STRINGS[lang]
   if (route === undefined) return side === 'selected' ? S.selectedNothing : S.observedNothing
