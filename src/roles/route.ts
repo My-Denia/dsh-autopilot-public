@@ -315,7 +315,7 @@ export async function routeForDelegation(input: RouteForDelegationInput): Promis
       const family = familyOf(selected)
       if (excluded.length === 0) {
         independence = 'reduced'
-        independenceNote = 'the reviewed work has no observed provider family to exclude, so cross-family review cannot be claimed'
+        independenceNote = 'the reviewed work has no observed provider family to exclude, so the vendor relation to it is not known'
       } else if (selected === undefined || family === undefined) {
         independence = 'reduced'
         independenceNote = 'the reviewer route is inherited from the host default, so its provider family is not observable'

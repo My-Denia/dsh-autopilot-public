@@ -35,7 +35,7 @@
      "reasoningEffort": "high"
     },
     "independence": "reduced",
-    "excludedFamilies": [],
+    "excludedFamilies": ["deepseek"],
     "independenceNote": "kimi and zai returned HTTP 503; same family used",
     "at": "2026-11-04T09:55:00Z"
    }

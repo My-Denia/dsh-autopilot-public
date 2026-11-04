@@ -210,14 +210,14 @@ export interface Strings {
   readonly findingCount: (n: number, severity: string) => string
   readonly noFindings: string
   readonly listSeparator: string
-  readonly crossFamily: string
-  readonly reducedKnown: string
-  readonly reducedUnknown: string
-  readonly reducedPrefix: string
+  readonly vendor: string
+  readonly vendorDifferent: string
+  readonly vendorSame: (families: string) => string
+  readonly vendorUnknown: string
   readonly reviewer: string
   readonly reviewerId: string
   readonly reviewedAt: string
-  readonly independenceNote: string
+  readonly routingNote: string
   readonly excludedFamilies: string
   readonly noneRecorded: string
   readonly subject: string
@@ -312,14 +312,14 @@ const en: Strings = {
   findingCount: (n, sev) => `${n} ${sev}`,
   noFindings: 'no findings',
   listSeparator: ', ',
-  crossFamily: 'Independent review (different provider)',
-  reducedKnown: 'no model from another provider was available',
-  reducedUnknown: 'Reduced independence (see details for the reason)',
-  reducedPrefix: 'Reduced independence: ',
+  vendor: 'Reviewer vendor',
+  vendorDifferent: 'different vendor',
+  vendorSame: families => (families === '' ? 'same as the reviewed work' : `same as the reviewed work (${families})`),
+  vendorUnknown: 'not determined',
   reviewer: 'Reviewer',
   reviewerId: 'Reviewer id',
   reviewedAt: 'Reviewed at',
-  independenceNote: 'Independence note',
+  routingNote: 'Routing note',
   excludedFamilies: 'Excluded providers',
   noneRecorded: 'none recorded',
   subject: 'Subject',
@@ -428,14 +428,14 @@ const zh: Strings = {
   findingCount: (n, sev) => `${sev} ${n}`,
   noFindings: '没有意见',
   listSeparator: ' · ',
-  crossFamily: '跨厂商独立审阅',
-  reducedKnown: '没有其他厂商的模型可选',
-  reducedUnknown: '独立性降低（原因见详情）',
-  reducedPrefix: '独立性降低：',
+  vendor: '审阅模型厂商',
+  vendorDifferent: '不同厂商',
+  vendorSame: families => (families === '' ? '与被审工作相同' : `与被审工作相同（${families}）`),
+  vendorUnknown: '未能确定',
   reviewer: '审阅者',
   reviewerId: '审阅者 ID',
   reviewedAt: '审阅时间',
-  independenceNote: '独立性说明',
+  routingNote: '路由记录',
   excludedFamilies: '排除的厂商',
   noneRecorded: '未记录',
   subject: '审阅对象',

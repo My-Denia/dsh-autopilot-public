@@ -114,7 +114,7 @@ describe('active-parallel', () => {
     const r = reviewRows(p)
     expect(r).toHaveLength(1)
     expect(r[0]?.reduced).toBe(false)
-    expect(r[0]?.independence).toBe('cross-family review (excluded: deepseek)')
+    expect(r[0]?.vendorText).toBe('different vendor')
     expect(r[0]?.verdict).toBe('pass')
     expect(r[0]?.verdictTone).toBe('success')
     expect(r[0]?.findings).toBe('1 minor')
@@ -220,11 +220,11 @@ describe('mismatch', () => {
 describe('reduced', () => {
   const p = load('reduced')
 
-  it('flags reduced independence with the note', () => {
+  it('states the vendor relation as a neutral fact and keeps the recorded note in details', () => {
     const r = reviewRows(p)[0]
     expect(r?.reduced).toBe(true)
-    expect(r?.independence).toContain('REDUCED INDEPENDENCE')
-    expect(r?.independence).toContain('503')
+    expect(r?.vendorText).toMatch(/^same as the reviewed work/)
+    expect(r?.details.find(d => d.label === 'Routing note')?.value).toContain('503')
     expect(r?.verdict).toBe('needs-fix')
     expect(r?.verdictTone).toBe('warn')
     expect(r?.findings).toBe('1 major')
@@ -400,21 +400,22 @@ describe('reviewRows independence label renders the recorded reason', () => {
   it('cross-family', () => {
     const r = reviewRows(withReview({ independence: 'cross-family', excludedFamilies: ['alpha'] }))[0]
     expect(r?.reduced).toBe(false)
-    expect(r?.independence).toBe('cross-family review (excluded: alpha)')
+    expect(r?.vendorText).toBe('different vendor')
   })
 
   it('reduced because same family: shows that note', () => {
     const note = 'the reviewer runs on provider family "alpha", which the reviewed work also used'
     const r = reviewRows(withReview({ independence: 'reduced', excludedFamilies: ['alpha'], independenceNote: note }))[0]
     expect(r?.reduced).toBe(true)
-    expect(r?.independence).toBe(`REDUCED INDEPENDENCE: ${note} (excluded: alpha)`)
+    expect(r?.vendorText).toBe('same as the reviewed work (alpha)')
+    expect(r?.details.find(d => d.label === 'Routing note')?.value).toBe(note)
   })
 
   it('reduced because no observed family: never claims "same provider family"', () => {
-    const note = 'the reviewed work has no observed provider family to exclude, so cross-family review cannot be claimed'
+    const note = 'the reviewed work has no observed provider family to exclude, so the vendor relation to it is not known'
     const r = reviewRows(withReview({ independence: 'reduced', excludedFamilies: [], independenceNote: note }))[0]
-    expect(r?.independence).toBe(`REDUCED INDEPENDENCE: ${note}`)
-    expect(r?.independence).not.toContain('same provider family')
+    expect(r?.vendorText).toBe('not determined')
+    expect(r?.details.find(d => d.label === 'Routing note')?.value).toBe(note)
   })
 })
 
@@ -618,22 +619,20 @@ describe('review rows in plain words', () => {
       .toBe('阻断 1 · 主要 1')
   })
 
-  it('cross-family is a muted plain line', () => {
-    const p = withReview({ independence: 'cross-family', excludedFamilies: ['alpha'] })
-    expect(reviewRows(p, 'zh')[0]?.independenceText).toBe('跨厂商独立审阅')
-    expect(reviewRows(p, 'zh')[0]?.independence).toBe('cross-family review (excluded: alpha)')
-  })
-
-  it('the known note shape maps to a plain reason; any other note never invents one', () => {
-    const known = withReview({ independence: 'reduced', independenceNote: 'no reviewer route outside provider families [alpha]' })
-    expect(reviewRows(known, 'zh')[0]?.independenceText).toBe('独立性降低：没有其他厂商的模型可选')
-    expect(reviewRows(known, 'en')[0]?.independenceText).toBe('Reduced independence: no model from another provider was available')
-    const other = withReview({ independence: 'reduced', independenceNote: 'HTTP 503 from the pool' })
-    expect(reviewRows(other, 'zh')[0]?.independenceText).toBe('独立性降低（原因见详情）')
-    expect(reviewRows(other, 'zh')[0]?.independenceText).not.toContain('503')
-    expect(reviewRows(other, 'zh')[0]?.details.find(d => d.label === '独立性说明')?.value).toBe('HTTP 503 from the pool')
-    const none = withReview({ independence: 'reduced' })
-    expect(reviewRows(none, 'en')[0]?.independenceText).toBe('Reduced independence (see details for the reason)')
+  it('vendor relation is a neutral detail row, never a body warning or the word reduced', () => {
+    const diff = withReview({ independence: 'cross-family', excludedFamilies: ['alpha'] })
+    expect(reviewRows(diff, 'zh')[0]?.vendorText).toBe('不同厂商')
+    const same = withReview({ independence: 'reduced', excludedFamilies: ['alpha'], independenceNote: 'no reviewer route outside provider families [alpha]' })
+    expect(reviewRows(same, 'zh')[0]?.vendorText).toBe('与被审工作相同（alpha）')
+    expect(reviewRows(same, 'en')[0]?.vendorText).toBe('same as the reviewed work (alpha)')
+    const other = withReview({ independence: 'reduced', excludedFamilies: ['alpha'], independenceNote: 'HTTP 503 from the pool' })
+    const d = reviewRows(other, 'zh')[0]!.details
+    expect(d.find(x => x.label === '审阅模型厂商')?.value).toBe('与被审工作相同（alpha）')
+    expect(d.find(x => x.label === '路由记录')?.value).toBe('HTTP 503 from the pool')
+    const labels = (lang: 'zh' | 'en') => JSON.stringify(reviewRows(other, lang).map(x => [x.vendorText, x.details]))
+    expect(labels('zh')).not.toContain('降低')
+    expect(labels('en')).not.toMatch(/[Rr]educed/)
+    expect(reviewRows(withReview({ independence: 'reduced', excludedFamilies: [] }), 'en')[0]?.vendorText).toBe('not determined')
   })
 
   it('details hold the reviewer, local time and excluded providers', () => {
