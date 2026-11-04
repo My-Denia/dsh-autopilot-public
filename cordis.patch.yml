@@ -2,7 +2,7 @@
 # Override per profile in the profile's cordis.patch.yml by targeting id: autopilot.
 #
 # No store pin is needed here: 0.3.0 always keeps one ledger file per session, and the
-# retired `storeKind` key is ignored (CHANGELOG, "Retired config keys").
+# retired `storeKind` key is ignored (CHANGELOG 0.3.0, Breaking changes).
 - insert:
     - id: autopilot
       name: dsh-goal-autopilot
