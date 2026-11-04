@@ -14,6 +14,12 @@ two desktop fixes: the tool probe for `scout` and `reviewer` is scoped to those
 roles, and the delegate card is shown at turn level. Neither fix has been
 verified on a real host yet.
 
+`0.3.0-rc.3` fixes two findings from the rc.2 desktop run: a reviewer
+dispatched without `reviewedChildIds` now links every settled non-reviewer
+delegation of the current goal (it used to cover write delegations only, so a
+review of scouts linked nothing), and the review card shows the independence
+reason recorded in the ledger instead of a fixed "same provider family" text.
+
 `0.3.0-rc.3` changes the skill text after two web-host findings. Inside an
 armed goal the agent waits inside the turn (`job_output` / `autopilot_agents`)
 instead of ending the turn for a `schedule_create` reminder, which made the

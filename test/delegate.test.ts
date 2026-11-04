@@ -531,6 +531,22 @@ describe('the reviewer', () => {
     expect(ledgerOf(h).reviews[0]).toMatchObject({ independence: 'reduced', verdict: 'needs-fix' })
   })
 
+  it('without reviewedChildIds, links every settled non-reviewer delegation (read-only scouts too) and computes independence from their observed family', async () => {
+    const h = delegationHost({ registered: REG, models: MODELS, policy: policyOf(['alpha', 'm-a'], ['beta', 'm-b']) })
+    await h.engine.mutate('root-1', l => ({
+      ...l,
+      delegations: [
+        delegation('s-1', 'completed', { role: 'scout', selected: { provider: 'beta', model: 'x' }, observed: { provider: 'alpha', model: 'm-a' } }),
+        delegation('s-2', 'idle', { role: 'scout', observed: { provider: 'alpha', model: 'm-a' } }),
+        delegation('s-3', 'running', { role: 'scout', observed: { provider: 'beta', model: 'm-b' } }),
+      ],
+    }))
+    const result = await reviewWith(h, PASS)
+    expect(ledgerOf(h).reviews[0]).toMatchObject({ reviewedChildIds: ['s-1', 's-2'], independence: 'cross-family', excludedFamilies: ['alpha'] })
+    expect(result.review?.excludedFamilies).toEqual(['alpha'])
+    expect(h.starts[0]!.agentOptions?.['provider']).toBe('beta')
+  })
+
   it('reviewedChildIds narrows what is excluded; an unknown id is refused', async () => {
     const h = delegationHost({ registered: REG, models: MODELS, policy: policyOf(['alpha', 'm-a'], ['beta', 'm-b']) })
     await h.engine.mutate('root-1', l => ({

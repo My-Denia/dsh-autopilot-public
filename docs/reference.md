@@ -44,7 +44,7 @@ Parameters:
 | `effort` | optional explicit reasoning effort |
 | `workClass` | optional override of the role's default work class (`mechanical`, `simple`, `hard`, `audit`, `extreme`) |
 | `replaces` | child id this dispatch replaces (escalation): same role, generation + 1 |
-| `reviewedChildIds` | reviewer only: the delegations under review (default: every settled write delegation) |
+| `reviewedChildIds` | reviewer only: the delegations under review (default: every settled non-reviewer delegation of the current goal, read-only roles included) |
 
 Give no `provider`, `model` or `effort` to let routing choose.
 

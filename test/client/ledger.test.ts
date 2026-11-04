@@ -376,3 +376,35 @@ describe('fetchLedger', () => {
     expect(await fetchLedger('s', async () => { throw new Error('offline') })).toBeUndefined()
   })
 })
+
+describe('reviewRows independence label renders the recorded reason', () => {
+  function withReview(patch: Record<string, unknown>): LedgerProjection {
+    const body = raw('reduced')
+    const reviews = body.ledger['reviews'] as Record<string, unknown>[]
+    delete reviews[0]!['independenceNote']
+    Object.assign(reviews[0]!, patch)
+    const p = readLedgerBody(body)
+    if (p === undefined) throw new Error('variant did not parse')
+    return p
+  }
+
+  it('cross-family', () => {
+    const r = reviewRows(withReview({ independence: 'cross-family', excludedFamilies: ['alpha'] }))[0]
+    expect(r?.reduced).toBe(false)
+    expect(r?.independence).toBe('cross-family review (excluded: alpha)')
+  })
+
+  it('reduced because same family: shows that note', () => {
+    const note = 'the reviewer runs on provider family "alpha", which the reviewed work also used'
+    const r = reviewRows(withReview({ independence: 'reduced', excludedFamilies: ['alpha'], independenceNote: note }))[0]
+    expect(r?.reduced).toBe(true)
+    expect(r?.independence).toBe(`REDUCED INDEPENDENCE: ${note} (excluded: alpha)`)
+  })
+
+  it('reduced because no observed family: never claims "same provider family"', () => {
+    const note = 'the reviewed work has no observed provider family to exclude, so cross-family review cannot be claimed'
+    const r = reviewRows(withReview({ independence: 'reduced', excludedFamilies: [], independenceNote: note }))[0]
+    expect(r?.independence).toBe(`REDUCED INDEPENDENCE: ${note}`)
+    expect(r?.independence).not.toContain('same provider family')
+  })
+})
