@@ -6,7 +6,7 @@ This page records **measured** host and packaging bounds for
 ## 0.3.0 (unreleased)
 
 Source version `0.3.0`, the goal-workflow adapter. Pre-releases up to
-`0.3.0-rc.5` are on npm `next`; `latest` is still `0.2.0`.
+`0.3.0-rc.6` are on npm `next`; `latest` is still `0.2.0`.
 
 - **Target host:** dsh `0.2.1-rc.5` only (npm `@deepseek-ai/dsh` `latest` was
   `0.2.1-rc.5` on 2026-10-29; that is the Windows desktop build). The plugin is
@@ -107,7 +107,7 @@ human-turn message.
   load. Use `modelOverrides` or remove the key. With the key removed, the
   "DeepSeek 账号" group appears in the model picker.
 
-npm: `0.3.0-rc.5` is on `next` (`0.3.0-rc.1`, `0.3.0-rc.3` and `0.3.0-rc.4` were published earlier); `latest`
+npm: `0.3.0-rc.6` is on `next` (`0.3.0-rc.1`, `0.3.0-rc.3` to `0.3.0-rc.5` were published earlier); `latest`
 is still `0.2.0`. The registry integrity matched the audited tarball.
 
 ## Not verified on a real host
