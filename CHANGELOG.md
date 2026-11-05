@@ -11,8 +11,8 @@ published: npm `latest` is still `dsh-goal-autopilot@0.2.0`. Target host is dsh
 
 The session card no longer labels a same-vendor review as reduced independence: the vendor relation is a neutral row in the review details, and the recorded ledger values are unchanged. The model-facing tool results (the reviewer verdict, `autopilot_status`) now carry a neutral `reviewerVendor` (`same`, `different`, `unknown`) with a `reviewerVendorNote` instead of `independence: "reduced"`, and the tool descriptions, routing notes and skill text no longer frame a same-vendor review as a defect (`0.3.0-rc.7`).
 
-`0.3.0-rc.1` and `0.3.0-rc.3` to `0.3.0-rc.6` are on npm `next` (`latest` is `0.2.0`). The
-registry integrity of rc.3 to rc.6 matched the audited tarballs. `0.3.0-rc.2` contains
+`0.3.0-rc.1` and `0.3.0-rc.3` to `0.3.0-rc.7` are on npm `next` (`latest` is `0.2.0`). The
+registry integrity of rc.3 to rc.7 matched the audited tarballs. `0.3.0-rc.2` contains
 two desktop fixes: the tool probe for `scout` and `reviewer` is scoped to those
 roles, and the delegate card is shown at turn level. Both were verified on the
 owner's Windows desktop (see Verification).
