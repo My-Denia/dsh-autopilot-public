@@ -20,6 +20,7 @@ import { AutopilotError } from './domain/types.js'
 import type { AgentRef, AutopilotEngine } from './engine.js'
 import { ROLE_NAMES } from './roles/index.js'
 import type { DelegationRoleName } from './domain/ledger-types.js'
+import { neutralReview } from './domain/review-vendor.js'
 import { WORK_CLASS_NAMES } from './routing/work-class.js'
 import type { AutopilotReadOnly } from './service.js'
 
@@ -55,10 +56,12 @@ export async function statusBody(service: AutopilotReadOnly, sessionId: string):
   const legacyRuns = ledger === undefined
     ? (await service.legacyRuns()).filter(run => run.sessionId === sessionId)
     : ledger.legacyRuns
+  // Reviews reach the model with a neutral vendor fact instead of the stored independence fields.
+  const shown = ledger === undefined ? null : { ...ledger, reviews: ledger.reviews.map(neutralReview) }
   return JSON.parse(JSON.stringify({
     sessionId,
     storeKind: service.storeKind,
-    ledger: ledger ?? null,
+    ledger: shown,
     legacyRuns,
     notes: service.notes(),
   })) as Record<string, unknown>
@@ -87,7 +90,7 @@ const plain = (value: unknown): never => JSON.parse(JSON.stringify(value)) as ne
 function delegateTool(engine: AutopilotEngine) {
   return defineTool({
     name: 'autopilot_delegate',
-    description: 'Start a delegated child: scout (read-only search), clerk (connector reads and writes), worker (implementation; declare writePaths), executor-lead (owns a chunk and can dispatch scout, clerk, worker), planner (read-only plan) or reviewer (independent one-shot review, different model family). Returns at once with the child id, the route chosen and where it came from; the child reports through the host settlement notice. The reviewer is the exception: the call waits and returns its verdict. Concurrent workers need disjoint writePaths. Give no provider, model or effort to let routing choose.',
+    description: 'Start a delegated child: scout (read-only search), clerk (connector reads and writes), worker (implementation; declare writePaths), executor-lead (owns a chunk and can dispatch scout, clerk, worker), planner (read-only plan) or reviewer (one-shot review; routing prefers a provider other than the reviewed work\'s when one is available). Returns at once with the child id, the route chosen and where it came from; the child reports through the host settlement notice. The reviewer is the exception: the call waits and returns its verdict and findings, plus reviewerVendor (same | different | unknown) as a neutral fact; a same-vendor review is normal. Concurrent workers need disjoint writePaths. Give no provider, model or effort to let routing choose.',
     parameters: {
       role: { type: 'string', required: true, enum: [...ROLE_NAMES], description: 'The delegation role.' },
       task: { type: 'string', required: true, description: 'The brief: goal, constraints, what to return.' },

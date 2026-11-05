@@ -9,7 +9,7 @@ The plugin becomes the dsh adapter of the goal-workflow. It is **not**
 published: npm `latest` is still `dsh-goal-autopilot@0.2.0`. Target host is dsh
 `0.2.1-rc.5` only. See Verification below for what was observed on a real host.
 
-The session card no longer labels a same-vendor review as reduced independence: the vendor relation is a neutral row in the review details, and the recorded ledger values are unchanged.
+The session card no longer labels a same-vendor review as reduced independence: the vendor relation is a neutral row in the review details, and the recorded ledger values are unchanged. The model-facing tool results (the reviewer verdict, `autopilot_status`) now carry a neutral `reviewerVendor` (`same`, `different`, `unknown`) with a `reviewerVendorNote` instead of `independence: "reduced"`, and the tool descriptions, routing notes and skill text no longer frame a same-vendor review as a defect (`0.3.0-rc.7`).
 
 `0.3.0-rc.1` and `0.3.0-rc.3` to `0.3.0-rc.6` are on npm `next` (`latest` is `0.2.0`). The
 registry integrity of rc.3 to rc.6 matched the audited tarballs. `0.3.0-rc.2` contains

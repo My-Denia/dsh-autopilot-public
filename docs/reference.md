@@ -93,8 +93,10 @@ came from; the child reports through the host's settlement notice. The
 reviewer is the exception: the call waits and returns the verdict in-band.
 The main agent cannot write a verdict into the ledger. The reviewer is given a
 model family different from the change when one is reachable; otherwise the
-same vendor is used, which is normal and not reported as a defect (the ledger
-field is `independence: "reduced"`).
+same vendor is used, which is normal and not reported as a defect. The result
+carries `reviewerVendor` (`same`, `different` or `unknown`) and a
+`reviewerVendorNote` with the providers involved; the ledger file keeps its
+stored `independence` fields, which tool results do not show.
 
 ### `autopilot_agents`
 

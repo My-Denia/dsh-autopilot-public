@@ -502,7 +502,8 @@ describe('the reviewer', () => {
     const start = h.starts[0]!
     expect(start).toMatchObject({ delivery: 'caller', maxDepth: 1, agentOptions: { provider: 'beta', model: 'm-b' } })
     expect(start.outputSchema).toBe(REVIEW_VERDICT_SCHEMA)
-    expect(result.review).toMatchObject({ verdict: 'pass', subject: 'the parser change', independence: 'cross-family', excludedFamilies: ['alpha'] })
+    expect(result.review).toMatchObject({ verdict: 'pass', subject: 'the parser change', reviewerVendor: 'different' })
+    expect(result.review).not.toHaveProperty('independence')
     const ledger = ledgerOf(h)
     expect(ledger.reviews).toHaveLength(1)
     expect(ledger.reviews[0]).toMatchObject({ reviewedChildIds: ['w-1'], independence: 'cross-family', verdict: 'pass', excludedFamilies: ['alpha'] })
@@ -523,90 +524,25 @@ describe('the reviewer', () => {
     expect(ledgerOf(h).reviews[0]?.reviewerRoute).toEqual({ provider: 'gamma', model: 'g-1' })
   })
 
-  it('reduced independence, said so, when only the same family exists', async () => {
+  it('a reviewer route inherited from the host is "unknown", not "same"', async () => {
     const h = delegationHost({ registered: REG, models: [MODELS[0]!], policy: policyOf(['alpha', 'm-a']) })
     await h.engine.mutate('root-1', l => ({ ...l, delegations: [worker('alpha')] }))
     const result = await reviewWith(h, { verdict: 'needs-fix', findings: [{ severity: 'major', summary: 'off by one', where: 'a.ts:3' }], subject: 's' })
-    expect(result.review?.independence).toBe('reduced')
-    expect(result.review?.independenceNote).toBeDefined()
+    expect(result.review?.reviewerVendor).toBe('unknown')
+    expect(result.review?.reviewerVendorNote).toMatch(/not observable/)
+    expect(JSON.stringify(result)).not.toMatch(/reduced|independence|cross-family/i)
+    // The stored record keeps its schema.
     expect(ledgerOf(h).reviews[0]).toMatchObject({ independence: 'reduced', verdict: 'needs-fix' })
   })
 
-  it('without reviewedChildIds, links every settled non-reviewer delegation (read-only scouts too) and computes independence from their observed family', async () => {
-    const h = delegationHost({ registered: REG, models: MODELS, policy: policyOf(['alpha', 'm-a'], ['beta', 'm-b']) })
-    await h.engine.mutate('root-1', l => ({
-      ...l,
-      delegations: [
-        delegation('s-1', 'completed', { role: 'scout', selected: { provider: 'beta', model: 'x' }, observed: { provider: 'alpha', model: 'm-a' } }),
-        delegation('s-2', 'idle', { role: 'scout', observed: { provider: 'alpha', model: 'm-a' } }),
-        delegation('s-3', 'running', { role: 'scout', observed: { provider: 'beta', model: 'm-b' } }),
-      ],
-    }))
-    const result = await reviewWith(h, PASS)
-    expect(ledgerOf(h).reviews[0]).toMatchObject({ reviewedChildIds: ['s-1', 's-2'], independence: 'cross-family', excludedFamilies: ['alpha'] })
-    expect(result.review?.excludedFamilies).toEqual(['alpha'])
-    expect(h.starts[0]!.agentOptions?.['provider']).toBe('beta')
-  })
-
-  /** Dispatch a scout and let it settle, so it is a settled delegation of whatever goal is current. */
-  async function settledScout(h: ReturnType<typeof delegationHost>): Promise<string> {
-    const before = h.starts.length
-    const result = await h.engine.delegate(h.root, { role: 'scout', task: 'look around' })
-    h.settle(result.childId)
-    for (let i = 0; i < 50 && ledgerOf(h).delegations.find(d => d.childId === result.childId)?.state !== 'completed'; i += 1) await new Promise(r => setTimeout(r, 2))
-    expect(h.starts.length).toBe(before + 1)
-    return result.childId
-  }
-
-  it('without reviewedChildIds, a second goal in the same session links only its own settled work', async () => {
-    let view: NativeGoalView = { id: 'g-a', revision: 1, objective: 'goal A', phase: 'active', maxGoalRounds: 40, roundsStarted: 0, activation: 'disarmed' }
-    const h = delegationHost({ registered: REG, models: MODELS, policy: policyOf(['alpha', 'm-a'], ['beta', 'm-b']), goal: () => view, driver: () => true })
-    const inA = await settledScout(h)
-    view = { ...view, id: 'g-b', objective: 'goal B' }
-    await h.engine.syncGoal(h.root)
-    const inB = await settledScout(h)
-
-    const pending = h.engine.delegate(h.root, { role: 'reviewer', task: 'review goal B' })
-    for (let i = 0; i < 50 && h.starts.length < 3; i += 1) await new Promise(r => setTimeout(r, 2))
-    h.settle(h.starts[2]!.childId!, { stopReason: 'completed', structured: PASS })
-    await pending
-    const review = ledgerOf(h).reviews[0]!
-    expect(review.reviewedChildIds).toEqual([inB])
-    expect(review.reviewedChildIds).not.toContain(inA)
-  })
-
-  it('the review syncs the goal itself: a switch with no goal event still narrows the window', async () => {
-    let view: NativeGoalView = { id: 'g-a', revision: 1, objective: 'goal A', phase: 'active', maxGoalRounds: 40, roundsStarted: 0, activation: 'disarmed' }
-    const h = delegationHost({ registered: REG, models: MODELS, policy: policyOf(['alpha', 'm-a'], ['beta', 'm-b']), goal: () => view, driver: () => true })
-    const inA = await settledScout(h)
-    view = { ...view, id: 'g-b', objective: 'goal B' }
-    // no syncGoal here: the scout's own start() mirrors B, the review must not rely on that
-    const inB = await settledScout(h)
-    view = { ...view, id: 'g-c', objective: 'goal C' }
-    const pending = h.engine.delegate(h.root, { role: 'reviewer', task: 'review goal C' })
-    for (let i = 0; i < 50 && h.starts.length < 3; i += 1) await new Promise(r => setTimeout(r, 2))
-    h.settle(h.starts[2]!.childId!, { stopReason: 'completed', structured: PASS })
-    await pending
-    const review = ledgerOf(h).reviews[0]!
-    expect(review.reviewedChildIds).toEqual([])
-    expect(review.reviewedChildIds).not.toContain(inA)
-    expect(review.reviewedChildIds).not.toContain(inB)
-  })
-
-  it('a goal first mirrored at the first dispatch still includes that dispatch', async () => {
-    const view: NativeGoalView = { id: 'g-1', revision: 1, objective: 'only goal', phase: 'active', maxGoalRounds: 40, roundsStarted: 0, activation: 'disarmed' }
-    const h = delegationHost({ registered: REG, models: MODELS, policy: policyOf(['alpha', 'm-a'], ['beta', 'm-b']), goal: () => view, driver: () => true })
-    expect(h.engine.peekLedger('root-1')).toBeUndefined()
-    const first = await settledScout(h)
-    const ledger = ledgerOf(h)
-    const record = ledger.delegations.find(d => d.childId === first)!
-    expect(ledger.goal!.firstSeenAt <= record.startedAt).toBe(true)
-
-    const pending = h.engine.delegate(h.root, { role: 'reviewer', task: 'review' })
-    for (let i = 0; i < 50 && h.starts.length < 2; i += 1) await new Promise(r => setTimeout(r, 2))
-    h.settle(h.starts[1]!.childId!, { stopReason: 'completed', structured: PASS })
-    await pending
-    expect(ledgerOf(h).reviews[0]!.reviewedChildIds).toEqual([first])
+  it('a same-vendor review is a neutral fact, not a defect', async () => {
+    const h = delegationHost({ registered: REG, models: [MODELS[0]!], policy: policyOf(['alpha', 'm-a']) })
+    await h.engine.mutate('root-1', l => ({ ...l, delegations: [worker('alpha')] }))
+    const result = await reviewWith(h, PASS, { provider: 'alpha', model: 'm-a' })
+    expect(result.review?.reviewerVendor).toBe('same')
+    expect(result.review?.reviewerVendorNote).toMatch(/also a provider of the reviewed work \(alpha\)/)
+    expect(JSON.stringify(result)).not.toMatch(/reduced|independence|cross-family/i)
+    expect(ledgerOf(h).reviews[0]).toMatchObject({ independence: 'reduced' })
   })
 
   it('reviewedChildIds narrows what is excluded; an unknown id is refused', async () => {
@@ -617,7 +553,7 @@ describe('the reviewer', () => {
     }))
     expect(await codeOf(h.engine.delegate(h.root, { role: 'reviewer', task: 't', reviewedChildIds: ['ghost'] }))).toBe('AP_UNKNOWN_CHILD')
     const result = await reviewWith(h, PASS, { reviewedChildIds: ['w-2'] })
-    expect(result.review?.excludedFamilies).toEqual(['beta'])
+    expect(ledgerOf(h).reviews[0]?.excludedFamilies).toEqual(['beta'])
     expect(h.starts[0]!.agentOptions?.['provider']).toBe('alpha')
   })
 
@@ -628,7 +564,7 @@ describe('the reviewer', () => {
       delegations: [delegation('w-1', 'idle', { role: 'worker', writePaths: ['a'], selected: { provider: 'alpha', model: 'x' }, observed: { provider: 'beta', model: 'y' } })],
     }))
     const result = await reviewWith(h, PASS)
-    expect(result.review?.excludedFamilies).toEqual(['beta'])
+    expect(ledgerOf(h).reviews[0]?.excludedFamilies).toEqual(['beta'])
   })
 
   it('an invalid structured result is AP_ROLE_VERDICT_INVALID, the delegation fails, no review is recorded', async () => {
@@ -668,7 +604,7 @@ describe('the reviewer', () => {
 
     // Decided from the snapshot: only alpha was known, so the reviewer is beta, and the late beta worker
     // does not retroactively exclude it.
-    expect(result.review?.excludedFamilies).toEqual(['alpha'])
+    expect(ledgerOf(h).reviews[0]?.excludedFamilies).toEqual(['alpha'])
     expect(h.starts[0]!.agentOptions?.['provider']).toBe('beta')
   })
 

@@ -34,6 +34,7 @@ import type {
 import type {
   LEDGER_ROUTE as LedgerRouteConst, LEGACY_RUN_ROUTE as LegacyRunRouteConst,
 } from '../domain/ledger-types.js'
+import { reviewerVendor } from '../domain/review-vendor.js'
 import type { LiveFetch } from './live.js'
 import { STRINGS, formatTime } from './i18n.js'
 import type { Lang } from './i18n.js'
@@ -679,9 +680,6 @@ export interface ReviewRow {
   readonly details: readonly DetailRow[]
 }
 
-/** Notes that mean the reviewer's vendor could not be observed, so "same vendor" would be a guess. */
-const UNOBSERVED_NOTE = /not observable|no observed provider family/
-
 export function reviewRows(p: LedgerProjection, lang: Lang = 'en', timeZone?: string): readonly ReviewRow[] {
   const S = STRINGS[lang]
   return p.reviews.map((r, i) => {
@@ -691,9 +689,10 @@ export function reviewRows(p: LedgerProjection, lang: Lang = 'en', timeZone?: st
       .map(([sev, n]) => S.findingCount(n, S.severities[sev]))
     const reduced = r.independence === 'reduced'
     const note = r.independenceNote
-    const vendorText = !reduced
+    const relation = reviewerVendor(r)
+    const vendorText = relation === 'different'
       ? S.vendorDifferent
-      : r.excludedFamilies.length === 0 || (note !== undefined && UNOBSERVED_NOTE.test(note))
+      : relation === 'unknown'
         ? S.vendorUnknown
         : S.vendorSame(r.excludedFamilies.join(', '))
     return {

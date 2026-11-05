@@ -117,5 +117,5 @@ reviewer child and recorded in the ledger).**
 - "There was no output, so nothing was wrong."
 - "The child probably finished; I will proceed on that."
 - A mock run or a status read reported as a real-host result.
-- A reviewer from the same family reported as independent.
+- A review reported as clean when the reviewer returned findings or a `blocked` verdict.
 - Ending a goal round to wait, instead of blocking on the child or job.
