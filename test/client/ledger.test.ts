@@ -405,7 +405,7 @@ describe('reviewRows independence label renders the recorded reason', () => {
 
   it('reduced because same family: shows that note', () => {
     const note = 'the reviewer runs on provider family "alpha", which the reviewed work also used'
-    const r = reviewRows(withReview({ independence: 'reduced', excludedFamilies: ['alpha'], independenceNote: note }))[0]
+    const r = reviewRows(withReview({ independence: 'reduced', excludedFamilies: ['alpha'], reviewerRoute: { provider: 'alpha', model: 'm' }, independenceNote: note }))[0]
     expect(r?.reduced).toBe(true)
     expect(r?.vendorText).toBe('same as the reviewed work (alpha)')
     expect(r?.details.find(d => d.label === 'Routing note')?.value).toBe(note)
@@ -416,6 +416,11 @@ describe('reviewRows independence label renders the recorded reason', () => {
     const r = reviewRows(withReview({ independence: 'reduced', excludedFamilies: [], independenceNote: note }))[0]
     expect(r?.vendorText).toBe('not determined')
     expect(r?.details.find(d => d.label === 'Routing note')?.value).toBe(note)
+  })
+
+  it('an older record with multiple children and an ambiguous provider list stays unknown', () => {
+    const r = reviewRows(withReview({ reviewedChildIds: ['w-1', 'w-2'], independence: 'cross-family', excludedFamilies: ['alpha'], reviewerRoute: { provider: 'beta', model: 'm' } }))[0]
+    expect(r?.vendorText).toBe('not determined')
   })
 })
 
@@ -622,10 +627,10 @@ describe('review rows in plain words', () => {
   it('vendor relation is a neutral detail row, never a body warning or the word reduced', () => {
     const diff = withReview({ independence: 'cross-family', excludedFamilies: ['alpha'] })
     expect(reviewRows(diff, 'zh')[0]?.vendorText).toBe('不同厂商')
-    const same = withReview({ independence: 'reduced', excludedFamilies: ['alpha'], independenceNote: 'no reviewer route outside provider families [alpha]' })
+    const same = withReview({ independence: 'reduced', excludedFamilies: ['alpha'], reviewerRoute: { provider: 'alpha', model: 'm' }, independenceNote: 'no reviewer route outside provider families [alpha]' })
     expect(reviewRows(same, 'zh')[0]?.vendorText).toBe('与被审工作相同（alpha）')
     expect(reviewRows(same, 'en')[0]?.vendorText).toBe('same as the reviewed work (alpha)')
-    const other = withReview({ independence: 'reduced', excludedFamilies: ['alpha'], independenceNote: 'HTTP 503 from the pool' })
+    const other = withReview({ independence: 'reduced', excludedFamilies: ['alpha'], reviewerRoute: { provider: 'alpha', model: 'm' }, independenceNote: 'HTTP 503 from the pool' })
     const d = reviewRows(other, 'zh')[0]!.details
     expect(d.find(x => x.label === '审阅模型厂商')?.value).toBe('与被审工作相同（alpha）')
     expect(d.find(x => x.label === '路由记录')?.value).toBe('HTTP 503 from the pool')

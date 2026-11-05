@@ -7,7 +7,10 @@
 
 import { describe, expect, it } from 'vitest'
 import { AutopilotError } from '../src/domain/types.js'
-import type { Ledger } from '../src/domain/ledger-types.js'
+import type { Ledger, LedgerProjection } from '../src/domain/ledger-types.js'
+import { readLedgerBody, reviewRows } from '../src/client/ledger.js'
+import { createAutopilotService } from '../src/service.js'
+import { statusBody } from '../src/tools.js'
 import { pathsIntersect, findWriteConflict } from '../src/roles/paths.js'
 import { allowListFor } from '../src/roles/tools.js'
 import { REVIEW_VERDICT_SCHEMA, ROLES } from '../src/roles/index.js'
@@ -524,15 +527,62 @@ describe('the reviewer', () => {
     expect(ledgerOf(h).reviews[0]?.reviewerRoute).toEqual({ provider: 'gamma', model: 'g-1' })
   })
 
-  it('a reviewer route inherited from the host is "unknown", not "same"', async () => {
+  it.each([
+    { name: 'selected different, observed same', selected: 'beta', observed: 'alpha', independence: 'cross-family', expected: 'same', explicit: false, inherit: false },
+    { name: 'selected same, observed different', selected: 'alpha', observed: 'beta', independence: 'reduced', expected: 'different', explicit: true, inherit: false },
+    { name: 'inherited unknown, observed same', selected: undefined, observed: 'alpha', independence: 'reduced', expected: 'same', explicit: false, inherit: true },
+  ] as const)('uses the settled reviewer route: $name', async ({ selected, observed, independence, expected, explicit, inherit }) => {
+    const models = inherit ? [MODELS[0]!] : MODELS
+    const policy = inherit ? policyOf(['alpha', 'm-a']) : policyOf(['alpha', 'm-a'], ['beta', 'm-b'])
+    const h = delegationHost({ registered: REG, models, policy, headerOnFirstRequest: true })
+    await h.engine.mutate('root-1', l => ({ ...l, delegations: [worker('alpha')] }))
+    const pending = h.engine.delegate(h.root, { role: 'reviewer', task: 'review the parser change', ...(explicit ? { provider: 'alpha', model: 'm-a' } : {}) })
+    for (let i = 0; i < 50 && h.starts.length === 0; i += 1) await new Promise(r => setTimeout(r, 2))
+    const id = h.starts[0]!.childId!
+    ;(h.agents.get(id) as { session: { append(k: string, v: unknown): void } }).session.append('request/header', { header: { config: { provider: observed, model: 'actual' } }, reason: 'initial' })
+    h.settleDisposed(id, { stopReason: 'completed', structured: PASS })
+    const result = await pending
+    const review = ledgerOf(h).reviews[0]!
+    expect(result.selected?.provider).toBe(selected)
+    expect(review).toMatchObject({ independence, excludedFamilies: ['alpha'], reviewerRoute: { provider: observed }, verdict: PASS.verdict, findings: PASS.findings })
+    expect(result.review).toMatchObject({ reviewerVendor: expected, reviewerRoute: { provider: observed }, verdict: PASS.verdict, findings: PASS.findings })
+    expect(result.review?.reviewerVendorNote).toContain(`reviewer provider "${observed}"`)
+    const service = createAutopilotService({ ledgers: h.ledgers, sources: {} })
+    const status = await statusBody(service, h.root.id)
+    const shown = (status['ledger'] as { reviews: Array<Record<string, unknown>> }).reviews[0]!
+    expect(shown).toMatchObject({ reviewerVendor: expected, reviewerVendorNote: result.review?.reviewerVendorNote, verdict: PASS.verdict, findings: PASS.findings })
+    const card = reviewRows({ reviews: [review] } as unknown as LedgerProjection)[0]!
+    expect(card.vendorText).toBe(expected === 'same' ? `same as the reviewed work (${observed})` : 'different vendor')
+  })
+
+  it('uses an observed host route even when routing inherited it', async () => {
     const h = delegationHost({ registered: REG, models: [MODELS[0]!], policy: policyOf(['alpha', 'm-a']) })
     await h.engine.mutate('root-1', l => ({ ...l, delegations: [worker('alpha')] }))
-    const result = await reviewWith(h, { verdict: 'needs-fix', findings: [{ severity: 'major', summary: 'off by one', where: 'a.ts:3' }], subject: 's' })
+    const findings = [{ severity: 'major', summary: 'off by one', where: 'a.ts:3' }]
+    const result = await reviewWith(h, { verdict: 'needs-fix', findings, subject: 's' })
+    expect(result.review).toMatchObject({ reviewerVendor: 'different', reviewerRoute: { provider: 'host' }, verdict: 'needs-fix', findings })
+    expect(result.review?.reviewerVendorNote).toMatch(/reviewer provider "host" is not among/)
+    expect(JSON.stringify(result)).not.toMatch(/reduced|independence|cross-family/i)
+    // The dispatch-time record keeps its original schema and note.
+    expect(ledgerOf(h).reviews[0]).toMatchObject({ independence: 'reduced', verdict: 'needs-fix', findings })
+  })
+
+  it('falls back to the selected reviewer route when no header was observed', async () => {
+    const h = delegationHost({ registered: REG, models: MODELS, policy: policyOf(['alpha', 'm-a'], ['beta', 'm-b']), headerOnFirstRequest: true })
+    await h.engine.mutate('root-1', l => ({ ...l, delegations: [worker('alpha')] }))
+    const result = await reviewWith(h, PASS, { provider: 'alpha', model: 'm-a' })
+    expect(ledgerOf(h).delegations.find(d => d.childId === result.childId)?.observed).toBeUndefined()
+    expect(ledgerOf(h).reviews[0]?.reviewerRoute).toMatchObject({ provider: 'alpha', model: 'm-a' })
+    expect(result.review).toMatchObject({ reviewerVendor: 'same', reviewerRoute: { provider: 'alpha' } })
+  })
+
+  it('reports unknown when neither the selected nor observed reviewer route is available', async () => {
+    const h = delegationHost({ registered: REG, models: [MODELS[0]!], policy: policyOf(['alpha', 'm-a']), headerOnFirstRequest: true })
+    await h.engine.mutate('root-1', l => ({ ...l, delegations: [worker('alpha')] }))
+    const result = await reviewWith(h, PASS)
+    expect(ledgerOf(h).reviews[0]?.reviewerRoute).toBeUndefined()
     expect(result.review?.reviewerVendor).toBe('unknown')
     expect(result.review?.reviewerVendorNote).toMatch(/not observable/)
-    expect(JSON.stringify(result)).not.toMatch(/reduced|independence|cross-family/i)
-    // The stored record keeps its schema.
-    expect(ledgerOf(h).reviews[0]).toMatchObject({ independence: 'reduced', verdict: 'needs-fix' })
   })
 
   it('a same-vendor review is a neutral fact, not a defect', async () => {
@@ -565,6 +615,28 @@ describe('the reviewer', () => {
     }))
     const result = await reviewWith(h, PASS)
     expect(ledgerOf(h).reviews[0]?.excludedFamilies).toEqual(['beta'])
+    expect(result.review).toMatchObject({ reviewerVendor: 'different', reviewerRoute: { provider: 'alpha' } })
+    expect(result.review?.reviewerVendorNote).toContain('reviewed work (beta)')
+  })
+
+  it.each([
+    { name: 'partial provider set', secondKnown: false, expected: 'unknown', card: 'not determined' },
+    { name: 'two known children on the same provider', secondKnown: true, expected: 'different', card: 'different vendor' },
+  ] as const)('reports $name consistently in the result, status and card', async ({ secondKnown, expected, card }) => {
+    const h = delegationHost({ registered: REG, models: MODELS, policy: policyOf(['alpha', 'm-a'], ['beta', 'm-b']) })
+    const second = delegation('w-2', 'idle', secondKnown ? { selected: { provider: 'alpha', model: 'x' } } : {})
+    await h.engine.mutate('root-1', l => ({ ...l, delegations: [worker('alpha'), second] }))
+    const result = await reviewWith(h, PASS, { provider: 'beta', model: 'm-b' })
+    const review = ledgerOf(h).reviews[0]!
+    expect(review).toMatchObject({ independence: 'cross-family', excludedFamilies: ['alpha'], reviewedProvidersComplete: secondKnown })
+    expect(result.review?.reviewerVendor).toBe(expected)
+    if (!secondKnown) expect(result.review?.reviewerVendorNote).toMatch(/some reviewed work providers/)
+    const service = createAutopilotService({ ledgers: h.ledgers, sources: {} })
+    const status = await statusBody(service, h.root.id)
+    const shown = (status['ledger'] as { reviews: Array<Record<string, unknown>> }).reviews[0]!
+    expect(shown).toMatchObject({ reviewerVendor: expected, reviewerVendorNote: result.review?.reviewerVendorNote })
+    const cardLedger = readLedgerBody({ ok: true, ledger: await service.ledger(h.root.id) })!
+    expect(reviewRows(cardLedger)[0]?.vendorText).toBe(card)
   })
 
   it('an invalid structured result is AP_ROLE_VERDICT_INVALID, the delegation fails, no review is recorded', async () => {

@@ -184,6 +184,7 @@ function readReview(value: unknown): ReviewRecord | undefined {
       return { severity, summary, ...opt('where', str(f.where)) }
     }),
     excludedFamilies: strList(value.excludedFamilies),
+    ...opt('reviewedProvidersComplete', typeof value.reviewedProvidersComplete === 'boolean' ? value.reviewedProvidersComplete : undefined),
     ...opt('reviewerRoute', readRoute(value.reviewerRoute)),
     ...opt('independenceNote', str(value.independenceNote)),
   }
@@ -694,7 +695,7 @@ export function reviewRows(p: LedgerProjection, lang: Lang = 'en', timeZone?: st
       ? S.vendorDifferent
       : relation === 'unknown'
         ? S.vendorUnknown
-        : S.vendorSame(r.excludedFamilies.join(', '))
+        : S.vendorSame(r.reviewerRoute?.provider.trim() ?? '')
     return {
       key: `${r.reviewerChildId}:${r.at}:${i}`,
       verdict: r.verdict,

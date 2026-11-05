@@ -555,10 +555,12 @@ export class Delegator {
         .map(d => d.childId)
     }
     const families = new Set<string>()
+    let reviewedProvidersComplete = true
     for (const d of snapshot.delegations) {
       if (!reviewedIds.includes(d.childId)) continue
       const family = familyOf(d.observed ?? d.selected)
       if (family !== undefined) families.add(family)
+      else reviewedProvidersComplete = false
     }
     const decision = await this.route('reviewer', args, caller, [...families])
     const registered = this.registeredNames(caller.agent)
@@ -599,6 +601,7 @@ export class Delegator {
         ...(reviewerRoute === undefined ? {} : { reviewerRoute }),
         independence: decision.independence ?? 'reduced',
         excludedFamilies: decision.excludedFamilies,
+        reviewedProvidersComplete,
         ...(decision.independenceNote === undefined ? {} : { independenceNote: decision.independenceNote }),
         at,
       }
@@ -617,7 +620,7 @@ export class Delegator {
         findings: parsed.findings,
         subject: parsed.subject,
         reviewerVendor: reviewerVendor(stored!),
-        reviewerVendorNote: reviewerVendorNote(stored!, reviewerRoute?.provider),
+        reviewerVendorNote: reviewerVendorNote(stored!),
         ...(reviewerRoute === undefined ? {} : { reviewerRoute }),
       },
     }

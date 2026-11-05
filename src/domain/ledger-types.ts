@@ -143,6 +143,8 @@ export interface ReviewRecord {
   readonly independence: ReviewIndependence
   /** Families excluded for independence (provider names). */
   readonly excludedFamilies: readonly string[]
+  /** Whether every reviewed child's provider was known at dispatch; absent in older records. */
+  readonly reviewedProvidersComplete?: boolean
   /** Routing note for a same-vendor or unobserved-vendor review, when there is one. */
   readonly independenceNote?: string
   readonly at: string
