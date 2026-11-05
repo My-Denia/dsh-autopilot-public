@@ -96,6 +96,11 @@ given the diff and the claim, not your reasoning. A different model family from
 the one that produced the change is preferred when one is available. A
 same-vendor review is normal and is not reported as a defect.
 
+When you report a review, give the verdict and the findings and name the
+reviewer model. Mention the vendor relation (`reviewerVendor`: same, different
+or unknown) only as a neutral fact, and only when it matters to the reader.
+Never describe it as reduced independence, and never ask the owner to act on it.
+
 The reviewer looks for normal work breaking, work being lost, a secret leaking
 and a result reported wrongly. Those block; other notes go to the backlog. Fix
 the blockers and verify them yourself.

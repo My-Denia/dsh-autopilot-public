@@ -506,7 +506,7 @@ describe('routeForDelegation: reviewer independence', () => {
     expect(result.excludedFamilies).toEqual(['alpha'])
     expect(result.independenceNote).toBeUndefined()
     expect(result.why.join('\n')).not.toContain('constraint not required')
-    expect(result.why.some(line => line.includes('families [alpha] excluded'))).toBe(true)
+    expect(result.why.some(line => line.includes('preferring a provider outside [alpha]'))).toBe(true)
   })
 
   it('a SINGLE route outside the excluded family is selected explicitly, never inherited', async () => {
@@ -528,7 +528,7 @@ describe('routeForDelegation: reviewer independence', () => {
     expect(result.independence).toBe('reduced')
     expect(result.independenceNote).toMatch(/no reviewer route outside provider families \[alpha\]/)
     expect(result.why.join('\n')).not.toContain('constraint not required')
-    expect(result.why.some(line => line.startsWith('independence: no reviewer route outside provider families [alpha]') && line.includes('fell back to the unfiltered ladder'))).toBe(true)
+    expect(result.why.some(line => line.startsWith('reviewer vendor: no reviewer route outside provider families [alpha]') && line.includes('used the normal ladder'))).toBe(true)
   })
 
   it('an inherited reviewer route cannot be claimed cross-family', async () => {
@@ -564,7 +564,7 @@ describe('routeForDelegation: reviewer independence', () => {
     expect(result.independence).toBe('reduced')
     expect(result.independenceNote).toMatch(/no observed provider family/)
     expect(result.why.join('\n')).not.toContain('constraint not required')
-    expect(result.why).toContain('independence: no reviewed provider family known; unfiltered ladder')
+    expect(result.why).toContain('reviewer vendor: no reviewed provider known; normal ladder')
   })
 
   it('non-reviewer roles carry no independence', async () => {

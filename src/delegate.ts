@@ -50,6 +50,8 @@ import { REVIEW_VERDICT_SCHEMA, ROLES, ROLE_NAMES, parseReviewVerdict } from './
 import { isRouteRefusal, routeForDelegation } from './roles/route.js'
 import type { RouteDecision } from './roles/route.js'
 import { familyOf } from './roles/cross-family.js'
+import { reviewerVendor, reviewerVendorNote } from './domain/review-vendor.js'
+import type { ReviewerVendor } from './domain/review-vendor.js'
 import { allowListDiagnostic, allowListFor, parseRestrictRejection } from './roles/tools.js'
 import { findWriteConflict } from './roles/paths.js'
 import { installChildTools } from './tools.js'
@@ -87,9 +89,9 @@ export interface DelegateResult {
     readonly verdict: string
     readonly findings: ReviewRecord['findings']
     readonly subject: string
-    readonly independence: ReviewRecord['independence']
-    readonly excludedFamilies: readonly string[]
-    readonly independenceNote?: string
+    /** Neutral fact: the reviewer's vendor relative to the reviewed work. Same-vendor review is normal. */
+    readonly reviewerVendor: ReviewerVendor
+    readonly reviewerVendorNote: string
     readonly reviewerRoute?: LedgerRoute
   }
 }
@@ -584,6 +586,7 @@ export class Delegator {
     }
     const at = this.engine.clock()
     let reviewerRoute: LedgerRoute | undefined
+    let stored: ReviewRecord | undefined
     await this.engine.mutate(caller.rootId, (ledger) => {
       const me = ledger.delegations.find(d => d.childId === base.childId)
       reviewerRoute = me?.observed ?? me?.selected
@@ -599,6 +602,7 @@ export class Delegator {
         ...(decision.independenceNote === undefined ? {} : { independenceNote: decision.independenceNote }),
         at,
       }
+      stored = record
       return {
         ...ledger,
         delegations: ledger.delegations.map(d => (d.childId === base.childId ? { ...d, state: 'completed' as const, settledAt: at } : d)),
@@ -612,9 +616,8 @@ export class Delegator {
         verdict: parsed.verdict,
         findings: parsed.findings,
         subject: parsed.subject,
-        independence: decision.independence ?? 'reduced',
-        excludedFamilies: decision.excludedFamilies,
-        ...(decision.independenceNote === undefined ? {} : { independenceNote: decision.independenceNote }),
+        reviewerVendor: reviewerVendor(stored!),
+        reviewerVendorNote: reviewerVendorNote(stored!, reviewerRoute?.provider),
         ...(reviewerRoute === undefined ? {} : { reviewerRoute }),
       },
     }

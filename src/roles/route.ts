@@ -294,10 +294,10 @@ export async function routeForDelegation(input: RouteForDelegationInput): Promis
       selected = { provider: selected.provider, model: selected.model, reasoningEffort: argEffort }
     }
     if (isReviewer) {
-      // The core is called with risk 'low' (see `select`), so its own independence line says "constraint not required" and would contradict the review's independence note. Replace it with the real reason.
+      // The core is called with risk 'low' (see `select`), so its own vendor line says "constraint not required" and would contradict the review's vendor note. Replace it with the real reason.
       for (let i = why.length - 1; i >= 0; i -= 1) if (why[i]!.startsWith('independence: risk ')) why.splice(i, 1)
-      if (ladderNote !== undefined) why.push(`independence: ${ladderNote}`)
-      else if (excluded.length === 0) why.push('independence: no reviewed provider family known; unfiltered ladder')
+      if (ladderNote !== undefined) why.push(`reviewer vendor: ${ladderNote}`)
+      else if (excluded.length === 0) why.push('reviewer vendor: no reviewed provider known; normal ladder')
     }
     const reasoningEffort = selected?.reasoningEffort ?? argEffort
     if (selected === undefined && argEffort !== undefined) {
@@ -431,10 +431,10 @@ export async function routeForDelegation(input: RouteForDelegationInput): Promis
       return finish({
         selected: toLedgerRoute(preferred.route),
         modelSource: 'ladder',
-        why: [classNote, `independence: families [${excluded.join(', ')}] excluded for the reviewer`, ...preferred.why],
+        why: [classNote, `reviewer vendor: preferring a provider outside [${excluded.join(', ')}]`, ...preferred.why],
       }, undefined)
     }
-    ladderNote = `no reviewer route outside provider families [${excluded.join(', ')}] was selectable${preferred === undefined ? '' : ` (${explain(preferred)})`}; fell back to the unfiltered ladder`
+    ladderNote = `no reviewer route outside provider families [${excluded.join(', ')}] was selectable${preferred === undefined ? '' : ` (${explain(preferred)})`}; used the normal ladder`
   }
 
   const decision = await select(policy, auto)
