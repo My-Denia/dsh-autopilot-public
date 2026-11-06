@@ -20,7 +20,7 @@ import {
 } from '../src/roles/index.js'
 import { isRouteRefusal, routeForDelegation } from '../src/roles/route.js'
 import type { RoleRoutingConfig, RouteDecision, RouteForDelegation } from '../src/roles/route.js'
-import { allowListFor, parseRestrictRejection, resolveToolAllow } from '../src/roles/tools.js'
+import { allowListDiagnostic, allowListFor, parseRestrictRejection, resolveToolAllow } from '../src/roles/tools.js'
 import { RouteCatalog } from '../src/routing/catalog.js'
 import type { LlmCallConfig, LlmRuntimeSubset } from '../src/routing/catalog.js'
 import type { SessionPolicyState } from '../src/routing/authorize.js'
@@ -204,6 +204,35 @@ describe('allowListFor', () => {
     expect(allowListFor('clerk', [...REGISTERED, 'mcp__linear__get_issue'], ['mcp__linear__get_issue', 'mcp__gone__x'])).toEqual([
       'read', 'glob', 'grep', 'read_image', 'web_fetch', 'mcp__linear__get_issue',
     ])
+  })
+
+  it('a clerk discovers registered MCP server and resource tools from the scope, excludes run_code/write/shell, and keeps diagnostics consistent', () => {
+    const scope = [
+      ...REGISTERED, 'run_code', 'list_mcp_resources', 'list_mcp_resource_templates', 'read_mcp_resource',
+      'mcp__linear__get_issue', 'mcp__notion__search_9f2a1c', 'mcp___linear__get_issue',
+      'mcp__', 'mcp____bad', 'mcp__onlyone',
+    ]
+    expect(allowListFor('clerk', scope)).toEqual([
+      'read', 'glob', 'grep', 'read_image', 'web_fetch',
+      'list_mcp_resources', 'list_mcp_resource_templates', 'read_mcp_resource',
+      'mcp__linear__get_issue', 'mcp__notion__search_9f2a1c', 'mcp___linear__get_issue',
+    ])
+    expect(allowListFor('scout', scope)).toEqual(['read', 'glob', 'grep', 'read_image', 'web_fetch'])
+    expect(allowListFor('planner', scope)).toEqual(['read', 'glob', 'grep', 'read_image'])
+    expect(allowListFor('reviewer', scope)).toEqual(['read', 'glob', 'grep', 'read_image'])
+    expect(allowListFor('clerk', undefined)).toEqual(['read', 'glob', 'grep', 'read_image', 'web_fetch', 'web_search'])
+    expect(allowListDiagnostic('clerk', [...REGISTERED, 'mcp__linear__get_issue'], ['mcp__linear__get_issue', 'mcp__gone__x'])).toBe(
+      'tool surface narrowed for the clerk: this deployment does not register "web_search", "mcp__gone__x" (kept 6 of 8)',
+    )
+  })
+
+  it('preserves explicit non-MCP connector requests and missing-name diagnostics', () => {
+    const registered = [...REGISTERED, 'web_search', 'linear_get_issue']
+    const extra = ['linear_get_issue', 'missing_connector']
+    expect(allowListFor('clerk', registered, extra)).toContain('linear_get_issue')
+    expect(allowListFor('clerk', registered, extra)).not.toContain('missing_connector')
+    expect(allowListDiagnostic('clerk', registered, extra)).toContain('"missing_connector"')
+    expect(allowListFor('clerk', undefined, ['linear_get_issue'])).toContain('linear_get_issue')
   })
 
   it('refuses (AP_TOOL_SURFACE_INCOMPLETE) a read-only role when `read` is not registered', () => {

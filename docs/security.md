@@ -22,9 +22,14 @@ Deeper design and measurements: [DESIGN.md](../DESIGN.md).
   write one.
 - **Delegated children** have a tool allow-list per role: scout, planner and
   reviewer get only `read`, `glob`, `grep` and `read_image` (scout also
-  `web_fetch` and `web_search`); a clerk gets the same set as a scout
-  today. Connector tools are not wired into delegation yet, so reads and writes
-  of external systems stay with the main agent. A worker
+  `web_fetch` and `web_search`); a clerk gets the scout set plus the DSH native
+  MCP resource tools (`list_mcp_resources`, `list_mcp_resource_templates`,
+  `read_mcp_resource`) and MCP server tools (`mcp__<server>__<tool>`) actually
+  registered in its scope on dispatch or cold resume. Automatic discovery does
+  not grant local file-write or shell capabilities. In native tool mode,
+  `run_code` is excluded from this allow-list; in PTC mode the host may present
+  `run_code` as its reserved transport, still limited to the underlying allowed
+  capabilities (not an extra shell or file-write grant). A worker
   and an executor-lead have no allow-list. `writePaths` is a conflict guard,
   not a permission system: a worker is not stopped from writing outside its
   declared paths, but a dispatch whose `writePaths` intersect those of a

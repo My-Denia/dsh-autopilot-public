@@ -1,0 +1,110 @@
+# Reusable no-secret DSH MCP connector overlay for `clerk` (target host: dsh 0.2.1-rc.5).
+#
+# Usage:
+# - Merge into `<profile>/cordis.patch.yml` or pass via `dsh --profile <name> --patch examples/clerk-connectors.patch.yml`.
+#
+# Pinned package & binary notes (`mcp-remote@0.16.1`):
+# - `mcp-remote` (`dist/proxy.js`): persistent STDIO-to-remote MCP proxy required by
+#   `@deepseek-ai/dsh-mcp-client` (`transport: stdio`).
+# - `mcp-remote-client` (`dist/client.js`, shipped in the same `mcp-remote@0.16.1` package;
+#   run via `npx --yes --package mcp-remote@0.16.1 mcp-remote-client <url>`): one-shot CLI
+#   that connects, lists tools/resources, and exits immediately (`process.exit(0)`). Do not
+#   configure `mcp-remote-client` as the persistent `dsh-mcp-client` command.
+# - `--protocol auto` (`legacy` | `auto` in `mcp-remote@0.16.1` `parseCommandLineArgs`)
+#   negotiates `server/discover` with automatic legacy fallback; `--transport` defaults to
+#   `http-first` (Streamable HTTP with SSE fallback).
+# - `@deepseek-ai/dsh-mcp-client` scrubs parent secret and `DSH_*` variables via
+#   `scrubbedParentEnv()`, then merges the explicit `env` map so `MCP_REMOTE_CONFIG_DIR`
+#   (`$DSH_HOME/mcp-auth`) reaches `mcp-remote`.
+#
+# Verification boundary:
+# - Config composition, schema projection, and local `mcp-remote@0.16.1` proxy tool calls
+#   are verified against local fixtures.
+# - First-time interactive OAuth login, token refresh, and cross-restart credential reuse
+#   against live remote services remain unverified.
+
+- insert:
+    - id: mcp-linear
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        transport: stdio
+        serverName: linear
+        command: npx
+        args:
+          - --yes
+          - --package
+          - mcp-remote@0.16.1
+          - mcp-remote
+          - https://mcp.linear.app/mcp
+          - --protocol
+          - auto
+        env:
+          MCP_REMOTE_CONFIG_DIR: !!js dshHomePath('mcp-auth')
+        toolCallTimeoutMs: 60000
+        failOnStartupError: false
+
+    - id: mcp-notion
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        transport: stdio
+        serverName: notion
+        command: npx
+        args:
+          - --yes
+          - --package
+          - mcp-remote@0.16.1
+          - mcp-remote
+          - https://mcp.notion.com/mcp
+          - --protocol
+          - auto
+        env:
+          MCP_REMOTE_CONFIG_DIR: !!js dshHomePath('mcp-auth')
+        toolCallTimeoutMs: 60000
+        failOnStartupError: false
+
+    # Slack (https://mcp.slack.com/mcp) — commented template (no secrets in repository):
+    # Requires a pre-registered Slack OAuth client_id and a fixed local callback port
+    # matching the registered redirect URI before interactive authorization can succeed.
+    # - id: mcp-slack
+    #   name: '@deepseek-ai/dsh-mcp-client'
+    #   config:
+    #     transport: stdio
+    #     serverName: slack
+    #     command: npx
+    #     args:
+    #       - --yes
+    #       - --package
+    #       - mcp-remote@0.16.1
+    #       - mcp-remote
+    #       - https://mcp.slack.com/mcp
+    #       - '3000'
+    #       - --protocol
+    #       - auto
+    #       - --static-oauth-client-info
+    #       - '{"client_id":"<SLACK_OAUTH_CLIENT_ID>"}'
+    #     env:
+    #       MCP_REMOTE_CONFIG_DIR: !!js dshHomePath('mcp-auth')
+    #     toolCallTimeoutMs: 60000
+    #     failOnStartupError: false
+
+    # Figma (https://mcp.figma.com/mcp) — commented template (non-blocking for project start):
+    # Compatibility between the official remote endpoint's OAuth client catalog rules
+    # and generic `mcp-remote` clients is unverified.
+    # - id: mcp-figma
+    #   name: '@deepseek-ai/dsh-mcp-client'
+    #   config:
+    #     transport: stdio
+    #     serverName: figma
+    #     command: npx
+    #     args:
+    #       - --yes
+    #       - --package
+    #       - mcp-remote@0.16.1
+    #       - mcp-remote
+    #       - https://mcp.figma.com/mcp
+    #       - --protocol
+    #       - auto
+    #     env:
+    #       MCP_REMOTE_CONFIG_DIR: !!js dshHomePath('mcp-auth')
+    #     toolCallTimeoutMs: 60000
+    #     failOnStartupError: false
