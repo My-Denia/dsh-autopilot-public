@@ -33,7 +33,7 @@ WSL CLI 的 profile 需要退回旧宿主时，先备份 profile，再执行 `np
 ## 目标怎么运行
 
 - 开始：读项目规则和 issue，把 Outcome、Done、Not in scope 写在 issue 或 PR 上，在 worktree 里工作。
-- 角色：主代理负责判断、整合和同 owner 沟通。`autopilot_delegate` 启动 `scout`（只读检索）、`clerk`（目前只读，工具集与 scout 相同；连接器工具尚未接入，外部系统的读写暂由主代理负责）、`worker`（带独立 `writePaths` 的有界实现）、`executor-lead`（负责一个工作块的完整交付，可再启动 scout、clerk、worker）、`planner`（只读规划或诊断）和 `reviewer`。跟踪子代理用 `autopilot_agents`（只有 `wait` 一个动作）以及宿主自带的 `list_agents`、`send_message`、`interrupt_agent`；卡住的子代理调用 `autopilot_escalate`。
+- 角色：主代理负责判断、整合和同 owner 沟通。`autopilot_delegate` 启动 `scout`（只读检索）、`clerk`（通过会话内已注册的 MCP 连接器、MCP 资源和网页工具读写外部系统并做写后回读，本地仓库仍保持只读）、`worker`（带独立 `writePaths` 的有界实现）、`executor-lead`（负责一个工作块的完整交付，可再启动 scout、clerk、worker）、`planner`（只读规划或诊断）和 `reviewer`。跟踪子代理用 `autopilot_agents`（只有 `wait` 一个动作）以及宿主自带的 `list_agents`、`send_message`、`interrupt_agent`；卡住的子代理调用 `autopilot_escalate`。
 - 并行委派：互相独立的子代理在同一轮一起启动。`writePaths` 有重叠的 worker 会在启动前被拒绝。
 - 独立评审：`reviewer` 一次性、只读、全新上下文，只看 diff 和结论。能找到不同厂商的模型时优先用；同厂商审阅属正常情况，不作为缺陷。
 - 模型与 effort：每次派发都写明模型和 effort（路由关闭或没有目录时除外：子代理沿用宿主路线，账本记为 inherit/host-default）。调用里的显式值或 profile 里的固定值优先于插件的选择。账本和卡片同时显示选定路线和实际观察到的路线。
@@ -45,11 +45,12 @@ WSL CLI 的 profile 需要退回旧宿主时，先备份 profile，再执行 `np
 
 ## 状态
 
-开发者预览版，`0.3.0-rc.7` 在 npm 的 `next` 标签上，`latest` 仍是 `0.2.0`。[已在真实宿主上验证](./docs/compatibility.md#verified-on-a-real-host)一节是在 Windows、dsh `0.2.1-rc.5`、单一模型厂商下观察到的行为，覆盖 headless profile、owner 的日常桌面应用（提示由 agent 经界面粘贴）和隔离的 Web Session 宿主（提示由 agent 经 API 发送）；[未验证](./docs/compatibility.md#not-verified-on-a-real-host)一节是没有观察到的（跨厂商 reviewer，需要第二个模型厂商；WSL 上的模型任务；DSH 侧 Linear；clerk 的连接器工具尚未接入）。测试通过、mock 运行和状态读取都不算观察。[docs/compatibility.md](./docs/compatibility.md) 里更早的测量针对插件 `0.2.x`。
+开发者预览版，`0.3.0-rc.7` 在 npm 的 `next` 标签上，`latest` 仍是 `0.2.0`。[已在真实宿主上验证](./docs/compatibility.md#verified-on-a-real-host)一节是在 Windows、dsh `0.2.1-rc.5`、单一模型厂商下观察到的行为，覆盖 headless profile、owner 的日常桌面应用（提示由 agent 经界面粘贴）和隔离的 Web Session 宿主（提示由 agent 经 API 发送）；[未验证](./docs/compatibility.md#not-verified-on-a-real-host)一节是没有观察到的（跨厂商 reviewer，需要第二个模型厂商；WSL 上的模型任务；DSH 侧持久 MCP profile 配置与 clerk 对真实外部服务的端到端调用）。测试通过、mock 运行和状态读取都不算观察。[docs/compatibility.md](./docs/compatibility.md) 里更早的测量针对插件 `0.2.x`。
 
 ## 文档
 
 - [docs/reference.md](./docs/reference.md)：工具、账本、配置
+- [examples/clerk-connectors.patch.yml](./examples/clerk-connectors.patch.yml)：供 `clerk` 复用的无密钥 MCP 连接器配置样例
 - [docs/compatibility.md](./docs/compatibility.md)：宿主、历史、尚未验证的部分
 - [docs/security.md](./docs/security.md)：插件管什么、不管什么
 - [skill/dsh-autopilot/SKILL.md](./skill/dsh-autopilot/SKILL.md)：会话内的适配器

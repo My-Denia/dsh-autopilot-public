@@ -35,13 +35,22 @@ to, and make no `create_goal` or `autopilot_*` call.
 
 ## Start
 
-1. Read the project rules, the issue with its comments, and the repository as
-   they are now. If someone else claimed the work, stop and tell the owner.
-2. Write three things before changing anything: Outcome (what is true when
+1. Read the project binding and applicable rules, the issue with its comments,
+   and the repository as they are now. When the project binding or owner
+   designates a cloud project archive, read its concise Current Brief at start
+   (delegate external reads and writes to `clerk` when the session registers
+   the connector tools). If someone else claimed the work, stop and tell the
+   owner; otherwise claim it on the issue and read the claim back.
+2. Before a key design change, or before deleting, reversing or replacing an
+   owner-designed element, read the project's Chronicle (causal design history)
+   for the original problem, evidence and owner ruling. If no record is found,
+   ask the owner before redoing it; when changing it, state in the PR what
+   problem it solved, why it changes now, and what carries that problem next.
+3. Write three things before changing anything: Outcome (what is true when
    finished), Done (commands or observations that prove it, each able to fail)
    and Not in scope. Post them on the issue, or in the PR description when there
    is no issue. If the goal is one small change, one line is enough.
-3. Work in a worktree on a branch from the current default branch. Side findings
+4. Work in a worktree on a branch from the current default branch. Side findings
    go on the backlog, not into this change.
 
 The issue and the PR are the record. `autopilot_status` shows the plugin ledger
@@ -56,9 +65,19 @@ talks to the owner. Start every other role with `autopilot_delegate`
 `executor-lead` may call it):
 
 - `scout`: read-only search, inventory, log reading. Returns compressed findings.
-- `clerk`: read-only today, with the same tools as `scout`. Connector tools are
-  not wired into delegation yet, so reads and writes of external systems stay
-  with you; do not delegate them to a clerk.
+- `clerk`: reads and writes external systems (trackers, project docs/archive,
+  chat, design tools, the web) through the DSH native connector tools actually
+  registered in this session (`mcp__<server>__<tool>`, `list_mcp_resources`,
+  `list_mcp_resource_templates`, `read_mcp_resource`, `web_fetch`,
+  `web_search`), while staying read-only on local repository files (`read`,
+  `glob`, `grep`, `read_image`; no local file-write or shell capability).
+  In PTC mode the host may show `run_code` as a reserved transport over these
+  same allowed capabilities; it is not an extra shell or file-write grant.
+  Returns a digest of at most 1.5K or a write readback (after any write, it
+  reads the target back and reports what the system now shows) and decides
+  nothing. When a needed connector tool is not registered in the session, it
+  says which one is missing instead of guessing; never count another host's or
+  main session's platform access as DSH connector verification.
 - `worker`: one bounded piece with explicit `writePaths`. Give it the outcome,
   the files, what it may not touch and a checkable result.
 - `executor-lead`: owns one chunk end to end; may start scout, clerk and worker
@@ -69,8 +88,10 @@ talks to the owner. Start every other role with `autopilot_delegate`
 
 Launch independent delegations together in one turn, not one after another.
 Parallel workers need disjoint `writePaths`; an overlap is refused before
-anything starts. Hand implementation, test runs and fixes to a worker and
-searches to a scout; do a step yourself only when it is a few short calls whose
+anything starts. Hand implementation, test runs and fixes to a worker, searches
+to a scout, and external-system reads and writes (issue claims, Current Brief
+and Chronicle reads, stage writebacks) to a clerk when the session registers
+the connector tools; do a step yourself only when it is a few short calls whose
 result you need at once.
 
 `autopilot_agents` has one action, `wait`. To list children, message them or
@@ -162,7 +183,15 @@ never calls `update_goal` with `complete`. Call it only when all of these hold:
   is unreviewed, not done.
 - The PR is merged with CI green, or the owner has been told exactly why not.
 - Anything installed or deployed was checked in the real place, not only in tests.
-- The issue records what changed, the evidence, and what is still unverified.
+- The issue (and, when designated by the project binding, the cloud archive's
+  Current Brief and appended Chronicle history) records what changed, the
+  evidence, and what is still unverified, with a post-write readback. If a
+  platform connector is not configured in this DSH session, state that gap and
+  what remains pending sync rather than claiming it synced.
+- Delegation is summarized on the issue from the facts DSH actually records in
+  `autopilot_status` (`<storeRoot>/ledgers/<sessionId>.json`: each child's role,
+  selected and observed route, `routeMatch` and state); do not claim
+  `agent-core`'s `scripts/delegation_report.py` parses DSH sessions.
 - Your worktrees and branches are gone.
 
 If a check cannot run, say so. Never report more than the evidence covers. When

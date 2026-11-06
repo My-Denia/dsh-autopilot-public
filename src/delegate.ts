@@ -650,7 +650,7 @@ export class Delegator {
     this.childSessions.set(agent.id, agent.session)
     const ctx = agent.ctx as { tools?: { restrict?: (filter: { allow: readonly string[] }) => void; register?: (def: unknown) => () => void } } | undefined
     try {
-      if (armed.allow !== 'inherit') this.restrict(ctx?.tools, armed.allow)
+      if (armed.allow !== 'inherit') this.restrict(ctx?.tools, armed.allow, armed.role)
       if (ctx?.tools?.register !== undefined) {
         this.childSurfaces.get(agent.id)?.()
         this.childSurfaces.set(agent.id, installChildTools(ctx.tools as { register(d: unknown): () => void }, this.engine, armed.role))
@@ -666,7 +666,11 @@ export class Delegator {
     }
   }
 
-  private restrict(tools: { restrict?: (filter: { allow: readonly string[] }) => void } | undefined, allow: readonly string[]): void {
+  private restrict(
+    tools: { restrict?: (filter: { allow: readonly string[] }) => void } | undefined,
+    allow: readonly string[],
+    role: DelegationRoleName,
+  ): void {
     if (tools?.restrict === undefined) fail('this child has no tool restriction surface, so its allow-list cannot be applied', AP_TOOL_SURFACE_INCOMPLETE)
     try {
       tools!.restrict!.call(tools, { allow })
@@ -677,7 +681,8 @@ export class Delegator {
       this.learnedToolNames = parsed.known
       const kept = allow.filter(name => parsed.known.includes(name))
       if (!kept.includes('read')) throw error
-      tools!.restrict!.call(tools, { allow: kept })
+      const next = role === 'clerk' ? (allowListFor('clerk', parsed.known) as readonly string[]) : kept
+      tools!.restrict!.call(tools, { allow: next })
     }
   }
 

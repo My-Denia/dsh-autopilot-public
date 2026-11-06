@@ -66,7 +66,7 @@ Roles (from `src/roles`):
 | role | what it is | tools | default work class |
 | --- | --- | --- | --- |
 | `scout` | search, inventory, log reading; returns compressed findings | `read`, `glob`, `grep`, `read_image`, `web_fetch`, `web_search` | `mechanical` |
-| `clerk` | read-only today, same tools as `scout`; connector tools are not wired yet, so external reads and writes stay with the main agent | the scout set | `mechanical` |
+| `clerk` | external reads and writes (trackers, docs/archive, chat, design, web) with write readback; local repository access stays read-only, and missing connector tools are reported as missing | the `scout` set plus any `list_mcp_resources`, `list_mcp_resource_templates`, `read_mcp_resource` and `mcp__<server>__<tool>` registered in the scope | `mechanical` |
 | `worker` | one bounded piece; `writePaths` required | no allow-list (inherits the profile's tools) | `simple` |
 | `executor-lead` | owns one chunk end to end; may start `scout`, `clerk` and `worker` only | no allow-list, plus `autopilot_delegate` and `autopilot_agents` | `hard` |
 | `planner` | read-only plan or diagnosis | `read`, `glob`, `grep`, `read_image` | `hard` |
@@ -244,6 +244,56 @@ For a web profile, include the web app bundle and the npm package name:
   "dsh-goal-autopilot"
 ] } }
 ```
+
+### MCP connectors for `clerk`
+
+A `clerk` child discovers any `mcp__<server>__<tool>` and MCP resource tools
+(`list_mcp_resources`, `list_mcp_resource_templates`, `read_mcp_resource`)
+registered in its scope, but a DSH profile registers none until
+`@deepseek-ai/dsh-mcp-client` entries are added to the profile's
+`cordis.patch.yml` (or passed with `--patch`). A reusable no-secret overlay is
+provided in
+[`examples/clerk-connectors.patch.yml`](../examples/clerk-connectors.patch.yml):
+
+- **Enabled examples (`linear`, `notion`).** Each entry mounts
+  `@deepseek-ai/dsh-mcp-client` (`transport: stdio`, `failOnStartupError: false`)
+  running `npx --yes --package mcp-remote@0.16.1 mcp-remote <url> --protocol auto`
+  with `MCP_REMOTE_CONFIG_DIR: !!js dshHomePath('mcp-auth')` so `mcp-remote`
+  stores OAuth/PKCE state under `$DSH_HOME/mcp-auth` even after
+  `@deepseek-ai/dsh-mcp-client` scrubs parent secret and `DSH_*` environment
+  variables.
+- **Binary distinction (`mcp-remote@0.16.1`).** Use `mcp-remote`
+  (`dist/proxy.js`), the persistent STDIO-to-remote proxy, in `dsh-mcp-client`.
+  The companion `mcp-remote-client` (`dist/client.js`, in the same
+  `mcp-remote@0.16.1` package; run via
+  `npx --yes --package mcp-remote@0.16.1 mcp-remote-client <url>`) is a one-shot
+  CLI that connects, prints tools/resources, and exits immediately
+  (`process.exit(0)`), so it cannot serve as the persistent `dsh-mcp-client`
+  command.
+- **Commented templates (`slack`, `figma`).** Slack requires a pre-registered
+  OAuth `client_id` and a matching fixed callback port (`--static-oauth-client-info`
+  with no secret committed). Figma's remote OAuth client catalog compatibility
+  with generic `mcp-remote` clients is unverified (non-blocking for project
+  start).
+- **Dump-only verification (no login or OAuth triggered) and boundaries:**
+
+  ```sh
+  dsh --profile <headless-profile> --patch examples/clerk-connectors.patch.yml --dump-config
+  dsh --profile <headless-profile> --patch examples/clerk-connectors.patch.yml --dump-config-schema
+  dsh --profile <web-profile> --patch examples/clerk-connectors.patch.yml --dump-config
+  ```
+
+  On `dsh 0.2.1-rc.5`, the three commands above exit `0`. Running
+  `dsh --profile <web-profile> --patch examples/clerk-connectors.patch.yml --dump-config-schema`
+  exits `1` because `@deepseek-ai/dsh-web-app`'s four `@deepseek-ai/dsh-agent-preset`
+  entries (`/187` to `/190`) emit `unrecognized Loader tree carrier` in the host
+  preset; the `mcp-linear` and `mcp-notion` patch entries themselves resolve
+  with `status: "schema"` and zero diagnostics. `--dump-config` and
+  `--dump-config-schema` validate YAML composition and `@deepseek-ai/dsh-mcp-client`
+  schema only, not child proxy flags; `--protocol auto` (`legacy` | `auto` in
+  `mcp-remote@0.16.1` `parseCommandLineArgs`) is verified against the locked
+  package source and a local Streamable HTTP fixture. First-time live OAuth
+  authorization, token refresh, and cross-restart reuse remain unverified.
 
 ## Skill copy fallback
 

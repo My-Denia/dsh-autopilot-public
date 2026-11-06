@@ -47,9 +47,16 @@ not required" independence line, which contradicted the independence note. They
 now state the real reason (fallback to the unfiltered ladder, or no reviewed
 provider family known).
 
-Docs correction: `clerk` is read-only today (same tools as `scout`); connector
-tools are not wired into delegation yet, and earlier text that said otherwise
-is fixed.
+`clerk` delegations (both fresh dispatch and cold resume) now discover and
+allow-list the DSH native MCP server tools (`mcp__<server>__<tool>`) and MCP
+resource tools (`list_mcp_resources`, `list_mcp_resource_templates`,
+`read_mcp_resource`) registered in the agent's scope alongside the read-only and
+web tools, while keeping local file-write, shell and `run_code` tools excluded.
+Earlier 0.3.0 pre-releases (PR #10) temporarily documented `clerk` as read-only
+and kept external reads/writes on the main agent only because connector
+discovery was not yet wired into `allowListFor`; the skill and docs now route
+external-system work (issue claims, Current Brief and Chronicle reads, stage
+writebacks) to `clerk` when those tools are registered in the session.
 
 ### Verification
 
@@ -72,8 +79,8 @@ the recorded note. Profile note: dsh `0.2.1-rc.5` rejects a `models` key under
 `llm-deepseek-account`; use `modelOverrides` or remove it.
 
 Not verified: a cross-family reviewer, a user-changed sandbox mode after the
-old clamp, any model task on WSL, DSH-side Linear, and connector tools for
-`clerk` (not wired). Details:
+old clamp, any model task on WSL, and DSH-side persistent MCP connector profiles
+with an end-to-end `clerk` call against a live external server. Details:
 [docs/compatibility.md](docs/compatibility.md#verified-on-a-real-host).
 
 ### Breaking changes

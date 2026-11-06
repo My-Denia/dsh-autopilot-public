@@ -28,6 +28,11 @@ export const ROLE_NAMES: readonly DelegationRoleName[] = ['scout', 'clerk', 'wor
  */
 export const READ_ONLY_TOOLS: readonly string[] = ['read', 'glob', 'grep', 'read_image']
 export const WEB_TOOLS: readonly string[] = ['web_fetch', 'web_search']
+export const MCP_RESOURCE_TOOLS: readonly string[] = [
+  'list_mcp_resources',
+  'list_mcp_resource_templates',
+  'read_mcp_resource',
+]
 
 /** Names a read-only role may never lose: a reviewer without `read` is a rubber stamp. */
 export const REQUIRED_READ_TOOLS: readonly string[] = ['read']
@@ -88,7 +93,7 @@ export const ROLES: Readonly<Record<DelegationRoleName, RoleSpec>> = {
       'After any write, read it back and report what the system now shows. ' +
       COMMON_REPORT,
     write: false,
-    // Connector tools are named by the host profile; the engine adds the ones actually present (open question: no fixed prefix is assumed here).
+    // Connector tools (`mcp__<server>__<tool>` and MCP_RESOURCE_TOOLS) come from the scope's registered set; ./tools.ts adds the ones actually present.
     requestedTools: [...READ_ONLY_TOOLS, ...WEB_TOOLS],
     delegationTools: [],
     canDispatch: [],

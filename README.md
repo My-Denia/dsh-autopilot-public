@@ -33,7 +33,7 @@ Questions, small reversible edits and ordinary read-only reviews stay in the mai
 ## How a goal runs
 
 - **Start.** The agent reads the project rules and the issue, writes Outcome, Done and Not in scope on the issue or PR, and works in a worktree.
-- **Roles.** The main agent decides, integrates and talks to the owner. `autopilot_delegate` starts `scout` (read-only search), `clerk` (read-only for now, same tools as scout; connector tools are not wired yet, so external-system reads and writes stay with the main agent), `worker` (a bounded piece with its own `writePaths`), `executor-lead` (one chunk end to end, may start scout, clerk and worker children), `planner` (read-only plan or diagnosis) and `reviewer`. Children are followed with `autopilot_agents` (`wait` only) and the host's `list_agents`, `send_message` and `interrupt_agent`; a stalled child calls `autopilot_escalate`.
+- **Roles.** The main agent decides, integrates and talks to the owner. `autopilot_delegate` starts `scout` (read-only search), `clerk` (external reads and writes through the MCP connector, MCP resource and web tools registered in the session, while local repository access stays read-only), `worker` (a bounded piece with its own `writePaths`), `executor-lead` (one chunk end to end, may start scout, clerk and worker children), `planner` (read-only plan or diagnosis) and `reviewer`. Children are followed with `autopilot_agents` (`wait` only) and the host's `list_agents`, `send_message` and `interrupt_agent`; a stalled child calls `autopilot_escalate`.
 - **Parallel delegation.** Independent children are started together in one turn. Workers whose `writePaths` overlap are refused before anything starts.
 - **Independent review.** The `reviewer` is one-shot, read-only, in a fresh context, and sees the diff and the claim. It uses a different model family from the change when one is reachable; otherwise the same vendor is used, which is normal.
 - **Model and effort.** Every dispatch names a model and an effort. An explicit value in the call or a pin in the profile beats the plugin's choice. The ledger and the card show the selected route and the observed one.
@@ -50,6 +50,7 @@ Developer preview. `0.3.0-rc.7` is on npm under the `next` tag; `latest` is stil
 ## Documentation
 
 - [docs/reference.md](./docs/reference.md): tools, ledger, configuration
+- [examples/clerk-connectors.patch.yml](./examples/clerk-connectors.patch.yml): reusable no-secret MCP connector overlay for `clerk`
 - [docs/compatibility.md](./docs/compatibility.md): hosts, history, what is and is not verified
 - [docs/security.md](./docs/security.md): what the plugin does and does not gate
 - [skill/dsh-autopilot/SKILL.md](./skill/dsh-autopilot/SKILL.md): the in-session adapter

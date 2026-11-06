@@ -179,6 +179,37 @@ describe('tool restriction is keyed by the child id', () => {
     expect(h.restricts.get('cold-scout')).toEqual([allowListFor('scout', REG)])
   })
 
+  it('a clerk gets the scope\'s registered MCP and resource tools on dispatch and cold resume, isolated from scout and worker', async () => {
+    let currentScope = [
+      ...REG.filter(name => name !== 'web_search'), 'run_code',
+      'list_mcp_resources', 'read_mcp_resource', 'mcp__linear__get_issue', 'mcp__notion__fetch',
+    ]
+    const h = delegationHost({ registeredFor: () => currentScope })
+    const [clerk, scout, worker] = await Promise.all([
+      h.engine.delegate(h.root, { role: 'clerk', task: 'read issue and brief' }),
+      h.engine.delegate(h.root, { role: 'scout', task: 'search repo' }),
+      h.engine.delegate(h.root, { role: 'worker', task: 'patch file', writePaths: ['src/a.ts'] }),
+    ])
+    const expectedClerk = [
+      'read', 'glob', 'grep', 'read_image', 'web_fetch',
+      'list_mcp_resources', 'read_mcp_resource', 'mcp__linear__get_issue', 'mcp__notion__fetch',
+    ]
+    expect(clerk.tools).toEqual(expectedClerk)
+    expect(h.restricts.get(clerk.childId)).toEqual([expectedClerk])
+    expect(clerk.routeWhy).toContain('tool surface narrowed for the clerk: this deployment does not register "web_search" (kept 9 of 10)')
+    expect(h.restricts.get(scout.childId)).toEqual([['read', 'glob', 'grep', 'read_image', 'web_fetch']])
+    expect(h.restricts.has(worker.childId)).toBe(false)
+
+    // Cold resume after restart uses the child's current scope view without leaking across roles.
+    currentScope = [...REG, 'run_code', 'read_mcp_resource', 'mcp__linear__create_comment']
+    h.announceExisting(clerk.childId)
+    h.announceExisting(scout.childId)
+    expect(h.restricts.get(clerk.childId)?.at(-1)).toEqual([
+      'read', 'glob', 'grep', 'read_image', 'web_fetch', 'web_search', 'read_mcp_resource', 'mcp__linear__create_comment',
+    ])
+    expect(h.restricts.get(scout.childId)?.at(-1)).toEqual(['read', 'glob', 'grep', 'read_image', 'web_fetch', 'web_search'])
+  })
+
   it('an agent the ledger does not know is left alone', () => {
     const h = delegationHost({ registered: REG })
     h.announceExisting('unrelated')

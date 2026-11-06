@@ -10,7 +10,7 @@
 import { AP_TOOL_SURFACE_INCOMPLETE } from '../domain/refusals.js'
 import { AutopilotError } from '../domain/types.js'
 import type { DelegationRoleName } from '../domain/ledger-types.js'
-import { REQUIRED_READ_TOOLS, ROLES } from './index.js'
+import { MCP_RESOURCE_TOOLS, REQUIRED_READ_TOOLS, ROLES } from './index.js'
 
 /**
  * The names under which a deployment registers a shell. `bash` and `pwsh` are one
@@ -122,6 +122,51 @@ export function parseRestrictRejection(
   return { unknown, known }
 }
 
+const MCP_RESOURCE_SET: ReadonlySet<string> = new Set(MCP_RESOURCE_TOOLS)
+// Match the native client's serverName schema, including leading underscores.
+const MCP_SERVER_TOOL = /^mcp__[A-Za-z0-9_-]{1,32}__.+$/
+
+/**
+ * Whether `name` is a DSH native MCP connector tool: one of the three MCP
+ * resource tools (`@deepseek-ai/dsh-mcp-client`) or a server tool registered as
+ * `mcp__<server>__<tool>` (`@deepseek-ai/dsh-mcp-manager`). Never matches
+ * `run_code` (reserved PTC transport) or local write/shell tools.
+ */
+export function isConnectorToolName(name: string): boolean {
+  return MCP_RESOURCE_SET.has(name) || MCP_SERVER_TOOL.test(name)
+}
+
+/**
+ * Discover the DSH native MCP and resource tools actually registered in
+ * `registeredToolNames`. Returns `[]` when the registry is unknown so no tool
+ * name is fabricated from prefixes.
+ */
+export function connectorToolsIn(registeredToolNames: readonly string[] | undefined): readonly string[] {
+  if (registeredToolNames === undefined) return []
+  const out: string[] = []
+  for (const name of registeredToolNames) {
+    if (isConnectorToolName(name) && !out.includes(name)) out.push(name)
+  }
+  return out
+}
+
+function clerkRequestedTools(
+  baseRequested: readonly string[],
+  registeredToolNames: readonly string[] | undefined,
+  extraRequested: readonly string[],
+): readonly string[] {
+  const out = [...baseRequested]
+  for (const name of connectorToolsIn(registeredToolNames)) {
+    if (!out.includes(name)) out.push(name)
+  }
+  // Preserve explicit requests, including connectors with non-MCP names.
+  // Automatic discovery above is limited to the native MCP namespace.
+  for (const name of extraRequested) {
+    if (!out.includes(name)) out.push(name)
+  }
+  return out
+}
+
 /**
  * The final allow-list for one child: the role's requested tools narrowed to
  * the registered names, plus its delegation tools; or `inherit` for a write
@@ -133,11 +178,12 @@ export function parseRestrictRejection(
  * the delegation names read `ROLES[role].delegationTools`.
  *
  * Read-only roles throw `AP_TOOL_SURFACE_INCOMPLETE` when `read` is not
- * registered; extra names (web_*, connector tools the engine appends) are
- * narrowed with a diagnostic by {@link allowListDiagnostic}.
+ * registered; extra names (web_*, connector tools discovered from the scope or
+ * appended in `extraRequested`) are narrowed with a diagnostic by
+ * {@link allowListDiagnostic}.
  *
  * @param registeredToolNames the deployment's registered tool names, or undefined when unknown (request passes through).
- * @param extraRequested connector tool names actually present that a clerk may use (the engine passes them).
+ * @param extraRequested additional tool names explicitly requested for a clerk (legacy contract).
  */
 export function allowListFor(
   role: DelegationRoleName,
@@ -146,7 +192,9 @@ export function allowListFor(
 ): readonly string[] | 'inherit' {
   const spec = ROLES[role]
   if (spec.requestedTools === 'inherit') return 'inherit'
-  const requested = role === 'clerk' ? [...spec.requestedTools, ...extraRequested] : spec.requestedTools
+  const requested = role === 'clerk'
+    ? clerkRequestedTools(spec.requestedTools, registeredToolNames, extraRequested)
+    : spec.requestedTools
   const resolved = resolveToolAllow(requested, registeredToolNames, REQUIRED_READ_TOOLS, `the ${role}`)
   const allow = [...resolved.allow]
   for (const name of spec.delegationTools) if (!allow.includes(name)) allow.push(name)
@@ -161,6 +209,8 @@ export function allowListDiagnostic(
 ): string | undefined {
   const spec = ROLES[role]
   if (spec.requestedTools === 'inherit') return undefined
-  const requested = role === 'clerk' ? [...spec.requestedTools, ...extraRequested] : spec.requestedTools
+  const requested = role === 'clerk'
+    ? clerkRequestedTools(spec.requestedTools, registeredToolNames, extraRequested)
+    : spec.requestedTools
   return resolveToolAllow(requested, registeredToolNames, REQUIRED_READ_TOOLS, `the ${role}`).diagnostic
 }

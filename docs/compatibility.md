@@ -121,9 +121,21 @@ None of the following has been observed on dsh `0.2.1-rc.5`.
 - A session whose sandbox mode the user changed after the old clamp stays
   unchanged. The candidate session needs a preset that headless refuses.
 - A model task on WSL.
-- DSH-side Linear access.
-- Connector tools for `clerk`. They are not wired into delegation, so `clerk`
-  is read-only today.
+- DSH-side MCP connector profiles and an end-to-end `clerk` run against a live
+  external server. `allowListFor('clerk', ...)` discovers `mcp__<server>__<tool>`
+  and `list_mcp_resources` / `list_mcp_resource_templates` / `read_mcp_resource`
+  from the scope's registered tools on dispatch and cold resume (verified
+  against local STDIO, Streamable HTTP, and `mcp-remote@0.16.1 --protocol auto`
+  fixtures; see [reference.md](reference.md#mcp-connectors-for-clerk) and
+  [`examples/clerk-connectors.patch.yml`](../examples/clerk-connectors.patch.yml)),
+  but existing DSH profiles have zero `mcp-client` servers configured by
+  default, native `streamable-http` supports static `headers` without an OAuth
+  flow or token refresh, and live OAuth authorization, token refresh, and
+  cross-restart reuse remain unverified. (`dsh --profile <web> --dump-config-schema`
+  exits `1` on `0.2.1-rc.5` due to four `@deepseek-ai/dsh-agent-preset`
+  `unrecognized Loader tree carrier` errors in `@deepseek-ai/dsh-web-app`, while
+  `headless --dump-config`, `headless --dump-config-schema`, and
+  `web --dump-config` exit `0`.)
 - The card in a live web client for a session whose only goal activity is a
   native goal call.
 - Whether children started by the plugin's runtime get native settlement

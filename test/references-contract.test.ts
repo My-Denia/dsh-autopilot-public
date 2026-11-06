@@ -118,6 +118,11 @@ describe('governance reference layer', () => {
     // The adapter binds the DSH tools; it must not carry the retired run shape.
     expect(skill).toContain('autopilot_delegate')
     expect(skill).toContain('update_goal')
+    expect(skill).toContain('Current Brief')
+    expect(skill).toContain('Chronicle')
+    expect(skill).toContain('list_mcp_resources')
+    expect(skill).not.toContain('connector tools are not wired')
+    expect(skill).not.toContain('app.notion.com')
     expect(skill).not.toContain('autopilot_init')
     expect(skill).not.toContain('| level | shape |')
   })
