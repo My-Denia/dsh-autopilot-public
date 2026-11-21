@@ -1,73 +1,99 @@
 <p align="right"><b>English</b> · <a href="./README.zh-CN.md">简体中文</a></p>
 
-# dsh-autopilot
-
-The [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (dsh) adapter of the goal-workflow. When the owner states a goal, the main agent keeps the decisions and the conversation, hands other work to role children started with an explicit model and effort (or, with routing off or no catalog, the host route, recorded as inherited), gets an independent review, and keeps the goal going until its Done checks hold. The issue and the pull request are the record; the plugin keeps only a small ledger of who was started, on what route, and how it ended.
+# dsh-goal-autopilot
 
 [![npm](https://img.shields.io/npm/v/dsh-goal-autopilot?style=flat-square)](https://www.npmjs.com/package/dsh-goal-autopilot)
 [![CI](https://img.shields.io/github/actions/workflow/status/My-Denia/dsh-autopilot-public/ci.yml?branch=main&style=flat-square)](https://github.com/My-Denia/dsh-autopilot-public/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](./LICENSE)
+
+A goal workflow adapter for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (dsh). When a goal is stated, the main agent keeps the decisions and the conversation, hands bounded work to role children of the host's own subagents, gets one independent review, and completes the goal only when its Done checks hold. The issue and the pull request are the record; the plugin keeps the delegation mechanics.
 
 > [!NOTE]
 > The npm package is **`dsh-goal-autopilot`**. The unscoped `dsh-autopilot` on npm is an unrelated package.
 
 ## Install
 
-This source is version `0.3.0` (`0.3.0-rc.1` and `0.3.0-rc.3` to `0.3.0-rc.7` were published to npm; `next` points to `0.3.0-rc.7`; stable is unreleased). It targets dsh `0.2.1-rc.5` only and has been tested on no other host. Node 22+ is required. The Windows desktop app and the WSL CLI are each treated as a native environment, not as one standing in for the other.
-
-Hosts older than `0.2.1-rc.5` (`0.1.x`, `0.2.0`) should stay on `dsh-goal-autopilot@0.2.0`, the last version for them. npm `latest` is still `0.2.0` today; stable `0.3.0` is not published; install a pre-release with `next` or a tarball built from this source.
+0.4.0 may not be the registry's `latest` tag yet. If `add` resolves to an older version, name this one:
 
 ```sh
-# a host on 0.1.x or 0.2.0
-dsh plugin --profile <name> add dsh-goal-autopilot@0.2.0
+dsh plugin --profile <name> add dsh-goal-autopilot
+dsh plugin --profile <name> add dsh-goal-autopilot@0.4.0   # pin the pre-release
 ```
 
-If a WSL CLI profile has to go back to the older host, keep a backup of the profile first, then `npm i -g @deepseek-ai/dsh@0.1.5-rc.1`.
+The package targets dsh `0.2.2-rc.5` and declares `engines.dsh` as `>=0.2.2-rc.5 <0.3.0-0`. Node 22 or newer is required. Older hosts cannot load 0.4.0; the 0.3.0 pre-releases were built for dsh `0.2.1-rc.5`, and `0.2.0` remains the last release for dsh `0.1.x` and `0.2.0`.
 
-## What starts it
+## When it starts
 
-The skill applies only when the owner states a goal, asks for autopilot, or hands over sustained multi-stage work (several stages, parallel pieces, a pull request to land). Then the agent calls `get_goal` and, if none is current, `create_goal` with the Outcome as the objective.
+The adapter skill applies when the user states a goal, asks for autopilot, or hands over sustained multi-stage work: several stages, parallel pieces, a pull request to land. The agent reads the current goal with `get_goal` and, when none is current, calls `create_goal` with the Outcome as the objective.
 
 Questions, small reversible edits and ordinary read-only reviews stay in the main thread. They make no goal call and no `autopilot_*` call.
 
 ## How a goal runs
 
 - **Start.** The agent reads the project rules and the issue, writes Outcome, Done and Not in scope on the issue or PR, and works in a worktree.
-- **Roles.** The main agent decides, integrates and talks to the owner. `autopilot_delegate` starts `scout` (read-only search), `clerk` (external reads and writes through the MCP connector, MCP resource and web tools registered in the session, while local repository access stays read-only), `worker` (a bounded piece with its own `writePaths`), `executor-lead` (one chunk end to end, may start scout, clerk and worker children), `planner` (read-only plan or diagnosis) and `reviewer`. Children are followed with `autopilot_agents` (`wait` only) and the host's `list_agents`, `send_message` and `interrupt_agent`; a stalled child calls `autopilot_escalate`.
-- **Parallel delegation.** Independent children are started together in one turn. Workers whose `writePaths` overlap are refused before anything starts.
-- **Independent review.** The `reviewer` is one-shot, read-only, in a fresh context, and sees the diff and the claim. It uses a different model family from the change when one is reachable; otherwise the same vendor is used, which is normal.
-- **Model and effort.** Every dispatch names a model and an effort. An explicit value in the call or a pin in the profile beats the plugin's choice. The ledger and the card show the selected route and the observed one.
-- **Goal persistence.** The goal lives in dsh's own `get_goal` / `create_goal` / `update_goal` and is continued by the host's goal round driver. Finishing a stage, opening a PR or a green CI does not complete the goal; the agent completes it only when all Done checks hold. Waiting for children or background jobs happens inside the turn (`autopilot_agents` `wait`, `job_output` with `wait`).
-- **After a restart.** Running children are gone and the goal stays disarmed until the owner says "continue". A `schedule_create` reminder is delivered after the restart but does not re-arm the goal.
-- **Legacy runs.** Runs written by 0.2.x stay readable and are shown read-only on the card. They are not continued.
+- **Roles.** The main agent decides, integrates and talks to the user. It starts role children with `autopilot_delegate`:
 
-The tool parameters, the ledger and the configuration are in the [operator reference](./docs/reference.md).
+  | role | what it does | tools |
+  | --- | --- | --- |
+  | `scout` | read-only search, inventory and log reading; returns compressed findings | `read`, `glob`, `grep`, `read_image`, `web_fetch`, `web_search` |
+  | `planner` | read-only plan or diagnosis | `read`, `glob`, `grep`, `read_image` |
+  | `worker` | one bounded piece of work; must declare `writePaths` | inherits the session tool set |
+  | `executor-lead` | one chunk end to end; may start `scout` and `worker` children | inherits the session tool set, plus the delegation tools |
+  | `reviewer` | one-shot read-only review in a fresh context; returns a verdict | `read`, `glob`, `grep`, `read_image`; cannot delegate |
 
-## Status
+- **Parallel delegation.** Independent children are started together in one turn. A new writer whose `writePaths` overlap a writer still running under the same root is refused before it starts.
+- **One independent review.** `reviewer` is one-shot, read-only and runs in a fresh context. It gets the diff and the claim in `task`, not the author's reasoning, and returns `pass` or `fail` with `blocker` and `note` findings in-band, as the result of the same call. The main agent cannot write a verdict. The route is whatever the call names or the host default supplies; a same-model review is normal, and the result records the route that ran when the host exposes it.
+- **Waiting.** `autopilot_agents` with `action: 'wait'` blocks until the listed children settle or the timeout fires (default 300 s, at most 600). Background jobs and CI watchers use the host's `job_output` with `wait`. Waiting happens inside the turn; the wait tools are not gates.
+- **Done.** The agent calls `update_goal` with `action: 'complete'` only when every Done check holds. Finishing a stage, opening a PR or a green CI run does not complete the goal. The host's goal driver continues an armed goal between turns.
+- **After a restart.** Running children are gone and an active goal is disarmed. Nothing resumes automatically: when the user says continue, the agent reads the goal with `get_goal` and rearms it with `update_goal` `resume`.
 
-Developer preview. `0.3.0-rc.7` is on npm under the `next` tag; `latest` is still `0.2.0`. The [verified list](./docs/compatibility.md#verified-on-a-real-host) is what was observed with dsh `0.2.1-rc.5` on Windows: a headless profile, the owner's daily desktop app (prompts pasted by an agent through the GUI), and an isolated Web Session host (prompts sent by an agent through the API), with one provider family. The [not-verified list](./docs/compatibility.md#not-verified-on-a-real-host) is what was not (among them a cross-family reviewer, which needs a second provider family). Passing tests, mock runs and status reads are not counted as observation. The earlier measurements in [docs/compatibility.md](./docs/compatibility.md) are for plugin `0.2.x`.
+## Tools
+
+| tool | callable by | what it does |
+| --- | --- | --- |
+| `autopilot_delegate` | root agent, `executor-lead` | starts one role child and returns at once with its child id, the route it was given, the route source (`call` or `inherit`) and the generation |
+| `autopilot_agents` | root agent, `executor-lead` | `action: 'wait'` only: blocks until the listed children settle or the timeout fires, and returns `timedOut` plus the delegation records |
+| `autopilot_escalate` | any delegated child except `reviewer` | records a request for a stronger route, more effort or a different split; the parent decides and re-dispatches with `replaces`. It never widens the role's permissions |
+
+## Configuration
+
+One key:
+
+| key | values | meaning |
+| --- | --- | --- |
+| `skillInstall` | `auto` (default) | publishes the adapter skill through the host's skills service, or copies `skill/dsh-goal-autopilot/SKILL.md` into `$DSH_AGENTS_HOME/skills/dsh-goal-autopilot` when that service is unavailable |
+|  | `off` | neither channel; the skill is not installed |
+
+There are no model pins, ladders, catalogs or work classes. A route comes from the dispatch call (`provider` and `model` together, optional `effort`) or from the host default.
+
+## What it deliberately does not do
+
+- **No model routing policy.** No ladder, model catalog, work classes, coverage report, onboarding notice or cross-family vendor rule. The plugin cannot grant, filter or rank routes; it records the route asked for, where it came from, and, when the host exposes the child's log, the route that ran.
+- **No persisted ledger.** Delegation records live in memory for one root session. A host restart loses them, and the children they describe are gone; there is no resume and no `lost` state.
+- **No session card, client bundle or web routes.** There is no list, status or link tool; the host's `list_agents` and `send_message` cover the tree, and the issue and PR carry the record.
+- **No external-system role.** The 0.2.x `clerk` role, the connector overlay and MCP write paths are not part of this package. Delegated work is local repository work; a `scout` may use the host's `web_search` and `web_fetch` for research, but there is no connector or external write path.
+- **No legacy 0.2.x history.** It does not read, fold, display or continue runs written by plugin 0.2.x, and it keeps no compatibility shims for old tools or config keys.
+- **No sandbox of its own.** Host approval and sandbox settings apply to every call; `writePaths` is a conflict guard between concurrent writers, not a permission system. See [docs/security.md](./docs/security.md).
 
 ## Documentation
 
-- [docs/reference.md](./docs/reference.md): tools, ledger, configuration
-- [examples/clerk-connectors.patch.yml](./examples/clerk-connectors.patch.yml): reusable no-secret MCP connector overlay for `clerk`
-- [docs/compatibility.md](./docs/compatibility.md): hosts, history, what is and is not verified
-- [docs/security.md](./docs/security.md): what the plugin does and does not gate
-- [skill/dsh-autopilot/SKILL.md](./skill/dsh-autopilot/SKILL.md): the in-session adapter
-- [skill/dsh-autopilot/references/model-routing.md](./skill/dsh-autopilot/references/model-routing.md): work classes, ladder, escalation
-- [skill/dsh-autopilot/references/refusals.md](./skill/dsh-autopilot/references/refusals.md): remaining `AP_*` refusals
-- [DESIGN.md](./DESIGN.md): architecture and design history
-- [CHANGELOG.md](./CHANGELOG.md)
+- [ARCHITECTURE.md](./ARCHITECTURE.md): how the plugin divides work with the host
+- [docs/reference.md](./docs/reference.md): exact tool parameters, refusals, configuration and host tools
+- [docs/security.md](./docs/security.md): what the plugin gates and does not gate
+- [skill/dsh-goal-autopilot/SKILL.md](./skill/dsh-goal-autopilot/SKILL.md): the in-session adapter
+- [CHANGELOG.md](./CHANGELOG.md): release history and the 0.4.0 break
 
 ## Development
+
+Node 22 and pnpm 11.17.0.
 
 ```sh
 git clone https://github.com/My-Denia/dsh-autopilot-public.git
 cd dsh-autopilot-public
 pnpm install
-npm run build
-npm run check
-npm test
+pnpm run build
+pnpm run check
+pnpm test
 dsh plugin --profile dev add .
 ```
 

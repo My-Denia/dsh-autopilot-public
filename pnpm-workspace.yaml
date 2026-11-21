@@ -3,69 +3,36 @@ packages:
 allowBuilds:
   esbuild: true
 
+# These pre-release versions are younger than the workspace's default release
+# age, so pnpm would otherwise refuse to install the exact devDependencies in
+# package.json.
 minimumReleaseAgeExclude:
-  - '@deepseek-ai/dsh-agent@0.2.1-rc.5'
-  - '@deepseek-ai/dsh-attachment@0.2.1-rc.5'
-  - '@deepseek-ai/dsh-brand@0.2.1-rc.5'
-  - '@deepseek-ai/dsh-chunked-list@0.2.1-rc.5'
-  - '@deepseek-ai/dsh-fs@0.2.1-rc.5'
-  - '@deepseek-ai/dsh-llm@0.2.1-rc.5'
-  - '@deepseek-ai/dsh-ptc-runtime@0.2.1-rc.5'
-  - '@deepseek-ai/dsh-sandbox-policy@0.2.1-rc.5'
-  - '@deepseek-ai/dsh-sandbox@0.2.1-rc.5'
-  - '@deepseek-ai/dsh-scope@0.2.1-rc.5'
-  - '@deepseek-ai/dsh-session-projection@0.2.1-rc.5'
-  - '@deepseek-ai/dsh-session@0.2.1-rc.5'
-  - '@deepseek-ai/dsh-subagent@0.2.1-rc.5'
-  - '@deepseek-ai/dsh-system-prompt@0.2.1-rc.5'
-  - '@deepseek-ai/dsh-timeout@0.2.1-rc.5'
-  - '@deepseek-ai/dsh-tools@0.2.1-rc.5'
-  - '@deepseek-ai/dsh-typert-protocol@0.2.1-rc.5'
-  - '@deepseek-ai/dsh-user-approval@0.2.1-rc.5'
-  - '@deepseek-ai/dsh-util-crypto@0.2.1-rc.5'
-  - '@deepseek-ai/dsh-util-time@0.2.1-rc.5'
-  - '@deepseek-ai/dsh-util-values@0.2.1-rc.5'
-  - '@deepseek-ai/dsh-working-directory@0.2.1-rc.5'
+  - '@deepseek-ai/dsh-agent@0.2.2-rc.5'
+  - '@deepseek-ai/dsh-attachment@0.2.2-rc.5'
+  - '@deepseek-ai/dsh-brand@0.2.2-rc.5'
+  - '@deepseek-ai/dsh-chunked-list@0.2.2-rc.5'
+  - '@deepseek-ai/dsh-fs@0.2.2-rc.5'
+  - '@deepseek-ai/dsh-llm@0.2.2-rc.5'
+  - '@deepseek-ai/dsh-ptc-runtime@0.2.2-rc.5'
+  - '@deepseek-ai/dsh-sandbox-policy@0.2.2-rc.5'
+  - '@deepseek-ai/dsh-sandbox@0.2.2-rc.5'
+  - '@deepseek-ai/dsh-scope@0.2.2-rc.5'
+  - '@deepseek-ai/dsh-session-projection@0.2.2-rc.5'
+  - '@deepseek-ai/dsh-session@0.2.2-rc.5'
+  - '@deepseek-ai/dsh-subagent@0.2.2-rc.5'
+  - '@deepseek-ai/dsh-system-prompt@0.2.2-rc.5'
+  - '@deepseek-ai/dsh-timeout@0.2.2-rc.5'
+  - '@deepseek-ai/dsh-tools@0.2.2-rc.5'
+  - '@deepseek-ai/dsh-typert-protocol@0.2.2-rc.5'
+  - '@deepseek-ai/dsh-user-approval@0.2.2-rc.5'
+  - '@deepseek-ai/dsh-util-crypto@0.2.2-rc.5'
+  - '@deepseek-ai/dsh-util-time@0.2.2-rc.5'
+  - '@deepseek-ai/dsh-util-values@0.2.2-rc.5'
+  - '@deepseek-ai/dsh-working-directory@0.2.2-rc.5'
 
-# Dependabot alerts #1/#2: qs < 6.16.0 is transitive-only here
-# (qs -> typed-rest-client -> @stryker-mutator/core, a devDependency), so there
-# is no direct spec to bump. An override is the only lever, and it lives HERE
-# rather than in package.json's `pnpm` field: pnpm 11 no longer reads settings
-# from that field (pnpm.io/package_json, read 2026-09-04), and `overrides` is a
-# root key of the workspace manifest (pnpm.io/settings/dependency-resolution).
-overrides:
-  qs: '>=6.16.0'
-
-# THE IMPLICIT-INSTALL GATE ACTUALLY LIVES HERE, not in .npmrc (measured
-# 2026-08-27; full transcript in evidence/npmrc-probe.txt, tracked).
-#
-# pnpm's `verify-deps-before-run` defaults to `install`, which makes
-# `pnpm run <script>` perform a network install whenever the project's
-# dependencies do not satisfy the lockfile. This repository was bitten by that
-# on 2026-08-25 by a command issued only to typecheck, and pinned `warn` in
-# .npmrc — where, it turns out, pnpm 11.17.0 does not read it. Measured against
-# a REAL stale dependency, with the network forced off so the wrong answer could
-# be observed safely:
-#
-#   .npmrc  verify-deps-before-run=error  -> pnpm spawned `pnpm install` anyway
-#                                            (default behaviour; NOT honoured)
-#   here    verifyDepsBeforeRun: error    -> ERR_PNPM_VERIFY_DEPS_BEFORE_RUN,
-#                                            script never ran (honoured)
-#   here    verifyDepsBeforeRun: warn     -> warning printed, script ran,
-#                                            nothing installed, lockfile
-#                                            byte-identical afterwards
-#
-# So .npmrc's own "MEASURED" note is inverted on both halves — that earlier test
-# used `touch package.json`, which creates no staleness, so BOTH locations
-# looked equally dead and neither could have refused.
-#
-# `warn` and not `error`: the information is what was missing, not the ability
-# to run. `warn` keeps the sentence "your lockfile is stale" and drops the
-# unasked side effect. Use `error` when you want a script to refuse until you
-# install deliberately. Never `install` — that is the default this exists to
-# override.
-#
-# The key MUST be camelCase here: pnpm merges workspace-manifest settings with
-# `if (!isCamelCase(key)) continue`, so a hyphenated spelling in this file is
-# silently skipped.
+# The implicit-install gate. pnpm's `verify-deps-before-run` defaults to
+# `install`, so `pnpm run <script>` would reach the network whenever the
+# lockfile is stale. `warn` keeps the staleness sentence and installs nothing;
+# `error` refuses until you install deliberately. The key must be camelCase
+# here: pnpm skips hyphenated spellings in the workspace manifest.
 verifyDepsBeforeRun: warn

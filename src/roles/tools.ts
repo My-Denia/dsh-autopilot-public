@@ -1,38 +1,38 @@
 /**
- * Per-child tool allow-list. The host has no `toolFilter` on
- * `startActivation`; the plugin restricts the child's tools on `agent/created`.
- * `tools.restrict()` throws on the first name the profile does not register, so
- * a requested list must be narrowed to the registry first, and narrowing must
- * never be silent. Ported from engine.ts (`resolveToolAllow`,
- * `parseRestrictRejection`); the engine copy is deleted later.
+ * Per-child tool allow-lists.
+ *
+ * The host's `startActivation` has no tool filter, so the plugin restricts the
+ * child's tools on `agent/created` with `ctx.tools.restrict({ allow })`. The
+ * registry rejects an unknown name outright, so a requested list must first be
+ * narrowed to the names this deployment actually registers — and narrowing
+ * must never be silent: a read-only role that loses `read` is refused, because
+ * a reviewer that cannot read still returns a schema-valid verdict having seen
+ * nothing.
+ *
+ * Pure module: it takes the role's tool data as an argument, so it imports no
+ * role table and stays testable in isolation.
  */
 
 import { AP_TOOL_SURFACE_INCOMPLETE } from '../domain/refusals.js'
 import { AutopilotError } from '../domain/types.js'
-import type { DelegationRoleName } from '../domain/ledger-types.js'
-import { MCP_RESOURCE_TOOLS, REQUIRED_READ_TOOLS, ROLES } from './index.js'
 
-/**
- * The names under which a deployment registers a shell. `bash` and `pwsh` are one
- * capability split by platform; the terminal pair carries command text too.
- */
-export const SHELL_TOOLS: readonly string[] = [
-  'bash', 'pwsh', 'run_code', 'terminal_open', 'terminal_send',
-]
+/** Read-only file tools every deployment that can be reviewed at all registers. */
+export const READ_ONLY_TOOLS: readonly string[] = ['read', 'glob', 'grep', 'read_image']
 
-/**
- * Interchangeable capability families. A family lets narrowing tell "this
- * deployment SPELLS the capability differently" from "this deployment does
- * not HAVE it": only losing every name of a family the request named is an
- * error.
- */
-const TOOL_FAMILIES: ReadonlyArray<{ readonly label: string; readonly members: readonly string[] }> = [
-  { label: 'shell', members: SHELL_TOOLS },
-  { label: 'file-write', members: ['write', 'edit', 'str_replace_editor'] },
-  { label: 'search', members: ['glob', 'grep'] },
-]
+/** Web tools a scout asks for; losing them narrows the scout, it does not refuse it. */
+export const WEB_TOOLS: readonly string[] = ['web_fetch', 'web_search']
 
-/** What one requested allow-list resolves to against a deployment's real registry. */
+/** Names a read-only role may never lose: a reviewer without `read` is a rubber stamp. */
+export const REQUIRED_READ_TOOLS: readonly string[] = ['read']
+
+/** The parts of a role this module reads. */
+export interface RoleToolSpec {
+  readonly name: string
+  readonly requestedTools: readonly string[] | 'inherit'
+  readonly delegationTools: readonly string[]
+}
+
+/** What one requested allow-list resolves to against a deployment's registry. */
 export interface ToolAllowResolution {
   /** The names to hand the host: `requested` ∩ registry, or `requested` verbatim when the registry is unknown. */
   readonly allow: readonly string[]
@@ -48,9 +48,6 @@ function quoteNames(names: readonly string[]): string {
 
 /**
  * Resolve a requested tool allow-list against what a deployment registers.
- * A drop that would cost a required name or a whole requested family REFUSES
- * (`AP_TOOL_SURFACE_INCOMPLETE`) instead of narrowing, because a reviewer that
- * cannot `read` still returns a schema-valid verdict having seen nothing.
  *
  * @param requested names the plugin asked for.
  * @param registered the deployment's restrictable tool names, or undefined when the host cannot be asked.
@@ -68,20 +65,10 @@ export function resolveToolAllow(
   const allow = requested.filter((name) => known.has(name))
   const dropped = requested.filter((name) => !known.has(name))
   if (dropped.length === 0) return { allow, dropped: [] }
-
   const missing = required.filter((name) => !known.has(name))
   if (missing.length > 0) {
     throw new AutopilotError(
       `${label} cannot be dispatched: this deployment does not register ${quoteNames(missing)}, and an agent narrowed off that surface would still return a schema-valid answer having seen nothing`,
-      AP_TOOL_SURFACE_INCOMPLETE,
-    )
-  }
-  for (const family of TOOL_FAMILIES) {
-    const asked = requested.filter((name) => family.members.includes(name))
-    if (asked.length === 0) continue
-    if (asked.some((name) => known.has(name))) continue
-    throw new AutopilotError(
-      `${label} cannot be dispatched: this deployment registers none of the ${family.label} tools it was given (${quoteNames(asked)}); narrowing would hand the child a surface with no ${family.label} capability at all`,
       AP_TOOL_SURFACE_INCOMPLETE,
     )
   }
@@ -93,7 +80,7 @@ export function resolveToolAllow(
 }
 
 /**
- * Upstream's restrict rejection, which names BOTH the unknown tools and the
+ * The tool registry's own rejection, which names BOTH the unknown tools and the
  * deployment's complete restrictable set:
  * `tools.restrict() names unknown global tools "a", "b"; known global tools: c, d, e`.
  */
@@ -101,8 +88,7 @@ const RESTRICT_REJECTION = /tools\.restrict\(\) names unknown global tools?\s+(.
 
 /**
  * Recover the deployment's tool registry from a `tools.restrict()` rejection
- * (the seam of last resort when no registry probe is wired). Returns undefined
- * for any message that is not exactly that shape.
+ * (the seam of last resort when the registry probe read nothing).
  */
 export function parseRestrictRejection(
   message: string,
@@ -122,80 +108,20 @@ export function parseRestrictRejection(
   return { unknown, known }
 }
 
-const MCP_RESOURCE_SET: ReadonlySet<string> = new Set(MCP_RESOURCE_TOOLS)
-// Match the native client's serverName schema, including leading underscores.
-const MCP_SERVER_TOOL = /^mcp__[A-Za-z0-9_-]{1,32}__.+$/
-
 /**
- * Whether `name` is a DSH native MCP connector tool: one of the three MCP
- * resource tools (`@deepseek-ai/dsh-mcp-client`) or a server tool registered as
- * `mcp__<server>__<tool>` (`@deepseek-ai/dsh-mcp-manager`). Never matches
- * `run_code` (reserved PTC transport) or local write/shell tools.
- */
-export function isConnectorToolName(name: string): boolean {
-  return MCP_RESOURCE_SET.has(name) || MCP_SERVER_TOOL.test(name)
-}
-
-/**
- * Discover the DSH native MCP and resource tools actually registered in
- * `registeredToolNames`. Returns `[]` when the registry is unknown so no tool
- * name is fabricated from prefixes.
- */
-export function connectorToolsIn(registeredToolNames: readonly string[] | undefined): readonly string[] {
-  if (registeredToolNames === undefined) return []
-  const out: string[] = []
-  for (const name of registeredToolNames) {
-    if (isConnectorToolName(name) && !out.includes(name)) out.push(name)
-  }
-  return out
-}
-
-function clerkRequestedTools(
-  baseRequested: readonly string[],
-  registeredToolNames: readonly string[] | undefined,
-  extraRequested: readonly string[],
-): readonly string[] {
-  const out = [...baseRequested]
-  for (const name of connectorToolsIn(registeredToolNames)) {
-    if (!out.includes(name)) out.push(name)
-  }
-  // Preserve explicit requests, including connectors with non-MCP names.
-  // Automatic discovery above is limited to the native MCP namespace.
-  for (const name of extraRequested) {
-    if (!out.includes(name)) out.push(name)
-  }
-  return out
-}
-
-/**
- * The final allow-list for one child: the role's requested tools narrowed to
- * the registered names, plus its delegation tools; or `inherit` for a write
- * role with no delegation tools (no restriction at all).
+ * The final allow-list for one child: `inherit` for a write role (no
+ * restriction at all; its own delegation tools are own-scope registrations,
+ * which restrictions never touch), or the role's requested names narrowed to
+ * the registry for a read-only role.
  *
- * A write role WITH delegation tools (executor-lead) also returns `inherit`:
- * the delegation tools are added to the child's surface by the engine, and the
- * allow-list vocabulary cannot express "everything except X". Callers that need
- * the delegation names read `ROLES[role].delegationTools`.
- *
- * Read-only roles throw `AP_TOOL_SURFACE_INCOMPLETE` when `read` is not
- * registered; extra names (web_*, connector tools discovered from the scope or
- * appended in `extraRequested`) are narrowed with a diagnostic by
- * {@link allowListDiagnostic}.
- *
- * @param registeredToolNames the deployment's registered tool names, or undefined when unknown (request passes through).
- * @param extraRequested additional tool names explicitly requested for a clerk (legacy contract).
+ * @param registeredToolNames the deployment's registered tool names, or undefined when unknown (the request passes through).
  */
 export function allowListFor(
-  role: DelegationRoleName,
+  spec: RoleToolSpec,
   registeredToolNames: readonly string[] | undefined,
-  extraRequested: readonly string[] = [],
 ): readonly string[] | 'inherit' {
-  const spec = ROLES[role]
   if (spec.requestedTools === 'inherit') return 'inherit'
-  const requested = role === 'clerk'
-    ? clerkRequestedTools(spec.requestedTools, registeredToolNames, extraRequested)
-    : spec.requestedTools
-  const resolved = resolveToolAllow(requested, registeredToolNames, REQUIRED_READ_TOOLS, `the ${role}`)
+  const resolved = resolveToolAllow(spec.requestedTools, registeredToolNames, REQUIRED_READ_TOOLS, `the ${spec.name}`)
   const allow = [...resolved.allow]
   for (const name of spec.delegationTools) if (!allow.includes(name)) allow.push(name)
   return allow
@@ -203,14 +129,9 @@ export function allowListFor(
 
 /** The narrowing record for the same inputs as {@link allowListFor}, or undefined when nothing was dropped. */
 export function allowListDiagnostic(
-  role: DelegationRoleName,
+  spec: RoleToolSpec,
   registeredToolNames: readonly string[] | undefined,
-  extraRequested: readonly string[] = [],
 ): string | undefined {
-  const spec = ROLES[role]
   if (spec.requestedTools === 'inherit') return undefined
-  const requested = role === 'clerk'
-    ? clerkRequestedTools(spec.requestedTools, registeredToolNames, extraRequested)
-    : spec.requestedTools
-  return resolveToolAllow(requested, registeredToolNames, REQUIRED_READ_TOOLS, `the ${role}`).diagnostic
+  return resolveToolAllow(spec.requestedTools, registeredToolNames, REQUIRED_READ_TOOLS, `the ${spec.name}`).diagnostic
 }

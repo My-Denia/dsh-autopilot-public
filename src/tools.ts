@@ -1,30 +1,29 @@
 /**
- * Model-facing autopilot tools (root controller surface).
+ * The three model-facing tools.
  *
- * 0.3.0 retired the run state machine and every tool that wrote it
- * (`autopilot_init`, `_amend_plan`, `_submit_plan`, `_audit`, `_self_check`,
- * `_external_audit`, `_usage`, `_log`, `_executor`, `_submit_evidence`, `_signal`,
- * `_submit_closeout`, and the child tools `_request_escalation` / `_submit_packet`).
- * What remains: `autopilot_status` (read-only apart from recording an issue or PR link),
- * `autopilot_delegate` and `autopilot_agents` (wait) on root agents and executor-leads, and
- * `autopilot_escalate` on delegated children. The native list_agents, send_message and
- * interrupt_agent tools already see and control children started through `startActivation`,
- * so the plugin adds no list, message or stop tool.
- * Registered per exact Agent scope.
+ * `autopilot_delegate` and `autopilot_agents` are registered on the root agent
+ * and on every executor-lead; `autopilot_escalate` on every delegated child
+ * except the reviewer. Registration is per exact Agent scope: dsh has no
+ * process-wide "tool visible only to the root" facility, so each surface is
+ * installed into the agent's own scope on `agent/created` (see `./index.ts`).
+ *
+ * The plugin adds no list, message or stop tool: the host's native
+ * `list_agents`, `send_message` and `interrupt_agent` already see and control
+ * children started through `startActivation`. The one review verdict is
+ * returned in-band from the same waiting call, so the main agent can never
+ * write one.
  */
 
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import type { InferValue, ValueSchemaSpec } from '@deepseek-ai/dsh-tools'
 import { AP_NO_AGENT } from './domain/refusals.js'
 import { AutopilotError } from './domain/types.js'
-import type { AgentRef, AutopilotEngine } from './engine.js'
 import { ROLE_NAMES } from './roles/index.js'
-import type { DelegationRoleName } from './domain/ledger-types.js'
-import { neutralReview } from './domain/review-vendor.js'
-import { WORK_CLASS_NAMES } from './routing/work-class.js'
-import type { AutopilotReadOnly } from './service.js'
+import type { Delegator } from './delegator.js'
+import type { DelegationRoleName } from './ledger.js'
+import type { AgentRef, ToolScopeRef } from './host-types.js'
 
-/** JSON output helper (tool-gah pattern). */
+/** JSON output helper: one canonical value rendered as its JSON text. */
 function jsonOutput<const S extends ValueSchemaSpec>(schema: S): {
   schema: S
   render: (args: unknown, value: InferValue<S>) => [{ type: 'text'; text: string }]
@@ -43,35 +42,6 @@ function callingAgent(agent: unknown, toolName: string): AgentRef {
   return agent as AgentRef
 }
 
-/**
- * The body of `autopilot_status`: the session's ledger projection, its legacy run
- * summaries and the one-time notes. Read-only, and total: a session with no
- * ledger answers with `ledger: null` instead of a refusal.
- *
- * The result goes through a JSON round trip because dsh's lossless-JSON tool
- * output validator rejects an own property that holds `undefined`.
- */
-export async function statusBody(service: AutopilotReadOnly, sessionId: string): Promise<Record<string, unknown>> {
-  const ledger = await service.ledger(sessionId)
-  const legacyRuns = ledger === undefined
-    ? (await service.legacyRuns()).filter(run => run.sessionId === sessionId)
-    : ledger.legacyRuns
-  // Reviews reach the model with a neutral vendor fact instead of the stored independence fields.
-  const shown = ledger === undefined ? null : { ...ledger, reviews: ledger.reviews.map(neutralReview) }
-  return JSON.parse(JSON.stringify({
-    sessionId,
-    storeKind: service.storeKind,
-    ledger: shown,
-    legacyRuns,
-    notes: service.notes(),
-  })) as Record<string, unknown>
-}
-
-/** Structural tool registry for one scope. */
-export interface ToolRegistryRef {
-  register(definition: unknown): () => void
-}
-
 const blank = (value: unknown): string | undefined => {
   if (typeof value !== 'string') return undefined
   const trimmed = value.trim()
@@ -80,61 +50,57 @@ const blank = (value: unknown): string | undefined => {
 
 const stringList = (value: unknown): string[] | undefined => {
   if (!Array.isArray(value)) return undefined
-  const out = value.map(blank).filter((v): v is string => v !== undefined)
+  const out = value.map(blank).filter((entry): entry is string => entry !== undefined)
   return out.length === 0 ? undefined : out
 }
 
-/** Strip own `undefined` properties (dsh's lossless-JSON validator rejects them). */
+/** Strip own `undefined` properties: dsh's lossless-JSON output validator rejects them. */
 const plain = (value: unknown): never => JSON.parse(JSON.stringify(value)) as never
 
-function delegateTool(engine: AutopilotEngine) {
+function delegateTool(delegator: Delegator) {
   return defineTool({
     name: 'autopilot_delegate',
-    description: 'Start a delegated child: scout (read-only search), clerk (connector reads and writes), worker (implementation; declare writePaths), executor-lead (owns a chunk and can dispatch scout, clerk, worker), planner (read-only plan) or reviewer (one-shot review; routing prefers a provider other than the reviewed work\'s when one is available). Returns at once with the child id, the route chosen and where it came from; the child reports through the host settlement notice. The reviewer is the exception: the call waits and returns its verdict and findings, plus reviewerVendor (same | different | unknown) as a neutral fact; a same-vendor review is normal. Concurrent workers need disjoint writePaths. Give no provider, model or effort to let routing choose.',
+    description:
+      'Start a delegated child in one role: scout (read-only search), worker (implementation; declare writePaths), executor-lead (owns a chunk; may dispatch scout and worker), planner (read-only plan) or reviewer (one-shot independent review). Returns at once with the child id, the route sent and whether that route came from the call or from the host default; the child reports through the host settlement notice. The reviewer is the exception: the call waits and returns its structured verdict in-band, and only the reviewer can produce that verdict. Concurrent writers need disjoint writePaths. Name no provider, model or effort to inherit the host route.',
     parameters: {
       role: { type: 'string', required: true, enum: [...ROLE_NAMES], description: 'The delegation role.' },
-      task: { type: 'string', required: true, description: 'The brief: goal, constraints, what to return.' },
-      writePaths: { type: 'array', items: { type: 'string' }, description: 'Files or prefixes (src/parser/**) the child may write. Required for worker.' },
-      provider: { type: 'string', description: 'Explicit provider (with model). Beats every pin and the ladder.' },
+      task: { type: 'string', required: true, description: 'The brief: the outcome, the files in play, what may not be touched, and the checkable result.' },
+      writePaths: { type: 'array', items: { type: 'string' }, description: 'Files or prefixes (src/parser/**) the child may write. Required for worker; ignored for read-only roles.' },
+      provider: { type: 'string', description: 'Explicit provider (with model). Omit to inherit the host route.' },
       model: { type: 'string', description: 'Explicit model (with provider).' },
-      effort: { type: 'string', description: 'Explicit reasoning effort.' },
-      workClass: { type: 'string', enum: [...WORK_CLASS_NAMES], description: 'Override the role default work class.' },
-      replaces: { type: 'string', description: 'Child id this dispatch replaces (escalation): same role, generation + 1.' },
-      reviewedChildIds: { type: 'array', items: { type: 'string' }, description: 'Reviewer only: the delegations under review (default: all settled non-reviewer delegations of the current goal).' },
+      effort: { type: 'string', description: 'Explicit reasoning effort. Requires provider and model.' },
+      replaces: { type: 'string', description: 'Child id this dispatch replaces: same role, generation + 1.' },
     },
     output: jsonOutput(JSON_VALUE),
     async execute(args, exec) {
       const agent = callingAgent(exec.agent, 'autopilot_delegate')
+      const writePaths = stringList(args.writePaths)
       const provider = blank(args.provider)
       const model = blank(args.model)
       const effort = blank(args.effort)
-      const writePaths = stringList(args.writePaths)
       const replaces = blank(args.replaces)
-      const reviewed = stringList(args.reviewedChildIds)
-      const workClass = blank(args.workClass) as (typeof WORK_CLASS_NAMES)[number] | undefined
-      const result = await engine.delegate(agent, {
+      const result = await delegator.delegate(agent, {
         role: args.role,
         task: args.task,
         ...(writePaths === undefined ? {} : { writePaths }),
         ...(provider === undefined ? {} : { provider }),
         ...(model === undefined ? {} : { model }),
         ...(effort === undefined ? {} : { effort }),
-        ...(workClass === undefined ? {} : { workClass }),
         ...(replaces === undefined ? {} : { replaces }),
-        ...(reviewed === undefined ? {} : { reviewedChildIds: reviewed }),
       })
       return plain(result)
     },
   })
 }
 
-function agentsTool(engine: AutopilotEngine) {
+function agentsTool(delegator: Delegator) {
   return defineTool({
     name: 'autopilot_agents',
-    description: 'Wait for delegated children to settle. Returns their states and observed routes. Waits until the listed children (default: all your active ones) settle or the timeout fires; not a gate. List, message and stop children with the native list_agents, send_message and interrupt_agent.',
+    description:
+      'Wait for delegated children to settle. Blocks until the listed children (default: all of yours still running) settle or the timeout fires, then returns timedOut and their records with the route each was given and how each ended. It is not a gate: it never refuses work. List, message and stop children with the native list_agents, send_message and interrupt_agent.',
     parameters: {
       action: { type: 'string', required: true, enum: ['wait'], description: 'Only wait.' },
-      childIds: { type: 'array', items: { type: 'string' }, description: 'Children to wait for; default all your active children.' },
+      childIds: { type: 'array', items: { type: 'string' }, description: 'Children to wait for; default all of yours still running.' },
       timeoutSeconds: { type: 'integer', description: 'Default 300, at most 600.' },
     },
     output: jsonOutput(JSON_VALUE),
@@ -142,97 +108,62 @@ function agentsTool(engine: AutopilotEngine) {
       const agent = callingAgent(exec.agent, 'autopilot_agents')
       const requested = typeof args.timeoutSeconds === 'number' ? args.timeoutSeconds : 300
       const timeout = Math.max(0, Math.min(600, Math.floor(requested)))
-      const out = await engine.wait(agent, stringList(args.childIds), timeout)
-      return plain({ timedOut: out.timedOut, delegations: out.delegations })
+      const result = await delegator.wait(agent, stringList(args.childIds), timeout)
+      return plain(result)
     },
   })
 }
 
-function escalateTool(engine: AutopilotEngine) {
+function escalateTool(delegator: Delegator) {
   return defineTool({
     name: 'autopilot_escalate',
-    description: 'Ask your parent for more: a stronger model, more effort or a different split. Records the request and returns; your parent decides and re-dispatches. Say what stalled and what you tried.',
+    description:
+      'Ask your parent for more: a stronger model, more effort, or a different split. Records the request on your delegation and returns; your parent decides and re-dispatches with replaces. It never widens your permissions. Say what stalled and what you tried.',
     parameters: { reason: { type: 'string', required: true, description: 'What stalled, and the evidence.' } },
     output: jsonOutput(JSON_VALUE),
     async execute(args, exec) {
       const agent = callingAgent(exec.agent, 'autopilot_escalate')
-      return plain({ guidance: await engine.escalate(agent, args.reason) })
+      return plain({ guidance: await delegator.escalate(agent, args.reason) })
     },
   })
 }
 
 /**
- * The tools a delegated child gets in ITS OWN scope: an executor-lead dispatches
- * and waits; every non-reviewer can escalate. Own-layer registrations are exempt
- * from the child's tool restriction, so they survive an allow-list that does not
- * name them.
+ * Install the root controller surface (delegate + wait) on one agent scope.
+ * Returns a disposer that unregisters what this call registered.
  */
-export function installChildTools(agentTools: ToolRegistryRef, engine: AutopilotEngine, role: DelegationRoleName): () => void {
+export function installRootTools(agentTools: ToolScopeRef, delegator: Delegator): () => void {
+  const disposers: Array<() => unknown> = []
+  try {
+    disposers.push(agentTools.register(delegateTool(delegator)))
+    disposers.push(agentTools.register(agentsTool(delegator)))
+  } catch (error: unknown) {
+    for (const dispose of [...disposers].reverse()) void dispose()
+    throw error
+  }
+  return () => { for (const dispose of [...disposers].reverse()) void dispose() }
+}
+
+/**
+ * The tools a delegated child gets in ITS OWN scope: an executor-lead dispatches
+ * and waits; every non-reviewer child can escalate. Own-layer registrations are
+ * exempt from the child's tool restriction, so they survive an allow-list that
+ * does not name them.
+ */
+export function installChildTools(agentTools: ToolScopeRef, delegator: Delegator, role: DelegationRoleName): () => void {
   const disposers: Array<() => unknown> = []
   try {
     if (role === 'executor-lead') {
-      disposers.push(agentTools.register(delegateTool(engine)))
-      disposers.push(agentTools.register(agentsTool(engine)))
+      disposers.push(agentTools.register(delegateTool(delegator)))
+      disposers.push(agentTools.register(agentsTool(delegator)))
     }
-    if (role !== 'reviewer') disposers.push(agentTools.register(escalateTool(engine)))
+    if (role !== 'reviewer') disposers.push(agentTools.register(escalateTool(delegator)))
   } catch (error: unknown) {
-    for (const dispose of disposers.reverse()) void dispose()
+    for (const dispose of [...disposers].reverse()) void dispose()
     throw error
   }
-  return () => { for (const dispose of disposers.reverse()) void dispose() }
+  return () => { for (const dispose of [...disposers].reverse()) void dispose() }
 }
 
-/** Install the root controller tools on one agent scope; returns a disposer. */
-export function installRootTools(
-  agentTools: ToolRegistryRef,
-  service: AutopilotReadOnly,
-  engine?: AutopilotEngine,
-): () => void {
-  const disposers: Array<() => unknown> = []
-  const register = (definition: unknown): void => { disposers.push(agentTools.register(definition)) }
-
-  try {
-    register(defineTool({
-      name: 'autopilot_status',
-      description: 'Read this session\'s autopilot ledger: delegated children (role, selected and observed route, state), reviews, links, whether auto-continue is available, legacy 0.2.x runs of this session, and one-time notes. Read-only.',
-      parameters: {
-        link: {
-          type: 'object',
-          additionalProperties: false,
-          description: 'Optional: record an issue or PR link on this session\'s ledger (idempotent on kind and ref).',
-          properties: {
-            kind: { type: 'string', required: true, enum: ['issue', 'pr'] },
-            ref: { type: 'string', required: true, description: 'e.g. MY-195, #12.' },
-            url: { type: 'string' },
-          },
-        },
-      },
-      output: jsonOutput(JSON_VALUE),
-      async execute(args, exec) {
-        const agent = callingAgent(exec.agent, 'autopilot_status')
-        if (engine !== undefined) {
-          const link = args.link as { kind?: 'issue' | 'pr'; ref?: string; url?: string } | undefined
-          const ref = blank(link?.ref)
-          if (link !== undefined && ref !== undefined && (link.kind === 'issue' || link.kind === 'pr')) {
-            const url = blank(link.url)
-            await engine.addLink(agent.id, { kind: link.kind, ref, ...(url === undefined ? {} : { url }) })
-          }
-          await engine.syncGoal(agent)
-          await engine.refreshRoutes(agent.id)
-        }
-        return await statusBody(service, agent.id) as never
-      },
-    }))
-    if (engine !== undefined) {
-      register(delegateTool(engine))
-      register(agentsTool(engine))
-    }
-  } catch (error: unknown) {
-    for (const dispose of disposers.reverse()) void dispose()
-    throw error
-  }
-
-  return () => {
-    for (const dispose of disposers.reverse()) void dispose()
-  }
-}
+/** Tool factories, exported for tests that want to inspect a definition directly. */
+export const toolFactories = { delegateTool, agentsTool, escalateTool } as const

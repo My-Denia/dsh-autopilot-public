@@ -1,372 +1,274 @@
-/** Shared test fixtures: fake agents, stub subagents, temp ledger stores, the engine harness. */
+/**
+ * Host-neutral fakes for the test suite.
+ *
+ * No dsh process, no network, no real subagent. The fakes implement exactly the
+ * structural seam `src/host.ts` declares, so every behaviour under test is the
+ * plugin's own logic: argument validation, the write-path guard, the prompt and
+ * route handed to the host, the tool restriction applied on `agent/created`,
+ * settlement bookkeeping and the in-band reviewer result.
+ *
+ * Route ids in tests are deliberately fake (`example/model-a`) so no real
+ * provider or model name appears anywhere in the suite.
+ */
 
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
-import { fileURLToPath } from 'node:url'
-import { AutopilotEngine } from '../src/engine.js'
+import { Delegator } from '../src/delegator.js'
+import type { DelegateArgs, DelegateResult } from '../src/delegator.js'
+import type { AgentRef, AgentRegistryRef, ToolScopeRef } from '../src/host-types.js'
 import type {
-  AgentRef,
-  EnginePorts,
-  EnvironmentProbes,
-  RoutingPorts,
-  SubagentActivationRef,
+  ActivationRef,
+  ActivationResultRef,
+  HostSeam,
+  StartActivationSpec,
   SubagentsRef,
-} from '../src/engine.js'
-import { resolveConfig } from '../src/index.js'
-import type { ConfigInput } from '../src/index.js'
-import { FileLedgerStore, legacySourcesOf } from '../src/store/ledger.js'
-import type { LedgerStoreLike } from '../src/store/ledger.js'
-import type { LegacySources } from '../src/legacy/index.js'
-import type { DelegationRecord } from '../src/domain/ledger-types.js'
+  ToolsRef,
+} from '../src/host.js'
 
-export interface FakeAgent extends AgentRef {
-  readonly appended: Array<{ type: string; data: unknown }>
-  /** The fake accepts ANY event type so tests can script a turn; the engine's mirror only names `sandbox/mode`. */
-  readonly session: AgentRef['session'] & { append(type: string, data: unknown): void }
+/** Every tool name a plausible deployment registers. */
+export const REGISTERED_TOOLS: readonly string[] = [
+  'read',
+  'glob',
+  'grep',
+  'read_image',
+  'web_fetch',
+  'web_search',
+  'bash',
+  'pwsh',
+  'write',
+  'edit',
+  'list_agents',
+  'send_message',
+  'interrupt_agent',
+  'autopilot_delegate',
+  'autopilot_agents',
+  'autopilot_escalate',
+]
+
+interface RestrictFilter {
+  readonly allow?: readonly string[]
+  readonly deny?: readonly string[]
 }
 
-export function fakeAgent(id: string, parentSession?: string, cwd?: string, ctx?: unknown): FakeAgent {
-  const events: Array<{ type: string; data: unknown }> = []
-  return {
-    id,
-    appended: events,
-    options: { provider: 'fake', model: 'fake-model' },
-    ...(ctx === undefined ? {} : { ctx }),
-    session: {
-      header: {
-        ...(parentSession === undefined ? {} : { parentSession }),
-        ...(cwd === undefined ? {} : { cwd }),
-      },
-      snapshotEvents: () => events.slice(),
-      append(type: string, data: unknown) {
-        events.push({ type, data })
-      },
-    },
-  }
-}
+/** One agent's scope-local tool registry. */
+export class FakeToolScope implements ToolScopeRef {
+  readonly registered: string[] = []
+  /** Every definition handed to egister, in registration order. */
+  readonly definitions: unknown[] = []
+  readonly restrictCalls: Array<RestrictFilter & { readonly result: 'applied' | 'threw' }> = []
+  /** When set, `restrict` throws this message instead of accepting the filter. */
+  restrictError: string | undefined
 
-export class FakeAgents {
-  private readonly map = new Map<string, AgentRef>()
-  add(agent: AgentRef): void { this.map.set(agent.id, agent) }
-  remove(id: string): void { this.map.delete(id) }
-  get(id: string): AgentRef | undefined { return this.map.get(id) }
-}
-
-/** A subagent runtime that records every activation and resolves each one immediately. */
-export function stubSubagents(): SubagentsRef & {
-  readonly activations: Array<{ childId?: string; label: string; prompt: string }>
-  readonly messages: Array<{ childId: string; text: string }>
-} {
-  const activations: Array<{ childId?: string; label: string; prompt: string }> = []
-  const messages: Array<{ childId: string; text: string }> = []
-  let counter = 0
-  return {
-    activations,
-    messages,
-    async startActivation(spec): Promise<SubagentActivationRef> {
-      counter += 1
-      const childId = spec.childId ?? `child-${counter}`
-      activations.push({
-        ...(spec.childId === undefined ? {} : { childId: spec.childId }),
-        label: spec.label,
-        prompt: spec.request.prompt.map(block => block.text).join('\n'),
-      })
-      return { childId, result: Promise.resolve({ stopReason: 'completed' }), async dispose() {} }
-    },
-    async sendMessage(_sender, childId, content) {
-      messages.push({ childId, text: content.map(block => block.text).join('\n') })
-      return {}
-    },
-    interrupt() {},
-    async drainChildren() { return {} },
-  }
-}
-
-export interface Harness {
-  engine: AutopilotEngine
-  agents: FakeAgents
-  subagents: ReturnType<typeof stubSubagents>
-  root: FakeAgent
-  ledgers: LedgerStoreLike
-  sources: LegacySources
-  storeDir: string
-  warnings: string[]
-}
-
-export function makeHarness(options: {
-  config?: ConfigInput
-  subagents?: ReturnType<typeof stubSubagents>
-  routing?: RoutingPorts
-  environment?: EnvironmentProbes
-  /** Legacy runs in the file root, as fixture file names under test/fixtures/legacy-synthetic. */
-  legacyFixtures?: readonly string[]
-  rootId?: string
-  cwd?: string
-  rootCtx?: unknown
-  ports?: Partial<EnginePorts>
-} = {}): Harness {
-  const storeDir = mkdtempSync(join(tmpdir(), 'dsh-autopilot-test-'))
-  const agents = new FakeAgents()
-  const root = fakeAgent(options.rootId ?? 'root-1', undefined, options.cwd, options.rootCtx)
-  agents.add(root)
-  const subagents = options.subagents ?? stubSubagents()
-  const warnings: string[] = []
-  for (const name of options.legacyFixtures ?? []) writeLegacyFixture(storeDir, name)
-  const ledgers = FileLedgerStore.open(storeDir)
-  const sources = legacySourcesOf(storeDir)
-  const engine = new AutopilotEngine(agents, subagents, ledgers, sources, resolveConfig(options.config), {
-    ...(options.routing === undefined ? {} : { routing: options.routing }),
-    ...(options.environment === undefined ? {} : { environment: options.environment }),
-    warn: message => warnings.push(message),
-    ...options.ports,
-  })
-  return { engine, agents, subagents, root, ledgers, sources, storeDir, warnings }
-}
-
-const LEGACY_FIXTURES = join(fileURLToPath(new URL('.', import.meta.url)), 'fixtures', 'legacy-synthetic')
-
-/** Copy one synthetic legacy stream into `<root>/runs/<runId>/events.jsonl`; returns its run id. */
-export function writeLegacyFixture(root: string, name: string): string {
-  const raw = readFileSync(join(LEGACY_FIXTURES, name), 'utf8')
-  const first = JSON.parse(raw.split('\n')[0]!) as { snapshot: { runId: string } }
-  const runId = first.snapshot.runId
-  mkdirSync(join(root, 'runs', runId), { recursive: true })
-  writeFileSync(join(root, 'runs', runId, 'events.jsonl'), raw)
-  return runId
-}
-
-/** A minimal delegation record for ledger fixtures. */
-export function delegation(childId: string, state: DelegationRecord['state'], overrides: Partial<DelegationRecord> = {}): DelegationRecord {
-  return {
-    childId,
-    role: 'worker',
-    parentId: 'root-1',
-    depth: 1,
-    generation: 1,
-    title: `task for ${childId}`,
-    state,
-    modelSource: 'inherit',
-    effortSource: 'host-default',
-    routeMatch: 'pending',
-    tools: 'inherit',
-    maxDepth: 1,
-    startedAt: '2026-11-04T00:00:00.000Z',
-    ...overrides,
-  }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// A fake host for the delegation tests: startActivation creates a real-shaped child agent,
-// announces it through the engine's agent/created hook, and settles on demand.
-// ─────────────────────────────────────────────────────────────────────────────
-
-import { RouteCatalog } from '../src/routing/catalog.js'
-import type { LlmCallConfig, LlmRuntimeSubset } from '../src/routing/catalog.js'
-import type { SessionPolicyState } from '../src/routing/authorize.js'
-import type { NativeGoalView } from '../src/engine.js'
-
-export interface StubModel {
-  readonly provider: string
-  readonly id: string
-  readonly contextWindow?: number
-  readonly defaultEffort?: string
-}
-
-export function stubLlm(models: readonly StubModel[], over: Partial<LlmRuntimeSubset> = {}): LlmRuntimeSubset {
-  const providers = [...new Set(models.map(model => model.provider))]
-  return {
-    listProviders: () => providers.map(id => ({ id, name: id })),
-    listModels: async (provider: string) => models.filter(m => m.provider === provider).map(m => ({ provider, id: m.id, name: m.id })),
-    resolveModelInfo: async (provider: string, model: string) => {
-      const hit = models.find(c => c.provider === provider && c.id === model)
-      if (hit === undefined) throw new Error(`unknown route ${provider}/${model}`)
-      return {
-        provider,
-        id: model,
-        name: model,
-        ...(hit.contextWindow !== undefined ? { context: { contextWindow: hit.contextWindow } } : {}),
-        ...(hit.defaultEffort !== undefined ? { reasoning: { efforts: [{ id: hit.defaultEffort, name: hit.defaultEffort }], defaultEffort: hit.defaultEffort } } : {}),
+  register(definition: unknown): () => void {
+    this.definitions.push(definition)
+    if (typeof definition === 'object' && definition !== null && 'name' in definition) {
+      this.registered.push(String((definition as { name: unknown }).name))
+    }
+    return () => {
+      for (let i = this.registered.length - 1; i >= 0; i -= 1) {
+        if (this.registered[i] === String((definition as { name: unknown }).name)) {
+          this.registered.splice(i, 1)
+          return
+        }
       }
-    },
-    resolveCallConfig: async (config: LlmCallConfig) => ({ ...config }),
-    ...over,
+    }
+  }
+
+  restrict(filter: RestrictFilter): unknown {
+    if (this.restrictError !== undefined) {
+      const message = this.restrictError
+      this.restrictError = undefined
+      this.restrictCalls.push({ ...filter, result: 'threw' })
+      throw new Error(message)
+    }
+    this.restrictCalls.push({ ...filter, result: 'applied' })
+    return () => {}
   }
 }
 
-export const catalogOf = (models: readonly StubModel[], over: Partial<LlmRuntimeSubset> = {}): RouteCatalog => new RouteCatalog(stubLlm(models, over))
+/** One fake live agent. */
+export class FakeAgent implements AgentRef {
+  readonly tools = new FakeToolScope()
+  readonly ctx = { tools: this.tools }
+  /** Events the fake session log exposes to the plugin. */
+  readonly sessionEvents: Array<{ type: string; data: unknown }> = []
 
-export const policyOf = (...routes: readonly [string, string][]): SessionPolicyState => ({
-  kind: 'present',
-  routes: routes.map(([provider, model]) => ({ provider, model })),
-})
+  constructor(readonly id: string, readonly parentSession?: string) {}
 
-export interface Deferred { resolve(value: { stopReason: string; structured?: unknown; diagnostic?: string }): void }
+  get session(): {
+    readonly header: { readonly parentSession?: string }
+    snapshotEvents(): ReadonlyArray<{ readonly type: string; readonly data: unknown }>
+  } {
+    return {
+      header: this.parentSession === undefined ? {} : { parentSession: this.parentSession },
+      snapshotEvents: () => this.sessionEvents,
+    }
+  }
 
-export interface DelegationHost {
-  engine: AutopilotEngine
-  agents: FakeAgents
-  root: FakeAgent
-  ledgers: LedgerStoreLike
-  storeDir: string
-  warnings: string[]
-  /** Every startActivation spec, in call order. */
-  starts: Array<{ childId?: string; label: string; delivery: string; maxDepth?: number; outputSchema?: object; agentOptions?: Record<string, unknown>; prompt: string; parentId: string; provider: string }>
-  /** restrict() calls per child id. */
-  restricts: Map<string, string[][]>
-  /** Tool names registered in each child's own scope. */
-  childTools: Map<string, string[]>
-  /** Settle one child's activation. */
-  settle(childId: string, result?: { stopReason: string; structured?: unknown; diagnostic?: string }): void
-  /**
-   * Settle one child the way dsh 0.2.1-rc.5 does (`dsh-subagent` `finishDisposal`):
-   * the child agent is disposed first (dropped from `ctx.agents`, `agent/disposed`
-   * delivered), and only then does the activation result resolve.
-   */
-  settleDisposed(childId: string, result?: { stopReason: string; structured?: unknown; diagnostic?: string }): void
-  /** With `headerOnFirstRequest`: append the child's route header, as its first model request does. */
-  firstRequest(childId: string): void
-  /** A child agent as the host would hold it (cold resume): created and announced without a start. */
-  announceExisting(childId: string, parentId?: string): FakeAgent
-  /** Make the next startActivation throw. */
-  failNextStart: { error?: Error }
-  /** Make restrict() throw for a child id once. */
-  restrictThrows: Map<string, Error>
-  /** Make EVERY restrict() throw while set. */
-  restrictAlways: { error?: Error }
-}
-
-export function delegationHost(options: {
-  config?: ConfigInput
-  models?: readonly StubModel[]
-  catalog?: RouteCatalog
-  policy?: SessionPolicyState
-  registered?: readonly string[]
-  /** Per-scope registry, for tests that need the probe to see which agent it is asked for. */
-  registeredFor?: (scope: unknown) => readonly string[] | undefined
-  maxDepthSetting?: number
-  goal?: () => NativeGoalView | undefined
-  driver?: () => boolean | undefined
-  rootId?: string
-  hold?: (childId: string) => boolean
-  /** Do not write the route header at creation (the real host writes it at the first request); see `firstRequest`. */
-  headerOnFirstRequest?: boolean
-} = {}): DelegationHost {
-  const storeDir = mkdtempSync(join(tmpdir(), 'dsh-autopilot-delegation-'))
-  const agents = new FakeAgents()
-  const rootTools: string[] = []
-  const root = fakeAgent(options.rootId ?? 'root-1', undefined, undefined, { tools: { register: (def: { name?: string }) => { rootTools.push(def.name ?? '?'); return () => {} } } })
-  agents.add(root)
-  const starts: DelegationHost['starts'] = []
-  const restricts = new Map<string, string[][]>()
-  const childTools = new Map<string, string[]>()
-  const deferreds = new Map<string, Deferred>()
-  const failNextStart: { error?: Error } = {}
-  const restrictThrows = new Map<string, Error>()
-  const restrictAlways: { error?: Error } = {}
-  const warnings: string[] = []
-  let counter = 0
-  let engine!: AutopilotEngine
-
-  const makeChild = (childId: string, parentId: string, options2?: Record<string, unknown>): FakeAgent => {
-    const tools: string[] = []
-    childTools.set(childId, tools)
-    const child = fakeAgent(childId, parentId, undefined, {
-      tools: {
-        restrict(filter: { allow: string[] }) {
-          if (restrictAlways.error !== undefined) throw restrictAlways.error
-          const thrown = restrictThrows.get(childId)
-          if (thrown !== undefined) { restrictThrows.delete(childId); throw thrown }
-          restricts.set(childId, [...(restricts.get(childId) ?? []), [...filter.allow]])
-        },
-        register(def: { name?: string }) { tools.push(def.name ?? '?'); return () => {} },
-      },
+  /** Append one well-formed request header, as a real child session would. */
+  recordRequest(provider: string, model: string, effort?: string): void {
+    this.sessionEvents.push({
+      type: 'request/header',
+      data: { header: { config: { provider, model, ...(effort === undefined ? {} : { reasoningEffort: effort }) } } },
     })
-    const config = { provider: (options2?.['provider'] as string | undefined) ?? 'host', model: (options2?.['model'] as string | undefined) ?? 'default', ...(options2?.['reasoningEffort'] === undefined ? {} : { reasoningEffort: options2['reasoningEffort'] }) }
-    if (options.headerOnFirstRequest === true) pendingHeaders.set(childId, config)
-    else child.session.append('request/header', { header: { config }, reason: 'initial' })
-    return child
   }
-  const pendingHeaders = new Map<string, Record<string, unknown>>()
+}
 
-  const subagents: SubagentsRef = {
-    async startActivation(spec): Promise<SubagentActivationRef> {
-      const pending = failNextStart.error
-      if (pending !== undefined) { failNextStart.error = undefined; throw pending }
-      counter += 1
-      const childId = spec.childId ?? `auto-child-${counter}`
-      const parent = spec.request.parent as FakeAgent
-      starts.push({
-        ...(spec.childId === undefined ? {} : { childId: spec.childId }),
-        label: spec.label,
-        delivery: spec.delivery,
-        ...(spec.request.maxDepth === undefined ? {} : { maxDepth: spec.request.maxDepth }),
-        ...(spec.request.outputSchema === undefined ? {} : { outputSchema: spec.request.outputSchema }),
-        ...(spec.request.agentOptions === undefined ? {} : { agentOptions: { ...spec.request.agentOptions } }),
-        prompt: spec.request.prompt.map(b => b.text).join('\n'),
-        parentId: parent.id,
-        provider: spec.provider,
-      })
-      const child = makeChild(childId, parent.id, spec.request.agentOptions as Record<string, unknown> | undefined)
-      agents.add(child)
-      // The host announces the child before startActivation returns; a throw vetoes it.
-      try {
-        engine.onChildCreated(child)
-      } catch (error) {
-        agents.remove(childId)
-        throw error
-      }
-      let resolve!: Deferred['resolve']
-      const result = new Promise<{ stopReason: string; structured?: unknown; diagnostic?: string }>((r) => { resolve = r })
-      deferreds.set(childId, { resolve })
-      return { childId, result, async dispose() {} }
-    },
-    async sendMessage() { return {} },
-    interrupt() {},
-    async drainChildren() { return {} },
+/** A minimal live-agent registry. */
+export class FakeAgents implements AgentRegistryRef {
+  private readonly agents = new Map<string, FakeAgent>()
+
+  add(agent: FakeAgent): FakeAgent {
+    this.agents.set(agent.id, agent)
+    return agent
   }
 
-  const ledgers = FileLedgerStore.open(storeDir)
-  engine = new AutopilotEngine(agents, subagents, ledgers, legacySourcesOf(storeDir), resolveConfig(options.config), {
-    routing: {
-      ...(options.catalog === undefined && options.models === undefined ? {} : { catalog: options.catalog ?? catalogOf(options.models ?? []) }),
-      policyReader: () => options.policy ?? { kind: 'absent' },
-    },
-    environment: {
-      ...(options.registeredFor !== undefined
-        ? { registeredToolNames: (scope?: unknown) => options.registeredFor!(scope) }
-        : options.registered === undefined ? {} : { registeredToolNames: () => options.registered }),
-      ...(options.maxDepthSetting === undefined ? {} : { subagentMaxDepth: () => options.maxDepthSetting }),
-      ...(options.goal === undefined ? {} : { readGoal: () => options.goal!() }),
-      ...(options.driver === undefined ? {} : { goalDriverPresent: options.driver }),
-    },
-    warn: message => warnings.push(message),
-    now: (() => { let t = 0; return () => `2026-11-04T10:00:${String(Math.min(59, t++)).padStart(2, '0')}.000Z` })(),
-  })
-  return {
-    engine, agents, root, ledgers, storeDir, warnings, starts, restricts, childTools,
-    settle(childId, result = { stopReason: 'completed' }) { deferreds.get(childId)?.resolve(result) },
-    settleDisposed(childId, result = { stopReason: 'completed' }) {
-      const child = agents.get(childId)
-      agents.remove(childId)
-      if (child !== undefined) engine.onChildDisposed(child)
-      deferreds.get(childId)?.resolve(result)
-    },
-    firstRequest(childId) {
-      const config = pendingHeaders.get(childId)
-      const child = agents.get(childId) as FakeAgent | undefined
-      if (config === undefined || child === undefined) throw new Error(`no pending first request for ${childId}`)
-      pendingHeaders.delete(childId)
-      child.session.append('request/header', { header: { config }, reason: 'initial' })
-    },
-    announceExisting(childId, parentId = root.id) {
-      const child = makeChild(childId, parentId)
-      agents.add(child)
-      engine.onChildCreated(child)
-      return child
-    },
-    failNextStart,
-    restrictThrows,
-    restrictAlways,
+  get(id: string): FakeAgent | undefined {
+    return this.agents.get(id)
   }
+
+  list(): Iterable<FakeAgent> {
+    return [...this.agents.values()]
+  }
+}
+
+interface PendingStart {
+  readonly spec: StartActivationSpec
+  readonly resolve: (activation: ActivationRef) => void
+  readonly reject: (error: unknown) => void
+}
+
+/** One accepted activation whose result the test settles. */
+export interface FakeActivation {
+  readonly activation: ActivationRef
+  /** Resolve the child's terminal result. */
+  settle(result: ActivationResultRef): Promise<void>
+  /** Reject the activation result (an infrastructure fault). */
+  fail(error: unknown): Promise<void>
+}
+
+/** A subagent runtime that records every start and lets tests settle it. */
+export class FakeSubagents implements SubagentsRef {
+  readonly starts: StartActivationSpec[] = []
+  private readonly pending: PendingStart[] = []
+  private minted = 0
+
+  startActivation(spec: StartActivationSpec): Promise<ActivationRef> {
+    this.starts.push(spec)
+    return new Promise<ActivationRef>((resolve, reject) => {
+      this.pending.push({ spec, resolve, reject })
+    })
+  }
+
+  /** Accept the nth pending start (default the first), minting its activation. */
+  accept(index = 0): FakeActivation {
+    const pending = this.pending[index]
+    if (pending === undefined) throw new Error(`no pending start at index ${index}`)
+    this.pending.splice(index, 1)
+    this.minted += 1
+    let settleResult: (value: ActivationResultRef) => void = () => {}
+    let failResult: (error: unknown) => void = () => {}
+    const result = new Promise<ActivationResultRef>((resolve, reject) => {
+      settleResult = resolve
+      failResult = reject
+    })
+    const activation: ActivationRef = {
+      childId: pending.spec.childId ?? `child-${this.minted}`,
+      result,
+      dispose: async () => {},
+    }
+    pending.resolve(activation)
+    return {
+      activation,
+      settle: async (value) => {
+        settleResult(value)
+        await flush()
+      },
+      fail: async (error) => {
+        failResult(error)
+        await flush()
+      },
+    }
+  }
+
+  /** Reject the nth pending start outright (the host refused to start the child). */
+  async refuse(index = 0, error: unknown = new Error('host refused')): Promise<void> {
+    const pending = this.pending[index]
+    if (pending === undefined) throw new Error(`no pending start at index ${index}`)
+    this.pending.splice(index, 1)
+    pending.reject(error)
+    await flush()
+  }
+}
+
+/** The `ctx.tools` registry view used to read registered names. */
+export class FakeTools implements ToolsRef {
+  constructor(public names: readonly string[] = REGISTERED_TOOLS, public unreadable = false) {}
+
+  schemas(): readonly { readonly name?: unknown }[] {
+    if (this.unreadable) throw new Error('tool registry unavailable')
+    return this.names.map((name) => ({ name }))
+  }
+}
+
+/** The host seam plus the fakes a test inspects. */
+export interface FakeHost {
+  readonly host: HostSeam
+  readonly agents: FakeAgents
+  readonly subagents: FakeSubagents
+  readonly warnings: string[]
+  readonly tools: FakeTools
+}
+
+/** Drain the microtask queue a few times so fire-and-forget settlement lands. */
+export async function flush(rounds = 8): Promise<void> {
+  for (let i = 0; i < rounds; i += 1) await Promise.resolve()
+}
+
+/** Build a host seam with a deterministic clock and a warning sink. */
+export function makeHost(options: {
+  readonly agents?: readonly FakeAgent[]
+  readonly tools?: FakeTools | undefined
+} = {}): FakeHost {
+  const agents = new FakeAgents()
+  for (const agent of options.agents ?? []) agents.add(agent)
+  const subagents = new FakeSubagents()
+  const warnings: string[] = []
+  const tools = options.tools ?? new FakeTools()
+  let tick = 0
+  const host: HostSeam = {
+    agents,
+    subagents,
+    tools,
+    signal: new AbortController().signal,
+    now: () => new Date(Date.UTC(2026, 0, 1, 0, 0, tick++)).toISOString(),
+    warn: (message) => { warnings.push(message) },
+  }
+  return { host, agents, subagents, warnings, tools }
+}
+
+/** A delegator bound to a fake host. */
+export function makeDelegator(host: FakeHost): Delegator {
+  return new Delegator(host.host)
+}
+
+/** Begin one delegate call; the start call is queued by the time this returns. */
+export async function startDelegation(
+  host: FakeHost,
+  agent: FakeAgent,
+  args: DelegateArgs,
+  existing?: Delegator,
+): Promise<{ delegator: Delegator; promise: Promise<DelegateResult> }> {
+  const delegator = existing ?? makeDelegator(host)
+  const promise = delegator.delegate(agent, args)
+  // The caller may assert on the rejection later; keep Node from reporting it
+  // as unhandled while the start call is still being observed.
+  void promise.catch(() => {})
+  await flush(2)
+  return { delegator, promise }
+}
+/** A root agent and a delegated child of it, both registered in the fake host. */
+export function makeTree(host: FakeHost, childId: string, parentId = 'root'): { root: FakeAgent; child: FakeAgent } {
+  const existingRoot = host.agents.get(parentId)
+  const root = existingRoot instanceof FakeAgent ? existingRoot : host.agents.add(new FakeAgent(parentId))
+  const child = host.agents.add(new FakeAgent(childId, parentId))
+  return { root, child }
 }

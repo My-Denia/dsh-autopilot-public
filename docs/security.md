@@ -1,113 +1,34 @@
 # Security and boundaries
 
-This plugin is an **experimental developer preview**. It is not a sandbox or a
-permission system, and it does not provide remote **exactly-once** delivery.
-
-Version 0.3.0 removed the plan gate, the read-only sandbox clamp, the egress
-gate and the outbound manifest. The plugin no longer stands between the agent
-and ordinary work. What remains is below, with the label for how each part is
-enforced.
-
-Deeper design and measurements: [DESIGN.md](../DESIGN.md).
+`dsh-goal-autopilot` is a developer preview. It is not a sandbox, not a permission system, not a scanner and not a connection to any external system. What it enforces is narrow, and saying so is the point of this page.
 
 ## What the plugin gates
 
-- **Nothing about outbound.** Commit, push, pull request and merge in the
-  repository you are working on are ordinary work. The plugin adds no manifest,
-  no egress check and no owner approval step. No `AP_*` refusal exists for them.
-- **The reviewer** is read-only and one-shot. It runs in a fresh context with
-  a read-only tool filter and cannot start children. *Mechanical*: the tool
-  filter is applied to the child when the host announces it. The reviewer's
-  verdict is returned in-band by the reviewer itself; the main agent cannot
-  write one.
-- **Delegated children** have a tool allow-list per role: scout, planner and
-  reviewer get only `read`, `glob`, `grep` and `read_image` (scout also
-  `web_fetch` and `web_search`); a clerk gets the scout set plus the DSH native
-  MCP resource tools (`list_mcp_resources`, `list_mcp_resource_templates`,
-  `read_mcp_resource`) and MCP server tools (`mcp__<server>__<tool>`) actually
-  registered in its scope on dispatch or cold resume. Automatic discovery does
-  not grant local file-write or shell capabilities. In native tool mode,
-  `run_code` is excluded from this allow-list; in PTC mode the host may present
-  `run_code` as its reserved transport, still limited to the underlying allowed
-  capabilities (not an extra shell or file-write grant). A worker
-  and an executor-lead have no allow-list. `writePaths` is a conflict guard,
-  not a permission system: a worker is not stopped from writing outside its
-  declared paths, but a dispatch whose `writePaths` intersect those of a
-  writer that is still running (`starting` or `running`) under the same root is refused before it starts, and a worker
-  dispatch without `writePaths` is refused. Only an executor-lead gets the
-  delegation tools, and it may start only scout, clerk and worker.
-  *Mechanical*: the allow-lists, the dispatch rule and the overlap check.
-  *Not mechanical*: whether a worker's task text keeps to its brief and its
-  declared paths.
-- **Ledger owner actions.** Actions that change the ledger on the owner's behalf,
-  such as clearing a legacy archive, require the owner's direct human turn.
-  An agent-generated turn is refused. Goal creation, editing and resuming are
-  checked by the host's own goal tool, not by this plugin.
+- **Role tool surfaces.** *Mechanical.* A delegated child's tool set is restricted when the host announces the child: `scout`, `planner` and `reviewer` see only `read`, `glob`, `grep`, `read_image` (scout also `web_fetch`, `web_search`). A read-only role whose `read` is missing is refused rather than started blind. `worker` and `executor-lead` are not filtered; they inherit the session's tools, which is what lets them write.
+- **Who may delegate.** *Mechanical.* Only the root agent and an `executor-lead` may call `autopilot_delegate`, and an `executor-lead` may start only `scout` and `worker`. A `reviewer` gets no plugin tool and cannot delegate. `autopilot_escalate` records a request; it never widens a role.
+- **Concurrent writers.** *Mechanical, advisory between writers.* A `worker` must declare `writePaths`, and a dispatch whose paths intersect a writer still `starting` or `running` under the same root is refused before the child starts.
+- **The reviewer's verdict.** *Mechanical.* The reviewer is one-shot and read-only, its verdict comes back in-band from its own call, the main agent cannot write one, and a malformed or contradictory verdict is refused.
 
-## What the host's approval settings do
+## What the plugin does not gate
 
-Whatever approval or sandbox settings the host and profile have still apply to
-every tool call, including `git push` and `gh pr create`. The plugin neither
-adds to them nor loosens them. A pending or refused approval is a question for
-the user. Deploys, deletions of native content and anything spending money or
-changing an external account need the owner's order for that action; that is
-skill discipline, not a plugin check.
+- **Sandbox and approval.** The host's approval and sandbox settings apply to every tool call, including a worker's writes and a root `git push`, exactly as they do without this plugin. The plugin neither adds a check nor loosens one; a pending or refused approval is a question for the user.
+- **Write paths are not permissions.** A worker has the inherited tool surface and is not stopped from writing outside its declared paths. The overlap check only compares declarations, only among writers under the same root in the same process; a declaration is an exact file or a prefix, and any other glob is read conservatively as the prefix before its first wildcard, so the check can over-report an overlap but cannot miss one. It does not inspect the filesystem, resolve symlinks, or see another dsh process or another session. Keeping inside the brief is the worker's job and the root's review.
+- **Outbound content.** Nothing scans or redacts a commit message, a PR body or an issue comment. Commit, push, pull request and merge in the repository are ordinary work. Redaction before posting is an instruction in the skill and a review item, not a gate.
+- **External systems.** The package has no MCP client, no connector overlay, no network call of its own and no external-system role. It sees only the tools the host registers in the session.
+- **Routes.** The plugin does not grant, filter or rank model routes. It passes an explicit `provider`/`model` pair to the host, or lets the child inherit the host default, and the host validates what it is given.
+- **Storage.** There is no ledger file, no storage-domain write, no web route and no client card. Delegation records exist only in plugin memory for one root session and are gone after a host restart.
 
-## Redaction before outbound
+## What the records are and are not
 
-Before anything leaves the workspace (a PR body, an issue comment, an upload),
-the skill tells the agent to remove credentials, tokens and private paths that
-carry a user name. This is an instruction in the skill and a review item for
-the reviewer ("a secret leaks"). It is **discipline**, not a gate: nothing in the
-plugin scans or blocks an outbound payload.
+- The route sent with a dispatch and its source say what the plugin asked for; `observed`, when the host exposes the child session log, is the route the child's first request actually used. Neither proves the work is right.
+- A reviewer verdict is evidence of one independent look, not proof that the change is correct.
+- `writePaths` is a statement of intent at dispatch time, not a boundary the filesystem enforces.
+- `idle` in a record means a child settled a turn and can be messaged, not that its work is finished or correct.
 
-## Legacy sandbox clamp
+## Non-goals
 
-Runs from plugin 0.2.x could leave a session in read-only sandbox mode. When
-such a session is opened or resumed, 0.3.0 restores the mode, but only if the
-current mode is still read-only and the last sandbox event is the plugin's own
-clamp. The target is the recorded prior mode, otherwise the host default. A mode
-the user changed after the clamp stays. A clamped legacy session was restored to its prior mode on a real host; the case where the user changed the mode after the clamp was not observed (see
-[compatibility.md](compatibility.md#verified-on-a-real-host)).
-
-## Enforcement labels (do not over-read)
-
-- *Mechanical* means the plugin code refuses or filters the action: the role
-  tool allow-lists, the `writePaths` overlap refusal, the direct-human-turn
-  check on ledger owner actions, the read-only tool set of the reviewer.
-- *Discipline* means the skill asks and a reviewer may catch it: redaction
-  before outbound, completing a goal only when Done holds, keeping to a
-  brief.
-- The ledger's selected and observed routes are what the plugin and the host
-  report. They show which model ran; they do not prove the work is right.
-- A reviewer verdict is evidence of an independent look, not proof of
-  correctness.
-
-## Web routes
-
-When the host has a web server, the plugin mounts three same-origin, GET-only
-routes under `/api/autopilot`:
-
-| route | answers |
-| --- | --- |
-| `GET /api/autopilot/ledger?session=<id>` | `200 {ok:true, ledger}`; `400 {ok:false, error:'missing-session'}` without `session`; `404 {ok:false, error:'no-ledger'}` when that session has no ledger and, if it is live, no native goal (a live session's goal is mirrored into a ledger on this read) |
-| `GET /api/autopilot/runs` | `200 {ok:true, runs}`: every legacy 0.2.x run, from both backends |
-| `GET /api/autopilot/run?id=<id>` | `200 {ok:true, run}`; `400 {ok:false, error:'missing-id'}` without `id`; `404 {ok:false, error:'no-run'}`. `id` is a run id, or a session id: then the last legacy run listed for that session is served |
-
-Any other method answers `405 {ok:false, error:'method-not-allowed'}`; an
-unexpected failure answers `500 {ok:false, error:'internal'}` with no store
-path or exception text. Every route is fenced by the host's `connection`
-service on each request (browser authentication and Host/Origin checks, `401`
-or `403` when rejected). A host with a web server but no `connection` service
-gets `503 {ok:false, error:'no-connection-service'}`, never an open route. The
-fence is the host's; the plugin only applies it. A host with no web server
-mounts nothing. Reading a ledger for a session found only in the legacy domain table copies it to its own file; the domain file is never written. The routes read through the read-only service and cannot
-change the ledger.
-
-## Explicit non-goals
-
-- Not a sandbox or permission system for the whole session.
-- Not complete production security.
-- Not remote exactly-once delivery.
-- Not a claim that a ledger entry, a timestamp or a reviewer verdict is true.
-- Not a scanner of outbound content.
+- A sandbox, a permission system or a policy layer for the session.
+- Redaction or scanning of outbound payloads.
+- Remote delivery, durability or exactly-once behaviour.
+- A cross-family or vendor guarantee for reviews.
+- Compatibility with plugin 0.2.x runs, tools or configuration.
