@@ -82,6 +82,7 @@ There are no model pins, ladders, catalogs or work classes. A route comes from t
 - [docs/security.md](./docs/security.md): what the plugin gates and does not gate
 - [skill/dsh-goal-autopilot/SKILL.md](./skill/dsh-goal-autopilot/SKILL.md): the in-session adapter
 - [CHANGELOG.md](./CHANGELOG.md): release history and the 0.4.0 break
+- [docs/release.md](./docs/release.md): how a release is built, published and tagged
 
 ## Development
 
