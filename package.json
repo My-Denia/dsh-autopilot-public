@@ -1,10 +1,7 @@
 {
   "name": "dsh-goal-autopilot",
-  "version": "0.4.0",
-  "description": "A goal-workflow adapter for DeepSeek Harness (dsh): role-scoped delegation over the host's native subagents, one independent review, and an in-memory delegation ledger. Out-of-tree plugin bundle.",
-  "type": "module",
-  "main": "lib/index.js",
-  "types": "lib/index.d.ts",
+  "version": "0.5.0",
+  "description": "A configuration-only DeepSeek Harness bundle for goal work: five agent presets, one delegate tool row and a skill. No plugin code.",
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -17,21 +14,22 @@
   "keywords": [
     "deepseek-harness",
     "dsh",
-    "dsh-plugin",
+    "dsh-bundle",
+    "agent-preset",
     "goal",
     "autopilot",
     "goal-workflow",
     "subagent-delegation"
   ],
   "files": [
-    "lib",
     "cordis.patch.yml",
     "skill",
     "docs",
+    "README.md",
+    "README.zh-CN.md",
     "ARCHITECTURE.md",
     "CHANGELOG.md",
-    "README.md",
-    "README.zh-CN.md"
+    "LICENSE"
   ],
   "engines": {
     "node": ">=22",
@@ -39,9 +37,7 @@
   },
   "packageManager": "pnpm@11.17.0",
   "scripts": {
-    "build": "tsc -p tsconfig.json",
-    "check": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.test.json",
-    "test": "vitest run"
+    "test": "node --test"
   },
   "dsh": {
     "bundle": {
@@ -49,27 +45,6 @@
     }
   },
   "devDependencies": {
-    "@deepseek-ai/cordis": "4.0.5",
-    "@deepseek-ai/dsh-agent": "0.2.2-rc.5",
-    "@deepseek-ai/dsh-llm": "0.2.2-rc.5",
-    "@deepseek-ai/dsh-session": "0.2.2-rc.5",
-    "@deepseek-ai/dsh-subagent": "0.2.2-rc.5",
-    "@deepseek-ai/dsh-tools": "0.2.2-rc.5",
-    "@deepseek-ai/dsh-util-values": "0.2.2-rc.5",
-    "@deepseek-ai/schemastery": "3.18.5",
-    "@types/node": "^22.10.0",
-    "typescript": "^5.9.0",
-    "vitest": "^3.0.0"
-  },
-  "peerDependencies": {
-    "@deepseek-ai/dsh-tools": ">=0.2.2-rc.5 <0.3.0-0",
-    "@deepseek-ai/schemastery": "^3.18.5"
-  },
-  "exports": {
-    ".": {
-      "types": "./lib/index.d.ts",
-      "default": "./lib/index.js"
-    },
-    "./package.json": "./package.json"
+    "yaml": "^2.9.1"
   }
 }

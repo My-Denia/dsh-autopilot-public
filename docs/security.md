@@ -1,34 +1,32 @@
 # Security and boundaries
 
-`dsh-goal-autopilot` is a developer preview. It is not a sandbox, not a permission system, not a scanner and not a connection to any external system. What it enforces is narrow, and saying so is the point of this page.
+`dsh-goal-autopilot` 0.5.0 is configuration only. It configures five child presets and one delegation tool row in the running profile; it contains no code, no service and no storage. What it enforces is narrow, and saying so is the point of this page.
 
-## What the plugin gates
+## What the bundle configures
 
-- **Role tool surfaces.** *Mechanical.* A delegated child's tool set is restricted when the host announces the child: `scout`, `planner` and `reviewer` see only `read`, `glob`, `grep`, `read_image` (scout also `web_fetch`, `web_search`). A read-only role whose `read` is missing is refused rather than started blind. `worker` and `executor-lead` are not filtered; they inherit the session's tools, which is what lets them write.
-- **Who may delegate.** *Mechanical.* Only the root agent and an `executor-lead` may call `autopilot_delegate`, and an `executor-lead` may start only `scout` and `worker`. A `reviewer` gets no plugin tool and cannot delegate. `autopilot_escalate` records a request; it never widens a role.
-- **Concurrent writers.** *Mechanical, advisory between writers.* A `worker` must declare `writePaths`, and a dispatch whose paths intersect a writer still `starting` or `running` under the same root is refused before the child starts.
-- **The reviewer's verdict.** *Mechanical.* The reviewer is one-shot and read-only, its verdict comes back in-band from its own call, the main agent cannot write one, and a malformed or contradictory verdict is refused.
+- **Child tool surfaces.** A child composed from a goal preset gets exactly that preset's tool rows. `goal-scout`, `goal-planner` and `goal-reviewer` mount `tool-fs` with `write` and `edit` off, and no shell; `goal-worker` and `goal-executor-lead` mount the shell, jobs and file tools. A preset's surface is fixed at declaration time, and a child cannot reach a tool outside it.
+- **Who may delegate.** The profile-level `delegate` row has an `allowedAgentPresets` allowlist of the five goal presets, and an absolute `maxDepth: 1`. A child at depth 1 inherits the row and is refused when it tries to delegate. The `goal-executor-lead` preset shadows the row with `maxDepth: 2` and the three leaf presets only.
+- **Routes.** The row passes an explicit `provider`/`model` pair only when the caller names one, with `reasoning_effort` only alongside both. The host validates the route against the session policy; the bundle has no route, model or effort table.
 
-## What the plugin does not gate
+## What the bundle does not gate
 
-- **Sandbox and approval.** The host's approval and sandbox settings apply to every tool call, including a worker's writes and a root `git push`, exactly as they do without this plugin. The plugin neither adds a check nor loosens one; a pending or refused approval is a question for the user.
-- **Write paths are not permissions.** A worker has the inherited tool surface and is not stopped from writing outside its declared paths. The overlap check only compares declarations, only among writers under the same root in the same process; a declaration is an exact file or a prefix, and any other glob is read conservatively as the prefix before its first wildcard, so the check can over-report an overlap but cannot miss one. It does not inspect the filesystem, resolve symlinks, or see another dsh process or another session. Keeping inside the brief is the worker's job and the root's review.
-- **Outbound content.** Nothing scans or redacts a commit message, a PR body or an issue comment. Commit, push, pull request and merge in the repository are ordinary work. Redaction before posting is an instruction in the skill and a review item, not a gate.
-- **External systems.** The package has no MCP client, no connector overlay, no network call of its own and no external-system role. It sees only the tools the host registers in the session.
-- **Routes.** The plugin does not grant, filter or rank model routes. It passes an explicit `provider`/`model` pair to the host, or lets the child inherit the host default, and the host validates what it is given.
-- **Storage.** There is no ledger file, no storage-domain write, no web route and no client card. Delegation records exist only in plugin memory for one root session and are gone after a host restart.
+- **Sandbox and approval.** The host's approval and sandbox settings apply to every call, including a worker's writes and a root `git push`. The bundle adds no check and loosens none.
+- **File scopes between concurrent writers.** The 0.4.0 `writePaths` conflict guard is gone. The host starts children without comparing their file scopes, so disjoint write scopes are the main agent's job to write into the briefs, and the main agent's job to review.
+- **The review.** A `goal-reviewer` child returns a verdict in its completion notice. Nothing validates the verdict's shape, and the main agent cannot write one; the workflow depends on the main agent treating a `fail` as a finding to fix.
+- **Outbound content.** Nothing scans or redacts a commit message, a pull request body or an issue comment.
+- **External systems.** The package has no MCP client, no connector and no network call of its own.
+- **Storage.** There is no ledger file, no storage domain, no web route and no client card. A delegation leaves no record beyond the transcript, the host's completion notice and `list_agents`.
 
 ## What the records are and are not
 
-- The route sent with a dispatch and its source say what the plugin asked for; `observed`, when the host exposes the child session log, is the route the child's first request actually used. Neither proves the work is right.
-- A reviewer verdict is evidence of one independent look, not proof that the change is correct.
-- `writePaths` is a statement of intent at dispatch time, not a boundary the filesystem enforces.
-- `idle` in a record means a child settled a turn and can be messaged, not that its work is finished or correct.
+- A completion notice says what a child answered; it does not prove the answer is right.
+- A reviewer verdict is evidence of one independent look, not proof that a change is correct.
+- The depth cap bounds recursion; it is not a permission boundary. A child still runs with the host's sandbox and approval policy, and with whatever the preset grants it.
 
 ## Non-goals
 
 - A sandbox, a permission system or a policy layer for the session.
 - Redaction or scanning of outbound payloads.
-- Remote delivery, durability or exactly-once behaviour.
+- Durable delegation records or resume across a host restart.
 - A cross-family or vendor guarantee for reviews.
-- Compatibility with plugin 0.2.x runs, tools or configuration.
+- Compatibility with the 0.4.0 plugin's tools, refusal codes or configuration.

@@ -2,12 +2,14 @@
 > package is on npm as `dsh-goal-autopilot`; the registry is the only install
 > channel.
 
-0.4.0 is the single outbound product: the basic local goal workflow for DeepSeek
-Harness. One skill, three tools (`autopilot_delegate`, `autopilot_agents`,
-`autopilot_escalate`), an in-memory delegation ledger, and one independent
-review. It targets dsh `0.2.2-rc.5` (`engines.dsh` `>=0.2.2-rc.5 <0.3.0-0`).
+0.5.0 is configuration only: five agent presets (`goal-scout`, `goal-worker`,
+`goal-executor-lead`, `goal-planner`, `goal-reviewer`), one profile-level
+`delegate` delegation row capped at depth 1, and one skill. There is no plugin
+code, no `lib/`, and no service. It targets dsh `0.2.2-rc.5`
+(`engines.dsh` `>=0.2.2-rc.5 <0.3.0-0`).
 
-This release removes the 0.2.x run state machine and its legacy reader, the
-routing engine, the persisted ledger and session card, the connector overlay and
-the `clerk` role. Routes come from the dispatch call or the host default. See
+This release removes the three `autopilot_*` tools, the in-memory delegation
+ledger, runtime role scoping, the `writePaths` guard, the reviewer wait and the
+plugin's skill publishing. Roles are presets now, delegation is the host's
+`delegate` tool, and the skill is a file you copy into a skill root. See
 CHANGELOG.md for the full break and migration notes.
