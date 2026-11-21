@@ -1,13 +1,13 @@
 # CI for dsh-goal-autopilot.
 #
-# 0.4.0 has one half: the host plugin in `src/`. There is no client bundle, no
-# web route and no storage domain, so every gate below covers the complete
-# product rather than only part of it.
+# 0.5.0 is configuration only: a Cordis patch, a skill and documentation. There
+# is no plugin code, so the gates are the configuration tests, and `node --test`
+# also parses `cordis.patch.yml` as part of them. A separate YAML step would only
+# repeat what the suite already fails on.
 #
 # The gates are invoked directly rather than through `pnpm run <script>` so CI
 # runs a fixed command list and does not depend on pnpm's
 # verify-deps-before-run behaviour (see pnpm-workspace.yaml).
-
 
 name: CI
 
@@ -24,8 +24,8 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  host:
-    name: Host (typecheck, test, build)
+  bundle:
+    name: Bundle (config tests)
     runs-on: ubuntu-latest
 
     steps:
@@ -57,14 +57,5 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
-      - name: Typecheck host sources
-        run: npx tsc -p tsconfig.json --noEmit
-
-      - name: Typecheck tests
-        run: npx tsc -p tsconfig.test.json
-
-      - name: Unit tests
-        run: npx vitest run
-
-      - name: Build host
-        run: npx tsc -p tsconfig.json
+      - name: Test configuration
+        run: node --test

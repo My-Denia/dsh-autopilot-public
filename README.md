@@ -6,83 +6,85 @@
 [![CI](https://img.shields.io/github/actions/workflow/status/My-Denia/dsh-autopilot-public/ci.yml?branch=main&style=flat-square)](https://github.com/My-Denia/dsh-autopilot-public/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](./LICENSE)
 
-A goal workflow adapter for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (dsh). When a goal is stated, the main agent keeps the decisions and the conversation, hands bounded work to role children of the host's own subagents, gets one independent review, and completes the goal only when its Done checks hold. The issue and the pull request are the record; the plugin keeps the delegation mechanics.
+A goal workflow for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (dsh), shipped as configuration only. Five agent presets carry the roles, one profile-level `delegate` tool starts a child on one of them, and one skill tells the main agent when and how to run a goal.
+
+There is no plugin code. No tools of its own, no service, no storage, no client bundle: the host starts the children, owns the goal, validates routes and applies the sandbox.
 
 > [!NOTE]
 > The npm package is **`dsh-goal-autopilot`**. The unscoped `dsh-autopilot` on npm is an unrelated package.
 
+## What is in the box
+
+| piece | what it is |
+| --- | --- |
+| `cordis.patch.yml` | the bundle patch: one `delegate` row and five `@deepseek-ai/dsh-agent-preset` declarations |
+| `skill/dsh-goal-autopilot/SKILL.md` | the adapter skill: when a goal applies, the order of work, the roles, the review, the done checks |
+| presets | `goal-scout`, `goal-worker`, `goal-executor-lead`, `goal-planner`, `goal-reviewer` |
+
+The manifest sets `dsh.bundle.patch`, so `dsh plugin add` composes the patch into the profile.
+
 ## Install
 
-0.4.0 may not be the registry's `latest` tag yet. If `add` resolves to an older version, name this one:
+0.5.0 targets dsh `>=0.2.2-rc.5 <0.3.0-0`. Node 22 or newer is required to run the test suite; the profile process is the host's.
 
 ```sh
-dsh plugin --profile <name> add dsh-goal-autopilot
-dsh plugin --profile <name> add dsh-goal-autopilot@0.4.0   # pin the pre-release
+dsh plugin --profile <name> add dsh-goal-autopilot@0.5.0
 ```
 
-The package targets dsh `0.2.2-rc.5` and declares `engines.dsh` as `>=0.2.2-rc.5 <0.3.0-0`. Node 22 or newer is required. Older hosts cannot load 0.4.0; the 0.3.0 pre-releases were built for dsh `0.2.1-rc.5`, and `0.2.0` remains the last release for dsh `0.1.x` and `0.2.0`.
+Pin the version when the registry's `latest` tag is an older release.
 
-## When it starts
+After the profile loads, a session gains a `delegate` tool and the preset roster gains the five role presets. Keep your usual preset for the session you talk to; the role presets are child presets.
 
-The adapter skill applies when the user states a goal, asks for autopilot, or hands over sustained multi-stage work: several stages, parallel pieces, a pull request to land. The agent reads the current goal with `get_goal` and, when none is current, calls `create_goal` with the Outcome as the objective.
+The depth cap is deliberate. The profile-level `delegate` row sets `maxDepth: 1`, an absolute cap enforced by the host against the calling agent's depth. A child started at depth 1 inherits the tool and is refused when it tries to delegate, so scout, worker, planner and reviewer children cannot spawn a tree of their own. Only `goal-executor-lead` mounts its own `delegate` row, with `maxDepth: 2` and the three leaf presets.
 
-Questions, small reversible edits and ordinary read-only reviews stay in the main thread. They make no goal call and no `autopilot_*` call.
+The skill is a file in the package. A bundle patch declares Loader rows and cannot copy files, so installing the bundle does not install the skill. Copy the directory into a root dsh scans with `@deepseek-ai/dsh-skill-filesystem`:
+
+```sh
+mkdir -p "$DSH_AGENTS_HOME/skills"
+cp -r skill/dsh-goal-autopilot "$DSH_AGENTS_HOME/skills/"
+```
+
+Use `<project>/.dsh/skills/` instead to scope it to one repository. Without the skill the presets and `delegate` still work; the skill is what tells the main agent the workflow.
 
 ## How a goal runs
 
-- **Start.** The agent reads the project rules and the issue, writes Outcome, Done and Not in scope on the issue or PR, and works in a worktree.
-- **Roles.** The main agent decides, integrates and talks to the user. It starts role children with `autopilot_delegate`:
+- **Start.** The main agent reads the project rules and the issue, writes Outcome, Done and Not in scope on the issue or pull request, and works in a worktree.
+- **Delegate.** `delegate` takes a short `description`, the `prompt` (the brief), and `agent_preset`. It starts a managed child and returns at once with the child's name; the child's final answer arrives later in the host's completion notice.
+- **Roles.** The main agent decides, integrates and talks to the user. Each child gets its preset's tools only:
 
-  | role | what it does | tools |
+  | preset | role | tools |
   | --- | --- | --- |
-  | `scout` | read-only search, inventory and log reading; returns compressed findings | `read`, `glob`, `grep`, `read_image`, `web_fetch`, `web_search` |
-  | `planner` | read-only plan or diagnosis | `read`, `glob`, `grep`, `read_image` |
-  | `worker` | one bounded piece of work; must declare `writePaths` | inherits the session tool set |
-  | `executor-lead` | one chunk end to end; may start `scout` and `worker` children | inherits the session tool set, plus the delegation tools |
-  | `reviewer` | one-shot read-only review in a fresh context; returns a verdict | `read`, `glob`, `grep`, `read_image`; cannot delegate |
+  | `goal-scout` | read-only search, inventory and log reading | `read`, `read_image`, `glob`, `grep` |
+  | `goal-worker` | one bounded implementation piece | shell (`bash` or `pwsh`), `jobs`, `read`, `read_image`, `write`, `edit`, `glob`, `grep` |
+  | `goal-executor-lead` | one chunk end to end; may start the three leaf roles | the worker's tools, plus `list_agents`, `send_message`, `wait_agent` and its own `delegate` |
+  | `goal-planner` | read-only diagnosis and a decision-complete plan | `read`, `read_image`, `glob`, `grep` |
+  | `goal-reviewer` | one-shot read-only review in a fresh context | `read`, `read_image`, `glob`, `grep` |
 
-- **Parallel delegation.** Independent children are started together in one turn. A new writer whose `writePaths` overlap a writer still running under the same root is refused before it starts.
-- **One independent review.** `reviewer` is one-shot, read-only and runs in a fresh context. It gets the diff and the claim in `task`, not the author's reasoning, and returns `pass` or `fail` with `blocker` and `note` findings in-band, as the result of the same call. The main agent cannot write a verdict. The route is whatever the call names or the host default supplies; a same-model review is normal, and the result records the route that ran when the host exposes it.
-- **Waiting.** `autopilot_agents` with `action: 'wait'` blocks until the listed children settle or the timeout fires (default 300 s, at most 600). Background jobs and CI watchers use the host's `job_output` with `wait`. Waiting happens inside the turn; the wait tools are not gates.
-- **Done.** The agent calls `update_goal` with `action: 'complete'` only when every Done check holds. Finishing a stage, opening a PR or a green CI run does not complete the goal. The host's goal driver continues an armed goal between turns.
-- **After a restart.** Running children are gone and an active goal is disarmed. Nothing resumes automatically: when the user says continue, the agent reads the goal with `get_goal` and rearms it with `update_goal` `resume`.
+- **Parallel work.** Independent children start in one message; the main agent keeps working while they run. The host does not compare file scopes, so disjoint write scopes belong in the briefs the main agent writes.
+- **One independent review.** `goal-reviewer` runs read-only in a fresh context and returns `pass` or `fail` with blocker and note findings in the completion notice. The main agent cannot write that verdict; a `fail` is fixed and re-reviewed.
+- **Waiting.** While a goal is armed, wait inside the turn with `wait_agent` or `job_output` instead of ending the turn to wait for a child.
+- **Done.** The main agent calls `update_goal` with `complete` only when every Done check passes on the final tree and the review is `pass`. After a session resume, an active goal is disarmed until `update_goal` `resume` rearms it.
 
-## Tools
+## Routes
 
-| tool | callable by | what it does |
-| --- | --- | --- |
-| `autopilot_delegate` | root agent, `executor-lead` | starts one role child and returns at once with its child id, the route it was given, the route source (`call` or `inherit`) and the generation |
-| `autopilot_agents` | root agent, `executor-lead` | `action: 'wait'` only: blocks until the listed children settle or the timeout fires, and returns `timedOut` plus the delegation records |
-| `autopilot_escalate` | any delegated child except `reviewer` | records a request for a stronger route, more effort or a different split; the parent decides and re-dispatches with `replaces`. It never widens the role's permissions |
+The route comes from the user's own configuration. Omit `provider`, `model` and `reasoning_effort` to inherit the host default, or name `provider` and `model` together and `reasoning_effort` only with both; the host rejects an effort on its own. The presets pin no model, no provider and no effort, and the package ships no routing table.
+
+`list_subagent_models` reports the routes and efforts the host and the user allow.
 
 ## Configuration
 
-One key:
+The bundle has no configuration keys and no code. To change a row, target its Loader id in the profile's own `cordis.patch.yml` (`delegate`, `preset-goal-scout`, `preset-goal-worker`, `preset-goal-executor-lead`, `preset-goal-planner`, `preset-goal-reviewer`). A targeted row replaces its whole `config`, so restate every field the row needs.
 
-| key | values | meaning |
-| --- | --- | --- |
-| `skillInstall` | `auto` (default) | publishes the adapter skill through the host's skills service, or copies `skill/dsh-goal-autopilot/SKILL.md` into `$DSH_AGENTS_HOME/skills/dsh-goal-autopilot` when that service is unavailable |
-|  | `off` | neither channel; the skill is not installed |
+## Supported host
 
-There are no model pins, ladders, catalogs or work classes. A route comes from the dispatch call (`provider` and `model` together, optional `effort`) or from the host default.
+| what | range |
+| --- | --- |
+| dsh | `>=0.2.2-rc.5 <0.3.0-0` |
+| Node | `>=22` (tests) |
 
-## What it deliberately does not do
+The package convention that carries an agent preset, a delegation tool's `agentPreset`/`allowedAgentPresets` and an absolute `maxDepth` first shipped in the 0.2.2 pre-releases this range starts from.
 
-- **No model routing policy.** No ladder, model catalog, work classes, coverage report, onboarding notice or cross-family vendor rule. The plugin cannot grant, filter or rank routes; it records the route asked for, where it came from, and, when the host exposes the child's log, the route that ran.
-- **No persisted ledger.** Delegation records live in memory for one root session. A host restart loses them, and the children they describe are gone; there is no resume and no `lost` state.
-- **No session card, client bundle or web routes.** There is no list, status or link tool; the host's `list_agents` and `send_message` cover the tree, and the issue and PR carry the record.
-- **No external-system role.** The 0.2.x `clerk` role, the connector overlay and MCP write paths are not part of this package. Delegated work is local repository work; a `scout` may use the host's `web_search` and `web_fetch` for research, but there is no connector or external write path.
-- **No legacy 0.2.x history.** It does not read, fold, display or continue runs written by plugin 0.2.x, and it keeps no compatibility shims for old tools or config keys.
-- **No sandbox of its own.** Host approval and sandbox settings apply to every call; `writePaths` is a conflict guard between concurrent writers, not a permission system. See [docs/security.md](./docs/security.md).
-
-## Documentation
-
-- [ARCHITECTURE.md](./ARCHITECTURE.md): how the plugin divides work with the host
-- [docs/reference.md](./docs/reference.md): exact tool parameters, refusals, configuration and host tools
-- [docs/security.md](./docs/security.md): what the plugin gates and does not gate
-- [skill/dsh-goal-autopilot/SKILL.md](./skill/dsh-goal-autopilot/SKILL.md): the in-session adapter
-- [CHANGELOG.md](./CHANGELOG.md): release history and the 0.4.0 break
-- [docs/release.md](./docs/release.md): how a release is built, published and tagged
+The profile must mount the agent-preset registry (`@deepseek-ai/dsh-agent-preset-registry`) and the in-process `spawn` subagent provider. The Web and Desktop profiles mount both; a bare base profile does not, and without the preset service the `delegate` row fails to load with `agent preset selection requires the agent-presets service`.
 
 ## Development
 
@@ -92,11 +94,20 @@ Node 22 and pnpm 11.17.0.
 git clone https://github.com/My-Denia/dsh-autopilot-public.git
 cd dsh-autopilot-public
 pnpm install
-pnpm run build
-pnpm run check
-pnpm test
+node --test
 dsh plugin --profile dev add .
 ```
+
+The test suite parses `cordis.patch.yml` with the `yaml` package, checks the preset declarations, the delegation rows, the skill frontmatter and the package manifest. It needs no host and no network.
+
+## Documentation
+
+- [ARCHITECTURE.md](./ARCHITECTURE.md): why the product is configuration, what the host owns, and the depth-cap reasoning
+- [docs/reference.md](./docs/reference.md): the preset ids and tool surfaces, the `delegate` parameters, the skill, and refused shapes
+- [docs/security.md](./docs/security.md): what the bundle configures and what stays with the host
+- [skill/dsh-goal-autopilot/SKILL.md](./skill/dsh-goal-autopilot/SKILL.md): the in-session adapter
+- [CHANGELOG.md](./CHANGELOG.md): release history and the 0.5.0 break
+- [docs/release.md](./docs/release.md): how a release is gated, published and tagged
 
 ## License
 

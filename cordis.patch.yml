@@ -1,7 +1,230 @@
-# dsh-goal-autopilot bundle layer: mounts the plugin with its default config.
-# Override per profile in the profile's own cordis.patch.yml by targeting
-# `id: autopilot`. The plugin takes one optional setting (`skillInstall`);
-# it pins no models and keeps no state.
+# dsh-goal-autopilot 0.5.0 — a configuration-only DSH bundle.
+#
+# This file is the whole product on the configuration side: five agent presets
+# (`goal-scout`, `goal-worker`, `goal-executor-lead`, `goal-planner`,
+# `goal-reviewer`) and one profile-level delegation tool row. There is no
+# JavaScript plugin, no service, no storage and no client bundle.
+#
+# The delegation row is `delegate` (tool name `delegate`, spawn backend). Its
+# `allowedAgentPresets` is the closed role list the model may pick through the
+# `agent_preset` argument; its `maxDepth` is an absolute delegation-depth cap:
+# a child at depth 1 that inherits this tool is refused at its own delegation
+# attempt, so read-only roles cannot spawn a tree of their own. The one
+# exception is `goal-executor-lead`, whose preset mounts its own `delegate` row
+# with `maxDepth: 2` and only the three leaf presets, so a lead can direct
+# leaves while its children cannot go deeper.
+#
+# `!!js` appears only on the shell rows copied from the shipped `standard`
+# preset: the Loader evaluates those platform guards at mount time.
+
 - insert:
-    - id: autopilot
-      name: dsh-goal-autopilot
+    # One profile-level delegation tool. The model chooses the role through
+    # `agent_preset`; the route fields come from `modelSelection`.
+    - id: delegate
+      name: '@deepseek-ai/dsh-tool-subagent'
+      config:
+        provider: spawn
+        toolName: delegate
+        modelSelection: true
+        modelDiscovery: true
+        allowedAgentPresets:
+          - goal-scout
+          - goal-worker
+          - goal-executor-lead
+          - goal-planner
+          - goal-reviewer
+        maxDepth: 1
+
+    # Read-only search and inventory.
+    - id: preset-goal-scout
+      name: '@deepseek-ai/dsh-agent-preset'
+      config:
+        id: goal-scout
+        name: Goal scout
+        description: Read-only search, inventory and log reading for a goal workflow.
+        order: 10
+        plugins:
+          - id: persona
+            name: '@deepseek-ai/dsh-persona'
+            config:
+              prefix: >-
+                You are goal-scout, the read-only search role of a goal workflow.
+                Read the files and logs your brief names, follow the evidence to
+                exact paths and line numbers, and return compressed findings: what
+                you found, where it is, and what you could not find. Change nothing.
+                You have no write, edit or shell tools, and you cannot delegate.
+          - id: time-context
+            name: '@deepseek-ai/dsh-time-context'
+          - id: tool-fs
+            name: '@deepseek-ai/dsh-tool-fs'
+            config:
+              read: true
+              readImage: true
+              write: false
+              edit: false
+          - id: tool-fs-search
+            name: '@deepseek-ai/dsh-tool-fs-search'
+            config:
+              sampleOverCapGlobResults: false
+
+    # Bounded implementation.
+    - id: preset-goal-worker
+      name: '@deepseek-ai/dsh-agent-preset'
+      config:
+        id: goal-worker
+        name: Goal worker
+        description: One bounded implementation piece with shell and file tools.
+        order: 11
+        plugins:
+          - id: persona
+            name: '@deepseek-ai/dsh-persona'
+            config:
+              prefix: >-
+                You are goal-worker, one bounded implementation role of a goal
+                workflow. Do the piece in your brief and nothing beside it: stay
+                inside the paths the brief declares, keep the change minimal, run
+                the checks the brief names, and report the exact commands, their
+                exit results and the final diff. You cannot delegate and you do
+                not decide that the goal is done.
+          - id: time-context
+            name: '@deepseek-ai/dsh-time-context'
+          - id: tool-bash
+            name: '@deepseek-ai/dsh-tool-bash'
+            disabled: !!js process.platform === 'win32'
+          - id: tool-pwsh
+            name: '@deepseek-ai/dsh-tool-pwsh'
+            disabled: !!js process.platform !== 'win32'
+          - id: tool-fs
+            name: '@deepseek-ai/dsh-tool-fs'
+            config:
+              applyPatch: false
+          - id: tool-fs-search
+            name: '@deepseek-ai/dsh-tool-fs-search'
+            config:
+              sampleOverCapGlobResults: false
+          - id: tool-jobs
+            name: '@deepseek-ai/dsh-tool-jobs'
+
+    # One chunk end to end, with its own bounded delegation.
+    - id: preset-goal-executor-lead
+      name: '@deepseek-ai/dsh-agent-preset'
+      config:
+        id: goal-executor-lead
+        name: Goal executor lead
+        description: Owns one chunk end to end and may direct the three leaf roles.
+        order: 12
+        plugins:
+          - id: persona
+            name: '@deepseek-ai/dsh-persona'
+            config:
+              prefix: >-
+                You are goal-executor-lead, owner of one chunk of a goal workflow.
+                Split the chunk into disjoint pieces, start the leaf roles with
+                `delegate` (`agent_preset` goal-scout, goal-worker or goal-planner),
+                keep working while they run, and integrate their results yourself.
+                Run the checks the chunk needs and report the exact commands, their
+                exit results and the final diff. You cannot start another lead or
+                the reviewer, and you do not decide that the goal is done.
+          - id: time-context
+            name: '@deepseek-ai/dsh-time-context'
+          - id: tool-bash
+            name: '@deepseek-ai/dsh-tool-bash'
+            disabled: !!js process.platform === 'win32'
+          - id: tool-pwsh
+            name: '@deepseek-ai/dsh-tool-pwsh'
+            disabled: !!js process.platform !== 'win32'
+          - id: tool-fs
+            name: '@deepseek-ai/dsh-tool-fs'
+            config:
+              applyPatch: false
+          - id: tool-fs-search
+            name: '@deepseek-ai/dsh-tool-fs-search'
+            config:
+              sampleOverCapGlobResults: false
+          - id: tool-jobs
+            name: '@deepseek-ai/dsh-tool-jobs'
+          - id: tool-subagent-control
+            name: '@deepseek-ai/dsh-tool-subagent-control'
+            config:
+              interrupt: false
+          # The lead's own delegation row: it shadows the profile-level
+          # `delegate` for agents on this preset and lifts the cap to 2, so the
+          # lead may start depth-2 leaves. Its allowlist is the three leaf
+          # presets; the reviewer stays the main agent's call.
+          - id: delegate
+            name: '@deepseek-ai/dsh-tool-subagent'
+            config:
+              provider: spawn
+              toolName: delegate
+              modelSelection: true
+              allowedAgentPresets:
+                - goal-scout
+                - goal-worker
+                - goal-planner
+              maxDepth: 2
+
+    # Read-only diagnosis and planning.
+    - id: preset-goal-planner
+      name: '@deepseek-ai/dsh-agent-preset'
+      config:
+        id: goal-planner
+        name: Goal planner
+        description: Read-only diagnosis and a decision-complete plan for hard work.
+        order: 13
+        plugins:
+          - id: persona
+            name: '@deepseek-ai/dsh-persona'
+            config:
+              prefix: >-
+                You are goal-planner, the read-only diagnosis role of a goal
+                workflow. Work from the evidence: name the root cause, the options
+                with their tradeoffs, the exact files and steps of the plan, and
+                the checks that will prove it. Separate verified facts from
+                assumptions. Change nothing and do not delegate.
+          - id: time-context
+            name: '@deepseek-ai/dsh-time-context'
+          - id: tool-fs
+            name: '@deepseek-ai/dsh-tool-fs'
+            config:
+              read: true
+              readImage: true
+              write: false
+              edit: false
+          - id: tool-fs-search
+            name: '@deepseek-ai/dsh-tool-fs-search'
+            config:
+              sampleOverCapGlobResults: false
+
+    # One-shot read-only review in a fresh context.
+    - id: preset-goal-reviewer
+      name: '@deepseek-ai/dsh-agent-preset'
+      config:
+        id: goal-reviewer
+        name: Goal reviewer
+        description: One-shot read-only review of a claim and its diff.
+        order: 14
+        plugins:
+          - id: persona
+            name: '@deepseek-ai/dsh-persona'
+            config:
+              prefix: >-
+                You are goal-reviewer, a one-shot reviewer in a fresh context. Judge
+                the claim against the evidence in your brief: the files as they are
+                now, the diff, and the commands with their results. Do not take the
+                author's reasoning as evidence. Return a verdict of pass or fail
+                with findings marked blocker or note (file and line when known) and
+                a short summary. A pass that carries a blocker finding is invalid.
+                Fix nothing, change nothing, and do not delegate.
+          - id: time-context
+            name: '@deepseek-ai/dsh-time-context'
+          - id: tool-fs
+            name: '@deepseek-ai/dsh-tool-fs'
+            config:
+              read: true
+              readImage: true
+              write: false
+              edit: false
+          - id: tool-fs-search
+            name: '@deepseek-ai/dsh-tool-fs-search'
+            config:
+              sampleOverCapGlobResults: false
