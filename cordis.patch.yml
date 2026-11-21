@@ -1,8 +1,7 @@
-# dsh-autopilot bundle layer: mounts the autopilot plugin with default config.
-# Override per profile in the profile's cordis.patch.yml by targeting id: autopilot.
-#
-# No store pin is needed here: 0.3.0 always keeps one ledger file per session, and the
-# retired `storeKind` key is ignored (CHANGELOG 0.3.0, Breaking changes).
+# dsh-goal-autopilot bundle layer: mounts the plugin with its default config.
+# Override per profile in the profile's own cordis.patch.yml by targeting
+# `id: autopilot`. The plugin takes one optional setting (`skillInstall`);
+# it pins no models and keeps no state.
 - insert:
     - id: autopilot
       name: dsh-goal-autopilot

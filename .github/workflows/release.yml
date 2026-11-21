@@ -1,19 +1,10 @@
-# Tag-triggered release for dsh-autopilot: verify, then publish NOTES ONLY.
+# Tag-triggered release for dsh-goal-autopilot.
 #
-# WHY THERE IS DELIBERATELY NO TARBALL. package.json `files` packs `lib/`
-# wholesale and `exports` declares `"./client": "./lib/client.js"` — but
-# `build:client` cannot run on a CI runner (its type gate resolves externals
-# through absolute paths into a sibling dsh checkout; see ci.yml's header),
-# and `npm pack` skips missing paths SILENTLY. A CI-built tarball would
-# therefore carry the `./client` export while shipping no lib/client.js:
-# every consumer of the artifact would get a dead subpath with no error at
-# install time. A release that looks complete and is not is worse than no
-# artifact — so this workflow gates the tag and writes the release notes,
-# and attaches nothing.
-#
-# UNLOCK CONDITION for a real tarball: the client half becoming CI-buildable
-# (typing its externals against publishable artifacts instead of a sibling
-# checkout) — parked product work, tracked in DESIGN.md.
+# npm is the distribution channel: the installable package is published to the
+# registry from a maintainer checkout. This workflow gates the tag on exactly
+# the four commands ci.yml runs on every pull request and publishes the GitHub
+# Release NOTES only — no tarball is attached, so the registry stays the single
+# source of installable artifacts.
 #
 # The four verification commands below are BYTE-IDENTICAL to ci.yml's gate
 # list, on purpose: a tag must not pass a weaker bar than a pull request.
@@ -61,7 +52,7 @@ jobs:
       - name: Unit tests
         run: npx vitest run
 
-      - name: Build host half
+      - name: Build host
         run: npx tsc -p tsconfig.json
 
       - name: Create the notes-only release
@@ -71,6 +62,6 @@ jobs:
           # --notes is documented to PREPEND to --generate-notes output;
           # --notes-file is not documented to combine, so it is not used.
           gh release create "$GITHUB_REF_NAME" \
-            --title "dsh-autopilot $GITHUB_REF_NAME" \
+            --title "dsh-goal-autopilot $GITHUB_REF_NAME" \
             --generate-notes \
             --notes "$(cat .github/release-notes-preamble.md)"

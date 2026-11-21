@@ -5,10 +5,16 @@
  * everything below `src`). Any other glob is read conservatively as the
  * directory prefix before its first wildcard, so it can only over-report an
  * intersection, never miss one. The check is a conflict guard between
- * concurrent writers under one root, not a permission system.
+ * concurrent writers under one root, not a permission system: the host's own
+ * sandbox and approval policy remain the authority over what a child may touch.
  */
 
-import type { DelegationRecord } from '../domain/ledger-types.js'
+/** The part of a delegation this module reads. */
+export interface WriteScope {
+  readonly childId: string
+  readonly state: string
+  readonly writePaths?: readonly string[] | undefined
+}
 
 interface Normalized {
   readonly kind: 'exact' | 'prefix'
@@ -46,18 +52,18 @@ export interface WriteConflict {
 const ACTIVE = new Set<string>(['starting', 'running'])
 
 /**
- * The first conflict between `paths` and the active writers of `delegations`,
+ * The first conflict between `paths` and the live writers of `records`,
  * skipping the new delegation's own ancestors: a lead's paths may contain its
  * workers', and a worker is checked against its siblings, not its lead.
  *
- * @param ancestors child ids of the dispatching chain (the lead, when a lead dispatches).
+ * @param ancestors child ids of the dispatching chain plus any replaced child.
  */
 export function findWriteConflict(
   paths: readonly string[],
-  delegations: readonly DelegationRecord[],
+  records: readonly WriteScope[],
   ancestors: ReadonlySet<string>,
 ): WriteConflict | undefined {
-  for (const other of delegations) {
+  for (const other of records) {
     if (!ACTIVE.has(other.state) || ancestors.has(other.childId)) continue
     for (const mine of paths) {
       for (const theirs of other.writePaths ?? []) {
